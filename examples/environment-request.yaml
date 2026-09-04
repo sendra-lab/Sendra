@@ -1,0 +1,20 @@
+# Variables from an environment file, substituted before the request is sent.
+#
+# Run it with the secret exported, from anywhere in the repository:
+#
+#   API_KEY=live-token cargo run -p sendra-cli -- run examples/environment-request.yaml
+#
+# `base_url` and `api_key` come from `.sendra/environments/default.yaml`;
+# `api_key` is `${API_KEY}` there, so its value is read from the OS environment
+# at send time and never written down. httpbin.org/headers echoes back the
+# headers it received, so the response shows the resolved value on the wire.
+#
+# Leave API_KEY unset and the run fails before connecting, naming the variable.
+
+name: Echo resolved variables
+method: GET
+url: '{{base_url}}/headers'
+headers:
+  Accept: application/json
+  Authorization: 'Bearer {{api_key}}'
+  X-Sendra-Base-Url: '{{base_url}}'

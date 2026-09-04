@@ -7,17 +7,19 @@ plain YAML files that live in your repo next to the code they exercise, and you
 send them from the shell. A request is just a file: method, URL, headers, body.
 That makes requests reviewable in a pull request, diffable over time, and
 shareable without exporting anything. A file holds either one request or a
-named collection of them, sent and printed. Environments, variables, scripting,
-assertions and an interactive TUI are all planned and deliberately absent for
-now.
+named collection of them, sent and printed, against variables from an
+environment file so the same request can point at staging or at production.
+Scripting, assertions and an interactive TUI are all planned and deliberately
+absent for now.
 
 ## Layout
 
 ```
 sendra/
-  sendra-core/     library: request/response types, YAML loading, config, HTTP execution
+  sendra-core/     library: request/response types, YAML loading, config, environments, HTTP execution
   sendra-cli/      binary `sendra`: argument parsing, output, exit codes
   examples/        sample request and collection files
+  .sendra/         this repo's own project config and environments
 ```
 
 `sendra-core` knows nothing about clap or terminal output. A `sendra-tui` crate
@@ -38,6 +40,18 @@ body, and `examples/collection.yaml`, which holds four requests in one file:
 cargo run -p sendra-cli -- run examples/collection.yaml              # all four
 cargo run -p sendra-cli -- run examples/collection.yaml "Post JSON"  # just one
 ```
+
+`examples/environment-request.yaml` uses variables instead of literals, and
+needs a secret in your shell to run:
+
+```sh
+API_KEY=live-token cargo run -p sendra-cli -- run examples/environment-request.yaml
+```
+
+It reads `base_url` and `api_key` from `.sendra/environments/default.yaml` in
+this repository and sends them to `httpbin.org/headers`, which echoes back what
+it received, so you can see the resolved values on the wire. Leave `API_KEY`
+unset and the run fails before connecting, naming the variable.
 
 ## Request file shape
 
@@ -166,13 +180,125 @@ the request's value is the one sent.
 
 There are no CLI flags to override config yet — the file is the only input.
 
+## Environments and variables
+
+An environment is a flat file of variables at
+`.sendra/environments/<name>.yaml`, found by the same upward walk as
+`.sendra/config.yaml`:
+
+```yaml
+# .sendra/environments/staging.yaml
+base_url: https://staging.api.example.com
+api_key: ${API_KEY} # read from your shell, never written down here
+```
+
+Requests reference them with `{{name}}`, in the `url`, in header names and
+values, and in the `body`:
+
+```yaml
+method: POST
+url: '{{base_url}}/users'
+headers:
+  Authorization: 'Bearer {{api_key}}'
+body: '{"tenant": "{{tenant}}"}'
+```
+
+Point the same file at production by changing which environment is loaded, and
+nothing in the request file moves.
+
+**Quote a value that starts with `{{`.** In YAML a bare `{` opens a flow
+mapping, so `url: {{base_url}}/users` is a syntax error before Sendra sees it.
+`url: '{{base_url}}/users'` is fine. A `{{...}}` in the middle of a value —
+`url: https://x/{{id}}` — needs no quotes.
+
+**Keeping secrets out of git.** A value written as `${VAR}` is read from your OS
+environment at send time, so the file names the secret without containing it and
+can be committed like any other request file. Sendra never reads a `.env` file:
+exporting the variable is the whole mechanism, which means it works the same in
+a shell, in CI, and under any secret manager that can export one.
+
+**Nothing resolves to an empty string.** A `{{var}}` with no such variable, or a
+`${VAR}` that is not exported, is an error naming what is missing, raised while
+that request is being built — so none of its bytes go out:
+
+```
+error: no variable named `base_url` in `.sendra/environments/default.yaml` (available: api_key, host)
+error: environment variable `API_KEY` is not set (referenced by `api_key` in `.sendra/environments/default.yaml`)
+```
+
+The alternative, sending `Authorization: Bearer ` and letting the server answer
+`401`, turns a one-line fix into a debugging session.
+
+**In a collection, one broken request fails alone.** Substitution happens as
+each request is reached, not as a check over the whole file first, so a missing
+variable is treated exactly like a refused connection: that request is reported
+as a failure, the requests around it are still sent, every result still prints,
+and the exit code is the worst of them.
+
+```
+→ First
+200 OK  412 ms
+...
+→ Broken
+error: no variable named `nope` in `.sendra/environments/default.yaml` (available: api_key, base_url)
+
+→ Third
+200 OK  388 ms
+...
+```
+
+`--allow-error-status` does not suppress this. That flag forgives a *status*,
+and a request that could not be built has no status — like a DNS or connection
+failure, it exits `1` either way.
+
+**Which environment is loaded — temporary.** There is no `--env` flag yet, so
+the name is hardcoded to `default`: Sendra loads
+`.sendra/environments/default.yaml` and nothing else. A project with no such
+file is not an error, it is the empty environment, under which a request
+containing no `{{...}}` behaves exactly as it did before environments existed.
+The flag is the next piece of work and replaces exactly this default.
+
+**What substitution touches, and what it does not.** Only `url`, `headers` and
+`body`. Not `method`, which is a closed set with no useful placeholder, and not
+`name`, which is what `sendra run <file> <name>` selects on — a label that
+changed with the environment could not be typed on the command line.
+
+Substitution runs on the parsed request, over string values only, rather than as
+a find-and-replace on the file text before parsing. A value is therefore only
+ever a value: a token containing `:`, a multi-line key, a body starting with `-`
+cannot change the shape of the document they land in. That is also why the
+leading-`{{` quoting rule above exists, and it is the one thing a text-level
+pass would have made easier.
+
+Substitution happens **before** config headers are applied, so the request that
+`Config::apply` merges into is the one that will actually be sent, and a
+templated header name is matched against config by its resolved name. The
+consequence: **config headers are not templated.** A `{{var}}` in
+`.sendra/config.yaml` is sent verbatim. A config applies to every project
+directory beneath it and is resolved without reference to any environment, so
+templating it is a decision to take on its own rather than to inherit from this
+one.
+
+Two further rules, both deliberate:
+
+- **No layering.** Environments are flat files; there is no "staging extends
+  base". A nested mapping in an environment file is a parse error rather than
+  something half-supported.
+- **One pass, no recursion.** A resolved value is copied in verbatim and never
+  re-scanned, so a value that itself contains `{{...}}` is data, not a further
+  reference.
+
+Values are strings, and an unquoted scalar substitutes as exactly the text you
+wrote: `port: 8080` is `8080`, `version: 1.0` is `1.0`. Nothing takes a round
+trip through a number on the way in, so `1.0` can never arrive as `1`.
+
 ## Exit codes
 
 - `0` — every request was sent and no response status was an error
   (1xx, 2xx, 3xx).
 - `1` — some request never got a response: the file was missing or malformed, no
-  request by that name, a header was invalid, or the request never completed
-  (DNS, TLS, connection).
+  request by that name, a `{{variable}}` or `${VAR}` had no value, a header was
+  invalid, or the request never completed (DNS, TLS, connection).
 - `2` — bad command-line usage (from clap).
 - `3` — every request completed but at least one server answered `4xx` or `5xx`.
   The responses print exactly as they would otherwise; only the exit code
@@ -220,8 +346,16 @@ push to `main` and every pull request against it — so a clean local run is a
 green build. Clippy is `-D warnings`: a warning fails the build.
 
 The test suite is hermetic. It parses YAML, checks exit-code logic, and resolves
-config against directory trees built under a temporary directory rather than
-against your real `~/.config`; the tests that name a URL point at a closed local
-port so they fail before connecting. Nothing under `cargo test` touches the network, which is what makes
-CI trustworthy rather than merely usually-green. The `examples/` files do hit
-`httpbin.org`, and are run by hand — deliberately never in CI.
+config and environments against directory trees built under a temporary
+directory rather than against your real `~/.config`; the tests that name a URL
+point at a closed local port so they fail before connecting. Nothing under
+`cargo test` touches the network, which is what makes CI trustworthy rather than
+merely usually-green. The `examples/` files do hit `httpbin.org`, and are run by
+hand — deliberately never in CI.
+
+No test calls `std::env::set_var` either. It is process-global, so one test
+setting a variable is visible to every test running beside it; the `${VAR}` path
+is tested by passing a stand-in OS environment to `Environment` instead, the
+same way config resolution takes its directories as arguments. The tests that do
+read the real environment only read it, and only for a name nothing could have
+set.
