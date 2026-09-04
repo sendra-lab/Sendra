@@ -1,0 +1,68 @@
+name: CI
+
+# Every push to main and every PR aimed at it. Feature branches are covered by
+# the pull_request trigger rather than a second push trigger, so a branch that
+# is pushed and then opened as a PR is not built twice for the same commit.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to the same branch supersedes the run already in flight. Runs on
+# main are exempt: main's history is the record CI results are read against.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Do not cancel the other two the moment one fails: "broken on Windows
+      # only" and "broken everywhere" are different bugs, and telling them
+      # apart needs the other jobs to have finished.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Restores ~/.cargo and target/, keyed on the compiler version, the lock
+      # file and the runner OS, so a green run does not recompile the whole
+      # dependency tree from scratch. Caches are per-OS by design.
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+
+      # --all-targets so tests, benches and examples are compiled here, where a
+      # compile error is reported as a build failure rather than a test failure.
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      # Every test is hermetic: they parse YAML and check exit-code logic, and
+      # the one test that names a URL points at a closed local port so it fails
+      # before any connection. Nothing here touches the network, which is what
+      # makes this job trustworthy rather than merely usually-green. The
+      # examples that do hit httpbin.org are run by hand, never here.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # -D warnings: a lint that only prints is a lint that gets scrolled past.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
