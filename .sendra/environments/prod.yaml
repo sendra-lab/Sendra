@@ -1,0 +1,14 @@
+# The other half of the `--env` demo. See `staging.yaml` beside it.
+#
+#   API_KEY=live-token cargo run -p sendra-cli -- run \
+#     examples/environment-request.yaml --env prod
+#
+# A different host from `staging.yaml`, so the same request file demonstrably
+# goes somewhere else. Nothing about the name `prod` is special to Sendra — it
+# is a filename, and so is `staging`.
+#
+# postman-echo.com/headers echoes headers back the way httpbin.org does, so the
+# two runs differ only in where they went, not in what you can see.
+base_url: https://postman-echo.com
+
+api_key: ${API_KEY}

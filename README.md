@@ -53,6 +53,19 @@ this repository and sends them to `httpbin.org/headers`, which echoes back what
 it received, so you can see the resolved values on the wire. Leave `API_KEY`
 unset and the run fails before connecting, naming the variable.
 
+`--env` picks a different environment for the same request file. This
+repository ships `staging.yaml` and `prod.yaml` beside `default.yaml`, pointing
+at two different echo services:
+
+```sh
+API_KEY=live-token cargo run -p sendra-cli -- run examples/environment-request.yaml --env staging
+API_KEY=live-token cargo run -p sendra-cli -- run examples/environment-request.yaml --env prod
+```
+
+The request file names no host at all — only `{{base_url}}` — so the two runs
+come back from `httpbin.org` and `postman-echo.com` respectively, with the
+resolved value echoed in the `X-Sendra-Base-Url` header of each response.
+
 ## Request file shape
 
 ```yaml
@@ -251,12 +264,41 @@ error: no variable named `nope` in `.sendra/environments/default.yaml` (availabl
 and a request that could not be built has no status — like a DNS or connection
 failure, it exits `1` either way.
 
-**Which environment is loaded — temporary.** There is no `--env` flag yet, so
-the name is hardcoded to `default`: Sendra loads
-`.sendra/environments/default.yaml` and nothing else. A project with no such
-file is not an error, it is the empty environment, under which a request
-containing no `{{...}}` behaves exactly as it did before environments existed.
-The flag is the next piece of work and replaces exactly this default.
+**Which environment is loaded.** `--env <name>` on `sendra run`:
+
+```sh
+sendra run req.yaml --env staging   # .sendra/environments/staging.yaml
+sendra run req.yaml --env prod      # .sendra/environments/prod.yaml
+sendra run req.yaml                 # .sendra/environments/default.yaml, if there is one
+```
+
+The name is a filename, not a keyword — `staging`, `prod`, `local`, `ci` and
+`default` are all just files in `.sendra/environments/`, found by the same
+upward walk, nearest one wins.
+
+Two rules about environments that are not there, and they are deliberately
+different from each other:
+
+- **No `--env` and no `default.yaml` is fine.** You get the empty environment,
+  and a request with no `{{...}}` in it behaves exactly as it did before
+  environments existed. Most projects have no `.sendra/` at all, and requiring
+  a flag to run a file with no variables in it would be absurd.
+- **`--env <name>` with no such file is an error, and nothing is sent.**
+
+  ```
+  error: no environment named `stagng`: no `.sendra/environments/stagng.yaml` in `/repo` or any parent directory
+  ```
+
+  The difference is not the file, it is what you asked for. Omitting `--env`
+  asks for a default; `--env staging` asserts that `staging` exists. Sendra
+  already answers a failed assertion of that shape loudly —
+  `sendra run collection.yaml Nope` is an error listing the names that do
+  exist, while omitting the name runs everything — and this is the same
+  pattern. The alternative fails in the two ways that matter: with `{{var}}` in
+  the file you get an error naming the *variable*, sending you to hunt for a
+  typo in your request file when the typo is on your command line; with no
+  variables in the file you get no error at all, exit `0`, and a flag that was
+  silently ignored.
 
 **What substitution touches, and what it does not.** Only `url`, `headers` and
 `body`. Not `method`, which is a closed set with no useful placeholder, and not
@@ -297,8 +339,9 @@ trip through a number on the way in, so `1.0` can never arrive as `1`.
 - `0` — every request was sent and no response status was an error
   (1xx, 2xx, 3xx).
 - `1` — some request never got a response: the file was missing or malformed, no
-  request by that name, a `{{variable}}` or `${VAR}` had no value, a header was
-  invalid, or the request never completed (DNS, TLS, connection).
+  request by that name, `--env` named an environment with no file behind it, a
+  `{{variable}}` or `${VAR}` had no value, a header was invalid, or the request
+  never completed (DNS, TLS, connection).
 - `2` — bad command-line usage (from clap).
 - `3` — every request completed but at least one server answered `4xx` or `5xx`.
   The responses print exactly as they would otherwise; only the exit code

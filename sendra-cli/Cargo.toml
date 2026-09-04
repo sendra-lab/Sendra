@@ -17,3 +17,9 @@ owo-colors = { workspace = true }
 # the current-thread runtime ("rt") is enough; "rt-multi-thread" would only add
 # a worker pool nothing here uses. "macros" is for #[tokio::main].
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[dev-dependencies]
+# Which environment `--env` resolves to is tested against real directory trees,
+# the way core tests config resolution, so the tests need somewhere disposable
+# to build them.
+tempfile = { workspace = true }

@@ -922,6 +922,7 @@ dependencies = [
  "clap",
  "owo-colors",
  "sendra-core",
+ "tempfile",
  "tokio",
 ]
 

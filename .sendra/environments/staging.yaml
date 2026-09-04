@@ -1,0 +1,17 @@
+# One half of the `--env` demo. See `prod.yaml` beside it.
+#
+#   API_KEY=live-token cargo run -p sendra-cli -- run \
+#     examples/environment-request.yaml --env staging
+#
+# `examples/environment-request.yaml` names no host at all — only
+# `{{base_url}}` — so the environment is the only thing that decides where it
+# goes. Run it with `--env staging` and then with `--env prod` and the two
+# responses come from two different services.
+#
+# httpbin.org and postman-echo.com both echo back the headers they received, so
+# the resolved `X-Sendra-Base-Url` is visible in the body either way.
+base_url: https://httpbin.org
+
+# Never the secret itself, only its name: `${VAR}` is read from the OS
+# environment when the variable is used, so this file is safe to commit.
+api_key: ${API_KEY}
