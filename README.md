@@ -1,6 +1,6 @@
 # Sendra
 
-Sendra is a terminal-native HTTP client — think Postman, but your requests are
+Sendra is a terminal-native HTTP client, think Postman, but your requests are
 plain YAML files that live in your repo next to the code they exercise, and you
 send them from the shell. A request is just a file: method, URL, headers, body.
 That makes requests reviewable in a pull request, diffable over time, and
@@ -34,12 +34,12 @@ body.
 ## Request file shape
 
 ```yaml
-name: Get user             # optional, used as a display label
-method: GET                # GET | POST | PUT | PATCH | DELETE | HEAD | OPTIONS
+name: Get user # optional, used as a display label
+method: GET # GET | POST | PUT | PATCH | DELETE | HEAD | OPTIONS
 url: https://api.example.com/users/1
-headers:                   # optional
+headers: # optional
   Accept: application/json
-body: null                 # optional, sent verbatim as a raw string
+body: null # optional, sent verbatim as a raw string
 ```
 
 Unknown top-level keys are rejected rather than silently ignored, so a typo in a
