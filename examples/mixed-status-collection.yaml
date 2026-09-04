@@ -1,0 +1,21 @@
+# A collection that deliberately mixes good and bad statuses, to show how the
+# exit code aggregates over a whole run.
+#
+#   sendra run examples/mixed-status-collection.yaml
+#
+# All three responses print. The run exits 3, because at least one request came
+# back 4xx/5xx — not because the last one did. Add --allow-error-status to
+# print the same output and exit 0.
+name: Status codes
+requests:
+  - name: OK
+    method: GET
+    url: https://httpbin.org/status/200
+
+  - name: Not found
+    method: GET
+    url: https://httpbin.org/status/404
+
+  - name: Server error
+    method: GET
+    url: https://httpbin.org/status/500
