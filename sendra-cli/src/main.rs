@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use owo_colors::{OwoColorize, Stream};
-use sendra_core::environment::DEFAULT_ENVIRONMENT_NAME;
+use sendra_core::environment::{environment_path, find_environment, DEFAULT_ENVIRONMENT_NAME};
 use sendra_core::{Config, Document, Environment, Request, Response, SendraError};
 
 /// Sendra's exit-code convention, in one place.
@@ -19,8 +19,9 @@ use sendra_core::{Config, Document, Environment, Request, Response, SendraError}
 ///                the user opted out of status-based failure with
 ///                --allow-error-status)
 /// 1  failure     some request never got a response: file missing or malformed,
-///                no such request name, a `{{variable}}` or `${VAR}` with no
-///                value, invalid header, DNS/TLS/connection failure
+///                no such request name, `--env` naming an environment with no
+///                file behind it, a `{{variable}}` or `${VAR}` with no value,
+///                invalid header, DNS/TLS/connection failure
 /// 2  (reserved)  bad command-line usage — clap exits with this itself
 /// 3  status      every request got a response, but at least one was 4xx/5xx
 /// ```
@@ -121,6 +122,19 @@ enum Command {
         /// there is nothing to choose between.
         request: Option<String>,
 
+        /// Name of the environment to substitute `{{variable}}` values from.
+        ///
+        /// `--env staging` loads `.sendra/environments/staging.yaml`, found by
+        /// walking up from the directory you are in. Omit it and the
+        /// environment named `default` is loaded if there is one, or no
+        /// environment at all if there is not. Naming an environment that has
+        /// no file is an error: the run stops rather than quietly sending
+        /// against variables you did not ask for.
+        // The reasoning behind those two answers lives on `environment_for`;
+        // this doc comment is what `--help` prints, so it stays user-facing.
+        #[arg(long, value_name = "NAME")]
+        env: Option<String>,
+
         /// Exit 0 even when a response status is 4xx or 5xx.
         ///
         /// Responses are printed either way; this only changes the exit code,
@@ -143,10 +157,16 @@ async fn main() -> ExitCode {
         Command::Run {
             path,
             request,
+            env,
             allow_error_status,
-        } => run(&path, request.as_deref(), allow_error_status)
-            .await
-            .into(),
+        } => run(
+            &path,
+            request.as_deref(),
+            env.as_deref(),
+            allow_error_status,
+        )
+        .await
+        .into(),
     }
 }
 
@@ -179,8 +199,15 @@ async fn main() -> ExitCode {
 /// category from anything a request can do: a config or environment file that
 /// does not parse is not "this request failed", it is "the settings this whole
 /// run was going to use are unreadable", and sending some requests under
-/// half-applied defaults would be worse than sending none.
-async fn run(path: &Path, name: Option<&str>, allow_error_status: bool) -> Exit {
+/// half-applied defaults would be worse than sending none. `--env` naming an
+/// environment that does not exist joins them, for the reason given on
+/// [`environment_for`].
+async fn run(
+    path: &Path,
+    name: Option<&str>,
+    environment_name: Option<&str>,
+    allow_error_status: bool,
+) -> Exit {
     // Resolved once for the whole run, before anything is read or sent: every
     // request in a collection is sent under the same defaults, and a broken
     // config file stops the run instead of failing partway through it.
@@ -192,17 +219,22 @@ async fn run(path: &Path, name: Option<&str>, allow_error_status: bool) -> Exit 
         }
     };
 
-    // TEMPORARY, pending the `--env` flag: the environment name is hardcoded,
-    // so the file loaded is always `.sendra/environments/default.yaml`, found by
-    // the same walk-up that finds `.sendra/config.yaml`. There being no such
-    // file is not an error — it is the empty environment, under which a request
-    // with no `{{...}}` in it behaves exactly as it did before environments
-    // existed. When the flag lands it replaces this one constant and nothing
-    // else in this function changes.
-    let environment = match Environment::resolve(DEFAULT_ENVIRONMENT_NAME) {
+    // The walk-up looking for the environment starts here rather than inside
+    // `Environment::resolve`, because a `--env` that finds nothing has to be
+    // able to say *where* it looked. `CurrentDir` is the same error core would
+    // have raised for the same reason.
+    let start_dir = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            print_error(&SendraError::CurrentDir(err));
+            return Exit::Failure;
+        }
+    };
+
+    let environment = match environment_for(&start_dir, environment_name) {
         Ok(environment) => environment,
         Err(err) => {
-            print_error(&err);
+            print_environment_error(&err);
             return Exit::Failure;
         }
     };
@@ -233,6 +265,84 @@ async fn run(path: &Path, name: Option<&str>, allow_error_status: bool) -> Exit 
         send(&request, config, allow_error_status).await
     })
     .await
+}
+
+/// Why the run could not get the environment it was going to send against.
+///
+/// A CLI-local type rather than a new [`SendraError`] variant, because
+/// `NotFound` is not a fact about a file — it is a fact about the *command
+/// line*, and `sendra-core` never sees the command line. Core's job is
+/// "environment `x` resolved to this file, or to nothing"; deciding that
+/// "nothing" is fatal because the user typed the name themselves is a
+/// front-end decision, and a `sendra-tui` that offers a picker instead of a
+/// flag would never raise it.
+#[derive(Debug)]
+enum EnvironmentError {
+    /// `--env <name>` was given and no `.sendra/environments/<name>.yaml`
+    /// exists anywhere up the tree from where sendra was run.
+    NotFound {
+        name: String,
+        searched_from: PathBuf,
+    },
+
+    /// An environment file was found but could not be read or parsed. Core's
+    /// error, passed through unchanged.
+    Unreadable(SendraError),
+}
+
+/// Load the environment this run substitutes from: the one `--env` named, or
+/// `default` when the flag was omitted.
+///
+/// Two decisions live here, and they are deliberately *not* the same decision.
+///
+/// **Omitting `--env` keeps the pre-flag behaviour.** The name falls back to
+/// [`DEFAULT_ENVIRONMENT_NAME`], and a project with no such file gets the empty
+/// environment rather than an error. That is the rule environments shipped
+/// with, and it has to stay: a request file with no `{{...}}` in it does not
+/// need an environment, and most projects have no `.sendra/` at all. Making the
+/// flag mandatory — or mandatory-when-a-`{{var}}`-appears — would either break
+/// every existing invocation or make whether a flag is required depend on the
+/// contents of a file the user has not opened.
+///
+/// **Naming an environment that does not exist is an error.** This is the one
+/// place this function departs from "a missing environment file is the empty
+/// environment", and the difference is not the file, it is the sentence the
+/// user typed. Omitting `--env` asks for a default; `--env staging` asserts
+/// that `staging` exists. Sendra already answers a failed assertion of exactly
+/// this shape with an error and not a shrug: `sendra run collection.yaml Nope`
+/// is [`RequestNotFound`](SendraError::RequestNotFound), while omitting the
+/// name runs everything. Same pattern, same answer.
+///
+/// The alternative — treating `--env stagng` as the empty environment — fails
+/// in the two ways that matter. If the request has `{{base_url}}` in it, the
+/// error names the *variable*, sending the reader to look for a typo in their
+/// request file when the typo is on their command line. If the request has no
+/// variables at all, there is no error: the run succeeds, exit 0, having
+/// ignored the flag entirely. A flag that can be silently ignored is worse than
+/// one that is occasionally strict, and "you asked to run against staging and I
+/// did not run against staging" should never be something the user has to
+/// notice for themselves.
+///
+/// Takes `start_dir` rather than reading the working directory, so the search
+/// is testable against a temporary tree — the same arrangement `Config` and
+/// `Environment` use in core.
+fn environment_for(
+    start_dir: &Path,
+    requested: Option<&str>,
+) -> Result<Environment, EnvironmentError> {
+    match requested {
+        Some(name) => match find_environment(start_dir, name) {
+            Some(path) => Environment::from_path(path).map_err(EnvironmentError::Unreadable),
+            None => Err(EnvironmentError::NotFound {
+                name: name.to_string(),
+                searched_from: start_dir.to_path_buf(),
+            }),
+        },
+        // No flag: core's rule, unchanged — nearest `default.yaml` wins, and no
+        // file at all is the empty environment.
+        None => Environment::resolve_from(start_dir, DEFAULT_ENVIRONMENT_NAME)
+            .map_err(EnvironmentError::Unreadable),
+    }
 }
 
 /// Substitute and send each of `requests` in file order, printing every outcome
@@ -366,9 +476,48 @@ fn print_response(response: &Response) {
     }
 }
 
-fn print_error(err: &SendraError) {
+/// The red `error:` line every failure starts with.
+fn print_error_line(message: impl std::fmt::Display) {
     let label = "error:".if_supports_color(Stream::Stderr, |t| t.red());
-    eprintln!("{} {}", label, err);
+    eprintln!("{} {}", label, message);
+}
+
+/// One dimmed `hint:` line under an error, suppressed when stderr is not a
+/// terminal: a hint is for a person reading the message, and a log or a pipe is
+/// neither helped by it nor able to act on it.
+fn print_hint(message: impl std::fmt::Display) {
+    if std::io::stderr().is_terminal() {
+        eprintln!(
+            "  {} {}",
+            "hint:".if_supports_color(Stream::Stderr, |t| t.dimmed()),
+            message
+        );
+    }
+}
+
+fn print_environment_error(err: &EnvironmentError) {
+    match err {
+        // Core's own error, printed like every other one — cause chain and all.
+        EnvironmentError::Unreadable(err) => print_error(err),
+        EnvironmentError::NotFound {
+            name,
+            searched_from,
+        } => {
+            // Name the path that was looked for, not just the environment name:
+            // it is where the file has to go to fix this, and it shows the
+            // typo back to whoever typed it.
+            print_error_line(format!(
+                "no environment named `{name}`: no `{}` in `{}` or any parent directory",
+                environment_path(Path::new(""), name).display(),
+                searched_from.display()
+            ));
+            print_hint("create that file, or omit --env to run without an environment");
+        }
+    }
+}
+
+fn print_error(err: &SendraError) {
+    print_error_line(err);
 
     // thiserror keeps the cause chain intact; show it so a TLS or DNS failure
     // buried under reqwest is still readable.
@@ -382,13 +531,9 @@ fn print_error(err: &SendraError) {
         source = cause.source();
     }
 
-    // Keeps the `IsTerminal` import honest and gives one actionable hint
-    // without turning this into a help system.
-    if matches!(err, SendraError::Io { .. }) && std::io::stderr().is_terminal() {
-        eprintln!(
-            "  {} check the path, or see examples/get-request.yaml for the file shape",
-            "hint:".if_supports_color(Stream::Stderr, |t| t.dimmed())
-        );
+    // One actionable hint, without turning this into a help system.
+    if matches!(err, SendraError::Io { .. }) {
+        print_hint("check the path, or see examples/get-request.yaml for the file shape");
     }
 }
 
@@ -647,6 +792,203 @@ requests:
             vec!["https://example.com/first", "https://example.com/second"]
         );
         assert_eq!(exit, Exit::Ok);
+    }
+
+    // --- which environment `--env` selects -------------------------------
+    //
+    // Built against real directory trees rather than by mocking the lookup:
+    // the walk-up is the behaviour under test, and `environment_for` takes its
+    // starting directory precisely so these can run without touching the
+    // process's working directory.
+
+    /// Write `.sendra/environments/<name>.yaml` under `root`.
+    fn write_environment(root: &Path, name: &str, body: &str) {
+        let path = environment_path(root, name);
+        std::fs::create_dir_all(path.parent().expect("has a parent")).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn omitting_env_loads_the_environment_named_default() {
+        let project = tempfile::tempdir().unwrap();
+        write_environment(
+            project.path(),
+            "default",
+            "base_url: https://default.example\n",
+        );
+        write_environment(
+            project.path(),
+            "staging",
+            "base_url: https://staging.example\n",
+        );
+
+        let environment = environment_for(project.path(), None).expect("default.yaml is there");
+
+        assert_eq!(
+            environment.variables.get("base_url").map(String::as_str),
+            Some("https://default.example"),
+            "no --env must keep loading `default`, as it did before the flag"
+        );
+    }
+
+    #[test]
+    fn omitting_env_with_no_default_file_is_the_empty_environment_not_an_error() {
+        // A project with no `.sendra/` at all: the overwhelmingly common case,
+        // and the reason omitting the flag can never be an error.
+        let project = tempfile::tempdir().unwrap();
+
+        let environment = environment_for(project.path(), None)
+            .unwrap_or_else(|_| panic!("a project with no environments must still run"));
+
+        assert!(environment.is_empty());
+    }
+
+    #[test]
+    fn naming_an_environment_loads_that_one_and_not_another() {
+        let project = tempfile::tempdir().unwrap();
+        write_environment(
+            project.path(),
+            "default",
+            "base_url: https://default.example\n",
+        );
+        write_environment(
+            project.path(),
+            "staging",
+            "base_url: https://staging.example\n",
+        );
+        write_environment(project.path(), "prod", "base_url: https://prod.example\n");
+
+        for (name, expected) in [
+            ("staging", "https://staging.example"),
+            ("prod", "https://prod.example"),
+        ] {
+            let environment =
+                environment_for(project.path(), Some(name)).expect("the file is there");
+            assert_eq!(
+                environment.variables.get("base_url").map(String::as_str),
+                Some(expected),
+                "--env {name} loaded the wrong file"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_environment_is_found_by_walking_up_from_a_subdirectory() {
+        // Same rule as config and as `default`: an environment at the
+        // repository root applies from anywhere inside the repository.
+        let project = tempfile::tempdir().unwrap();
+        write_environment(
+            project.path(),
+            "staging",
+            "base_url: https://staging.example\n",
+        );
+
+        let nested = project.path().join("crates").join("api").join("tests");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let environment = environment_for(&nested, Some("staging")).expect("found up the tree");
+
+        assert_eq!(
+            environment.variables.get("base_url").map(String::as_str),
+            Some("https://staging.example")
+        );
+    }
+
+    #[test]
+    fn naming_an_environment_that_does_not_exist_is_an_error() {
+        // The decision this issue turns on: an explicit name is an assertion
+        // that the environment exists, so a typo fails loudly instead of
+        // silently running against no variables at all. See `environment_for`.
+        let project = tempfile::tempdir().unwrap();
+        write_environment(
+            project.path(),
+            "staging",
+            "base_url: https://staging.example\n",
+        );
+
+        let Err(err) = environment_for(project.path(), Some("stagng")) else {
+            panic!("a mistyped --env must not be silently ignored");
+        };
+
+        match err {
+            EnvironmentError::NotFound { name, .. } => assert_eq!(name, "stagng"),
+            EnvironmentError::Unreadable(err) => panic!("wrong error: {err}"),
+        }
+    }
+
+    #[test]
+    fn naming_default_explicitly_errors_where_omitting_env_would_not() {
+        // The asymmetry, pinned: same missing file, two different answers,
+        // because the difference is what the user asked for and not what is on
+        // disk. If this ever collapses into one behaviour it should be because
+        // someone changed it on purpose.
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(
+            environment_for(project.path(), None).is_ok(),
+            "omitting --env falls back to the empty environment"
+        );
+        assert!(
+            environment_for(project.path(), Some("default")).is_err(),
+            "`--env default` names a file that is not there"
+        );
+    }
+
+    #[test]
+    fn a_named_environment_that_does_not_parse_is_still_a_core_error() {
+        // Finding the file and failing to read it is core's error, not the
+        // flag's, and must not be flattened into "no such environment".
+        let project = tempfile::tempdir().unwrap();
+        write_environment(project.path(), "staging", "base_url: [not, a, string]\n");
+
+        let Err(err) = environment_for(project.path(), Some("staging")) else {
+            panic!("a malformed environment file is an error");
+        };
+
+        assert!(
+            matches!(
+                err,
+                EnvironmentError::Unreadable(SendraError::EnvParse { .. })
+            ),
+            "a malformed file must keep its own error"
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_and_prod_put_different_urls_on_the_wire() {
+        // The acceptance criterion, end to end minus the socket: one request
+        // file, two `--env` values, two different resolved URLs.
+        let project = tempfile::tempdir().unwrap();
+        write_environment(
+            project.path(),
+            "staging",
+            "base_url: https://staging.example\n",
+        );
+        write_environment(project.path(), "prod", "base_url: https://prod.example\n");
+
+        let document =
+            Document::from_yaml_str("name: Health\nmethod: GET\nurl: '{{base_url}}/health'\n")
+                .unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+
+        let mut sent = Vec::new();
+        for name in ["staging", "prod"] {
+            let environment = environment_for(project.path(), Some(name)).expect("both exist");
+            let exit = run_requests(&requests, &environment, |request| {
+                sent.push(request.url.clone());
+                async { Exit::Ok }
+            })
+            .await;
+            assert_eq!(exit, Exit::Ok);
+        }
+
+        assert_eq!(
+            sent,
+            vec![
+                "https://staging.example/health",
+                "https://prod.example/health"
+            ]
+        );
     }
 
     #[test]

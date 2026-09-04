@@ -1,9 +1,9 @@
-# The environment `sendra run` loads today.
+# The environment `sendra run` loads when `--env` is not given.
 #
-# TEMPORARY WIRING: there is no `--env` flag yet, so the CLI always loads the
-# environment named `default`, which is this file. Once the flag lands, this
-# becomes one environment among several (`staging.yaml`, `prod.yaml`, ...) and
-# stops being special apart from being the one loaded when no name is given.
+# One environment among the three in this directory, and special only in being
+# the fallback: `staging.yaml` and `prod.yaml` beside it are reached with
+# `--env staging` and `--env prod`. A project with no `default.yaml` at all is
+# not an error, it is the empty environment.
 #
 # It is found by walking up from the directory you ran sendra in, the same way
 # `.sendra/config.yaml` is, so this file applies anywhere inside the repository.

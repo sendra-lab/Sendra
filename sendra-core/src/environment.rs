@@ -62,13 +62,13 @@ use crate::{Collection, Document, Request, SendraError};
 /// Directory holding environment files, under a project's `.sendra/`.
 const ENVIRONMENTS_DIR_NAME: &str = "environments";
 
-/// The environment loaded when nothing selects one.
+/// The environment name `sendra run` falls back to when `--env` is omitted.
 ///
-/// **Temporary.** There is no `--env` flag yet (that is the next issue), so the
-/// CLI always loads this name and a project that wants variables puts them in
-/// `.sendra/environments/default.yaml`. Everything else in this module already
-/// takes an environment name as an argument, so the flag replaces exactly this
-/// constant at its one call site in `sendra-cli` and nothing else moves.
+/// Nothing in this module treats it as special: it resolves like any other
+/// name, and a project with no `default.yaml` gets the empty environment the
+/// same way `staging` with no `staging.yaml` would. The front-end is what
+/// decides an *explicitly named* environment with no file is an error while an
+/// absent default is not — see `environment_for` in `sendra-cli`.
 pub const DEFAULT_ENVIRONMENT_NAME: &str = "default";
 
 /// Delimiters for a `{{variable}}` reference in a request file.
