@@ -15,7 +15,7 @@ now.
 
 ```
 sendra/
-  sendra-core/     library: request/response types, YAML loading, HTTP execution
+  sendra-core/     library: request/response types, YAML loading, config, HTTP execution
   sendra-cli/      binary `sendra`: argument parsing, output, exit codes
   examples/        sample request and collection files
 ```
@@ -103,6 +103,69 @@ Asking for a name that is not in the collection is an error that lists the names
 that are (`no request named X (available: ...)`), as is passing a name to a file
 that holds a single request.
 
+## Configuration
+
+Defaults that apply to every request live in a config file. There are two, both
+optional:
+
+| Scope   | Location                                                                       |
+| ------- | ------------------------------------------------------------------------------ |
+| Project | `.sendra/config.yaml`, searched for from the current directory upwards          |
+| Global  | `config.yaml` in your platform's config directory (see below)                   |
+
+```yaml
+headers: # merged into every request; a header in the request file wins
+  User-Agent: sendra
+  Accept: application/json
+timeout_seconds: 20 # whole-request timeout: connect, send and body read
+```
+
+Those two keys are the whole schema for now. Unknown keys are rejected, like
+everywhere else in Sendra, so `timeout` instead of `timeout_seconds` is an error
+you see rather than a setting that quietly never applies.
+
+**Finding the project config.** Sendra walks up from the directory you ran it
+in, looking for `.sendra/config.yaml`, the same way git looks for `.git`. So a
+config at the repository root applies from anywhere inside the repository. The
+nearest one wins; configs further up are not stacked on top of each other. The
+search starts at the working directory, not at the request file's directory, so
+`sendra run ../other-project/req.yaml` still uses *your* defaults.
+
+**Finding the global config.** `$XDG_CONFIG_HOME/sendra/config.yaml` when
+`XDG_CONFIG_HOME` is set to an absolute path, on any platform. Otherwise the
+platform's own config directory: `~/.config/sendra/config.yaml` on Linux,
+`~/Library/Application Support/sendra/config.yaml` on macOS, and
+`%APPDATA%\sendra\config.yaml` on Windows.
+
+**How they combine.** Project over global, **key by key** — not file by file. A
+project config that sets only `timeout_seconds` still inherits the global
+config's `headers`, and one that overrides a single default header keeps the
+rest. Anything neither file mentions falls back to the built-in defaults: no
+extra headers, and a 30-second timeout. No config file anywhere is a perfectly
+ordinary state, not a warning.
+
+Config headers are defaults, so a request file always wins a conflict:
+
+```yaml
+# .sendra/config.yaml
+headers:
+  Authorization: Bearer dev-token
+```
+
+```yaml
+# req.yaml — sent with Bearer other-token, plus any other config headers
+method: GET
+url: https://api.example.com/me
+headers:
+  Authorization: Bearer other-token
+```
+
+Names are compared case-insensitively, because that is how HTTP header names
+work: a config `Authorization` and a request `authorization` are one header, and
+the request's value is the one sent.
+
+There are no CLI flags to override config yet — the file is the only input.
+
 ## Exit codes
 
 - `0` — every request was sent and no response status was an error
@@ -156,8 +219,9 @@ Those four are exactly what CI runs, on Linux, Windows and macOS, for every
 push to `main` and every pull request against it — so a clean local run is a
 green build. Clippy is `-D warnings`: a warning fails the build.
 
-The test suite is hermetic. It parses YAML and checks exit-code logic, and the
-one test that names a URL points at a closed local port so it fails before
-connecting. Nothing under `cargo test` touches the network, which is what makes
+The test suite is hermetic. It parses YAML, checks exit-code logic, and resolves
+config against directory trees built under a temporary directory rather than
+against your real `~/.config`; the tests that name a URL point at a closed local
+port so they fail before connecting. Nothing under `cargo test` touches the network, which is what makes
 CI trustworthy rather than merely usually-green. The `examples/` files do hit
 `httpbin.org`, and are run by hand — deliberately never in CI.

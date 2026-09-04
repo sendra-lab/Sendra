@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+pub mod config;
+
+pub use config::Config;
+
 /// Every way loading or sending a request can fail.
 ///
 /// Typed rather than `anyhow` so front-ends can branch on the variant (e.g. a
@@ -67,6 +71,32 @@ pub enum SendraError {
     /// those names must be unique.
     #[error("invalid collection: {reason}")]
     InvalidCollection { reason: String },
+
+    /// A config file was found but could not be read. Separate from [`Io`](Self::Io)
+    /// so a front-end can say "your config is broken" rather than "your request
+    /// file is broken" — the user did not name this path on the command line
+    /// and needs to be told which file to go and fix.
+    #[error("could not read config file `{path}`")]
+    ConfigIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A config file was read but is not valid: bad YAML, an unknown key, or a
+    /// value of the wrong type. Never silently ignored — a config that does not
+    /// parse is a config whose settings are not being applied.
+    #[error("could not parse config file `{path}`")]
+    ConfigParse {
+        path: PathBuf,
+        #[source]
+        source: serde_yaml::Error,
+    },
+
+    /// The working directory could not be read, so the walk-up looking for a
+    /// project config has nowhere to start.
+    #[error("could not determine the current directory")]
+    CurrentDir(#[source] std::io::Error),
 }
 
 /// HTTP methods Sendra can send. Deliberately a closed set for now — an
@@ -370,11 +400,22 @@ impl Response {
     }
 }
 
-/// Send `request` and collect the full response.
+/// Send `request` under `config` and collect the full response.
 ///
 /// The elapsed time covers connect, send and body read — i.e. what a user
 /// waits for, not just time-to-first-byte.
-pub async fn send(request: &Request) -> Result<Response, SendraError> {
+///
+/// `config` is a parameter rather than something resolved in here, and is not
+/// optional, so that there is exactly one way to send a request and it is the
+/// one that applies configuration. Callers with nothing to apply pass
+/// [`Config::default`], which is the same defaults resolution falls back to. It
+/// contributes two things: default headers, merged by [`Config::apply`] with
+/// the request winning ties, and the timeout the client is built with.
+pub async fn send(request: &Request, config: &Config) -> Result<Response, SendraError> {
+    // Everything below works from the merged request, so a config header is
+    // validated and sent exactly like one written in the file.
+    let request = &config.apply(request);
+
     let mut headers = reqwest::header::HeaderMap::new();
     for (name, value) in &request.headers {
         let header_name = reqwest::header::HeaderName::try_from(name.as_str()).map_err(|e| {
@@ -397,7 +438,12 @@ pub async fn send(request: &Request) -> Result<Response, SendraError> {
         source,
     };
 
-    let client = reqwest::Client::builder().build().map_err(network_err)?;
+    // reqwest has no timeout of its own by default, so an unresponsive server
+    // would hang the process indefinitely; the config always supplies one.
+    let client = reqwest::Client::builder()
+        .timeout(config.timeout)
+        .build()
+        .map_err(network_err)?;
 
     let mut builder = client
         .request(request.method.into(), &request.url)
@@ -699,7 +745,34 @@ enviroment: staging
             headers: BTreeMap::from([("bad header".to_string(), "x".to_string())]),
             body: None,
         };
-        let err = send(&request).await.expect_err("invalid header must error");
+        let err = send(&request, &Config::default())
+            .await
+            .expect_err("invalid header must error");
+        assert!(
+            matches!(err, SendraError::InvalidHeader { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_header_from_the_config_is_reported_the_same_way() {
+        // A config default is merged in before validation, so a bad header name
+        // in `.sendra/config.yaml` fails as loudly as one in a request file
+        // rather than being dropped on the way to the wire.
+        let request = Request {
+            name: None,
+            method: Method::Get,
+            url: "http://127.0.0.1:1/".to_string(),
+            headers: BTreeMap::new(),
+            body: None,
+        };
+        let config = Config {
+            headers: BTreeMap::from([("bad header".to_string(), "x".to_string())]),
+            ..Config::default()
+        };
+        let err = send(&request, &config)
+            .await
+            .expect_err("invalid header must error");
         assert!(
             matches!(err, SendraError::InvalidHeader { .. }),
             "got {err:?}"
