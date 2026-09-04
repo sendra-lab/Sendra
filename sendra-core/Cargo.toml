@@ -1,0 +1,16 @@
+[package]
+name = "sendra-core"
+description = "Core request/response model, YAML loading and HTTP execution for Sendra."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Only the test harness needs a runtime here; the binary picks its own.
+tokio = { workspace = true, features = ["rt", "macros"] }

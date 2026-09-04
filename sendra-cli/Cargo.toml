@@ -1,0 +1,19 @@
+[package]
+name = "sendra-cli"
+description = "Terminal-native HTTP client. Sends requests defined in YAML files."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sendra"
+path = "src/main.rs"
+
+[dependencies]
+sendra-core = { path = "../sendra-core" }
+clap = { workspace = true }
+owo-colors = { workspace = true }
+# A single request per invocation means no work to spread across threads, so
+# the current-thread runtime ("rt") is enough; "rt-multi-thread" would only add
+# a worker pool nothing here uses. "macros" is for #[tokio::main].
+tokio = { workspace = true, features = ["rt", "macros"] }

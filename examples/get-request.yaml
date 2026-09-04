@@ -1,0 +1,7 @@
+name: Get IP from httpbin
+method: GET
+url: https://httpbin.org/get
+headers:
+  Accept: application/json
+  User-Agent: sendra/0.1.0
+body: null

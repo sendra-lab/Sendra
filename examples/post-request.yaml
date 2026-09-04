@@ -1,0 +1,8 @@
+name: Post JSON to httpbin
+method: POST
+url: https://httpbin.org/post
+headers:
+  Accept: application/json
+  Content-Type: application/json
+body: |
+  {"project": "sendra", "stage": "skeleton"}
