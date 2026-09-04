@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use owo_colors::{OwoColorize, Stream};
-use sendra_core::{Document, Request, Response, SendraError};
+use sendra_core::{Config, Document, Request, Response, SendraError};
 
 /// Sendra's exit-code convention, in one place.
 ///
@@ -156,6 +156,17 @@ async fn main() -> ExitCode {
 /// single error to propagate. Every outcome is printed as it happens and folded
 /// into the code with [`worst`].
 async fn run(path: &Path, name: Option<&str>, allow_error_status: bool) -> Exit {
+    // Resolved once for the whole run, before anything is read or sent: every
+    // request in a collection is sent under the same defaults, and a broken
+    // config file stops the run instead of failing partway through it.
+    let config = match Config::resolve() {
+        Ok(config) => config,
+        Err(err) => {
+            print_error(&err);
+            return Exit::Failure;
+        }
+    };
+
     let document = match Document::from_path(path) {
         Ok(document) => document,
         Err(err) => {
@@ -183,7 +194,7 @@ async fn run(path: &Path, name: Option<&str>, allow_error_status: bool) -> Exit 
         if index > 0 {
             println!();
         }
-        exit = worst(exit, send(request, allow_error_status).await);
+        exit = worst(exit, send(request, &config, allow_error_status).await);
     }
     exit
 }
@@ -193,7 +204,7 @@ async fn run(path: &Path, name: Option<&str>, allow_error_status: bool) -> Exit 
 /// A failure is printed and returned rather than propagated: in a collection
 /// run the requests after this one still deserve to be sent, and the user still
 /// deserves to see them.
-async fn send(request: &Request, allow_error_status: bool) -> Exit {
+async fn send(request: &Request, config: &Config, allow_error_status: bool) -> Exit {
     eprintln!(
         "{} {}",
         "→".if_supports_color(Stream::Stderr, |t| t.dimmed()),
@@ -202,7 +213,7 @@ async fn send(request: &Request, allow_error_status: bool) -> Exit {
             .if_supports_color(Stream::Stderr, |t| t.bold())
     );
 
-    match sendra_core::send(request).await {
+    match sendra_core::send(request, config).await {
         Ok(response) => {
             print_response(&response);
             exit_for_status(response.status, allow_error_status)

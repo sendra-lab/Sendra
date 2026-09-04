@@ -10,7 +10,13 @@ serde = { workspace = true }
 serde_yaml = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
+# Locating the global config directory per platform. `dirs`, not `directories`:
+# see the note on `config::global_config_path`.
+dirs = { workspace = true }
 
 [dev-dependencies]
 # Only the test harness needs a runtime here; the binary picks its own.
 tokio = { workspace = true, features = ["rt", "macros"] }
+# Config resolution is tested against real directory trees, so the tests need
+# somewhere disposable to build them.
+tempfile = { workspace = true }
