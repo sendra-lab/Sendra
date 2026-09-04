@@ -9,7 +9,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use owo_colors::{OwoColorize, Stream};
-use sendra_core::{Config, Document, Request, Response, SendraError};
+use sendra_core::environment::DEFAULT_ENVIRONMENT_NAME;
+use sendra_core::{Config, Document, Environment, Request, Response, SendraError};
 
 /// Sendra's exit-code convention, in one place.
 ///
@@ -155,12 +156,44 @@ async fn main() -> ExitCode {
 /// half-succeed: one request failing does not stop the rest, so there is no
 /// single error to propagate. Every outcome is printed as it happens and folded
 /// into the code with [`worst`].
+///
+/// The order of the two passes over a request is fixed here and matters:
+/// **environment substitution first, then config**. Substitution belongs to the
+/// request file — `{{base_url}}` is something its author wrote — while config
+/// headers are tool-wide defaults that know nothing about which environment is
+/// active. Running substitution first also means [`Config::apply`] compares
+/// header names against the names that will actually be sent: a request header
+/// written as `{{prefix}}-Auth` would otherwise never be recognised as the same
+/// header as a config `X-Auth`, and both would go out.
+///
+/// The consequence, stated plainly: **config headers are not templated.** A
+/// `{{var}}` in `.sendra/config.yaml` is sent verbatim. That is the honest
+/// reading of the ordering — config is applied after substitution has finished —
+/// and it is the conservative one, since a config is resolved without reference
+/// to any environment and applies to every request in every project directory
+/// beneath it. Templating config is a decision to make on its own, not a side
+/// effect of this one.
 async fn run(path: &Path, name: Option<&str>, allow_error_status: bool) -> Exit {
     // Resolved once for the whole run, before anything is read or sent: every
     // request in a collection is sent under the same defaults, and a broken
     // config file stops the run instead of failing partway through it.
     let config = match Config::resolve() {
         Ok(config) => config,
+        Err(err) => {
+            print_error(&err);
+            return Exit::Failure;
+        }
+    };
+
+    // TEMPORARY, pending the `--env` flag: the environment name is hardcoded,
+    // so the file loaded is always `.sendra/environments/default.yaml`, found by
+    // the same walk-up that finds `.sendra/config.yaml`. There being no such
+    // file is not an error — it is the empty environment, under which a request
+    // with no `{{...}}` in it behaves exactly as it did before environments
+    // existed. When the flag lands it replaces this one constant and nothing
+    // else in this function changes.
+    let environment = match Environment::resolve(DEFAULT_ENVIRONMENT_NAME) {
+        Ok(environment) => environment,
         Err(err) => {
             print_error(&err);
             return Exit::Failure;
@@ -186,6 +219,26 @@ async fn run(path: &Path, name: Option<&str>, allow_error_status: bool) -> Exit 
         // No name: a single-request file yields its one request, a collection
         // yields all of them, in file order.
         None => document.requests().iter().collect(),
+    };
+
+    // Substituted up front, for every request about to be sent, so a `{{var}}`
+    // with nothing behind it fails the run before the first byte goes out
+    // rather than halfway through a collection.
+    //
+    // Only the *selected* requests are substituted, not the whole file: asking
+    // for one request by name should not be blocked by a variable another
+    // request in the same collection happens to need. Running the collection
+    // with no name selects them all, so that case is still all-or-nothing.
+    let requests: Vec<Request> = match requests
+        .iter()
+        .map(|request| environment.apply(request))
+        .collect()
+    {
+        Ok(requests) => requests,
+        Err(err) => {
+            print_error(&err);
+            return Exit::Failure;
+        }
     };
 
     let mut exit = Exit::Ok;

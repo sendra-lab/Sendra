@@ -11,9 +11,13 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::environment::{describe_environment, describe_variables};
+
 pub mod config;
+pub mod environment;
 
 pub use config::Config;
+pub use environment::Environment;
 
 /// Every way loading or sending a request can fail.
 ///
@@ -97,6 +101,62 @@ pub enum SendraError {
     /// project config has nowhere to start.
     #[error("could not determine the current directory")]
     CurrentDir(#[source] std::io::Error),
+
+    /// An environment file was found but could not be read. Its own variant for
+    /// the same reason [`ConfigIo`](Self::ConfigIo) is: the user did not name
+    /// this path on the command line, so the error has to say which file to go
+    /// and fix.
+    #[error("could not read environment file `{path}`")]
+    EnvIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// An environment file was read but is not a flat map of string to string:
+    /// bad YAML, a nested mapping, or a value that is not a string. Never
+    /// ignored — an environment that does not parse is a set of variables that
+    /// are not being substituted.
+    #[error("could not parse environment file `{path}`")]
+    EnvParse {
+        path: PathBuf,
+        #[source]
+        source: serde_yaml::Error,
+    },
+
+    /// A request referenced `{{name}}` and the active environment has no such
+    /// variable.
+    ///
+    /// Carries the names that *are* defined, and the file they came from, the
+    /// way [`RequestNotFound`](Self::RequestNotFound) carries the request names
+    /// a collection does have. Raised while the request is being built, so it
+    /// happens before anything goes over the wire.
+    #[error("no variable named `{name}` in {}", describe_variables(.environment, .available))]
+    VariableNotFound {
+        name: String,
+        available: Vec<String>,
+        /// The environment file the variable was looked for in, or `None` when
+        /// no environment file was found at all.
+        environment: Option<PathBuf>,
+    },
+
+    /// An environment file value is `${VAR}` and `VAR` is not in the OS
+    /// environment.
+    ///
+    /// Deliberately an error rather than an empty string: silently sending
+    /// `Authorization: Bearer ` would turn a missing secret into a puzzling 401
+    /// instead of a message naming the variable to export.
+    #[error(
+        "environment variable `{name}` is not set (referenced by `{variable}` in {})",
+        describe_environment(.environment)
+    )]
+    EnvVarNotSet {
+        /// The OS environment variable that is not set.
+        name: String,
+        /// The environment-file variable whose value referenced it.
+        variable: String,
+        environment: Option<PathBuf>,
+    },
 }
 
 /// HTTP methods Sendra can send. Deliberately a closed set for now — an
@@ -716,6 +776,9 @@ enviroment: staging
             "post-request.yaml",
             "collection.yaml",
             "mixed-status-collection.yaml",
+            // Parses like any other request file: the `{{...}}` in it is a
+            // string value, and substitution is a separate pass afterwards.
+            "environment-request.yaml",
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("..")

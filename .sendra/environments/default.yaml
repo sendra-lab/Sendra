@@ -1,0 +1,18 @@
+# The environment `sendra run` loads today.
+#
+# TEMPORARY WIRING: there is no `--env` flag yet, so the CLI always loads the
+# environment named `default`, which is this file. Once the flag lands, this
+# becomes one environment among several (`staging.yaml`, `prod.yaml`, ...) and
+# stops being special apart from being the one loaded when no name is given.
+#
+# It is found by walking up from the directory you ran sendra in, the same way
+# `.sendra/config.yaml` is, so this file applies anywhere inside the repository.
+# It exists here to make `examples/environment-request.yaml` runnable by hand.
+
+base_url: https://httpbin.org
+
+# Never the secret itself, only its name: `${VAR}` is read from the OS
+# environment when the variable is used, so this file is safe to commit. Export
+# API_KEY before running the example, or you get a typed error naming it rather
+# than a header sent empty.
+api_key: ${API_KEY}

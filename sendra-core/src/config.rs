@@ -32,10 +32,12 @@ use crate::{Request, SendraError};
 /// under the global config directory.
 const CONFIG_FILE_NAME: &str = "config.yaml";
 
-/// Directory a project keeps its Sendra files in. Only `config.yaml` is read
-/// from it today; it is a directory rather than a bare `.sendra.yaml` so later
-/// per-project state has somewhere obvious to go.
-const PROJECT_DIR_NAME: &str = ".sendra";
+/// Directory a project keeps its Sendra files in: `config.yaml` directly
+/// inside it, and the environment files of
+/// [`crate::environment`] under `environments/`. A directory rather than a bare
+/// `.sendra.yaml` precisely so that the second of those had somewhere obvious
+/// to go.
+pub(crate) const PROJECT_DIR_NAME: &str = ".sendra";
 
 /// Name of the global config directory, under the platform config root.
 const APP_DIR_NAME: &str = "sendra";
