@@ -1,5 +1,7 @@
 # Sendra
 
+[![CI](https://github.com/dubemoyibe-star/Sendra/actions/workflows/ci.yml/badge.svg)](https://github.com/dubemoyibe-star/Sendra/actions/workflows/ci.yml)
+
 Sendra is a terminal-native HTTP client, think Postman, but your requests are
 plain YAML files that live in your repo next to the code they exercise, and you
 send them from the shell. A request is just a file: method, URL, headers, body.
@@ -144,6 +146,18 @@ enum in `sendra-cli/src/main.rs`.
 ## Development
 
 ```sh
-cargo build --workspace
+cargo build --workspace --all-targets
 cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+Those four are exactly what CI runs, on Linux, Windows and macOS, for every
+push to `main` and every pull request against it — so a clean local run is a
+green build. Clippy is `-D warnings`: a warning fails the build.
+
+The test suite is hermetic. It parses YAML and checks exit-code logic, and the
+one test that names a URL points at a closed local port so it fails before
+connecting. Nothing under `cargo test` touches the network, which is what makes
+CI trustworthy rather than merely usually-green. The `examples/` files do hit
+`httpbin.org`, and are run by hand — deliberately never in CI.
