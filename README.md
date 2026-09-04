@@ -4,9 +4,10 @@ Sendra is a terminal-native HTTP client, think Postman, but your requests are
 plain YAML files that live in your repo next to the code they exercise, and you
 send them from the shell. A request is just a file: method, URL, headers, body.
 That makes requests reviewable in a pull request, diffable over time, and
-shareable without exporting anything. This is the first slice: one request per
-file, sent and printed. Environments, variables, scripting, assertions and an
-interactive TUI are all planned and deliberately absent for now.
+shareable without exporting anything. A file holds either one request or a
+named collection of them, sent and printed. Environments, variables, scripting,
+assertions and an interactive TUI are all planned and deliberately absent for
+now.
 
 ## Layout
 
@@ -14,7 +15,7 @@ interactive TUI are all planned and deliberately absent for now.
 sendra/
   sendra-core/     library: request/response types, YAML loading, HTTP execution
   sendra-cli/      binary `sendra`: argument parsing, output, exit codes
-  examples/        sample request files
+  examples/        sample request and collection files
 ```
 
 `sendra-core` knows nothing about clap or terminal output. A `sendra-tui` crate
@@ -29,7 +30,12 @@ cargo run -p sendra-cli -- run examples/get-request.yaml
 
 That sends a real request to `https://httpbin.org/get` and prints the status,
 headers and body. There is also `examples/post-request.yaml`, which posts a JSON
-body.
+body, and `examples/collection.yaml`, which holds four requests in one file:
+
+```sh
+cargo run -p sendra-cli -- run examples/collection.yaml              # all four
+cargo run -p sendra-cli -- run examples/collection.yaml "Post JSON"  # just one
+```
 
 ## Request file shape
 
@@ -45,16 +51,82 @@ body: null # optional, sent verbatim as a raw string
 Unknown top-level keys are rejected rather than silently ignored, so a typo in a
 field name is an error you see immediately.
 
+## Collection file shape
+
+A collection is several named requests in one file — the endpoints of a single
+API, say — under a top-level `requests` key:
+
+```yaml
+name: Example API # optional, a label for the collection as a whole
+requests:
+  - name: List users # required here: it is how you select a request
+    method: GET
+    url: https://api.example.com/users
+    headers:
+      Accept: application/json
+  - name: Create user
+    method: POST
+    url: https://api.example.com/users
+    body: '{"name": "ada"}'
+```
+
+Each entry uses exactly the same fields as a standalone request file, so a
+request can be lifted into a collection, or pulled back out into its own file,
+verbatim. The only extra rule is that `name` is required inside a collection,
+must be unique, and `requests` must not be empty; all three are checked when the
+file is loaded, before anything is sent.
+
+`requests` is a list rather than a map of name-to-request so that entries stay
+identical to single-request files, and so that file order — which is the order
+`sendra run` sends them in — survives parsing.
+
+**Which shape is a file?** The presence of a top-level `requests` key, and
+nothing else: no separate extension, no CLI flag. It cannot be ambiguous,
+because the single-request shape rejects unknown top-level keys and so could
+never have carried a `requests` key of its own.
+
+## Running requests
+
+```sh
+sendra run req.yaml                    # the one request in the file
+sendra run collection.yaml             # every request in it, in file order
+sendra run collection.yaml "List users"  # one named request
+```
+
+Requests in a collection are sent sequentially, in file order, and each response
+is printed as it arrives. A request that fails does not stop the ones after it —
+you see every result, and the exit code reports the worst of them.
+
+Asking for a name that is not in the collection is an error that lists the names
+that are (`no request named X (available: ...)`), as is passing a name to a file
+that holds a single request.
+
 ## Exit codes
 
-- `0` — the request was sent and the response status was not an error
+- `0` — every request was sent and no response status was an error
   (1xx, 2xx, 3xx).
-- `1` — no response came back: the file was missing or malformed, a header was
-  invalid, or the request never completed (DNS, TLS, connection).
+- `1` — some request never got a response: the file was missing or malformed, no
+  request by that name, a header was invalid, or the request never completed
+  (DNS, TLS, connection).
 - `2` — bad command-line usage (from clap).
-- `3` — the request completed but the server answered `4xx` or `5xx`. The
-  response is printed exactly as it would be otherwise; only the exit code
+- `3` — every request completed but at least one server answered `4xx` or `5xx`.
+  The responses print exactly as they would otherwise; only the exit code
   differs, so `sendra run req.yaml && deploy.sh` does not proceed on a 404.
+
+For a collection, these are aggregates over the whole run: the worst outcome
+wins, ranked `0` < `3` < `1`. One 4xx anywhere in the collection exits `3`, and
+one request that could not be sent at all exits `1` — "never got a response" is
+a bigger problem than "got a 500", so it takes precedence.
+
+The alternative — letting the last request decide — would make the exit code
+depend on the order the file happens to list requests in, so reordering a
+collection could change whether a script proceeds. Worst-wins keeps exit `0`
+meaning the same thing for a collection as for a single request: a promise that
+nothing in the run failed.
+
+```sh
+sendra run examples/mixed-status-collection.yaml   # prints 200, 404, 500; exits 3
+```
 
 `3` is separate from `1` on purpose: "could not send" and "sent, got a 500" call
 for different handling in a script. Pass `--allow-error-status` to opt out and

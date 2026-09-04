@@ -1,0 +1,38 @@
+# A collection: several named requests in one file. The top-level `requests`
+# key is what tells Sendra this is a collection rather than a single request.
+#
+#   sendra run examples/collection.yaml              # runs all four, in order
+#   sendra run examples/collection.yaml "Post JSON"  # runs just that one
+#
+# Each entry under `requests` uses exactly the same fields as a standalone
+# request file, except that `name` is required — it is how you select one.
+name: httpbin tour
+requests:
+  - name: Get IP
+    method: GET
+    url: https://httpbin.org/get
+    headers:
+      Accept: application/json
+      User-Agent: sendra/0.1.0
+
+  - name: Post JSON
+    method: POST
+    url: https://httpbin.org/post
+    headers:
+      Accept: application/json
+      Content-Type: application/json
+    body: |
+      {"project": "sendra", "stage": "collections"}
+
+  - name: Echo headers
+    method: GET
+    url: https://httpbin.org/headers
+    headers:
+      Accept: application/json
+      X-Sendra-Example: collection
+
+  - name: Delete resource
+    method: DELETE
+    url: https://httpbin.org/delete
+    headers:
+      Accept: application/json
