@@ -47,12 +47,27 @@ field name is an error you see immediately.
 
 ## Exit codes
 
-- `0` — the request was sent and a response came back. Note that an HTTP error
-  status (404, 500) is still `0`: the request itself succeeded. Assertions, in a
-  later version, are what will make a bad status a failing run.
-- `1` — the file was missing or malformed, a header was invalid, or the request
-  never completed (DNS, TLS, connection).
+- `0` — the request was sent and the response status was not an error
+  (1xx, 2xx, 3xx).
+- `1` — no response came back: the file was missing or malformed, a header was
+  invalid, or the request never completed (DNS, TLS, connection).
 - `2` — bad command-line usage (from clap).
+- `3` — the request completed but the server answered `4xx` or `5xx`. The
+  response is printed exactly as it would be otherwise; only the exit code
+  differs, so `sendra run req.yaml && deploy.sh` does not proceed on a 404.
+
+`3` is separate from `1` on purpose: "could not send" and "sent, got a 500" call
+for different handling in a script. Pass `--allow-error-status` to opt out and
+exit `0` on any status, for inspecting an error response without failing the
+surrounding script:
+
+```sh
+sendra run examples/get-request.yaml --allow-error-status
+```
+
+Codes `4` and up are reserved for later commands (`sendra test` will need its
+own outcome for failing assertions). The full table lives next to the `Exit`
+enum in `sendra-cli/src/main.rs`.
 
 ## Development
 
