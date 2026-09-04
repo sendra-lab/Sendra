@@ -219,7 +219,7 @@ a shell, in CI, and under any secret manager that can export one.
 
 **Nothing resolves to an empty string.** A `{{var}}` with no such variable, or a
 `${VAR}` that is not exported, is an error naming what is missing, raised while
-the request is being built — before anything is sent:
+that request is being built — so none of its bytes go out:
 
 ```
 error: no variable named `base_url` in `.sendra/environments/default.yaml` (available: api_key, host)
@@ -228,6 +228,28 @@ error: environment variable `API_KEY` is not set (referenced by `api_key` in `.s
 
 The alternative, sending `Authorization: Bearer ` and letting the server answer
 `401`, turns a one-line fix into a debugging session.
+
+**In a collection, one broken request fails alone.** Substitution happens as
+each request is reached, not as a check over the whole file first, so a missing
+variable is treated exactly like a refused connection: that request is reported
+as a failure, the requests around it are still sent, every result still prints,
+and the exit code is the worst of them.
+
+```
+→ First
+200 OK  412 ms
+...
+→ Broken
+error: no variable named `nope` in `.sendra/environments/default.yaml` (available: api_key, base_url)
+
+→ Third
+200 OK  388 ms
+...
+```
+
+`--allow-error-status` does not suppress this. That flag forgives a *status*,
+and a request that could not be built has no status — like a DNS or connection
+failure, it exits `1` either way.
 
 **Which environment is loaded — temporary.** There is no `--env` flag yet, so
 the name is hardcoded to `default`: Sendra loads

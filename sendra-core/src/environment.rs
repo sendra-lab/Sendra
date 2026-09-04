@@ -179,8 +179,8 @@ impl Environment {
     /// [`VariableNotFound`](SendraError::VariableNotFound), and a value whose
     /// `${VAR}` is not in the OS environment is
     /// [`EnvVarNotSet`](SendraError::EnvVarNotSet) — never an empty string, and
-    /// never a half-substituted request. The whole request is built before
-    /// anything is sent, so both failures land before the first byte goes out.
+    /// never a half-substituted request. The whole request is built before it is
+    /// sent, so both failures land before any of its bytes go out.
     pub fn apply(&self, request: &Request) -> Result<Request, SendraError> {
         let mut headers = BTreeMap::new();
         for (name, value) in &request.headers {
@@ -216,6 +216,15 @@ impl Environment {
     }
 
     /// [`Environment::apply`] for every request in a collection, in file order.
+    ///
+    /// All or nothing: one request that cannot be substituted fails the whole
+    /// call. That suits a caller that wants a fully-resolved collection in hand,
+    /// which is what this returns. It is *not* what `sendra run` does with a
+    /// collection — there each request is substituted as it is reached, so a
+    /// broken one fails on its own and the requests around it are still sent, in
+    /// the same way a refused connection does not cancel its siblings. A caller
+    /// wanting those per-request outcomes calls [`Environment::apply`] in a loop
+    /// and keeps each `Result`.
     ///
     /// The collection's own `name` is left alone for the same reason a
     /// request's is.
@@ -700,7 +709,12 @@ requests:
     }
 
     #[test]
-    fn one_bad_variable_fails_the_whole_collection_before_anything_is_sent() {
+    fn applying_to_a_whole_document_is_all_or_nothing() {
+        // `apply_document` substitutes a collection as a unit, so one bad
+        // variable fails the lot. That is this function's contract, not the
+        // CLI's behaviour: `sendra run` substitutes each request as it reaches
+        // it, so a broken request there fails alone and its siblings are still
+        // sent. Anything wanting per-request outcomes calls `apply` in a loop.
         let yaml = "\
 requests:
   - name: Fine
