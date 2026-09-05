@@ -12,43 +12,68 @@ use owo_colors::{OwoColorize, Stream};
 use sendra_core::environment::{environment_path, find_environment, DEFAULT_ENVIRONMENT_NAME};
 use sendra_core::{AssertionReport, Config, Document, Environment, Request, Response, SendraError};
 
-/// Sendra's exit-code convention, in one place.
+/// Sendra's exit-code convention, in one place, for every subcommand.
 ///
 /// ```text
-/// 0  ok          every request sent, and no response was an error status (or
-///                the user opted out of status-based failure with
-///                --allow-error-status)
-/// 1  failure     some request never got a response: file missing or malformed,
-///                no such request name, `--env` naming an environment with no
-///                file behind it, a `{{variable}}` or `${VAR}` with no value,
-///                invalid header, DNS/TLS/connection failure
-/// 2  (reserved)  bad command-line usage — clap exits with this itself
-/// 3  status      every request got a response, but at least one was 4xx/5xx
+/// code  run  test  meaning
+///
+/// 0      ·    ·    nothing went wrong. For `run`: every request was sent and
+///                  no response was an error status (or the user opted out
+///                  with --allow-error-status). For `test`: every request got
+///                  a response, and every assertion any of them declared,
+///                  passed.
+/// 1      ·    ·    some request never got a response: file missing or
+///                  malformed, no such request name, `--env` naming an
+///                  environment with no file behind it, a `{{variable}}` or
+///                  `${VAR}` with no value, invalid header, DNS/TLS/connection
+///                  failure.
+/// 2      ·    ·    bad command-line usage — clap exits with this itself.
+/// 3      ·         `run` only: every request got a response, but at least one
+///                  was 4xx/5xx.
+/// 4           ·    `test` only: every request got a response, but at least one
+///                  had a failing assertion.
 /// ```
 ///
 /// A collection run sends many requests under one exit code, so these are
-/// aggregates; [`worst`] is where they combine.
+/// aggregates; [`worst`] is where they combine, over [`Outcome`]s produced by
+/// the loop both subcommands share.
 ///
-/// Codes 4 and up are deliberately free: `sendra test` will need its own
-/// outcome (assertions failed) that is neither "could not send" nor "one bad
-/// status". Every exit path in the binary returns one of these variants rather
-/// than calling `std::process::exit` inline, so adding a code later means
-/// adding a row here and nothing else.
+/// **One enum for both subcommands, not one each.** `sendra run` and
+/// `sendra test` answer different questions, but they answer them to the same
+/// shell, and a number that means one thing under `run` and another under
+/// `test` is a trap for anyone writing `case $? in` around either. So the codes
+/// are globally unique across the binary: `1` means "never got a response"
+/// whichever command produced it, and the two commands' *own* verdicts get
+/// their own numbers — `3` for `run`'s bad status, `4` for `test`'s failed
+/// assertion. Reusing `3` for a failed assertion was the alternative, and it
+/// would have made the same number mean "the server said 500" in one command
+/// and "the server said exactly what you asked for, and it was wrong" in the
+/// other.
 ///
-/// **A failed assertion is not in this table.** `sendra run` prints assertion
-/// results and ignores them when deciding what to return, so a run can report
-/// "1 failed" and still exit `0`. That is deliberate and temporary: `run` sends
-/// requests and reports what came back, and `sendra test` is the command whose
-/// job is to pass or fail on expectations. Wiring assertions into `run`'s exit
-/// code would silently change what every existing `sendra run x && deploy.sh`
-/// means the moment an `assertions` block is added to a file. See
-/// [`exit_for_response`], which is the single place that decision lives.
+/// Every exit path in the binary returns one of these variants rather than
+/// calling `std::process::exit` inline, so adding a code later means adding a
+/// row here and nothing else. Codes 5 and up stay free.
+///
+/// **`test` never returns 3, and `run` never returns 4.** `run` does not read
+/// assertions when deciding what to return — see [`exit_for_response`], which
+/// is the single place that decision lives — so a `run` that prints "1 failed"
+/// still exits `0`. That asymmetry is deliberate and permanent, not a stage on
+/// the way to unifying them: wiring assertions into `run`'s exit code would
+/// silently change what every existing `sendra run x && deploy.sh` means the
+/// moment an `assertions` block is added to a file, and `sendra test` exists
+/// precisely so that nobody has to.
+///
+/// Symmetrically, `test` does not read raw status: a request that declared no
+/// assertions and came back `404` exits `0` under `test`. See [`Summary`] for
+/// why, and for the three-way split — passed, failed, no assertions — that
+/// makes it visible rather than silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Exit {
     Ok = 0,
     Failure = 1,
     // 2 belongs to clap; see the table above.
     ErrorStatus = 3,
+    TestFailed = 4,
 }
 
 impl From<Exit> for ExitCode {
@@ -74,26 +99,23 @@ fn exit_for_status(status: u16, allow_error_status: bool) -> Exit {
     }
 }
 
-/// The outcome of a request that came back, assertions included — which is to
-/// say, assertions *excluded*.
+/// The outcome `sendra run` reports for a request that came back, assertions
+/// included — which is to say, assertions *excluded*.
 ///
 /// This exists rather than calling [`exit_for_status`] directly at the call
-/// site so that "assertions do not affect the exit code" is a stated decision
-/// with a test on it, in one place, instead of an absence nobody can point at.
-/// `sendra test` is where the report starts counting; when it lands, this
-/// function is what it changes.
-fn exit_for_response(
-    response: &Response,
-    assertions: &AssertionReport,
-    allow_error_status: bool,
-) -> Exit {
+/// site so that "assertions do not affect `run`'s exit code" is a stated
+/// decision with a test on it, in one place, instead of an absence nobody can
+/// point at. [`Summary::exit`] is the other half of the pair: the same report,
+/// read rather than discarded, for the command whose job is to read it.
+fn exit_for_response(status: u16, assertions: &AssertionReport, allow_error_status: bool) -> Exit {
     // Read and deliberately discarded: see above, and the `Exit` table.
     let _ = assertions;
-    exit_for_status(response.status, allow_error_status)
+    exit_for_status(status, allow_error_status)
 }
 
 /// Fold the outcomes of several requests into the single code the process can
-/// return. The worst outcome wins, ranked `Ok` < `ErrorStatus` < `Failure`.
+/// return. The worst outcome wins, ranked
+/// `Ok` < `ErrorStatus` < `TestFailed` < `Failure`.
 ///
 /// "Worst wins" rather than "the last request wins": the exit code should
 /// answer "did anything go wrong?", and tying it to the last request would make
@@ -103,17 +125,25 @@ fn exit_for_response(
 /// means for a single request — exit 0 is a promise that nothing in the run
 /// failed.
 ///
-/// `Failure` outranks `ErrorStatus` because "never got a response" is the
+/// `Failure` outranks both middle tiers because "never got a response" is the
 /// bigger problem: a 404 is an answer, a DNS failure is not. A run reports the
 /// most serious thing that happened, not the most recent.
+///
+/// `ErrorStatus` and `TestFailed` cannot meet today — one is produced only by
+/// `run` and the other only by `test`, per the [`Exit`] table — so their
+/// relative order is a convention rather than an observable. It is set the way
+/// it is because if they ever did meet, the explicit failed expectation is the
+/// more informative answer than the status nobody wrote down.
 fn worst(a: Exit, b: Exit) -> Exit {
-    // Rank by severity, not by the exit numbers: 3 (ErrorStatus) is the milder
-    // outcome of the two failures, so the numeric order is the wrong order.
+    // Rank by severity, not by the exit numbers: 3 (ErrorStatus) and 4
+    // (TestFailed) are the milder outcomes, so the numeric order is the wrong
+    // order.
     fn severity(exit: Exit) -> u8 {
         match exit {
             Exit::Ok => 0,
             Exit::ErrorStatus => 1,
-            Exit::Failure => 2,
+            Exit::TestFailed => 2,
+            Exit::Failure => 3,
         }
     }
 
@@ -122,6 +152,175 @@ fn worst(a: Exit, b: Exit) -> Exit {
     } else {
         a
     }
+}
+
+/// What became of one request in a run.
+///
+/// `run` and `test` disagree about what to print and about what to return, but
+/// not about what happened, so [`run_requests`] produces these and each
+/// subcommand folds them its own way — [`exit_for_run`] for `run`, [`Summary`]
+/// for `test`. Keeping the shared loop's output a fact rather than an exit code
+/// is what let the two commands share it at all: `test` needs to know *why* a
+/// request contributed a failure, and an `Exit` has already thrown that away.
+#[derive(Debug)]
+enum Outcome {
+    /// The request never got a response: a `{{variable}}` with nothing behind
+    /// it, an invalid header, a refused connection. There is no status and no
+    /// assertion report, because neither of them exists without a response.
+    NoResponse,
+
+    /// A response came back, and the request's assertions — if it declared any
+    /// — were evaluated against it.
+    ///
+    /// The report is empty when the file declared none, which is a third thing
+    /// from "passed" and from "failed"; see [`Summary`].
+    Responded {
+        status: u16,
+        assertions: AssertionReport,
+    },
+}
+
+/// `run`'s verdict on one outcome. Assertions are carried through and ignored;
+/// see [`exit_for_response`].
+fn exit_for_outcome(outcome: &Outcome, allow_error_status: bool) -> Exit {
+    match outcome {
+        Outcome::NoResponse => Exit::Failure,
+        Outcome::Responded { status, assertions } => {
+            exit_for_response(*status, assertions, allow_error_status)
+        }
+    }
+}
+
+/// Fold a whole `run` into the one code the process returns.
+fn exit_for_run(outcomes: &[Outcome], allow_error_status: bool) -> Exit {
+    outcomes.iter().fold(Exit::Ok, |exit, outcome| {
+        worst(exit, exit_for_outcome(outcome, allow_error_status))
+    })
+}
+
+/// The counts `sendra test` prints at the end of a run, and the exit code it
+/// derives from them.
+///
+/// **Five numbers, and the middle three are separate categories on purpose.**
+/// A request that declared no assertions is not a pass and not a failure: it is
+/// a request nobody said anything about. Folding it into `passed` would make a
+/// collection with no assertions anywhere report a perfect green run, which is
+/// the single most misleading thing a test command can do; folding it into
+/// `failed` would make adding a request to a collection break the build until
+/// somebody wrote expectations for it. Counting it on its own line says the
+/// true thing — "these ran, and nothing was checked" — and leaves what to do
+/// about it to the person reading.
+///
+/// **What fails the run.** `failed` and `no_response`, and nothing else:
+///
+/// - A request whose assertions did not all hold is the whole point of the
+///   command. [`Exit::TestFailed`].
+/// - A request that never got a response cannot have its assertions evaluated,
+///   so a run containing one cannot honestly say the expectations held. It is
+///   [`Exit::Failure`], the same code `run` gives it, because it is the same
+///   event: the tool could not do its job, as against the API failing to meet
+///   expectations. In CI those two want different handling — one is "fix your
+///   test setup", the other is "fix your API" — which is exactly why they get
+///   different numbers instead of one generic non-zero.
+///
+/// **`without_assertions` does not fail the run, whatever the status was.**
+/// This is the debatable one, so: a request with no `assertions` block that
+/// comes back `404` exits `0` under `sendra test`. The command's contract is
+/// that the *file* says what it expects and `test` reports whether it got it.
+/// Failing on a bare 404 means asserting something the file never wrote down —
+/// inventing an expectation on the author's behalf — which is the same class of
+/// mistake as a silently-ignored assertion typo, only inverted. Sendra already
+/// refuses to guess anywhere else in its schema, and the check is one line to
+/// write when it is wanted:
+///
+/// ```yaml
+/// assertions:
+///   status: 200
+/// ```
+///
+/// It also keeps `test` from having two independent verdicts that can
+/// disagree — "assertions passed but the status was bad" has no sensible
+/// single answer — and it leaves a real use intact: a request that is in the
+/// collection to *reach* an endpoint (a login, a setup call) rather than to be
+/// checked. The raw-status question already has a command that answers it, and
+/// answers it well: `sendra run`, exit `3`. Nothing is lost by `test` declining
+/// to answer it a second time with a different number.
+///
+/// The safeguard against that decision hiding a problem is the summary itself:
+/// `without_assertions` is printed, so a run whose expectations were never
+/// written is visibly not the same thing as a run that passed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Summary {
+    /// Every request the run attempted. Always the sum of the four below.
+    total: usize,
+    /// Got a response, declared at least one assertion, and all of them held.
+    passed: usize,
+    /// Got a response, declared assertions, and at least one did not hold.
+    failed: usize,
+    /// Got a response and declared no assertions at all.
+    without_assertions: usize,
+    /// Never got a response, so there was nothing to evaluate against.
+    no_response: usize,
+}
+
+impl Summary {
+    /// Classify each outcome into exactly one of the four categories.
+    fn of(outcomes: &[Outcome]) -> Self {
+        let mut summary = Summary {
+            total: outcomes.len(),
+            ..Summary::default()
+        };
+
+        for outcome in outcomes {
+            match outcome {
+                Outcome::NoResponse => summary.no_response += 1,
+                // An empty report is a request that declared nothing, whether
+                // it had no `assertions` key or an empty one. Either way there
+                // is nothing to have passed.
+                Outcome::Responded { assertions, .. } if assertions.is_empty() => {
+                    summary.without_assertions += 1
+                }
+                Outcome::Responded { assertions, .. } if assertions.passed() => summary.passed += 1,
+                Outcome::Responded { .. } => summary.failed += 1,
+            }
+        }
+
+        summary
+    }
+
+    /// The code the process returns. Worst-wins over the two failing
+    /// categories, through the same [`worst`] every other aggregate uses, so
+    /// the ordering lives in one place.
+    fn exit(&self) -> Exit {
+        let mut exit = Exit::Ok;
+
+        if self.failed > 0 {
+            exit = worst(exit, Exit::TestFailed);
+        }
+        if self.no_response > 0 {
+            exit = worst(exit, Exit::Failure);
+        }
+
+        exit
+    }
+}
+
+/// How much of a response to print.
+///
+/// The two subcommands print the same *assertion* block — issue 6's format,
+/// unchanged, because a second way to render a passed check would be a second
+/// thing to learn — and differ only in how much of the response they put above
+/// it. `run` exists to show you what came back, so it shows all of it. `test`
+/// answers a yes/no question about a whole collection, and burying that answer
+/// under four JSON bodies would make the summary the hardest line to find in
+/// its own output; it prints the status line, which is one line, carries the
+/// timing, and says which response the checks below it are about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Detail {
+    /// Status line, headers and body.
+    Full,
+    /// The status line alone.
+    StatusOnly,
 }
 
 #[derive(Parser)]
@@ -170,6 +369,36 @@ enum Command {
         #[arg(long)]
         allow_error_status: bool,
     },
+
+    /// Run every request in a YAML file and pass or fail on its assertions.
+    ///
+    /// Sends the same requests `run` sends, under the same config and the same
+    /// environment, and prints the same per-request assertion results — then a
+    /// summary across the whole run, and an exit code decided by the
+    /// assertions rather than by the response statuses. See `sendra help run`
+    /// for the shared parts.
+    Test {
+        /// Path to the request or collection file.
+        ///
+        /// A single-request file and a collection are both accepted, and a
+        /// collection runs every request in it, in file order. There is no
+        /// name argument: `test`'s answer is a verdict over the whole file.
+        path: PathBuf,
+
+        /// Name of the environment to substitute `{{variable}}` values from.
+        ///
+        /// Behaves exactly as it does on `run`: `--env staging` loads
+        /// `.sendra/environments/staging.yaml`, found by walking up from the
+        /// directory you are in; omitting it loads `default` if there is one;
+        /// naming an environment that has no file is an error.
+        #[arg(long, value_name = "NAME")]
+        env: Option<String>,
+
+        /// Accepted only so that passing it can be refused with an
+        /// explanation. Hidden from `--help`, rejected in `main`.
+        #[arg(long, hide = true)]
+        allow_error_status: bool,
+    },
 }
 
 // Current-thread runtime: a collection is sent sequentially, in file order, so
@@ -194,7 +423,125 @@ async fn main() -> ExitCode {
         )
         .await
         .into(),
+
+        Command::Test {
+            path,
+            env,
+            allow_error_status,
+        } => {
+            if allow_error_status {
+                reject_allow_error_status();
+            }
+            test(&path, env.as_deref()).await.into()
+        }
     }
+}
+
+/// Refuse `sendra test --allow-error-status`, and say why.
+///
+/// The flag has no meaning here. `test`'s exit code is decided by assertions
+/// and never by a raw status — a `404` that no assertion mentions already
+/// exits `0` — so there is no status-based failure for it to suppress. It
+/// would be a no-op, and Sendra does not have silently-ignored inputs: an
+/// assertion typo is an error, an unknown config key is an error, a `--env`
+/// naming a file that is not there is an error, all for the same reason. A
+/// flag accepted and quietly discarded reads, to whoever typed it, exactly
+/// like one that worked.
+///
+/// Raised through clap rather than as a `SendraError` because it is a fact
+/// about the command line and nothing else, which puts it in exit code `2`
+/// with every other usage error — the same reasoning that keeps
+/// [`EnvironmentError`] out of core.
+fn reject_allow_error_status() -> ! {
+    use clap::CommandFactory;
+
+    Cli::command()
+        .error(
+            clap::error::ErrorKind::UnknownArgument,
+            "`--allow-error-status` does not apply to `sendra test`.\n\n  \
+             `test` decides its exit code from assertions, not from response \
+             statuses: a 4xx or 5xx that no assertion mentions does not fail a \
+             test run in the first place, so there is nothing here for the \
+             flag to forgive.\n\n  \
+             To check a status under `test`, assert it (`assertions:` with \
+             `status: 404` under it). To inspect an error response without \
+             failing the surrounding script, that is what \
+             `sendra run --allow-error-status` is for.",
+        )
+        .exit()
+}
+
+/// Everything both subcommands do before the first byte goes out: the config,
+/// the environment, and the file.
+struct Prepared {
+    config: Config,
+    environment: Environment,
+    document: Document,
+}
+
+/// Resolve the config, the environment and the request file, in that order.
+///
+/// Returns `Err(Exit::Failure)` — having already printed the error — because
+/// there is nothing for the caller to add: these three failures are fatal to
+/// the whole run in both subcommands, and both report them the same way.
+///
+/// **Config and the environment are resolved once, before anything is read or
+/// sent.** Those two failures stop the run, and belong in a different category
+/// from anything a request can do: a config or environment file that does not
+/// parse is not "this request failed", it is "the settings this whole run was
+/// going to use are unreadable", and sending some requests under half-applied
+/// defaults would be worse than sending none. `--env` naming an environment
+/// that does not exist joins them, for the reason given on
+/// [`environment_for`].
+///
+/// Both subcommands share this because they must: `sendra test` that resolved
+/// config differently from `sendra run` would mean a request could pass under
+/// one and fail under the other for reasons neither prints.
+fn prepare(path: &Path, environment_name: Option<&str>) -> Result<Prepared, Exit> {
+    // Resolved once for the whole run: every request in a collection is sent
+    // under the same defaults, and a broken config file stops the run instead
+    // of failing partway through it.
+    let config = match Config::resolve() {
+        Ok(config) => config,
+        Err(err) => {
+            print_error(&err);
+            return Err(Exit::Failure);
+        }
+    };
+
+    // The walk-up looking for the environment starts here rather than inside
+    // `Environment::resolve`, because a `--env` that finds nothing has to be
+    // able to say *where* it looked. `CurrentDir` is the same error core would
+    // have raised for the same reason.
+    let start_dir = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            print_error(&SendraError::CurrentDir(err));
+            return Err(Exit::Failure);
+        }
+    };
+
+    let environment = match environment_for(&start_dir, environment_name) {
+        Ok(environment) => environment,
+        Err(err) => {
+            print_environment_error(&err);
+            return Err(Exit::Failure);
+        }
+    };
+
+    let document = match Document::from_path(path) {
+        Ok(document) => document,
+        Err(err) => {
+            print_error(&err);
+            return Err(Exit::Failure);
+        }
+    };
+
+    Ok(Prepared {
+        config,
+        environment,
+        document,
+    })
 }
 
 /// Load `path` and send either the one request named, or all of them.
@@ -202,7 +549,7 @@ async fn main() -> ExitCode {
 /// Returns an exit code rather than a `Result` because a collection run can
 /// half-succeed: one request failing does not stop the rest, so there is no
 /// single error to propagate. Every outcome is printed as it happens and folded
-/// into the code with [`worst`].
+/// into the code with [`exit_for_run`].
 ///
 /// The order of the two passes over a request is fixed and matters:
 /// **environment substitution first, then config**. Substitution belongs to the
@@ -221,57 +568,23 @@ async fn main() -> ExitCode {
 /// beneath it. Templating config is a decision to make on its own, not a side
 /// effect of this one.
 ///
-/// Config and the environment are both resolved here, once, before anything is
-/// read or sent. Those two failures *do* stop the run, and belong in a different
-/// category from anything a request can do: a config or environment file that
-/// does not parse is not "this request failed", it is "the settings this whole
-/// run was going to use are unreadable", and sending some requests under
-/// half-applied defaults would be worse than sending none. `--env` naming an
-/// environment that does not exist joins them, for the reason given on
-/// [`environment_for`].
+/// The setup this shares with [`test`] lives in [`prepare`]; the sending loop
+/// they share is [`run_requests`]. What is left here is the two things `run`
+/// does that `test` does not: selecting one request by name, and reading raw
+/// statuses to produce an exit code.
 async fn run(
     path: &Path,
     name: Option<&str>,
     environment_name: Option<&str>,
     allow_error_status: bool,
 ) -> Exit {
-    // Resolved once for the whole run, before anything is read or sent: every
-    // request in a collection is sent under the same defaults, and a broken
-    // config file stops the run instead of failing partway through it.
-    let config = match Config::resolve() {
-        Ok(config) => config,
-        Err(err) => {
-            print_error(&err);
-            return Exit::Failure;
-        }
-    };
-
-    // The walk-up looking for the environment starts here rather than inside
-    // `Environment::resolve`, because a `--env` that finds nothing has to be
-    // able to say *where* it looked. `CurrentDir` is the same error core would
-    // have raised for the same reason.
-    let start_dir = match std::env::current_dir() {
-        Ok(dir) => dir,
-        Err(err) => {
-            print_error(&SendraError::CurrentDir(err));
-            return Exit::Failure;
-        }
-    };
-
-    let environment = match environment_for(&start_dir, environment_name) {
-        Ok(environment) => environment,
-        Err(err) => {
-            print_environment_error(&err);
-            return Exit::Failure;
-        }
-    };
-
-    let document = match Document::from_path(path) {
-        Ok(document) => document,
-        Err(err) => {
-            print_error(&err);
-            return Exit::Failure;
-        }
+    let Prepared {
+        config,
+        environment,
+        document,
+    } = match prepare(path, environment_name) {
+        Ok(prepared) => prepared,
+        Err(exit) => return exit,
     };
 
     let requests: Vec<&Request> = match name {
@@ -288,10 +601,52 @@ async fn run(
     };
 
     let config = &config;
-    run_requests(&requests, &environment, |request| async move {
-        send(&request, config, allow_error_status).await
+    let outcomes = run_requests(&requests, &environment, |request| async move {
+        send(&request, config, Detail::Full).await
     })
-    .await
+    .await;
+
+    exit_for_run(&outcomes, allow_error_status)
+}
+
+/// Load `path`, send every request in it, and pass or fail on the assertions.
+///
+/// The sending half is exactly the one `run` uses: same [`prepare`], same
+/// [`run_requests`], same substitution, same rule that one request failing does
+/// not stop the rest, same assertion evaluation in [`send`]. The two commands
+/// diverge only after the outcomes are in — `run` folds them by status through
+/// [`exit_for_run`], `test` counts them into a [`Summary`] — which is why the
+/// shared code is the whole pipeline rather than an abstraction invented to
+/// hold two similar things together.
+///
+/// **No name argument, unlike `run`.** `run <file> <name>` exists to send one
+/// request out of a collection and look at it; `test` produces a verdict over a
+/// file, and a verdict over one hand-picked request out of a collection is a
+/// different, narrower thing that nothing has yet asked for. It can be added
+/// later without changing anything here.
+async fn test(path: &Path, environment_name: Option<&str>) -> Exit {
+    let Prepared {
+        config,
+        environment,
+        document,
+    } = match prepare(path, environment_name) {
+        Ok(prepared) => prepared,
+        Err(exit) => return exit,
+    };
+
+    // Every request in the file, in file order — a single-request file is a
+    // run of one.
+    let requests: Vec<&Request> = document.requests().iter().collect();
+
+    let config = &config;
+    let outcomes = run_requests(&requests, &environment, |request| async move {
+        send(&request, config, Detail::StatusOnly).await
+    })
+    .await;
+
+    let summary = Summary::of(&outcomes);
+    print_summary(&summary);
+    summary.exit()
 }
 
 /// Why the run could not get the environment it was going to send against.
@@ -372,25 +727,30 @@ fn environment_for(
     }
 }
 
-/// Substitute and send each of `requests` in file order, printing every outcome
-/// and folding them into the one code the process returns.
+/// Substitute and send each of `requests` in file order, printing each result
+/// as it arrives and returning what became of every one of them.
+///
+/// Returns [`Outcome`]s rather than an exit code because its two callers want
+/// different answers out of the same run: `run` folds them by status, `test`
+/// counts them by assertion. An `Exit` per request would have already discarded
+/// the distinction `test` is built on — a `Failure` cannot say whether it was a
+/// refused connection or a failed check.
 ///
 /// **Substitution happens here, per request, not as a pass over the batch
 /// first.** A `{{var}}` with nothing behind it, or a `${VAR}` that is not
 /// exported, is exactly the same category of problem as a refused connection:
 /// *this* request could not be completed. Issue 2 settled what a run does with
 /// that — the sibling requests are still sent, every result is still printed,
-/// and [`worst`] decides the exit code — and there is no reason a variable
+/// and the aggregate decides the exit code — and there is no reason a variable
 /// should be the one failure that also cancels the requests around it. Checking
 /// the whole collection up front would additionally mean the file's *last*
 /// request could stop the first one from ever being sent, which is the kind of
 /// order-dependence [`worst`] exists to keep out of the exit code.
 ///
-/// A substitution failure is `Failure`, not `ErrorStatus`, so
-/// `--allow-error-status` does not suppress it: that flag suppresses a *status*,
-/// and a request that was never built has no status to forgive. It sits in the
-/// same tier as a DNS or connection failure, which the flag does not suppress
-/// either.
+/// A substitution failure is [`Outcome::NoResponse`], the same as a DNS or TLS
+/// failure, and both commands treat it the same way for the same reason: there
+/// is no response, so there is no status for `--allow-error-status` to forgive
+/// and nothing for an assertion to be evaluated against.
 ///
 /// `send_one` is a parameter rather than a direct call to [`send`] so that this
 /// loop — which is the whole of "one request failing does not stop the rest" —
@@ -400,12 +760,12 @@ async fn run_requests<S, F>(
     requests: &[&Request],
     environment: &Environment,
     mut send_one: S,
-) -> Exit
+) -> Vec<Outcome>
 where
     S: FnMut(Request) -> F,
-    F: std::future::Future<Output = Exit>,
+    F: std::future::Future<Output = Outcome>,
 {
-    let mut exit = Exit::Ok;
+    let mut outcomes = Vec::with_capacity(requests.len());
 
     for (index, request) in requests.iter().enumerate() {
         // Blank line between results so a multi-request run stays readable.
@@ -431,21 +791,19 @@ where
                 .if_supports_color(Stream::Stderr, |t| t.bold())
         );
 
-        let outcome = match substituted {
+        outcomes.push(match substituted {
             Ok(request) => send_one(request).await,
             Err(err) => {
                 print_error(&err);
-                Exit::Failure
+                Outcome::NoResponse
             }
-        };
-
-        exit = worst(exit, outcome);
+        });
     }
 
-    exit
+    outcomes
 }
 
-/// Send one request, print whatever came back, and report its outcome.
+/// Send one request, print whatever came back, and report what happened.
 ///
 /// A failure is printed and returned rather than propagated: in a collection
 /// run the requests after this one still deserve to be sent, and the user still
@@ -457,12 +815,21 @@ where
 /// Assertions are evaluated here, against the response this request got, and
 /// printed under it — so in a collection run each block of results sits with
 /// the response it is about, rather than in a summary at the end that would
-/// have to name every request again. Aggregate reporting over a whole
-/// collection is `sendra test`'s job.
-async fn send(request: &Request, config: &Config, allow_error_status: bool) -> Exit {
+/// have to name every request again. `sendra test` adds a summary *as well as*
+/// these blocks, not instead of them: the counts say how the run went, and
+/// these say which check, in which request, was the reason.
+///
+/// Both subcommands come through here, so both evaluate assertions in exactly
+/// the same place, from exactly the same [`Assertions::evaluate`]. `detail` is
+/// the only thing they differ on; see [`Detail`].
+async fn send(request: &Request, config: &Config, detail: Detail) -> Outcome {
     match sendra_core::send(request, config).await {
         Ok(response) => {
-            print_response(&response);
+            match detail {
+                Detail::Full => print_response(&response),
+                Detail::StatusOnly => print_status_line(&response),
+            }
+
             // No `assertions` block is the empty report, which prints nothing:
             // a request written before this feature existed looks exactly as it
             // did before it existed.
@@ -471,17 +838,39 @@ async fn send(request: &Request, config: &Config, allow_error_status: bool) -> E
                 .as_ref()
                 .map(|assertions| assertions.evaluate(&response))
                 .unwrap_or_default();
-            print_assertions(&assertions);
-            exit_for_response(&response, &assertions, allow_error_status)
+
+            if assertions.is_empty() && detail == Detail::StatusOnly {
+                // `run` says nothing here, and must keep saying nothing. Under
+                // `test` the silence is the problem: the summary is about to
+                // count this request as one of N "without assertions", and
+                // without a marker there is nothing to match that number
+                // against. One dimmed line, no symbol, so it reads as an
+                // absence rather than as a result.
+                print_no_assertions();
+            } else {
+                print_assertions(&assertions);
+            }
+
+            Outcome::Responded {
+                status: response.status,
+                assertions,
+            }
         }
         Err(err) => {
             print_error(&err);
-            Exit::Failure
+            Outcome::NoResponse
         }
     }
 }
 
-fn print_response(response: &Response) {
+/// The one line every response gets, whichever subcommand asked for it:
+/// `200 OK  412 ms`.
+///
+/// Split out of [`print_response`] so that `sendra test`, which prints no
+/// headers and no body, still says which response the assertions under it are
+/// about — and says it in the same words and the same colours, rather than in a
+/// second rendering of the same fact.
+fn print_status_line(response: &Response) {
     let status_line = format!("{} {}", response.status, response.status_text);
     let status_line = status_line.trim_end().to_string();
 
@@ -503,6 +892,10 @@ fn print_response(response: &Response) {
         format!("{} ms", response.elapsed.as_millis())
             .if_supports_color(Stream::Stdout, |t| t.dimmed())
     );
+}
+
+fn print_response(response: &Response) {
+    print_status_line(response);
 
     for (name, value) in &response.headers {
         println!(
@@ -597,6 +990,98 @@ fn print_assertions(report: &AssertionReport) {
             .to_string();
         println!("  {passed}, {failed}");
     }
+}
+
+/// The `sendra test` counterpart to [`print_assertions`] for a request that
+/// declared none:
+///
+/// ```text
+/// no assertions
+/// ```
+///
+/// In the same position an `assertions` heading would occupy, dimmed and with
+/// no `✓`/`✗` under it, because it is the absence of results rather than a
+/// result. It exists so the summary's `without assertions` count has something
+/// to point at: without it, the only way to find which request was uncovered
+/// would be to notice which one printed nothing.
+///
+/// `sendra run` does not print it. A request with no assertions has always
+/// produced byte-for-byte the output it produced before assertions existed, and
+/// that stays true.
+fn print_no_assertions() {
+    println!();
+    println!(
+        "{}",
+        "no assertions".if_supports_color(Stream::Stdout, |t| t.dimmed())
+    );
+}
+
+/// Print the counts `sendra test` ends a run with.
+///
+/// ```text
+/// summary
+///   5 requests: 2 passed, 1 failed, 1 without assertions, 1 no response
+/// ```
+///
+/// The total and the passes are always shown; the other three appear only when
+/// they are not zero, so a clean run reads `3 requests: 3 passed` and nothing
+/// competes with it. That follows [`print_assertions`], which prints
+/// `4 passed` and adds `, 2 failed` only when there is something to add — one
+/// rule, applied at both levels, rather than a per-request line that hides its
+/// zeroes under a summary line that spells them out.
+///
+/// Each count is coloured like what it counts: green for passes, red for the
+/// two that fail the run, dimmed for the one that does not. `without
+/// assertions` being dimmed rather than yellow is deliberate — it is not a
+/// warning, it is a fact about what the file asked for.
+///
+/// Under the same dimmed heading style as the per-request `assertions` blocks,
+/// and for the same reason: a response body can end in anything, and the
+/// heading plus the blank line is what keeps the summary from reading as the
+/// tail of whatever printed above it.
+fn print_summary(summary: &Summary) {
+    println!();
+    println!(
+        "{}",
+        "summary".if_supports_color(Stream::Stdout, |t| t.dimmed())
+    );
+
+    let mut counts = vec![format!("{} passed", summary.passed)
+        .if_supports_color(Stream::Stdout, |t| t.green())
+        .to_string()];
+
+    if summary.failed > 0 {
+        counts.push(
+            format!("{} failed", summary.failed)
+                .if_supports_color(Stream::Stdout, |t| t.red())
+                .to_string(),
+        );
+    }
+    if summary.without_assertions > 0 {
+        counts.push(
+            format!("{} without assertions", summary.without_assertions)
+                .if_supports_color(Stream::Stdout, |t| t.dimmed())
+                .to_string(),
+        );
+    }
+    if summary.no_response > 0 {
+        counts.push(
+            format!("{} no response", summary.no_response)
+                .if_supports_color(Stream::Stdout, |t| t.red())
+                .to_string(),
+        );
+    }
+
+    println!(
+        "  {} {}: {}",
+        summary.total,
+        if summary.total == 1 {
+            "request"
+        } else {
+            "requests"
+        },
+        counts.join(", ")
+    );
 }
 
 /// The red `error:` line every failure starts with.
@@ -753,8 +1238,8 @@ mod tests {
     fn worst_is_order_independent() {
         // Every pair, both ways round: aggregation must not depend on file
         // order, which is the whole point of not using "last request wins".
-        for a in [Exit::Ok, Exit::ErrorStatus, Exit::Failure] {
-            for b in [Exit::Ok, Exit::ErrorStatus, Exit::Failure] {
+        for a in [Exit::Ok, Exit::ErrorStatus, Exit::TestFailed, Exit::Failure] {
+            for b in [Exit::Ok, Exit::ErrorStatus, Exit::TestFailed, Exit::Failure] {
                 assert_eq!(
                     worst(a, b),
                     worst(b, a),
@@ -786,6 +1271,22 @@ requests:
         Environment::from_yaml_str("base_url: https://example.com\n").unwrap()
     }
 
+    /// The outcome of a request that came back with `status` and declared no
+    /// assertions: what a fake `send_one` hands back when the response itself
+    /// is not what the test is about.
+    fn responded(status: u16) -> Outcome {
+        Outcome::Responded {
+            status,
+            assertions: AssertionReport::default(),
+        }
+    }
+
+    /// The outcome of a request that came back with `status` carrying an
+    /// already-evaluated assertion report.
+    fn checked(status: u16, assertions: AssertionReport) -> Outcome {
+        Outcome::Responded { status, assertions }
+    }
+
     #[tokio::test]
     async fn a_broken_variable_does_not_stop_the_requests_after_it() {
         let document = Document::from_yaml_str(COLLECTION_WITH_A_BROKEN_VARIABLE).unwrap();
@@ -794,11 +1295,12 @@ requests:
         // Stands in for the network: records what it was handed and reports a
         // clean response, so the substitution is the only failure in the run.
         let mut sent = Vec::new();
-        let exit = run_requests(&requests, &environment(), |request| {
+        let outcomes = run_requests(&requests, &environment(), |request| {
             sent.push(request.url.clone());
-            async { Exit::Ok }
+            async { responded(200) }
         })
         .await;
+        let exit = exit_for_run(&outcomes, false);
 
         // The requests either side of the broken one were still sent, with
         // their variables resolved — a request that cannot be built is that
@@ -827,12 +1329,9 @@ requests:
         // ...but it suppresses a *status*, and a request that was never built
         // has no status to forgive. Same treatment as a connection failure,
         // which the flag does not suppress either.
-        let exit = run_requests(&requests, &environment(), |_| async {
-            exit_for_status(404, true)
-        })
-        .await;
+        let outcomes = run_requests(&requests, &environment(), |_| async { responded(404) }).await;
 
-        assert_eq!(exit, Exit::Failure);
+        assert_eq!(exit_for_run(&outcomes, true), Exit::Failure);
     }
 
     #[tokio::test]
@@ -842,12 +1341,9 @@ requests:
 
         // Every sibling answers 500, so the run holds both kinds of failure at
         // once. "Never got a response" is the more serious of the two.
-        let exit = run_requests(&requests, &environment(), |_| async {
-            exit_for_status(500, false)
-        })
-        .await;
+        let outcomes = run_requests(&requests, &environment(), |_| async { responded(500) }).await;
 
-        assert_eq!(exit, Exit::Failure);
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Failure);
     }
 
     #[tokio::test]
@@ -859,14 +1355,14 @@ requests:
         let request = document.get("Third").expect("`Third` is in the collection");
 
         let mut sent = Vec::new();
-        let exit = run_requests(&[request], &environment(), |request| {
+        let outcomes = run_requests(&[request], &environment(), |request| {
             sent.push(request.url.clone());
-            async { Exit::Ok }
+            async { responded(200) }
         })
         .await;
 
         assert_eq!(sent, vec!["https://example.com/third"]);
-        assert_eq!(exit, Exit::Ok);
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
     }
 
     #[tokio::test]
@@ -877,14 +1373,14 @@ requests:
             .expect("`Broken` is in the collection");
 
         let mut sent = Vec::new();
-        let exit = run_requests(&[request], &environment(), |request| {
+        let outcomes = run_requests(&[request], &environment(), |request| {
             sent.push(request.url.clone());
-            async { Exit::Ok }
+            async { responded(200) }
         })
         .await;
 
         assert!(sent.is_empty(), "nothing should have been sent");
-        assert_eq!(exit, Exit::Failure);
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Failure);
     }
 
     #[tokio::test]
@@ -904,9 +1400,9 @@ requests:
         let requests: Vec<&Request> = document.requests().iter().collect();
 
         let mut sent = Vec::new();
-        let exit = run_requests(&requests, &environment(), |request| {
+        let outcomes = run_requests(&requests, &environment(), |request| {
             sent.push(request.url.clone());
-            async { Exit::Ok }
+            async { responded(200) }
         })
         .await;
 
@@ -914,7 +1410,7 @@ requests:
             sent,
             vec!["https://example.com/first", "https://example.com/second"]
         );
-        assert_eq!(exit, Exit::Ok);
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
     }
 
     // --- which environment `--env` selects -------------------------------
@@ -1097,12 +1593,12 @@ requests:
         let mut sent = Vec::new();
         for name in ["staging", "prod"] {
             let environment = environment_for(project.path(), Some(name)).expect("both exist");
-            let exit = run_requests(&requests, &environment, |request| {
+            let outcomes = run_requests(&requests, &environment, |request| {
                 sent.push(request.url.clone());
-                async { Exit::Ok }
+                async { responded(200) }
             })
             .await;
-            assert_eq!(exit, Exit::Ok);
+            assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
         }
 
         assert_eq!(
@@ -1170,7 +1666,7 @@ assertions:
     fn failing_assertions_do_not_change_the_exit_code_of_a_successful_response() {
         // The intentional, temporary asymmetry: four failed assertions printed,
         // exit 0 all the same.
-        let exit = exit_for_response(&response(200), &a_failing_report(200), false);
+        let exit = exit_for_response(200, &a_failing_report(200), false);
         assert_eq!(exit, Exit::Ok);
         assert_eq!(exit as u8, 0);
     }
@@ -1180,11 +1676,11 @@ assertions:
         // Nor do they promote a 404 to something else, or rescue it: the status
         // is still the only thing being read.
         assert_eq!(
-            exit_for_response(&response(404), &a_failing_report(404), false),
+            exit_for_response(404, &a_failing_report(404), false),
             Exit::ErrorStatus
         );
         assert_eq!(
-            exit_for_response(&response(404), &a_failing_report(404), true),
+            exit_for_response(404, &a_failing_report(404), true),
             Exit::Ok,
             "--allow-error-status still forgives the status, and nothing else"
         );
@@ -1201,7 +1697,7 @@ assertions:
         );
 
         assert_eq!(
-            exit_for_response(&response(500), &report, false),
+            exit_for_response(500, &report, false),
             Exit::ErrorStatus,
             "a 500 the file expected is still a 500"
         );
@@ -1213,8 +1709,8 @@ assertions:
         for status in [200, 301, 404, 500] {
             for allow in [false, true] {
                 assert_eq!(
-                    exit_for_response(&response(status), &AssertionReport::default(), allow),
-                    exit_for_response(&response(status), &a_failing_report(status), allow),
+                    exit_for_response(status, &AssertionReport::default(), allow),
+                    exit_for_response(status, &a_failing_report(status), allow),
                     "assertions changed the exit code for {status} (allow_error_status={allow})"
                 );
             }
@@ -1232,18 +1728,18 @@ assertions:
         assert!(requests[0].assertions.is_none());
 
         let mut sent = Vec::new();
-        let exit = run_requests(&requests, &environment(), |request| {
+        let outcomes = run_requests(&requests, &environment(), |request| {
             assert!(
                 request.assertions.is_none(),
                 "substitution must not invent a block"
             );
             sent.push(request.url.clone());
-            async { Exit::Ok }
+            async { responded(200) }
         })
         .await;
 
         assert_eq!(sent, vec!["https://example.com/plain"]);
-        assert_eq!(exit, Exit::Ok);
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
     }
 
     #[tokio::test]
@@ -1264,13 +1760,13 @@ assertions:
         let requests: Vec<&Request> = document.requests().iter().collect();
 
         let mut seen = Vec::new();
-        let exit = run_requests(&requests, &environment(), |request| {
+        let outcomes = run_requests(&requests, &environment(), |request| {
             seen.push(request.assertions.clone());
-            async { Exit::Ok }
+            async { responded(200) }
         })
         .await;
 
-        assert_eq!(exit, Exit::Ok);
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
         let assertions = seen.pop().flatten().expect("the block reached `send`");
         assert_eq!(assertions.status, Some(200));
         assert_eq!(
@@ -1287,5 +1783,472 @@ assertions:
         assert_eq!(Exit::Ok as u8, 0);
         assert_eq!(Exit::Failure as u8, 1);
         assert_eq!(Exit::ErrorStatus as u8, 3);
+        assert_eq!(Exit::TestFailed as u8, 4);
+    }
+
+    // --- `sendra test`: the summary, and the exit code it comes from ------
+    //
+    // The command's whole contract is in `Summary`: which of the four
+    // categories each request lands in, and which of them make the run fail.
+    // These test that against outcomes built by hand, and — where the point is
+    // that a request that never got a response is not special-cased anywhere —
+    // through the real `run_requests` loop.
+
+    /// An outcome that came back with `status` and declared one assertion,
+    /// which held.
+    fn all_passed(status: u16) -> Outcome {
+        let report = assertions_from(&format!(
+            "method: GET\nurl: https://example.com\nassertions:\n  status: {status}\n"
+        ))
+        .evaluate(&response(status));
+
+        assert!(report.passed(), "the assertion asked for exactly {status}");
+        checked(status, report)
+    }
+
+    /// An outcome that came back with `status` and declared assertions, none of
+    /// which held.
+    fn some_failed(status: u16) -> Outcome {
+        checked(status, a_failing_report(status))
+    }
+
+    #[test]
+    fn a_mixed_collection_counts_each_category_separately() {
+        // One of each of the three things a response can be, so no two
+        // categories can be collapsed without this noticing.
+        let outcomes = vec![all_passed(200), some_failed(200), responded(200)];
+
+        assert_eq!(
+            Summary::of(&outcomes),
+            Summary {
+                total: 3,
+                passed: 1,
+                failed: 1,
+                without_assertions: 1,
+                no_response: 0,
+            }
+        );
+        assert_eq!(Summary::of(&outcomes).exit(), Exit::TestFailed);
+        assert_eq!(Exit::TestFailed as u8, 4);
+    }
+
+    #[test]
+    fn a_collection_where_everything_passes_exits_zero() {
+        let outcomes = vec![all_passed(200), all_passed(201), all_passed(204)];
+
+        assert_eq!(
+            Summary::of(&outcomes),
+            Summary {
+                total: 3,
+                passed: 3,
+                ..Summary::default()
+            }
+        );
+        assert_eq!(Summary::of(&outcomes).exit(), Exit::Ok);
+    }
+
+    #[test]
+    fn a_request_with_no_assertions_is_neither_a_pass_nor_a_failure() {
+        // The third category, on its own: three requests that came back fine
+        // and were never checked. Nothing failed, so the run exits 0 — and
+        // nothing passed either, so the summary cannot be read as three green
+        // checks.
+        let outcomes = vec![responded(200), responded(200), responded(200)];
+        let summary = Summary::of(&outcomes);
+
+        assert_eq!(
+            summary,
+            Summary {
+                total: 3,
+                without_assertions: 3,
+                ..Summary::default()
+            }
+        );
+        assert_eq!(summary.passed, 0, "an unchecked request is not a pass");
+        assert_eq!(summary.failed, 0, "nor is it a failure");
+        assert_eq!(summary.exit(), Exit::Ok);
+    }
+
+    #[test]
+    fn an_empty_assertions_block_counts_as_no_assertions_at_all() {
+        // `assertions: {}` is a block that asserts nothing, and is the same
+        // thing to this command as having written no block: an empty report
+        // either way. See `Assertions::is_empty` in core.
+        let assertions = assertions_from("method: GET\nurl: https://example.com\nassertions: {}\n");
+        assert!(assertions.is_empty());
+
+        let outcomes = vec![checked(200, assertions.evaluate(&response(200)))];
+
+        assert_eq!(
+            Summary::of(&outcomes),
+            Summary {
+                total: 1,
+                without_assertions: 1,
+                ..Summary::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_bad_status_with_no_assertions_does_not_fail_a_test_run() {
+        // The debatable decision, pinned. A request that declared nothing and
+        // came back 404 or 500 exits 0 under `test`: the file said nothing
+        // about the status, so `test` says nothing about it either. See
+        // `Summary` for the reasoning.
+        let outcomes = vec![responded(404), responded(500)];
+        let summary = Summary::of(&outcomes);
+
+        assert_eq!(
+            summary,
+            Summary {
+                total: 2,
+                without_assertions: 2,
+                ..Summary::default()
+            }
+        );
+        assert_eq!(
+            summary.exit(),
+            Exit::Ok,
+            "an unasserted status must not fail a test run"
+        );
+
+        // And the contrast that makes it a decision rather than an oversight:
+        // the very same run, under `sendra run`, still exits 3. The raw-status
+        // question has a command that answers it; `test` declining to answer it
+        // a second time loses nothing.
+        assert_eq!(exit_for_run(&outcomes, false), Exit::ErrorStatus);
+    }
+
+    #[test]
+    fn an_asserted_bad_status_behaves_exactly_as_written() {
+        // The corollary of the rule above: the status is not ignored, it is
+        // only ever read through an assertion. Asserting `status: 404` and
+        // getting one is a pass; asserting `status: 200` and getting a 404 is
+        // a failure. Both under the same command that shrugs at an unasserted
+        // 404.
+        assert_eq!(Summary::of(&[all_passed(404)]).exit(), Exit::Ok);
+
+        let wrong =
+            assertions_from("method: GET\nurl: https://example.com\nassertions:\n  status: 200\n")
+                .evaluate(&response(404));
+        assert!(!wrong.passed());
+        assert_eq!(Summary::of(&[checked(404, wrong)]).exit(), Exit::TestFailed);
+    }
+
+    #[test]
+    fn a_failed_assertion_on_a_perfectly_good_status_still_fails_the_run() {
+        // The other half of "status is not the input": a 200 does not rescue a
+        // check that did not hold.
+        let outcomes = vec![some_failed(200)];
+
+        assert_eq!(
+            Summary::of(&outcomes),
+            Summary {
+                total: 1,
+                failed: 1,
+                ..Summary::default()
+            }
+        );
+        assert_eq!(Summary::of(&outcomes).exit(), Exit::TestFailed);
+    }
+
+    #[test]
+    fn passing_assertions_on_an_error_status_pass_the_test_run() {
+        // A request that expects a 500 and gets one has met its expectations.
+        // `sendra run` would still exit 3 on the same response, and that is the
+        // difference between the two commands stated as a test rather than as a
+        // paragraph.
+        let outcomes = vec![all_passed(500)];
+
+        assert_eq!(Summary::of(&outcomes).exit(), Exit::Ok);
+        assert_eq!(exit_for_run(&outcomes, false), Exit::ErrorStatus);
+    }
+
+    #[test]
+    fn a_request_that_never_got_a_response_fails_the_run() {
+        // No response means no assertions could be evaluated, so the run cannot
+        // claim its expectations held — whatever the requests around it did.
+        let outcomes = vec![all_passed(200), Outcome::NoResponse, all_passed(200)];
+        let summary = Summary::of(&outcomes);
+
+        assert_eq!(
+            summary,
+            Summary {
+                total: 3,
+                passed: 2,
+                no_response: 1,
+                ..Summary::default()
+            }
+        );
+        assert_eq!(summary.exit(), Exit::Failure);
+        assert_eq!(Exit::Failure as u8, 1);
+    }
+
+    #[test]
+    fn never_got_a_response_outranks_a_failed_assertion() {
+        // Both are failures and both are non-zero; the code says which kind,
+        // and "the tool could not do its job" is the more serious of the two —
+        // the same ranking `run` uses.
+        let outcomes = vec![some_failed(200), Outcome::NoResponse];
+        assert_eq!(Summary::of(&outcomes).exit(), Exit::Failure);
+
+        // And it does not depend on which came first.
+        let outcomes = vec![Outcome::NoResponse, some_failed(200)];
+        assert_eq!(Summary::of(&outcomes).exit(), Exit::Failure);
+    }
+
+    #[test]
+    fn every_outcome_lands_in_exactly_one_category() {
+        // The four counts are a partition, not four overlapping questions, so
+        // the printed line always adds up.
+        let outcomes = vec![
+            all_passed(200),
+            some_failed(200),
+            responded(200),
+            responded(404),
+            Outcome::NoResponse,
+            all_passed(500),
+        ];
+        let summary = Summary::of(&outcomes);
+
+        assert_eq!(summary.total, outcomes.len());
+        assert_eq!(
+            summary.passed + summary.failed + summary.without_assertions + summary.no_response,
+            summary.total,
+            "the categories must partition the run: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn the_summary_does_not_depend_on_the_order_of_the_requests() {
+        // Same reasoning as `worst`: reordering a collection must not change
+        // whether a script proceeds.
+        let forwards = Summary::of(&[all_passed(200), some_failed(200), responded(200)]);
+        let backwards = Summary::of(&[responded(200), some_failed(200), all_passed(200)]);
+
+        assert_eq!(forwards, backwards);
+        assert_eq!(forwards.exit(), backwards.exit());
+    }
+
+    #[test]
+    fn a_test_run_never_returns_the_code_that_belongs_to_run() {
+        // `3` is `run`'s answer to a question `test` does not ask. Over every
+        // shape of summary the classifier can produce, `test` returns one of
+        // exactly three codes.
+        for passed in 0..2 {
+            for failed in 0..2 {
+                for without_assertions in 0..2 {
+                    for no_response in 0..2 {
+                        let summary = Summary {
+                            total: passed + failed + without_assertions + no_response,
+                            passed,
+                            failed,
+                            without_assertions,
+                            no_response,
+                        };
+
+                        assert!(
+                            matches!(summary.exit(), Exit::Ok | Exit::TestFailed | Exit::Failure),
+                            "{summary:?} produced {:?}",
+                            summary.exit()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_substitution_failure_is_counted_and_fails_the_test_run() {
+        // Through the real loop, not with a hand-built `NoResponse`: the
+        // continue-on-failure model is shared with `run`, so the broken request
+        // in the middle must still not stop the two around it, and `test` must
+        // count it in the category that has no response in it.
+        let document = Document::from_yaml_str(COLLECTION_WITH_A_BROKEN_VARIABLE).unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+
+        let mut sent = Vec::new();
+        let outcomes = run_requests(&requests, &environment(), |request| {
+            sent.push(request.url.clone());
+            async { all_passed(200) }
+        })
+        .await;
+
+        assert_eq!(
+            sent,
+            vec!["https://example.com/first", "https://example.com/third"],
+            "the siblings of a broken request are still sent under `test`"
+        );
+
+        let summary = Summary::of(&outcomes);
+        assert_eq!(
+            summary,
+            Summary {
+                total: 3,
+                passed: 2,
+                no_response: 1,
+                ..Summary::default()
+            }
+        );
+        assert_eq!(summary.exit(), Exit::Failure);
+    }
+
+    #[tokio::test]
+    async fn a_connection_failure_is_counted_the_same_way_a_substitution_failure_is() {
+        // `send` returns `NoResponse` for a refused connection, a DNS failure
+        // and a TLS failure alike; this is that path, with the network stubbed
+        // out. Same category, same exit code, for the same reason: there is no
+        // response to check anything against.
+        let document = Document::from_yaml_str(
+            "\
+requests:
+  - name: Fine
+    method: GET
+    url: '{{base_url}}/fine'
+  - name: Unreachable
+    method: GET
+    url: '{{base_url}}/unreachable'
+",
+        )
+        .unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+
+        let outcomes = run_requests(&requests, &environment(), |request| async move {
+            if request.url.ends_with("/unreachable") {
+                Outcome::NoResponse
+            } else {
+                all_passed(200)
+            }
+        })
+        .await;
+
+        let summary = Summary::of(&outcomes);
+        assert_eq!(
+            summary,
+            Summary {
+                total: 2,
+                passed: 1,
+                no_response: 1,
+                ..Summary::default()
+            }
+        );
+        assert_eq!(summary.exit(), Exit::Failure);
+    }
+
+    #[tokio::test]
+    async fn a_single_request_file_is_a_test_run_of_one() {
+        // `test` takes the same two shapes `run` does, through the same
+        // `Document`, so a file with no `requests` key is a collection of one
+        // as far as the summary is concerned.
+        let document = Document::from_yaml_str(
+            "\
+name: Solo
+method: GET
+url: '{{base_url}}/solo'
+assertions:
+  status: 200
+",
+        )
+        .unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+        assert_eq!(requests.len(), 1);
+
+        let outcomes = run_requests(&requests, &environment(), |_| async { all_passed(200) }).await;
+
+        assert_eq!(
+            Summary::of(&outcomes),
+            Summary {
+                total: 1,
+                passed: 1,
+                ..Summary::default()
+            }
+        );
+    }
+
+    // --- `--allow-error-status` has no meaning under `test` ---------------
+
+    #[test]
+    fn the_cli_definition_is_internally_consistent() {
+        use clap::CommandFactory;
+
+        // clap's own check that the two subcommands' arguments are well-formed
+        // — cheap, and it catches a duplicated long name or a bad default the
+        // moment it is written rather than the first time someone runs the
+        // command.
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_accepts_allow_error_status_only_so_that_it_can_be_refused() {
+        // Not defining the flag at all would also reject it, with clap's
+        // generic "unexpected argument". It is defined and hidden so that the
+        // refusal can say *why* it does not apply — see
+        // `reject_allow_error_status`.
+        let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--allow-error-status"])
+            .expect("the flag must parse, so `main` can refuse it with an explanation");
+
+        match cli.command {
+            Command::Test {
+                allow_error_status, ..
+            } => assert!(
+                allow_error_status,
+                "the flag must reach `main` to be refused"
+            ),
+            _ => panic!("`sendra test` should have parsed as `Command::Test`"),
+        }
+    }
+
+    #[test]
+    fn allow_error_status_is_advertised_by_run_and_hidden_by_test() {
+        use clap::CommandFactory;
+
+        let mut cli = Cli::command();
+
+        let run_help = cli
+            .find_subcommand_mut("run")
+            .expect("`run` is a subcommand")
+            .render_help()
+            .to_string();
+        assert!(
+            run_help.contains("--allow-error-status"),
+            "`run` still offers the flag"
+        );
+
+        let test_help = cli
+            .find_subcommand_mut("test")
+            .expect("`test` is a subcommand")
+            .render_help()
+            .to_string();
+        assert!(
+            !test_help.contains("--allow-error-status"),
+            "`test` must not offer a flag it refuses: {test_help}"
+        );
+    }
+
+    #[test]
+    fn test_takes_a_path_and_an_env_and_no_request_name() {
+        let cli = Cli::try_parse_from(["sendra", "test", "collection.yaml", "--env", "staging"])
+            .expect("path and --env are the whole surface");
+
+        match cli.command {
+            Command::Test {
+                path,
+                env,
+                allow_error_status,
+            } => {
+                assert_eq!(path, PathBuf::from("collection.yaml"));
+                assert_eq!(env.as_deref(), Some("staging"));
+                assert!(!allow_error_status);
+            }
+            _ => panic!("`sendra test` should have parsed as `Command::Test`"),
+        }
+
+        // A second positional is `run`'s, not `test`'s: a verdict over one
+        // hand-picked request is a different thing, and is not offered rather
+        // than being offered and ignored.
+        assert!(
+            Cli::try_parse_from(["sendra", "test", "collection.yaml", "One request"]).is_err(),
+            "`test` takes no request name"
+        );
     }
 }

@@ -9,15 +9,16 @@ That makes requests reviewable in a pull request, diffable over time, and
 shareable without exporting anything. A file holds either one request or a
 named collection of them, sent and printed, against variables from an
 environment file so the same request can point at staging or at production, and
-a file can declare what it expects the response to look like. Scripting and an
-interactive TUI are both planned and deliberately absent for now.
+a file can declare what it expects the response to look like — which
+`sendra test` then passes or fails your build on. Scripting and an interactive
+TUI are both planned and deliberately absent for now.
 
 ## Layout
 
 ```
 sendra/
   sendra-core/     library: request/response types, YAML loading, config, environments, HTTP execution
-  sendra-cli/      binary `sendra`: argument parsing, output, exit codes
+  sendra-cli/      binary `sendra`: argument parsing, output, exit codes, `run` and `test`
   examples/        sample request and collection files
   .sendra/         this repo's own project config and environments
 ```
@@ -75,6 +76,17 @@ cargo run -p sendra-cli -- run examples/assertions.yaml
 
 Two of its assertions are meant to fail, so one run shows both halves of the
 output. It still exits `0` — see [Assertions](#assertions).
+
+`examples/test-collection.yaml` is the same idea under `sendra test`, which
+does not exit `0`:
+
+```sh
+cargo run -p sendra-cli -- test examples/test-collection.yaml
+```
+
+Four requests: two that pass, one whose assertion is wrong on purpose, and one
+that asserts nothing and comes back `404`. It exits `4` — see
+[Testing](#testing).
 
 ## Request file shape
 
@@ -141,6 +153,139 @@ you see every result, and the exit code reports the worst of them.
 Asking for a name that is not in the collection is an error that lists the names
 that are (`no request named X (available: ...)`), as is passing a name to a file
 that holds a single request.
+
+`sendra test` sends the same requests the same way and answers a different
+question about them; see [Testing](#testing).
+
+## Testing
+
+`sendra run` reports what came back. `sendra test` reports whether it was what
+the file said it should be, and puts that answer in the exit code:
+
+```sh
+sendra test req.yaml                 # the one request in the file
+sendra test collection.yaml          # every request in it, in file order
+sendra test collection.yaml --env ci # against .sendra/environments/ci.yaml
+```
+
+Everything about *sending* is the same as `run`: the same file shapes, the same
+config, the same `--env` and `{{variable}}` substitution, the same sequential
+order, and the same rule that one broken request does not stop the ones after
+it. The same assertion results print under each response, in the same format.
+Three things differ:
+
+- Responses print as a status line only — no headers, no body. `test` answers a
+  question about a whole collection, and burying that answer under four JSON
+  bodies would make the summary the hardest line to find in its own output. Use
+  `sendra run` when you want to look at a response.
+- A summary of the whole run prints at the end.
+- The exit code comes from the assertions.
+
+`examples/test-collection.yaml`, run against httpbin, prints exactly this:
+
+```text
+→ Status and body
+200 OK  1657 ms
+
+assertions
+  ✓ status is 200
+  ✓ header `content-type` is `application/json`
+  ✓ body contains `"url"`
+  ✓ `$.url` is "https://httpbin.org/get"
+  4 passed
+
+→ Wrong expectation
+200 OK  1390 ms
+
+assertions
+  ✓ status is 200
+  ✓ `$.json.project` is "sendra"
+  ✗ `$.json.stage` is "collections" — got "test"
+  2 passed, 1 failed
+
+→ Unasserted 404
+404 Not Found  1598 ms
+
+no assertions
+
+→ Expected 500
+500 Internal Server Error  1422 ms
+
+assertions
+  ✓ status is 500
+  1 passed
+
+summary
+  4 requests: 2 passed, 1 failed, 1 without assertions
+```
+
+**Four categories, and they do not overlap.** Every request lands in exactly
+one, so the counts always add up to the total:
+
+| Category             | Meaning                                                   |
+| -------------------- | --------------------------------------------------------- |
+| `passed`             | Got a response, declared assertions, and all of them held. |
+| `failed`             | Got a response, declared assertions, one or more did not.  |
+| `without assertions` | Got a response and declared nothing to check.              |
+| `no response`        | Never got a response, so there was nothing to check against. |
+
+The last three are printed only when they are not zero, so a clean run reads
+`4 requests: 4 passed` and nothing competes with it. A request that declared
+nothing prints a dimmed `no assertions` where its results would have gone, so
+the `without assertions` count has something to point at.
+
+**A request with no assertions is not a pass.** It is a request nobody said
+anything about, and it gets its own count for that reason. Folding it into
+`passed` would let a collection with no assertions anywhere report a perfect
+green run, which is the most misleading thing a test command can do; folding it
+into `failed` would break the build every time somebody added a request before
+writing expectations for it. The count is the honest answer — "these ran, and
+nothing was checked" — and what to do about it is yours.
+
+**A status nobody asserted does not fail a test run.** `Unasserted 404` above
+comes back `404` and the run still exits `4` because of the *assertion* that
+failed, not because of it. This is the debatable one, so, plainly: `test`'s
+contract is that the file says what it expects and `test` reports whether it got
+it. Failing on a bare `404` means asserting something the file never wrote down
+— inventing an expectation on the author's behalf — which is the same class of
+mistake as an assertion silently ignored because of a typo, only inverted.
+Sendra refuses to guess everywhere else in its schema, and the check is one line
+to write when you want it:
+
+```yaml
+assertions:
+  status: 200
+```
+
+It also keeps a real use intact: a request that is in the collection to *reach*
+an endpoint — a login, a setup call — rather than to be checked. And the
+raw-status question already has a command that answers it, and answers it well:
+`sendra run`, exit `3`. Nothing is lost by `test` declining to answer it a
+second time with a different number. The safeguard against the decision hiding a
+problem is the summary itself: `without assertions` is printed, so a run whose
+expectations were never written is visibly not the same thing as a run that
+passed.
+
+**`--allow-error-status` does not apply to `sendra test`,** and passing it is an
+error rather than a no-op:
+
+```text
+error: `--allow-error-status` does not apply to `sendra test`.
+
+  `test` decides its exit code from assertions, not from response statuses: a
+  4xx or 5xx that no assertion mentions does not fail a test run in the first
+  place, so there is nothing here for the flag to forgive.
+```
+
+There is nothing for it to suppress, and a flag accepted and quietly discarded
+reads, to whoever typed it, exactly like one that worked.
+
+**No request-name argument.** `sendra run <file> <name>` exists to send one
+request out of a collection and look at it. `test` produces a verdict over a
+file, and a verdict over one hand-picked request is a different, narrower thing;
+it can be added later if it turns out to be wanted.
+
+See [Exit codes](#exit-codes) for `4` and how it ranks against `1`.
 
 ## Configuration
 
@@ -276,12 +421,14 @@ error: no variable named `nope` in `.sendra/environments/default.yaml` (availabl
 and a request that could not be built has no status — like a DNS or connection
 failure, it exits `1` either way.
 
-**Which environment is loaded.** `--env <name>` on `sendra run`:
+**Which environment is loaded.** `--env <name>`, on `sendra run` and on
+`sendra test` alike:
 
 ```sh
 sendra run req.yaml --env staging   # .sendra/environments/staging.yaml
 sendra run req.yaml --env prod      # .sendra/environments/prod.yaml
 sendra run req.yaml                 # .sendra/environments/default.yaml, if there is one
+sendra test req.yaml --env ci       # same rule, same walk-up, same errors
 ```
 
 The name is a filename, not a keyword — `staging`, `prod`, `local`, `ci` and
@@ -300,6 +447,9 @@ different from each other:
   ```
   error: no environment named `stagng`: no `.sendra/environments/stagng.yaml` in `/repo` or any parent directory
   ```
+
+  Under `sendra test` this is exit `1`, not `4`: nothing was sent, so no
+  assertion was evaluated, and the run cannot have failed on its expectations.
 
   The difference is not the file, it is what you asked for. Omitting `--env`
   asks for a default; `--env staging` asserts that `staging` exists. Sendra
@@ -391,13 +541,15 @@ assertions
 A request with no `assertions` block prints exactly what it printed before this
 feature existed — an empty report produces no output at all.
 
-**Assertions do not affect the exit code.** The run above exits `0`: six
-assertions, two of them failed, exit `0`. That is deliberate and temporary.
+**Assertions do not affect `sendra run`'s exit code.** The run above exits `0`:
+six assertions, two of them failed, exit `0`. That is deliberate and permanent.
 `sendra run` sends requests and reports what came back; `sendra test` is the
-command whose job is to pass or fail on expectations, and it is where the two
-get wired together. Doing it here would silently change what every existing
-`sendra run req.yaml && deploy.sh` means the moment someone adds an `assertions`
-block to `req.yaml`.
+command whose job is to pass or fail on expectations. Doing it in `run` would
+silently change what every existing `sendra run req.yaml && deploy.sh` means the
+moment someone adds an `assertions` block to `req.yaml`.
+
+The same file under `sendra test` exits `4`, and that is the only difference
+between the two commands worth remembering. See [Testing](#testing).
 
 **Header names are matched case-insensitively, values exactly.** HTTP header
 names are case-insensitive, so which casing a server picks is not something a
@@ -441,21 +593,56 @@ like a missing variable in its URL.
 
 ## Exit codes
 
-- `0` — every request was sent and no response status was an error
-  (1xx, 2xx, 3xx).
+One table for the whole binary, not one per subcommand: `run` and `test` answer
+different questions, but they answer them to the same shell, and a number that
+means one thing under one command and something else under the other is a trap
+for anyone writing `case $? in` around either.
+
+| Code | `run` | `test` | Meaning                                                             |
+| ---- | :---: | :----: | ------------------------------------------------------------------- |
+| `0`  |   ·   |   ·    | Nothing went wrong — see below for what each command means by that. |
+| `1`  |   ·   |   ·    | Some request never got a response.                                  |
+| `2`  |   ·   |   ·    | Bad command-line usage (from clap).                                 |
+| `3`  |   ·   |        | `run` only: every request got a response, at least one was 4xx/5xx. |
+| `4`  |       |   ·    | `test` only: every request got a response, at least one had a failing assertion. |
+
+- `0` — for `run`, every request was sent and no response status was an error
+  (1xx, 2xx, 3xx). For `test`, every request got a response and every assertion
+  that was declared, passed.
 - `1` — some request never got a response: the file was missing or malformed, no
   request by that name, `--env` named an environment with no file behind it, a
   `{{variable}}` or `${VAR}` had no value, a header was invalid, or the request
-  never completed (DNS, TLS, connection).
-- `2` — bad command-line usage (from clap).
-- `3` — every request completed but at least one server answered `4xx` or `5xx`.
-  The responses print exactly as they would otherwise; only the exit code
-  differs, so `sendra run req.yaml && deploy.sh` does not proceed on a 404.
+  never completed (DNS, TLS, connection). The same meaning under both commands,
+  which is why it is the same number.
+- `2` — bad command-line usage (from clap). `sendra test --allow-error-status`
+  is one of these; see [Testing](#testing).
+- `3` — `sendra run` only: every request completed but at least one server
+  answered `4xx` or `5xx`. The responses print exactly as they would otherwise;
+  only the exit code differs, so `sendra run req.yaml && deploy.sh` does not
+  proceed on a 404.
+- `4` — `sendra test` only: every request got a response, but at least one had
+  an assertion that did not hold.
+
+Codes `5` and up are free.
+
+**Why `4` and not `3` for a failing assertion.** Reusing `3` would have made one
+number mean "the server said 500" under `run` and "the server said exactly what
+you asked for, and it was wrong" under `test`. They are different events and
+they want different handling.
+
+**Why a `test` run with an unsendable request exits `1` and not `4`.** Both are
+failures and both are non-zero, but they are not the same failure: `4` means the
+API did not meet the expectations, `1` means Sendra could not get far enough to
+find out. In CI one says "fix your API" and the other says "fix your test
+setup", and a single generic non-zero would have thrown that away. When a run
+contains both, `1` wins — see the ranking below.
 
 For a collection, these are aggregates over the whole run: the worst outcome
-wins, ranked `0` < `3` < `1`. One 4xx anywhere in the collection exits `3`, and
-one request that could not be sent at all exits `1` — "never got a response" is
-a bigger problem than "got a 500", so it takes precedence.
+wins, ranked `0` < `3` < `4` < `1`. One 4xx anywhere in a `run` exits `3`, one
+failing assertion anywhere in a `test` exits `4`, and one request that could not
+be sent at all exits `1` — "never got a response" is a bigger problem than "got
+a 500" or "got the wrong body", so it takes precedence. (`3` and `4` never meet:
+one is only ever produced by `run` and the other only by `test`.)
 
 The alternative — letting the last request decide — would make the exit code
 depend on the order the file happens to list requests in, so reordering a
@@ -476,14 +663,18 @@ surrounding script:
 sendra run examples/get-request.yaml --allow-error-status
 ```
 
-A failed assertion is not in this table at all: `sendra run` prints assertion
-results and does not read them when deciding what to return. See
-[Assertions](#assertions) for why, and `exit_for_response` in
-`sendra-cli/src/main.rs` for the single place that decision lives.
+A failed assertion never enters `run`'s answer: `sendra run` prints assertion
+results and does not read them when deciding what to return, so a run that
+reports "2 failed" still exits `0`. That is permanent, not a stage on the way to
+unifying the two commands — wiring assertions into `run`'s exit code would
+silently change what every existing `sendra run req.yaml && deploy.sh` means the
+moment an `assertions` block is added to `req.yaml`, and `sendra test` exists so
+that nobody has to. See [Assertions](#assertions) for the whole argument, and
+`exit_for_response` in `sendra-cli/src/main.rs` for the single place that
+decision lives.
 
-Codes `4` and up are reserved for later commands (`sendra test` will need its
-own outcome for failing assertions). The full table lives next to the `Exit`
-enum in `sendra-cli/src/main.rs`.
+The table above lives next to the `Exit` enum in `sendra-cli/src/main.rs`, and
+`Summary` beside it is where `test`'s half of it is decided.
 
 ## Development
 
