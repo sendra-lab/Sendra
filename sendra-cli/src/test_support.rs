@@ -4,6 +4,7 @@
 use sendra_core::{AssertionReport, Document, Response};
 
 use crate::exit::Outcome;
+use crate::output::{Detail, Format, Reporter};
 
 /// A response to hand [`exit_for_response`]. Built by hand: none of these
 /// tests need a socket, and the field values other than `status` never
@@ -56,4 +57,15 @@ pub(crate) fn all_passed(status: u16) -> Outcome {
 
     assert!(report.passed(), "the assertion asked for exactly {status}");
     checked(status, report)
+}
+
+/// A reporter for tests that are about the sending loop rather than about
+/// output.
+///
+/// Human format, which is what those tests have always exercised: it prints as
+/// it goes, into the harness's captured stdout, and records nothing. A test
+/// that is about `--json` builds its own [`Reporter`] and reads the document
+/// back — see `output`'s tests.
+pub(crate) fn reporter() -> Reporter {
+    Reporter::new(Format::Human, Detail::StatusOnly)
 }

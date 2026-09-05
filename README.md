@@ -25,6 +25,7 @@ sendra/
     output.rs        everything printed to the terminal
     exit.rs          `Exit`, `Outcome`, `Summary`: exit-code policy, no I/O
     test_support.rs  fixtures shared by more than one module's tests
+    tests/           integration tests that run the built binary and read its output
   examples/        sample request and collection files
   .sendra/         this repo's own project config and environments
 ```
@@ -160,6 +161,29 @@ Asking for a name that is not in the collection is an error that lists the names
 that are (`no request named X (available: ...)`), as is passing a name to a file
 that holds a single request.
 
+A response body whose `content-type` is `application/json` — or anything with a
+`+json` suffix, such as `application/problem+json` — is printed indented, with
+the server's key order preserved:
+
+```text
+200 OK  412 ms
+content-type: application/json
+
+{
+  "id": 7,
+  "name": "ada",
+  "tags": [
+    "a",
+    "b"
+  ]
+}
+```
+
+The `content-type` is the only thing consulted; a body that merely starts with a
+`{` is printed as it arrived. So is a body that claims to be JSON and does not
+parse — a truncated response is exactly when the raw bytes are worth seeing, so
+it is printed rather than swallowed.
+
 `sendra test` sends the same requests the same way and answers a different
 question about them; see [Testing](#testing).
 
@@ -292,6 +316,130 @@ file, and a verdict over one hand-picked request is a different, narrower thing;
 it can be added later if it turns out to be wanted.
 
 See [Exit codes](#exit-codes) for `4` and how it ranks against `1`.
+
+## JSON output
+
+`--json` replaces the terminal output with one JSON object describing the whole
+run, on stdout. Both subcommands take it:
+
+```sh
+sendra run collection.yaml --json | jq '.requests[] | select(.response.status >= 400)'
+sendra test collection.yaml --json > results.json
+```
+
+**Stdout holds the document and nothing else.** The `→ label` lines and every
+error message stay on stderr, where they already were, so a redirected stdout is
+a file `jq` can read and a terminal still shows what went wrong as it happens.
+
+**Exit codes are unchanged.** `--json` is a different serialisation of the same
+result, not part of deciding it: the [table above](#exit-codes) applies to both
+renderings, and a run reports the same number either way.
+
+**One object per invocation, not one per request.** A stream of objects would
+make `sendra run collection.yaml --json | jq .` a stream of documents rather
+than a document, and `test`'s summary would have nowhere to live in it. The cost
+is that nothing is printed until the run is over.
+
+### `sendra run --json`
+
+```json
+{
+  "requests": [
+    {
+      "label": "Get user",
+      "response": {
+        "status": 200,
+        "status_text": "OK",
+        "elapsed_ms": 412,
+        "headers": [
+          { "name": "content-type", "value": "application/json" }
+        ],
+        "body": "{\"id\":7,\"name\":\"ada\"}"
+      },
+      "error": null,
+      "assertions": {
+        "total": 2,
+        "passed": 1,
+        "failed": 1,
+        "results": [
+          {
+            "kind": "status",
+            "expectation": "status is 200",
+            "passed": true,
+            "failure": null
+          },
+          {
+            "kind": "json_path",
+            "expectation": "`$.name` is \"ada\"",
+            "passed": false,
+            "failure": "got \"grace\""
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+- `requests` — one entry per request the run attempted, in file order.
+- `label` — the request's `name`, or `METHOD url` when it has none. The same
+  label the `→` line on stderr shows.
+- `response` and `error` — always both present, exactly one of them `null`. A
+  request either came back or it did not; `error` carries the message and its
+  causes joined with `: `, so a connection failure names both the request and
+  the reason.
+- `body` — the raw body, exactly as it arrived. The indenting described under
+  [Running requests](#running-requests) is for a terminal; rewriting the
+  server's bytes inside a document about them would misreport what came back.
+  `jq` has `fromjson` when you want it parsed.
+- `headers` — a list of `{name, value}` objects rather than one object keyed by
+  name, because HTTP lets a header repeat (`set-cookie`) and a map would drop
+  all but one of them. Wire order is preserved.
+- `assertions` — always an object, with an empty `results` list for a request
+  that declared none. `kind` is one of `status`, `header`, `body_contains` or
+  `json_path` — the keys the `assertions` block is written with.
+  `expectation` and `failure` are the same strings the terminal prints.
+
+### `sendra test --json`
+
+The same document, plus a `summary` object holding the counts the terminal run
+ends with:
+
+```json
+{
+  "requests": [ "..." ],
+  "summary": {
+    "total": 4,
+    "passed": 2,
+    "failed": 1,
+    "without_assertions": 1,
+    "no_response": 0
+  }
+}
+```
+
+Every count is present, zeroes included — the terminal leaves a zero out, and a
+script reading `.summary.failed` should not have to know that. The four
+categories are the ones described under [Testing](#testing), and they still add
+up to `total`.
+
+Two differences from the terminal output are worth stating:
+
+- `summary` is **absent** under `run`, rather than null. `run` has no summary;
+  it is not a summary that is empty.
+- `requests` carries whole responses under `test` — headers and body included —
+  where the terminal shows a status line only. That brevity is a decision about
+  what is readable on a screen, and a program reading the output has no such
+  problem.
+
+**When the run never starts, stdout stays empty.** A missing file, a config that
+does not parse, a `--env` naming an environment that is not there: these fail
+before the first request, so there is no document to write. The error is on
+stderr and the exit code is `1`, as it is without the flag.
+
+**No stability promise yet.** This is v1 and Sendra has no external consumers;
+the shape above is the one to script against today, and it will grow keys before
+it is frozen.
 
 ## Configuration
 
@@ -698,8 +846,9 @@ green build. Clippy is `-D warnings`: a warning fails the build.
 The test suite is hermetic. It parses YAML, checks exit-code logic, and resolves
 config and environments against directory trees built under a temporary
 directory rather than against your real `~/.config`; the tests that name a URL
-point at a closed local port so they fail before connecting. Nothing under
-`cargo test` touches the network, which is what makes CI trustworthy rather than
+point at a closed local port on `127.0.0.1`, so they fail before connecting or —
+in the one `--json` test that really sends — while connecting. Nothing under
+`cargo test` reaches a network, which is what makes CI trustworthy rather than
 merely usually-green. The `examples/` files do hit `httpbin.org`, and are run by
 hand — deliberately never in CI.
 

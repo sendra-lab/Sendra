@@ -13,6 +13,14 @@ path = "src/main.rs"
 sendra-core = { path = "../sendra-core" }
 clap = { workspace = true }
 owo-colors = { workspace = true }
+# `--json` output is built from view structs defined in `output.rs`, so the
+# derive macro is what turns them into the documented schema.
+serde = { workspace = true }
+# Two jobs: emitting `--json`, and re-indenting a JSON response body in the
+# human output. "preserve_order" is for the second — pretty-printing must show
+# the object the server sent, in the order it sent it, and the default
+# `Map<String, Value>` is a `BTreeMap` that would silently sort the keys.
+serde_json = { workspace = true, features = ["preserve_order"] }
 # A single request per invocation means no work to spread across threads, so
 # the current-thread runtime ("rt") is enough; "rt-multi-thread" would only add
 # a worker pool nothing here uses. "macros" is for #[tokio::main].
@@ -23,3 +31,5 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 # the way core tests config resolution, so the tests need somewhere disposable
 # to build them.
 tempfile = { workspace = true }
+# The `--json` integration tests read the binary's stdout back as JSON.
+serde_json = { workspace = true }

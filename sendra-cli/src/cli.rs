@@ -50,6 +50,18 @@ pub(crate) enum Command {
         /// script.
         #[arg(long)]
         allow_error_status: bool,
+
+        /// Print one JSON object describing the whole run, instead of the
+        /// human-readable output.
+        ///
+        /// `{"requests": [...]}`, one entry per request in file order, each
+        /// carrying its response — status, headers, body, elapsed time — or the
+        /// error that stopped it, and its assertion results. Nothing else goes
+        /// to stdout in this mode: the `→` labels and every error message stay
+        /// on stderr, so `sendra run req.yaml --json > out.json` leaves a file
+        /// `jq` can read. Exit codes are exactly the same either way.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Run every request in a YAML file and pass or fail on its assertions.
@@ -75,6 +87,19 @@ pub(crate) enum Command {
         /// naming an environment that has no file is an error.
         #[arg(long, value_name = "NAME")]
         env: Option<String>,
+
+        /// Print one JSON object describing the whole run, instead of the
+        /// human-readable output.
+        ///
+        /// The same document `sendra run --json` writes — `requests`, in file
+        /// order, each with its full response and assertion results — plus a
+        /// `summary` object holding the counts the terminal output ends with.
+        /// Note that `requests` carries whole responses here, headers and body
+        /// included, where the terminal output shows only a status line: that
+        /// is a decision about what is readable on a screen, and a program
+        /// reading the output has no such problem.
+        #[arg(long)]
+        json: bool,
 
         /// Accepted only so that passing it can be refused with an
         /// explanation. Hidden from `--help`, rejected in `main`.
@@ -156,14 +181,25 @@ mod tests {
             Command::Test {
                 path,
                 env,
+                json,
                 allow_error_status,
             } => {
                 assert_eq!(path, PathBuf::from("collection.yaml"));
                 assert_eq!(env.as_deref(), Some("staging"));
+                assert!(!json, "the human output is what you get without --json");
                 assert!(!allow_error_status);
             }
             _ => panic!("`sendra test` should have parsed as `Command::Test`"),
         }
+
+        // Whether the flag was passed is all `main` needs from it; what it
+        // then means is `Reporter`'s.
+        let cli = Cli::try_parse_from(["sendra", "test", "collection.yaml", "--json"])
+            .expect("`--json` is offered by `test` as well as by `run`");
+        assert!(
+            matches!(cli.command, Command::Test { json: true, .. }),
+            "`--json` must reach `main`"
+        );
 
         // A second positional is `run`'s, not `test`'s: a verdict over one
         // hand-picked request is a different thing, and is not offered rather

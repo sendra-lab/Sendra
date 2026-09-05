@@ -3,33 +3,11 @@
 
 use std::path::{Path, PathBuf};
 
-use owo_colors::{OwoColorize, Stream};
 use sendra_core::environment::{find_environment, DEFAULT_ENVIRONMENT_NAME};
 use sendra_core::{Config, Document, Environment, Request, SendraError};
 
 use crate::exit::{exit_for_run, Exit, Outcome, Summary};
-use crate::output::{
-    print_assertions, print_environment_error, print_error, print_no_assertions, print_response,
-    print_status_line, print_summary,
-};
-
-/// How much of a response to print.
-///
-/// The two subcommands print the same *assertion* block — issue 6's format,
-/// unchanged, because a second way to render a passed check would be a second
-/// thing to learn — and differ only in how much of the response they put above
-/// it. `run` exists to show you what came back, so it shows all of it. `test`
-/// answers a yes/no question about a whole collection, and burying that answer
-/// under four JSON bodies would make the summary the hardest line to find in
-/// its own output; it prints the status line, which is one line, carries the
-/// timing, and says which response the checks below it are about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Detail {
-    /// Status line, headers and body.
-    Full,
-    /// The status line alone.
-    StatusOnly,
-}
+use crate::output::{print_environment_error, print_error, Detail, Format, Reporter};
 
 /// Everything both subcommands do before the first byte goes out: the config,
 /// the environment, and the file.
@@ -132,11 +110,18 @@ fn prepare(path: &Path, environment_name: Option<&str>) -> Result<Prepared, Exit
 /// they share is [`run_requests`]. What is left here is the two things `run`
 /// does that `test` does not: selecting one request by name, and reading raw
 /// statuses to produce an exit code.
+///
+/// `json` chooses the rendering and nothing else: the same requests are sent in
+/// the same order and the exit code is the one this run earned either way. A
+/// failure in [`prepare`] returns before the reporter has anything to say, so
+/// `--json` writes nothing at all on stdout in that case — the run never
+/// started, and the error is on stderr with the exit code that says so.
 pub(crate) async fn run(
     path: &Path,
     name: Option<&str>,
     environment_name: Option<&str>,
     allow_error_status: bool,
+    json: bool,
 ) -> Exit {
     let Prepared {
         config,
@@ -161,10 +146,12 @@ pub(crate) async fn run(
     };
 
     let config = &config;
-    let outcomes = run_requests(&requests, &environment, |request| async move {
-        send(&request, config, Detail::Full).await
+    let reporter = &Reporter::new(Format::for_json_flag(json), Detail::Full);
+    let outcomes = run_requests(&requests, &environment, reporter, |request| async move {
+        send(&request, config, reporter).await
     })
     .await;
+    reporter.finish_run();
 
     exit_for_run(&outcomes, allow_error_status)
 }
@@ -184,7 +171,12 @@ pub(crate) async fn run(
 /// file, and a verdict over one hand-picked request out of a collection is a
 /// different, narrower thing that nothing has yet asked for. It can be added
 /// later without changing anything here.
-pub(crate) async fn test(path: &Path, environment_name: Option<&str>) -> Exit {
+///
+/// `json` behaves exactly as it does on `run` — see there — with one addition:
+/// the document `test` writes carries the [`Summary`] the terminal output ends
+/// with. The counts, and the exit code they produce, are the same numbers in
+/// both renderings.
+pub(crate) async fn test(path: &Path, environment_name: Option<&str>, json: bool) -> Exit {
     let Prepared {
         config,
         environment,
@@ -199,13 +191,14 @@ pub(crate) async fn test(path: &Path, environment_name: Option<&str>) -> Exit {
     let requests: Vec<&Request> = document.requests().iter().collect();
 
     let config = &config;
-    let outcomes = run_requests(&requests, &environment, |request| async move {
-        send(&request, config, Detail::StatusOnly).await
+    let reporter = &Reporter::new(Format::for_json_flag(json), Detail::StatusOnly);
+    let outcomes = run_requests(&requests, &environment, reporter, |request| async move {
+        send(&request, config, reporter).await
     })
     .await;
 
     let summary = Summary::of(&outcomes);
-    print_summary(&summary);
+    reporter.finish_test(&summary);
     summary.exit()
 }
 
@@ -287,8 +280,12 @@ fn environment_for(
     }
 }
 
-/// Substitute and send each of `requests` in file order, printing each result
+/// Substitute and send each of `requests` in file order, reporting each result
 /// as it arrives and returning what became of every one of them.
+///
+/// Everything this says out loud goes through `reporter`, which is what decides
+/// whether "reporting" means printing as the run goes or collecting a document
+/// for the end of it; see [`Reporter`].
 ///
 /// Returns [`Outcome`]s rather than an exit code because its two callers want
 /// different answers out of the same run: `run` folds them by status, `test`
@@ -321,6 +318,7 @@ fn environment_for(
 pub(crate) async fn run_requests<S, F>(
     requests: &[&Request],
     environment: &Environment,
+    reporter: &Reporter,
     mut send_one: S,
 ) -> Vec<Outcome>
 where
@@ -331,8 +329,9 @@ where
 
     for (index, request) in requests.iter().enumerate() {
         // Blank line between results so a multi-request run stays readable.
+        // Under `--json` there is no such line, and no stdout to put it on.
         if index > 0 {
-            println!();
+            reporter.separate();
         }
 
         let substituted = environment.apply(request);
@@ -343,20 +342,12 @@ where
         // On success the label describes the request as it will actually be
         // sent (a resolved URL, for a request with no `name`); on failure there
         // is no such request, so it falls back to the label as written.
-        eprintln!(
-            "{} {}",
-            "→".if_supports_color(Stream::Stderr, |t| t.dimmed()),
-            substituted
-                .as_ref()
-                .unwrap_or(request)
-                .label()
-                .if_supports_color(Stream::Stderr, |t| t.bold())
-        );
+        reporter.request_started(&substituted.as_ref().unwrap_or(request).label());
 
         outcomes.push(match substituted {
             Ok(request) => send_one(request).await,
             Err(err) => {
-                print_error(&err);
+                reporter.request_failed(&err);
                 Outcome::NoResponse
             }
         });
@@ -382,16 +373,12 @@ where
 /// these say which check, in which request, was the reason.
 ///
 /// Both subcommands come through here, so both evaluate assertions in exactly
-/// the same place, from exactly the same [`Assertions::evaluate`]. `detail` is
-/// the only thing they differ on; see [`Detail`].
-async fn send(request: &Request, config: &Config, detail: Detail) -> Outcome {
+/// the same place, from exactly the same [`Assertions::evaluate`]. What they
+/// differ on — how much of the response is shown, and whether it is shown at
+/// all or recorded for `--json` — belongs to the [`Reporter`] they were given.
+async fn send(request: &Request, config: &Config, reporter: &Reporter) -> Outcome {
     match sendra_core::send(request, config).await {
         Ok(response) => {
-            match detail {
-                Detail::Full => print_response(&response),
-                Detail::StatusOnly => print_status_line(&response),
-            }
-
             // No `assertions` block is the empty report, which prints nothing:
             // a request written before this feature existed looks exactly as it
             // did before it existed.
@@ -401,17 +388,7 @@ async fn send(request: &Request, config: &Config, detail: Detail) -> Outcome {
                 .map(|assertions| assertions.evaluate(&response))
                 .unwrap_or_default();
 
-            if assertions.is_empty() && detail == Detail::StatusOnly {
-                // `run` says nothing here, and must keep saying nothing. Under
-                // `test` the silence is the problem: the summary is about to
-                // count this request as one of N "without assertions", and
-                // without a marker there is nothing to match that number
-                // against. One dimmed line, no symbol, so it reads as an
-                // absence rather than as a result.
-                print_no_assertions();
-            } else {
-                print_assertions(&assertions);
-            }
+            reporter.responded(&response, &assertions);
 
             Outcome::Responded {
                 status: response.status,
@@ -419,7 +396,7 @@ async fn send(request: &Request, config: &Config, detail: Detail) -> Outcome {
             }
         }
         Err(err) => {
-            print_error(&err);
+            reporter.request_failed(&err);
             Outcome::NoResponse
         }
     }
@@ -432,7 +409,7 @@ mod tests {
     use sendra_core::environment::environment_path;
 
     use crate::exit::exit_for_status;
-    use crate::test_support::{all_passed, responded};
+    use crate::test_support::{all_passed, reporter, responded};
 
     /// Three requests, the middle one referencing a variable that does not
     /// exist. The broken request is in the middle so "the run carried on" and
@@ -464,7 +441,7 @@ requests:
         // Stands in for the network: records what it was handed and reports a
         // clean response, so the substitution is the only failure in the run.
         let mut sent = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), |request| {
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |request| {
             sent.push(request.url.clone());
             async { responded(200) }
         })
@@ -498,7 +475,10 @@ requests:
         // ...but it suppresses a *status*, and a request that was never built
         // has no status to forgive. Same treatment as a connection failure,
         // which the flag does not suppress either.
-        let outcomes = run_requests(&requests, &environment(), |_| async { responded(404) }).await;
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |_| async {
+            responded(404)
+        })
+        .await;
 
         assert_eq!(exit_for_run(&outcomes, true), Exit::Failure);
     }
@@ -510,7 +490,10 @@ requests:
 
         // Every sibling answers 500, so the run holds both kinds of failure at
         // once. "Never got a response" is the more serious of the two.
-        let outcomes = run_requests(&requests, &environment(), |_| async { responded(500) }).await;
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |_| async {
+            responded(500)
+        })
+        .await;
 
         assert_eq!(exit_for_run(&outcomes, false), Exit::Failure);
     }
@@ -524,7 +507,7 @@ requests:
         let request = document.get("Third").expect("`Third` is in the collection");
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&[request], &environment(), |request| {
+        let outcomes = run_requests(&[request], &environment(), &reporter(), |request| {
             sent.push(request.url.clone());
             async { responded(200) }
         })
@@ -542,7 +525,7 @@ requests:
             .expect("`Broken` is in the collection");
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&[request], &environment(), |request| {
+        let outcomes = run_requests(&[request], &environment(), &reporter(), |request| {
             sent.push(request.url.clone());
             async { responded(200) }
         })
@@ -569,7 +552,7 @@ requests:
         let requests: Vec<&Request> = document.requests().iter().collect();
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), |request| {
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |request| {
             sent.push(request.url.clone());
             async { responded(200) }
         })
@@ -762,7 +745,7 @@ requests:
         let mut sent = Vec::new();
         for name in ["staging", "prod"] {
             let environment = environment_for(project.path(), Some(name)).expect("both exist");
-            let outcomes = run_requests(&requests, &environment, |request| {
+            let outcomes = run_requests(&requests, &environment, &reporter(), |request| {
                 sent.push(request.url.clone());
                 async { responded(200) }
             })
@@ -790,7 +773,7 @@ requests:
         assert!(requests[0].assertions.is_none());
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), |request| {
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |request| {
             assert!(
                 request.assertions.is_none(),
                 "substitution must not invent a block"
@@ -822,7 +805,7 @@ assertions:
         let requests: Vec<&Request> = document.requests().iter().collect();
 
         let mut seen = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), |request| {
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |request| {
             seen.push(request.assertions.clone());
             async { responded(200) }
         })
@@ -848,7 +831,7 @@ assertions:
         let requests: Vec<&Request> = document.requests().iter().collect();
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), |request| {
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |request| {
             sent.push(request.url.clone());
             async { all_passed(200) }
         })
@@ -893,13 +876,18 @@ requests:
         .unwrap();
         let requests: Vec<&Request> = document.requests().iter().collect();
 
-        let outcomes = run_requests(&requests, &environment(), |request| async move {
-            if request.url.ends_with("/unreachable") {
-                Outcome::NoResponse
-            } else {
-                all_passed(200)
-            }
-        })
+        let outcomes = run_requests(
+            &requests,
+            &environment(),
+            &reporter(),
+            |request| async move {
+                if request.url.ends_with("/unreachable") {
+                    Outcome::NoResponse
+                } else {
+                    all_passed(200)
+                }
+            },
+        )
         .await;
 
         let summary = Summary::of(&outcomes);
@@ -933,7 +921,10 @@ assertions:
         let requests: Vec<&Request> = document.requests().iter().collect();
         assert_eq!(requests.len(), 1);
 
-        let outcomes = run_requests(&requests, &environment(), |_| async { all_passed(200) }).await;
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |_| async {
+            all_passed(200)
+        })
+        .await;
 
         assert_eq!(
             Summary::of(&outcomes),
