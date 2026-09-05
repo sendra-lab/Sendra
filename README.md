@@ -8,9 +8,9 @@ send them from the shell. A request is just a file: method, URL, headers, body.
 That makes requests reviewable in a pull request, diffable over time, and
 shareable without exporting anything. A file holds either one request or a
 named collection of them, sent and printed, against variables from an
-environment file so the same request can point at staging or at production.
-Scripting, assertions and an interactive TUI are all planned and deliberately
-absent for now.
+environment file so the same request can point at staging or at production, and
+a file can declare what it expects the response to look like. Scripting and an
+interactive TUI are both planned and deliberately absent for now.
 
 ## Layout
 
@@ -66,6 +66,16 @@ The request file names no host at all — only `{{base_url}}` — so the two run
 come back from `httpbin.org` and `postman-echo.com` respectively, with the
 resolved value echoed in the `X-Sendra-Base-Url` header of each response.
 
+`examples/assertions.yaml` checks the response it gets back, and prints a
+pass/fail line per check under it:
+
+```sh
+cargo run -p sendra-cli -- run examples/assertions.yaml
+```
+
+Two of its assertions are meant to fail, so one run shows both halves of the
+output. It still exits `0` — see [Assertions](#assertions).
+
 ## Request file shape
 
 ```yaml
@@ -75,6 +85,8 @@ url: https://api.example.com/users/1
 headers: # optional
   Accept: application/json
 body: null # optional, sent verbatim as a raw string
+assertions: # optional, checked against the response — see below
+  status: 200
 ```
 
 Unknown top-level keys are rejected rather than silently ignored, so a typo in a
@@ -300,10 +312,13 @@ different from each other:
   variables in the file you get no error at all, exit `0`, and a flag that was
   silently ignored.
 
-**What substitution touches, and what it does not.** Only `url`, `headers` and
-`body`. Not `method`, which is a closed set with no useful placeholder, and not
-`name`, which is what `sendra run <file> <name>` selects on — a label that
-changed with the environment could not be typed on the command line.
+**What substitution touches, and what it does not.** Only `url`, `headers`,
+`body` and the values inside `assertions`. Not `method`, which is a closed set
+with no useful placeholder, and not `name`, which is what
+`sendra run <file> <name>` selects on — a label that changed with the
+environment could not be typed on the command line. Inside `assertions`, the
+keys that select part of the response are excluded too; see
+[Assertions](#assertions).
 
 Substitution runs on the parsed request, over string values only, rather than as
 a find-and-replace on the file text before parsing. A value is therefore only
@@ -333,6 +348,96 @@ Two further rules, both deliberate:
 Values are strings, and an unquoted scalar substitutes as exactly the text you
 wrote: `port: 8080` is `8080`, `version: 1.0` is `1.0`. Nothing takes a round
 trip through a number on the way in, so `1.0` can never arrive as `1`.
+
+## Assertions
+
+A request can say what it expects of the response, under an optional
+`assertions` key:
+
+```yaml
+method: GET
+url: https://httpbin.org/get
+assertions:
+  status: 200 # the exact status code
+  headers:
+    content-type: application/json # present, and exactly this value
+    x-request-id: # present, value not checked
+  body_contains: '"url"' # a case-sensitive substring of the body
+  json: # JSON path -> the single value it must select
+    $.url: https://httpbin.org/get
+    $.headers.Accept: application/json
+```
+
+Every key is optional, and every *entry* is one assertion — the block above is
+six of them. All six are checked and all six are reported: a failing assertion
+never hides the ones after it. Unknown keys are rejected, like everywhere else
+in Sendra's schema, because an assertion that is silently ignored because of a
+typo reads exactly like one that is passing.
+
+Results print under the response they are about, so in a collection run each
+block sits with its own request:
+
+```text
+assertions
+  ✓ status is 200
+  ✓ header `content-type` is `application/json`
+  ✗ header `x-request-id` is present — not present (the response has: date, content-type, server)
+  ✓ body contains `"url"`
+  ✓ `$.url` is "https://httpbin.org/get"
+  ✗ `$.origin` is "203.0.113.1" — got "104.28.220.44"
+  4 passed, 2 failed
+```
+
+A request with no `assertions` block prints exactly what it printed before this
+feature existed — an empty report produces no output at all.
+
+**Assertions do not affect the exit code.** The run above exits `0`: six
+assertions, two of them failed, exit `0`. That is deliberate and temporary.
+`sendra run` sends requests and reports what came back; `sendra test` is the
+command whose job is to pass or fail on expectations, and it is where the two
+get wired together. Doing it here would silently change what every existing
+`sendra run req.yaml && deploy.sh` means the moment someone adds an `assertions`
+block to `req.yaml`.
+
+**Header names are matched case-insensitively, values exactly.** HTTP header
+names are case-insensitive, so which casing a server picks is not something a
+request file should have to know. Values are compared whole:
+`content-type: application/json` does **not** match
+`application/json; charset=utf-8`. A substring match would quietly accept
+`application/json-seq` too, so when a server decorates a value, assert the whole
+value or drop to presence-only (`content-type:` with nothing after it). A
+repeated header — `set-cookie` — passes if any of its values matches.
+
+**A JSON path must select exactly one value.** `$.users[*].id` against three
+users is a question with no single answer; it fails, saying how many it matched,
+rather than silently comparing against the first. Paths are RFC 9535 JSON path,
+evaluated by [`jsonpath-rust`](https://docs.rs/jsonpath-rust). The expected
+value is written as ordinary YAML and compared as JSON, so `42` is a number,
+`'42'` is a string, and a mapping or sequence compares whole.
+
+**A body that is not JSON fails every JSON assertion, and nothing else.** It is
+a failed assertion with the parser's own message, not a crash and not a
+load-time error — whether the body parses is a property of a response that does
+not exist until the request has been sent:
+
+```text
+  ✗ `$.user.id` is 42 — the response body is not JSON: expected value at line 1 column 1 (content-type: text/html; charset=utf-8)
+```
+
+The `content-type` is reported to explain the failure, never to decide whether
+to try: a JSON body served as `text/plain` is still a JSON body, and refusing to
+look at it would fail an assertion that is plainly true. A JSON path that does
+not parse is reported the same way, and reported first — it is wrong about every
+response there could ever be, so it is the one you have to go and fix.
+
+**Assertion values are substituted; assertion keys are not.** `{{var}}` works in
+a header's expected value, in `body_contains`, and in the strings of an expected
+JSON value, so an assertion can move between environments with the request it
+belongs to. Header names, JSON paths and the keys inside an expected object stay
+literal: an environment is meant to change what a response is compared against —
+a tenant, an id, a host — not which part of the response is being looked at. A
+missing variable in an assertion fails that request before it is sent, exactly
+like a missing variable in its URL.
 
 ## Exit codes
 
@@ -370,6 +475,11 @@ surrounding script:
 ```sh
 sendra run examples/get-request.yaml --allow-error-status
 ```
+
+A failed assertion is not in this table at all: `sendra run` prints assertion
+results and does not read them when deciding what to return. See
+[Assertions](#assertions) for why, and `exit_for_response` in
+`sendra-cli/src/main.rs` for the single place that decision lives.
 
 Codes `4` and up are reserved for later commands (`sendra test` will need its
 own outcome for failing assertions). The full table lives next to the `Exit`

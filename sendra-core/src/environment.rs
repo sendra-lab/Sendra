@@ -10,9 +10,10 @@
 //! ```
 //!
 //! Request and collection files reference those values with `{{name}}` inside
-//! `url`, `headers` (names and values) and `body`. A value written as `${VAR}`
-//! is read from the OS environment when it is used, so a file that names a
-//! secret can still be committed — the secret itself never is.
+//! `url`, `headers` (names and values), `body`, and the values of an
+//! `assertions` block. A value written as `${VAR}` is read from the OS
+//! environment when it is used, so a file that names a secret can still be
+//! committed — the secret itself never is.
 //!
 //! Two references, two syntaxes, on purpose. `{{name}}` only ever means "a
 //! variable from the environment file" and is only looked for in request files;
@@ -44,6 +45,9 @@
 //! closed enum with no useful placeholder, and `name` is deliberately excluded
 //! because it is the selector `sendra run <file> <name>` matches on: a label
 //! that changed with the environment could not be typed on the command line.
+//! Inside `assertions`, values are templated but the keys that select part of
+//! the response — header names, JSON paths — are not, for a related reason:
+//! see [`Environment::apply_assertions`].
 //!
 //! # Why there is no `EnvironmentFile`/`Environment` pair
 //!
@@ -56,6 +60,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::assertions::Assertions;
 use crate::config::PROJECT_DIR_NAME;
 use crate::{Collection, Document, Request, SendraError};
 
@@ -174,13 +179,19 @@ impl Environment {
     /// Substitute this environment into `request`, returning the request as it
     /// will be sent.
     ///
-    /// Every `{{name}}` in `url`, in each header name, in each header value and
-    /// in `body` is replaced. An unknown name is
-    /// [`VariableNotFound`](SendraError::VariableNotFound), and a value whose
-    /// `${VAR}` is not in the OS environment is
+    /// Every `{{name}}` in `url`, in each header name, in each header value, in
+    /// `body` and in the *values* of the `assertions` block is replaced. An
+    /// unknown name is [`VariableNotFound`](SendraError::VariableNotFound), and
+    /// a value whose `${VAR}` is not in the OS environment is
     /// [`EnvVarNotSet`](SendraError::EnvVarNotSet) — never an empty string, and
     /// never a half-substituted request. The whole request is built before it is
     /// sent, so both failures land before any of its bytes go out.
+    ///
+    /// Assertions are substituted for the same reason the rest of the file is:
+    /// what a staging response should say is exactly as environment-dependent
+    /// as what the request asks for, and `body_contains: '{{tenant}}'` would
+    /// otherwise compare against the literal braces. See
+    /// [`apply_assertions`](Self::apply_assertions) for the one line it draws.
     pub fn apply(&self, request: &Request) -> Result<Request, SendraError> {
         let mut headers = BTreeMap::new();
         for (name, value) in &request.headers {
@@ -212,6 +223,75 @@ impl Environment {
                 .as_deref()
                 .map(|body| self.expand_templates(body))
                 .transpose()?,
+            assertions: request
+                .assertions
+                .as_ref()
+                .map(|assertions| self.apply_assertions(assertions))
+                .transpose()?,
+        })
+    }
+
+    /// [`Environment::apply`] for an `assertions` block.
+    ///
+    /// **Values are substituted; keys are not.** A header name and a JSON path
+    /// select *what part of the response is being looked at*, and an object key
+    /// inside an expected value names a field the same way. An environment is
+    /// meant to change what a response is compared against — a tenant, an id, a
+    /// host — not to change which field is inspected, and a run where `--env`
+    /// silently redirected an assertion onto a different header would be very
+    /// hard to read back. Keeping keys literal also means substitution here can
+    /// never collapse two entries into one, so no assertion can go missing on
+    /// the way to being checked.
+    ///
+    /// `status` is a number and has nothing to substitute.
+    fn apply_assertions(&self, assertions: &Assertions) -> Result<Assertions, SendraError> {
+        let mut headers = BTreeMap::new();
+        for (name, expected) in &assertions.headers {
+            let expected = expected
+                .as_deref()
+                .map(|value| self.expand_templates(value))
+                .transpose()?;
+            headers.insert(name.clone(), expected);
+        }
+
+        let mut json = BTreeMap::new();
+        for (path, expected) in &assertions.json {
+            json.insert(path.clone(), self.expand_json(expected)?);
+        }
+
+        Ok(Assertions {
+            status: assertions.status,
+            headers,
+            body_contains: assertions
+                .body_contains
+                .as_deref()
+                .map(|body| self.expand_templates(body))
+                .transpose()?,
+            json,
+        })
+    }
+
+    /// Substitute into every string *value* of an expected JSON value,
+    /// including those nested in arrays and objects. Object keys are left alone,
+    /// per the rule on [`apply_assertions`](Self::apply_assertions); numbers,
+    /// booleans and null have no text to expand.
+    fn expand_json(&self, value: &serde_json::Value) -> Result<serde_json::Value, SendraError> {
+        use serde_json::Value;
+        Ok(match value {
+            Value::String(text) => Value::String(self.expand_templates(text)?),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| self.expand_json(item))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .map(|(key, value)| Ok((key.clone(), self.expand_json(value)?)))
+                    .collect::<Result<_, SendraError>>()?,
+            ),
+            other => other.clone(),
         })
     }
 
@@ -497,6 +577,111 @@ body: '{\"host\": \"{{base_url}}\"}'
         // The label is deliberately untouched: it is the run selector.
         assert_eq!(applied.name.as_deref(), Some("Templated"));
         assert_eq!(applied.method, Method::Post);
+    }
+
+    /// A request whose every assertion carries a placeholder, in each of the
+    /// three places one can appear.
+    const TEMPLATED_ASSERTIONS: &str = "\
+method: GET
+url: '{{base_url}}/users/{{user_id}}'
+assertions:
+  status: 200
+  headers:
+    x-tenant: '{{tenant}}'
+    content-type:
+  body_contains: '{{tenant}}'
+  json:
+    $.id: '{{user_id}}'
+    $.nested:
+      tenant: '{{tenant}}'
+      tags: ['{{tenant}}', literal]
+";
+
+    #[test]
+    fn substitutes_the_values_in_an_assertions_block() {
+        let request = Request::from_yaml_str(TEMPLATED_ASSERTIONS).unwrap();
+        let environment = environment(
+            &[
+                ("base_url", "https://staging.example.com"),
+                ("user_id", "42"),
+                ("tenant", "acme"),
+            ],
+            &[],
+        );
+
+        let assertions = environment
+            .apply(&request)
+            .expect("every variable is set")
+            .assertions
+            .expect("the block survives substitution");
+
+        assert_eq!(assertions.status, Some(200));
+        assert_eq!(
+            assertions.headers.get("x-tenant"),
+            Some(&Some("acme".to_string()))
+        );
+        // A presence-only assertion has no value to substitute and stays one.
+        assert_eq!(assertions.headers.get("content-type"), Some(&None));
+        assert_eq!(assertions.body_contains.as_deref(), Some("acme"));
+        // Including strings nested inside an expected object or array.
+        assert_eq!(assertions.json["$.id"], serde_json::json!("42"));
+        assert_eq!(
+            assertions.json["$.nested"],
+            serde_json::json!({"tenant": "acme", "tags": ["acme", "literal"]})
+        );
+    }
+
+    #[test]
+    fn assertion_keys_are_not_substituted() {
+        // The line drawn in `apply_assertions`: an environment changes what a
+        // response is compared against, never which part of it is inspected. A
+        // header name, a JSON path, and a key inside an expected object all
+        // stay exactly as written — including one that looks like a
+        // placeholder, which is then simply text that never matches.
+        let request = Request::from_yaml_str(
+            "\
+method: GET
+url: https://example.com
+assertions:
+  headers:
+    '{{header_name}}': fixed
+  json:
+    '$.{{field}}': 1
+    $.obj:
+      '{{key}}': 2
+",
+        )
+        .unwrap();
+        let environment = environment(
+            &[("header_name", "X-Tenant"), ("field", "id"), ("key", "k")],
+            &[],
+        );
+
+        let assertions = environment.apply(&request).unwrap().assertions.unwrap();
+
+        assert!(assertions.headers.contains_key("{{header_name}}"));
+        assert!(assertions.json.contains_key("$.{{field}}"));
+        assert_eq!(assertions.json["$.obj"], serde_json::json!({"{{key}}": 2}));
+    }
+
+    #[test]
+    fn a_missing_variable_in_an_assertion_fails_the_request_like_any_other() {
+        // Assertions are substituted on the way to the wire, so an unresolvable
+        // one is the same failure as an unresolvable URL: the request is never
+        // sent, rather than being sent and then checked against `{{nope}}`.
+        let request = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nassertions:\n  body_contains: '{{nope}}'\n",
+        )
+        .unwrap();
+
+        let err = environment(&[("tenant", "acme")], &[])
+            .apply(&request)
+            .expect_err("`nope` is not defined");
+
+        assert!(
+            matches!(err, SendraError::VariableNotFound { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

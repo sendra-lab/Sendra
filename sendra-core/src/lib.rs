@@ -13,9 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::environment::{describe_environment, describe_variables};
 
+pub mod assertions;
 pub mod config;
 pub mod environment;
 
+pub use assertions::{AssertionKind, AssertionReport, AssertionResult, Assertions};
 pub use config::Config;
 pub use environment::Environment;
 
@@ -218,11 +220,17 @@ impl std::fmt::Display for Method {
 /// headers:
 ///   Accept: application/json
 /// body: null
+/// assertions:
+///   status: 200
 /// ```
 ///
-/// `name`, `headers` and `body` are optional. Headers are a `BTreeMap` so
+/// Everything but `method` and `url` is optional. Headers are a `BTreeMap` so
 /// iteration order is deterministic across runs.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is deliberately absent where `PartialEq` is derived: an expected JSON
+/// value in an [`Assertions`] block can be a float, and JSON floats are not
+/// `Eq`. Nothing keys a map on a request, so the bound was never load-bearing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -234,6 +242,16 @@ pub struct Request {
     /// Raw body, sent verbatim. Structured/multipart bodies come later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// Declarative checks on the response, evaluated by
+    /// [`Assertions::evaluate`] once it arrives.
+    ///
+    /// `None` — no `assertions:` key at all — is not the same as an empty
+    /// block, and both are kept distinct on the way back out to YAML. Neither
+    /// changes how the request is sent: assertions are read after the response,
+    /// never before it, and they do not decide the process exit code. See the
+    /// module docs on [`assertions`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assertions: Option<Assertions>,
 }
 
 impl Request {
@@ -287,7 +305,7 @@ impl Request {
 /// reaches for either sort the entries (`BTreeMap`) or need a dependency
 /// (`IndexMap`) to avoid it. Lookup by name is then a linear scan, which costs
 /// nothing at the sizes a hand-written collection reaches.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Collection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -369,7 +387,7 @@ impl Collection {
 /// failure into "data did not match any variant" with no position; picking the
 /// target first and then deserializing the original text keeps serde's real
 /// error message, line and column included.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Document {
     Single(Request),
     Collection(Collection),
@@ -570,6 +588,7 @@ body: null
                 url: "https://api.example.com/users/1".to_string(),
                 headers: expected_headers,
                 body: None,
+                assertions: None,
             }
         );
     }
@@ -581,7 +600,70 @@ body: null
         assert_eq!(request.method, Method::Post);
         assert!(request.headers.is_empty());
         assert_eq!(request.body, None);
+        assert_eq!(
+            request.assertions, None,
+            "a file written before assertions existed still parses to no assertions"
+        );
         assert_eq!(request.label(), "POST https://example.com");
+    }
+
+    #[test]
+    fn parses_a_request_with_an_assertions_block() {
+        // The whole on-disk shape at once; what each entry *means* is tested in
+        // the `assertions` module, this is the file contract.
+        let request = Request::from_yaml_str(
+            "\
+method: GET
+url: https://api.example.com/users/1
+assertions:
+  status: 200
+  headers:
+    content-type: application/json
+    x-request-id:
+  body_contains: ada
+  json:
+    $.user.id: 42
+",
+        )
+        .expect("an assertions block is part of the request shape");
+
+        let assertions = request.assertions.expect("the block parsed");
+        assert_eq!(assertions.status, Some(200));
+        assert_eq!(
+            assertions.headers.get("content-type"),
+            Some(&Some("application/json".to_string()))
+        );
+        // A key with no value is presence-only, not a missing entry.
+        assert_eq!(assertions.headers.get("x-request-id"), Some(&None));
+        assert_eq!(assertions.body_contains.as_deref(), Some("ada"));
+        assert_eq!(assertions.json["$.user.id"], serde_json::json!(42));
+    }
+
+    #[test]
+    fn an_empty_assertions_block_is_kept_distinct_from_no_block_at_all() {
+        // `assertions: {}` asserts nothing, which is what an absent block does
+        // too — but the file said something, and round-tripping it should not
+        // silently rewrite it into a different file.
+        let empty =
+            Request::from_yaml_str("method: GET\nurl: https://example.com\nassertions: {}\n")
+                .unwrap();
+        assert_eq!(empty.assertions, Some(Assertions::default()));
+        assert!(empty.assertions.as_ref().unwrap().is_empty());
+
+        // A null block is the absent one: `assertions:` with nothing under it
+        // is a key the author has not filled in yet.
+        let null =
+            Request::from_yaml_str("method: GET\nurl: https://example.com\nassertions:\n").unwrap();
+        assert_eq!(null.assertions, None);
+    }
+
+    #[test]
+    fn a_request_with_no_assertions_serialises_without_the_key() {
+        // The round trip other Sendra features build on: nothing that did not
+        // write an `assertions` block gets one back.
+        let request = Request::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
+        let yaml = serde_yaml::to_string(&request).expect("a request serialises");
+        assert!(!yaml.contains("assertions"), "got {yaml}");
     }
 
     #[test]
@@ -779,6 +861,7 @@ enviroment: staging
             // Parses like any other request file: the `{{...}}` in it is a
             // string value, and substitution is a separate pass afterwards.
             "environment-request.yaml",
+            "assertions.yaml",
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("..")
@@ -807,6 +890,7 @@ enviroment: staging
             url: "http://127.0.0.1:1/".to_string(),
             headers: BTreeMap::from([("bad header".to_string(), "x".to_string())]),
             body: None,
+            assertions: None,
         };
         let err = send(&request, &Config::default())
             .await
@@ -828,6 +912,7 @@ enviroment: staging
             url: "http://127.0.0.1:1/".to_string(),
             headers: BTreeMap::new(),
             body: None,
+            assertions: None,
         };
         let config = Config {
             headers: BTreeMap::from([("bad header".to_string(), "x".to_string())]),

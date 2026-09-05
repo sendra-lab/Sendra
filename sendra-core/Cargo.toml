@@ -8,6 +8,13 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_yaml = { workspace = true }
+# Response bodies are parsed as JSON to evaluate `assertions.json`, and the
+# expected values in that block are held as `serde_json::Value` so they are
+# already in the form they will be compared against.
+serde_json = { workspace = true }
+# JSON path evaluation for `assertions.json`. See the note on
+# `assertions::Assertions::json` for why this crate and not another.
+jsonpath-rust = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 # Locating the global config directory per platform. `dirs`, not `directories`:
