@@ -1,6 +1,6 @@
 # Sendra
 
-[![CI](https://github.com/dubemoyibe-star/Sendra/actions/workflows/ci.yml/badge.svg)](https://github.com/dubemoyibe-star/Sendra/actions/workflows/ci.yml)
+[![CI](https://github.com/sendra-lab/sendra/actions/workflows/ci.yml/badge.svg)](https://github.com/sendra-lab/sendra/actions/workflows/ci.yml)
 
 Sendra is a terminal-native HTTP client, think Postman, but your requests are
 plain YAML files that live in your repo next to the code they exercise, and you
