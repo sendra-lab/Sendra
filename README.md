@@ -19,6 +19,12 @@ TUI are both planned and deliberately absent for now.
 sendra/
   sendra-core/     library: request/response types, YAML loading, config, environments, HTTP execution
   sendra-cli/      binary `sendra`: argument parsing, output, exit codes, `run` and `test`
+    main.rs          `main()`, and the module declarations
+    cli.rs           the clap definitions: subcommands, arguments, `--help` text
+    run.rs           the pipeline both subcommands share, and the two handlers
+    output.rs        everything printed to the terminal
+    exit.rs          `Exit`, `Outcome`, `Summary`: exit-code policy, no I/O
+    test_support.rs  fixtures shared by more than one module's tests
   examples/        sample request and collection files
   .sendra/         this repo's own project config and environments
 ```
@@ -670,10 +676,10 @@ unifying the two commands — wiring assertions into `run`'s exit code would
 silently change what every existing `sendra run req.yaml && deploy.sh` means the
 moment an `assertions` block is added to `req.yaml`, and `sendra test` exists so
 that nobody has to. See [Assertions](#assertions) for the whole argument, and
-`exit_for_response` in `sendra-cli/src/main.rs` for the single place that
+`exit_for_response` in `sendra-cli/src/exit.rs` for the single place that
 decision lives.
 
-The table above lives next to the `Exit` enum in `sendra-cli/src/main.rs`, and
+The table above lives next to the `Exit` enum in `sendra-cli/src/exit.rs`, and
 `Summary` beside it is where `test`'s half of it is decided.
 
 ## Development
