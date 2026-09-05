@@ -415,13 +415,22 @@ async fn send(request: &Request, config: &Config, reporter: &Reporter) -> Outcom
     // above for why this is here and not inside `sendra_core::send`.
     let configured = config.apply(request);
     let prepared = match scripts.pre_request() {
-        Some(script) => match run_pre_request(script, &configured) {
-            Ok(prepared) => prepared,
-            Err(err) => {
-                reporter.request_failed(&err);
-                return Outcome::NoResponse;
+        Some(script) => {
+            let (result, output) = run_pre_request(script, &configured);
+
+            // Printed before the verdict is acted on, and whether or not the
+            // script succeeded: a script that printed and then threw usually
+            // printed the reason.
+            reporter.script_output(&output);
+
+            match result {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    reporter.request_failed(&err);
+                    return Outcome::NoResponse;
+                }
             }
-        },
+        }
         None => configured,
     };
 
@@ -430,9 +439,11 @@ async fn send(request: &Request, config: &Config, reporter: &Reporter) -> Outcom
             // No `post_request` block is `None`, which prints nothing — a
             // different thing from a script that ran and was happy. Same rule
             // as the empty assertion report below.
-            let script = scripts
-                .post_request()
-                .map(|script| run_post_request(script, &response));
+            let script = scripts.post_request().map(|script| {
+                let (outcome, output) = run_post_request(script, &response);
+                reporter.script_output(&output);
+                outcome
+            });
 
             // No `assertions` block is the empty report, which prints nothing:
             // a request written before this feature existed looks exactly as it
@@ -576,8 +587,8 @@ requests:
 
         let scripts = Scripts::compile(&request).expect("the script compiles");
         let configured = config.apply(&request);
-        let prepared =
-            run_pre_request(scripts.pre_request().unwrap(), &configured).expect("the script runs");
+        let (prepared, _) = run_pre_request(scripts.pre_request().unwrap(), &configured);
+        let prepared = prepared.expect("the script runs");
 
         assert_eq!(
             prepared.headers.get("X-From-Config").map(String::as_str),
@@ -628,8 +639,8 @@ requests:
         // And the script really does see the braces as ordinary text: running
         // it puts the literal placeholder on the wire, not the variable value.
         let scripts = Scripts::compile(&substituted).expect("the script compiles");
-        let prepared =
-            run_pre_request(scripts.pre_request().unwrap(), &substituted).expect("it runs");
+        let (prepared, _) = run_pre_request(scripts.pre_request().unwrap(), &substituted);
+        let prepared = prepared.expect("it runs");
 
         assert_eq!(
             prepared.headers.get("X").map(String::as_str),
@@ -709,7 +720,7 @@ requests:
         let response = crate::test_support::response(200);
 
         let scripts = Scripts::compile(&request).expect("the script compiles");
-        let script = run_post_request(scripts.post_request().unwrap(), &response);
+        let (script, _) = run_post_request(scripts.post_request().unwrap(), &response);
         let assertions = request.assertions.as_ref().unwrap().evaluate(&response);
 
         assert_eq!(

@@ -75,6 +75,7 @@
 //! [Rhai]: https://rhai.rs
 //! [`Environment::apply`]: crate::Environment::apply
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use rhai::{Dynamic, Engine, Map, Scope, AST};
@@ -176,6 +177,46 @@ impl Scripts {
     }
 }
 
+/// Anything a script printed while it ran, in the order it printed it.
+///
+/// Rhai's `print` and `debug` write somewhere, and the only question is where.
+/// Core does not answer it: it collects the lines and hands them back, and the
+/// front-end decides what a line is for — stderr for the CLI, a pane for a TUI,
+/// a log record for something else. That is the same arrangement as every other
+/// piece of "what does the outside world do here" in this crate: `Config` and
+/// `Environment` take the directory to search rather than reading the real one,
+/// and the CLI's sending loop takes the function that sends rather than calling
+/// the network itself.
+///
+/// It matters more here than it looks. `sendra-core` has no `println!` or
+/// `eprintln!` anywhere, by design, because a `sendra-tui` sharing this crate
+/// cannot have a library writing over its interface — and a `print` in a script
+/// is exactly the kind of thing that would otherwise land in the middle of a
+/// redrawn frame, or inside the single JSON document `--json` promises stdout
+/// holds.
+///
+/// A `debug` line is already formatted with its source and position by the time
+/// it lands here, because that formatting is Rhai's information to render and
+/// not the front-end's to reconstruct. Which stream it goes to, and whether it
+/// is coloured, is the front-end's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScriptOutput {
+    lines: Vec<String>,
+}
+
+impl ScriptOutput {
+    /// The lines, in the order the script printed them.
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+
+    /// Whether the script printed nothing — the usual case, and the one a
+    /// front-end should be able to check without allocating.
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+}
+
 /// What a `post_request` script decided about a response.
 ///
 /// Not a `Result<(), SendraError>`, because neither outcome is an error in the
@@ -211,7 +252,8 @@ impl ScriptOutcome {
     }
 }
 
-/// Run a `pre_request` script and return the request it left behind.
+/// Run a `pre_request` script and return the request it left behind, along
+/// with anything it printed.
 ///
 /// The script sees `request` as an object map — see [`request_map`] for the
 /// exact shape — mutates it in place, and this reads it back out and validates
@@ -219,44 +261,62 @@ impl ScriptOutcome {
 /// there is no response and never will be: whatever went wrong, this request is
 /// not being sent, which is the same category of failure as a missing variable
 /// or a refused connection.
-pub fn run_pre_request(script: &Script, request: &Request) -> Result<Request, SendraError> {
+///
+/// The [`ScriptOutput`] comes back **whether the script succeeded or not**,
+/// which is why it is beside the `Result` rather than inside its `Ok`: a script
+/// that printed three lines and then threw printed three lines, and those are
+/// usually the three lines that explain the throw. Losing them on the error
+/// path would lose them exactly when they are worth the most.
+pub fn run_pre_request(
+    script: &Script,
+    request: &Request,
+) -> (Result<Request, SendraError>, ScriptOutput) {
     debug_assert_eq!(script.hook, Hook::PreRequest);
 
     let mut scope = Scope::new();
     scope.push("request", request_map(request));
 
-    ENGINE
-        .with(|engine| engine.run_ast_with_scope(&mut scope, &script.ast))
+    let (result, output) = capture(|engine| engine.run_ast_with_scope(&mut scope, &script.ast));
+
+    let result = result
         .map_err(|err| SendraError::ScriptFailed {
             hook: Hook::PreRequest,
             message: failure_message(&err),
-        })?;
+        })
+        .and_then(|()| {
+            let left_behind = scope.get_value::<Dynamic>("request").expect(
+                "`request` was pushed into the scope and a script cannot remove a variable",
+            );
 
-    let left_behind = scope
-        .get_value::<Dynamic>("request")
-        .expect("`request` was pushed into the scope and a script cannot remove a variable");
+            request_from_dynamic(request, left_behind)
+        });
 
-    request_from_dynamic(request, left_behind)
+    (result, output)
 }
 
-/// Run a `post_request` script against a response.
+/// Run a `post_request` script against a response, returning its verdict and
+/// anything it printed.
 ///
-/// Infallible by design: every way this can go wrong is a statement about the
-/// response, and the caller reports all of them the same way. The response is
-/// pushed as a *constant*, so assigning to it is Rhai's own error rather than a
-/// silent no-op — see [`response_map`].
-pub fn run_post_request(script: &Script, response: &Response) -> ScriptOutcome {
+/// The verdict is infallible by design: every way this can go wrong is a
+/// statement about the response, and the caller reports all of them the same
+/// way. The response is pushed as a *constant*, so assigning to it is Rhai's
+/// own error rather than a silent no-op — see [`response_map`].
+pub fn run_post_request(script: &Script, response: &Response) -> (ScriptOutcome, ScriptOutput) {
     debug_assert_eq!(script.hook, Hook::PostRequest);
 
     let mut scope = Scope::new();
     scope.push_constant("response", response_map(response));
 
-    match ENGINE.with(|engine| engine.run_ast_with_scope(&mut scope, &script.ast)) {
+    let (result, output) = capture(|engine| engine.run_ast_with_scope(&mut scope, &script.ast));
+
+    let outcome = match result {
         Ok(()) => ScriptOutcome::Passed,
         Err(err) => ScriptOutcome::Failed {
             message: failure_message(&err),
         },
-    }
+    };
+
+    (outcome, output)
 }
 
 // --- the script's view of a request and a response -----------------------
@@ -556,6 +616,38 @@ thread_local! {
     /// `Sync` unless built with its `sync` feature, which costs every value an
     /// atomic refcount for a binary that runs on one thread.
     static ENGINE: Engine = build_engine();
+
+    /// Where the engine's `print` and `debug` handlers put their lines, until
+    /// [`capture`] takes them.
+    ///
+    /// A scratch buffer, not state: [`capture`] empties it before a run and
+    /// takes everything out of it afterwards, so nothing is ever carried from
+    /// one script to the next and nothing outside this file can observe it.
+    ///
+    /// It exists because Rhai's `on_print` takes a `'static` callback, so the
+    /// handler cannot borrow a sink the caller passed in. Somewhere has to hold
+    /// the lines between the engine producing them and this module handing them
+    /// over, and a per-thread buffer beside the per-thread engine is the
+    /// smallest thing that does — the alternative, rebuilding the engine for
+    /// every script so its handlers could own an `Rc` to a fresh buffer, throws
+    /// away the caching for no gain the caller can see.
+    static OUTPUT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Run `body` against the shared engine, collecting whatever it printed.
+///
+/// The one place a script's output is gathered, so that neither entry point can
+/// forget to drain the buffer and leak lines into the next script's output.
+/// Reentrancy is not a concern: a script cannot call back into this module,
+/// because nothing from this module is registered into the engine.
+fn capture<T>(body: impl FnOnce(&Engine) -> T) -> (T, ScriptOutput) {
+    OUTPUT.with(|output| output.borrow_mut().clear());
+
+    let result = ENGINE.with(body);
+
+    let lines = OUTPUT.with(|output| std::mem::take(&mut *output.borrow_mut()));
+
+    (result, ScriptOutput { lines })
 }
 
 /// Build the one engine every script runs in.
@@ -593,27 +685,42 @@ thread_local! {
 ///
 /// # Where `print` goes
 ///
-/// To **stderr**. Rhai's default handler writes to stdout, which would put
-/// script output inside the single JSON document `--json` promises stdout
-/// holds. Discarding it instead was the alternative and is worse — a silently
-/// ignored input is the thing this codebase refuses everywhere else — so it
-/// goes where the `→` labels and every error already go. Capturing it is a
-/// non-goal for now; this is the one place in `sendra-core` that writes to a
-/// terminal, and a front-end that needs to intercept it (a TUI) is the reason
-/// to make the handler injectable later.
+/// Into a [`ScriptOutput`], handed back to whoever called the script, and
+/// nowhere else. Rhai's default handler writes to stdout; this crate must not
+/// write anywhere at all, so both handlers append to [`OUTPUT`] and [`capture`]
+/// carries the lines out with the result.
+///
+/// Discarding the lines was the alternative and is worse — a silently ignored
+/// input is the thing this codebase refuses everywhere else — and writing them
+/// somewhere chosen here is worse still: stdout would land inside the single
+/// JSON document `--json` promises, and even stderr is a decision that belongs
+/// to whatever is drawing the screen. `sendra-cli` prints them to stderr,
+/// beside the `→` labels; a `sendra-tui` will put them somewhere a redrawn
+/// frame does not wipe out.
+///
+/// A `debug` line is formatted here, with its source and position, because that
+/// is Rhai's information to render rather than something a front-end should
+/// have to reconstruct from parts.
 fn build_engine() -> Engine {
     let mut engine = Engine::new();
 
-    engine.on_print(|text| eprintln!("{text}"));
-    engine.on_debug(|text, source, position| match source {
-        Some(source) => eprintln!("{source} @ {position:?}: {text}"),
-        None => eprintln!("{position:?}: {text}"),
+    engine.on_print(|text| push_output(text.to_string()));
+    engine.on_debug(|text, source, position| {
+        push_output(match source {
+            Some(source) => format!("{source} @ {position:?}: {text}"),
+            None => format!("{position:?}: {text}"),
+        })
     });
 
     engine.disable_symbol("eval");
     engine.set_max_operations(MAX_OPERATIONS);
 
     engine
+}
+
+/// Add one line to the buffer [`capture`] is about to drain.
+fn push_output(line: String) {
+    OUTPUT.with(|output| output.borrow_mut().push(line));
 }
 
 #[cfg(test)]
@@ -655,14 +762,33 @@ mod tests {
             .join("\n")
     }
 
-    /// Compile and run a `pre_request` script against `request`.
+    /// Compile and run a `pre_request` script against `request`, for the tests
+    /// that are about the verdict rather than about what it printed.
     fn run_pre(request: &Request) -> Result<Request, SendraError> {
+        // Two layers of failure flattened into one: the outer is "it did not
+        // compile", the inner is "it compiled and then went wrong". These tests
+        // only care which of them happened via the variant, not via the nesting.
+        let (result, _output) = pre(request)?;
+        result
+    }
+
+    /// The same, keeping the output — for the tests that are about it.
+    #[allow(clippy::type_complexity)]
+    fn pre(request: &Request) -> Result<(Result<Request, SendraError>, ScriptOutput), SendraError> {
         let scripts = Scripts::compile(request)?;
-        run_pre_request(scripts.pre_request().expect("the test has one"), request)
+        Ok(run_pre_request(
+            scripts.pre_request().expect("the test has one"),
+            request,
+        ))
     }
 
     /// Compile and run a `post_request` script against `response`.
     fn run_post(request: &Request, response: &Response) -> ScriptOutcome {
+        post(request, response).0
+    }
+
+    /// The same, keeping the output.
+    fn post(request: &Request, response: &Response) -> (ScriptOutcome, ScriptOutput) {
         let scripts = Scripts::compile(request).expect("the test script should compile");
         run_post_request(scripts.post_request().expect("the test has one"), response)
     }
@@ -967,6 +1093,100 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    // --- what a script prints ---------------------------------------------
+    //
+    // `sendra-core` writes to no stream at all, so `print` and `debug` come
+    // back as data and the front-end decides where they go. These pin the
+    // collecting; where the CLI puts them is `Reporter::script_output`.
+
+    #[test]
+    fn a_script_that_prints_nothing_produces_no_output() {
+        // The usual case, and the one a front-end should be able to skip
+        // without allocating.
+        let request = with_pre_request(r#"request.headers["X"] = "y";"#);
+        let (result, output) = pre(&request).unwrap();
+
+        assert!(result.is_ok());
+        assert!(output.is_empty());
+        assert_eq!(output.lines(), &[] as &[String]);
+    }
+
+    #[test]
+    fn print_is_collected_one_line_at_a_time_in_order() {
+        let request = with_pre_request(
+            "print(\"first\");\nprint(\"second \" + 40 + 2);\nprint(request.method);",
+        );
+        let (result, output) = pre(&request).unwrap();
+
+        assert!(result.is_ok());
+        assert_eq!(output.lines(), ["first", "second 402", "POST"]);
+    }
+
+    #[test]
+    fn debug_carries_its_position_the_way_rhai_renders_it() {
+        // The formatting is Rhai's information, so it is applied where the
+        // engine's handler is set rather than left for a front-end to
+        // reconstruct from parts it was handed separately. `1:1` is Rhai's
+        // `Position` as line:column, and the value is debug-formatted, which is
+        // why the string arrives quoted — this is byte-for-byte what the old
+        // `eprintln!("{position:?}: {text}")` produced.
+        let request = with_pre_request(r#"debug("looking");"#);
+        let (_, output) = pre(&request).unwrap();
+
+        assert_eq!(output.lines(), [r#"1:1: "looking""#]);
+    }
+
+    #[test]
+    fn output_comes_back_even_when_the_script_throws() {
+        // The reason `ScriptOutput` sits beside the `Result` rather than inside
+        // its `Ok`: the lines printed before a throw are usually the ones that
+        // explain it, and the error path is exactly when they are worth most.
+        let request = with_pre_request("print(\"about to give up\");\nthrow \"no key\";");
+        let (result, output) = pre(&request).unwrap();
+
+        assert!(result.is_err(), "the script threw");
+        assert_eq!(output.lines(), ["about to give up"]);
+    }
+
+    #[test]
+    fn a_post_request_script_reports_what_it_printed_alongside_its_verdict() {
+        let request = with_post_request(
+            "print(\"status was \" + response.status);\nthrow \"not good enough\";",
+        );
+        let (outcome, output) = post(&request, &response());
+
+        assert_eq!(
+            outcome,
+            ScriptOutcome::Failed {
+                message: "not good enough".to_string()
+            }
+        );
+        assert_eq!(output.lines(), ["status was 201"]);
+    }
+
+    #[test]
+    fn one_script_never_sees_another_script_s_output() {
+        // The buffer behind `capture` is scratch space, not state: it is
+        // emptied going in and drained coming out, so a run cannot inherit
+        // lines from the run before it.
+        let noisy = with_pre_request(r#"print("from the first");"#);
+        let (_, first) = pre(&noisy).unwrap();
+        assert_eq!(first.lines(), ["from the first"]);
+
+        let quiet = with_pre_request(r#"request.url = request.url;"#);
+        let (_, second) = pre(&quiet).unwrap();
+        assert!(
+            second.is_empty(),
+            "the second script printed nothing, but got {:?}",
+            second.lines()
+        );
+
+        // And a third that prints starts from empty rather than appending.
+        let noisy_again = with_pre_request(r#"print("from the third");"#);
+        let (_, third) = pre(&noisy_again).unwrap();
+        assert_eq!(third.lines(), ["from the third"]);
     }
 
     // --- the sandbox ------------------------------------------------------

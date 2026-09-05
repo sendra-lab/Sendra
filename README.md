@@ -972,7 +972,14 @@ On top of that:
 
 `print` and `debug` go to **stderr**, alongside the `→` labels and every error,
 so they do not end up inside the single JSON document `--json` promises stdout
-holds.
+holds. A script that printed and then threw keeps its lines: they are usually
+the ones that explain the throw.
+
+That choice belongs to the CLI, not to the library. `sendra-core` has no
+`println!` or `eprintln!` anywhere in it — running a script returns the lines it
+printed alongside its verdict, and `sendra-cli` decides they are stderr. A
+`sendra-tui` reusing the same crate will put them somewhere a redrawn frame does
+not wipe out, without a library writing over its interface.
 
 [Rhai]: https://rhai.rs
 

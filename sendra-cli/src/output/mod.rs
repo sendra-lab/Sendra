@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::io::Write;
 
 use owo_colors::{OwoColorize, Stream};
-use sendra_core::{AssertionReport, Response, ScriptOutcome, SendraError};
+use sendra_core::{AssertionReport, Response, ScriptOutcome, ScriptOutput, SendraError};
 
 use crate::exit::Summary;
 
@@ -145,6 +145,30 @@ impl Reporter {
 
         if self.recording() {
             self.requests.borrow_mut().push(RequestRecord::new(label));
+        }
+    }
+
+    /// Whatever a script printed with `print` or `debug`, one line at a time.
+    ///
+    /// **To stderr, in both formats**, alongside the `→` labels and every error,
+    /// and for the same two reasons. A `--json` run must keep stdout holding one
+    /// document and nothing else, and a script's `print` is not part of the
+    /// result — it is the script author talking to whoever is watching the run.
+    ///
+    /// Core hands these back rather than printing them; this is where they
+    /// become output. That is the whole of the arrangement: `sendra-core` has no
+    /// `println!` or `eprintln!` in it, so a `sendra-tui` reusing the crate can
+    /// put a script's chatter somewhere a redrawn frame will not wipe out,
+    /// instead of having a library write over its interface.
+    ///
+    /// Nothing is recorded for `--json`. Capturing script output into the
+    /// document is a debugging feature that has not been asked for, and adding
+    /// a key nobody reads would freeze a shape before anyone knows what it
+    /// should be. The lines are on stderr either way, which is where a person
+    /// watching a run will look for them.
+    pub(crate) fn script_output(&self, output: &ScriptOutput) {
+        for line in output.lines() {
+            eprintln!("{line}");
         }
     }
 

@@ -21,7 +21,7 @@ pub mod script;
 pub use assertions::{AssertionKind, AssertionReport, AssertionResult, Assertions};
 pub use config::Config;
 pub use environment::Environment;
-pub use script::{Hook, Script, ScriptOutcome, Scripts};
+pub use script::{Hook, Script, ScriptOutcome, ScriptOutput, Scripts};
 
 /// Every way loading or sending a request can fail.
 ///
