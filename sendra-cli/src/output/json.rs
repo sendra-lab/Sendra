@@ -9,7 +9,9 @@
 //! and nested two-element arrays — instead of `elapsed_ms` and named header
 //! pairs. Nothing in core needed changing to add this.
 
-use sendra_core::{AssertionKind, AssertionReport, Response, ScriptOutcome, SendraError};
+use sendra_core::{
+    AssertionKind, AssertionReport, CaptureReport, Response, ScriptOutcome, SendraError,
+};
 use serde::Serialize;
 
 use crate::exit::Summary;
@@ -75,6 +77,7 @@ pub(super) struct RequestRecord {
     pub(super) error: Option<String>,
     pub(super) post_request: Option<PostRequestRecord>,
     pub(super) assertions: AssertionsRecord,
+    pub(super) capture: Option<CaptureRecord>,
 }
 
 impl RequestRecord {
@@ -85,8 +88,70 @@ impl RequestRecord {
             error: None,
             post_request: None,
             assertions: AssertionsRecord::default(),
+            capture: None,
         }
     }
+}
+
+/// What a request's `capture` block produced.
+///
+/// Null for a request that declared no block, which is a different thing from a
+/// block that captured nothing — the same distinction `post_request` draws by
+/// being null rather than `{"passed": true}`.
+///
+/// Two keys rather than one list, because they answer two different questions
+/// and a consumer almost always wants only one of them. `values` is a plain
+/// name-to-value object, so chaining a captured token into another tool is
+/// `.requests[0].capture.values.auth_token` and not a search through a list for
+/// the right `variable`. `failures` is the list, because a failure is several
+/// facts (which name, which path, what went wrong) and there is usually none of
+/// them.
+///
+/// **The values are here even though the terminal does not print them.** The
+/// document already carries every response body verbatim under both
+/// subcommands, so a captured value is text that is in the output twice rather
+/// than a secret this key newly exposes; and a program reading `--json` has no
+/// equivalent of the "do not put it on a terminal someone is screenshotting"
+/// problem the human rendering is avoiding.
+#[derive(Debug, Serialize)]
+pub(super) struct CaptureRecord {
+    /// Every name this request captured, and what it captured. Empty when
+    /// every entry failed.
+    values: std::collections::BTreeMap<String, String>,
+    /// The entries that produced no value, in evaluation order. Empty when
+    /// they all did.
+    failures: Vec<CaptureFailureRecord>,
+}
+
+impl From<&CaptureReport> for CaptureRecord {
+    fn from(report: &CaptureReport) -> Self {
+        Self {
+            values: report.values(),
+            failures: report
+                .failures()
+                .map(|result| CaptureFailureRecord {
+                    variable: result.variable.clone(),
+                    path: result.path.clone(),
+                    // Core's own wording, the same string the terminal shows.
+                    failure: result
+                        .failure()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// One `capture` entry that produced no value.
+#[derive(Debug, Serialize)]
+struct CaptureFailureRecord {
+    /// The name that is now not defined for the requests downstream.
+    variable: String,
+    /// The JSON path it was read from, as written in the file.
+    path: String,
+    /// Why it produced nothing.
+    failure: String,
 }
 
 /// What a request's `post_request` script decided.

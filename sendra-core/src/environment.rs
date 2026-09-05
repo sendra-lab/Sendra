@@ -102,6 +102,24 @@ pub struct Environment {
     /// missing-variable error can name the file to go and fix.
     pub source: Option<PathBuf>,
 
+    /// Variables captured by requests earlier in the same run, looked up
+    /// alongside [`variables`](Self::variables) — see
+    /// [`with_captured`](Self::with_captured), which is the only way to set it.
+    ///
+    /// Private, and set by rebuilding rather than by mutation, because the
+    /// growth of this map is the *whole* of how ordering works: the store is a
+    /// fact about a point in a run, and an `Environment` that could be mutated
+    /// in place would let a value reach a request that ran before it was
+    /// captured. Rebuilding per request makes each substitution see exactly the
+    /// captures that existed when it started, which is what "file order is real
+    /// order" has to mean.
+    ///
+    /// Disjoint from `variables` by construction: a capture whose name the file
+    /// already defines is refused where it happens, as
+    /// [`CaptureFailure::Shadowed`](crate::CaptureFailure::Shadowed), so it
+    /// never reaches this map.
+    captured: BTreeMap<String, String>,
+
     /// Stands in for the OS environment when set.
     ///
     /// Tests need to know what `${VAR}` resolves to, and the alternative is
@@ -120,6 +138,7 @@ impl Environment {
         Ok(Self {
             variables: parse(yaml, SendraError::ParseStr)?,
             source: None,
+            captured: BTreeMap::new(),
             os_env_override: None,
         })
     }
@@ -137,6 +156,7 @@ impl Environment {
                 source,
             })?,
             source: Some(path.to_path_buf()),
+            captured: BTreeMap::new(),
             os_env_override: None,
         })
     }
@@ -164,16 +184,57 @@ impl Environment {
         }
     }
 
-    /// The variable names this environment defines, sorted — the list a
-    /// "no variable named X" error offers, the way
+    /// This environment as it stands at one point in a run: the file's own
+    /// variables, plus everything captured by the requests that have already
+    /// finished.
+    ///
+    /// **This is the whole of the accumulating store.** A run holds one growing
+    /// map and calls this once per request, so the environment a request is
+    /// substituted against is a *view* built from the captures that existed
+    /// when that request was reached — request 3 sees what 1 and 2 captured,
+    /// request 1 sees nothing, and no request can see forwards. Threading the
+    /// growth through a rebuilt value rather than through a mutable
+    /// `Environment` is what makes that structural instead of a rule the loop
+    /// has to remember: there is no `&mut Environment` anywhere for a later
+    /// capture to reach an earlier request through.
+    ///
+    /// The copy is a `BTreeMap` clone per request, which is nothing at the
+    /// sizes a hand-written collection reaches, and it buys the property that
+    /// the value handed to [`apply`](Self::apply) cannot change underneath it.
+    ///
+    /// Nothing else changes: `source`, and the OS-environment override tests
+    /// use, are carried through untouched.
+    pub fn with_captured(&self, captured: &BTreeMap<String, String>) -> Self {
+        Self {
+            variables: self.variables.clone(),
+            source: self.source.clone(),
+            captured: captured.clone(),
+            os_env_override: self.os_env_override.clone(),
+        }
+    }
+
+    /// The variable names this environment's **file** defines, sorted — the
+    /// list a "no variable named X" error offers, the way
     /// [`RequestNotFound`](SendraError::RequestNotFound) offers request names.
+    ///
+    /// Captured names are deliberately not in here: this list is offered under
+    /// the name of the file it came from, and a capture did not come from that
+    /// file. They are reported beside it — see
+    /// [`captured_names`](Self::captured_names).
     pub fn names(&self) -> Vec<String> {
         self.variables.keys().cloned().collect()
     }
 
-    /// Whether this environment defines no variables at all.
+    /// The names captured by earlier requests in this run, sorted. Empty
+    /// unless [`with_captured`](Self::with_captured) put something there.
+    pub fn captured_names(&self) -> Vec<String> {
+        self.captured.keys().cloned().collect()
+    }
+
+    /// Whether this environment defines no variables at all — captures
+    /// included, since a `{{name}}` can resolve against either.
     pub fn is_empty(&self) -> bool {
-        self.variables.is_empty()
+        self.variables.is_empty() && self.captured.is_empty()
     }
 
     /// Substitute this environment into `request`, returning the request as it
@@ -241,6 +302,16 @@ impl Environment {
             // it runs.
             pre_request: request.pre_request.clone(),
             post_request: request.post_request.clone(),
+            // **The `capture` block is not substituted either**, and for the
+            // rule `apply_assertions` already draws rather than the one above.
+            // A capture's value is a JSON path, which selects *which part of
+            // the response is being looked at* — exactly the role a JSON path
+            // plays in an assertion, where keys are left literal so `--env`
+            // cannot silently redirect a check onto a different field. Its key
+            // is a variable name, and a name that changed with the environment
+            // could not be written as `{{name}}` in the request that uses it,
+            // for the same reason a request's `name` is left alone.
+            capture: request.capture.clone(),
         })
     }
 
@@ -361,6 +432,20 @@ impl Environment {
     /// value fetched from the OS environment be read as a template rather than
     /// as data.
     fn lookup(&self, name: &str) -> Result<String, SendraError> {
+        // Captured first, and it costs nothing to be exact about why: the two
+        // maps are disjoint by construction, since a capture whose name the
+        // file already defines is refused at capture time rather than allowed
+        // to shadow it. So this order is a statement of that invariant, not a
+        // precedence rule — if it ever mattered, something upstream is broken.
+        if let Some(value) = self.captured.get(name) {
+            // **Not scanned for `${VAR}`.** A captured value is text that came
+            // back from a server, not a line someone wrote in an environment
+            // file, and a token that happens to contain `${` is data. This is
+            // the same single-pass rule the doc comment above states for
+            // `{{...}}`, applied to the other syntax.
+            return Ok(value.clone());
+        }
+
         let value = self
             .variables
             .get(name)
@@ -368,6 +453,7 @@ impl Environment {
                 name: name.to_string(),
                 available: self.names(),
                 environment: self.source.clone(),
+                captured: self.captured_names(),
             })?;
 
         expand(value, OS_VAR_OPEN, OS_VAR_CLOSE, |os_var| {
@@ -510,6 +596,23 @@ pub(crate) fn describe_variables(environment: &Option<PathBuf>, available: &[Str
     }
 }
 
+/// The " or captured earlier in this run (...)" half of a
+/// [`VariableNotFound`](SendraError::VariableNotFound) message, or nothing at
+/// all when this run has captured nothing.
+///
+/// Its own clause rather than extra entries in `available`, because the two
+/// lists have different answers to "where do I go to add this name": one is a
+/// file to edit, the other is a `capture:` block on an earlier request. A run
+/// with no captures produces the empty string, so the message every single
+/// request has ever printed is unchanged.
+pub(crate) fn describe_captured(captured: &[String]) -> String {
+    if captured.is_empty() {
+        String::new()
+    } else {
+        format!(" — captured so far in this run: {}", captured.join(", "))
+    }
+}
+
 /// "`path/to/env.yaml`", or a stand-in when the environment came from nowhere.
 pub(crate) fn describe_environment(environment: &Option<PathBuf>) -> String {
     match environment {
@@ -530,6 +633,7 @@ mod tests {
         Environment {
             variables: pairs(variables),
             source: None,
+            captured: BTreeMap::new(),
             os_env_override: Some(pairs(os_env)),
         }
     }
@@ -882,6 +986,7 @@ assertions:
         let environment = Environment {
             variables: pairs(&[("token", "${SENDRA_TEST_DEFINITELY_NOT_SET_9F3A}")]),
             source: None,
+            captured: BTreeMap::new(),
             os_env_override: None,
         };
 
@@ -1180,6 +1285,149 @@ headers:
         assert_eq!(
             environment.variables.get("which").map(String::as_str),
             Some("inner")
+        );
+    }
+
+    // --- captured variables ----------------------------------------------
+
+    /// The store as it stands after one request captured `auth_token`.
+    fn captured(pairs_in: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs(pairs_in)
+    }
+
+    #[test]
+    fn a_captured_variable_substitutes_exactly_like_a_file_one() {
+        let request = Request::from_yaml_str(
+            "method: GET
+url: '{{base_url}}/me?t={{auth_token}}'
+",
+        )
+        .unwrap();
+        let environment = environment(&[("base_url", "https://example.com")], &[]);
+
+        // Before anything is captured the reference has nothing behind it...
+        assert!(environment.apply(&request).is_err());
+
+        // ...and once it does, it resolves through the same single pass.
+        let view = environment.with_captured(&captured(&[("auth_token", "abc123")]));
+        let applied = view.apply(&request).expect("both variables resolve");
+        assert_eq!(applied.url, "https://example.com/me?t=abc123");
+    }
+
+    #[test]
+    fn a_view_never_changes_the_environment_it_was_built_from() {
+        // The property the run loop depends on: request 1 substitutes against
+        // an environment that a later `with_captured` cannot reach back into.
+        let environment = environment(&[("base_url", "https://example.com")], &[]);
+        let view = environment.with_captured(&captured(&[("token", "t")]));
+
+        assert_eq!(view.captured_names(), vec!["token".to_string()]);
+        assert!(
+            environment.captured_names().is_empty(),
+            "the original must not have grown a capture"
+        );
+        assert!(environment
+            .apply(
+                &Request::from_yaml_str(
+                    "method: GET
+url: '{{token}}'
+"
+                )
+                .unwrap()
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn a_captured_value_is_data_and_is_never_read_as_a_reference() {
+        // A token that happens to contain `${...}` or `{{...}}` is text a
+        // server sent, not a line someone wrote in a file: substitution is one
+        // pass and what it hands back is copied out verbatim.
+        let request = Request::from_yaml_str(
+            "method: GET
+url: 'https://x/{{token}}'
+",
+        )
+        .unwrap();
+        let view = environment(&[], &[("HOME", "/root")])
+            .with_captured(&captured(&[("token", "${HOME}-{{base_url}}")]));
+
+        let applied = view.apply(&request).expect("the captured value is data");
+        assert_eq!(applied.url, "https://x/${HOME}-{{base_url}}");
+    }
+
+    #[test]
+    fn a_missing_variable_names_what_was_captured_as_well_as_what_the_file_has() {
+        let request = Request::from_yaml_str(
+            "method: GET
+url: '{{nope}}'
+",
+        )
+        .unwrap();
+        let view = environment(&[("base_url", "https://example.com")], &[])
+            .with_captured(&captured(&[("auth_token", "abc")]));
+
+        let err = view.apply(&request).expect_err("`nope` is neither");
+        match &err {
+            SendraError::VariableNotFound {
+                available,
+                captured,
+                ..
+            } => {
+                // Kept in separate lists: one names a file to edit, the other
+                // names a `capture:` block on an earlier request.
+                assert_eq!(available, &["base_url".to_string()]);
+                assert_eq!(captured, &["auth_token".to_string()]);
+            }
+            other => panic!("expected VariableNotFound, got {other:?}"),
+        }
+
+        let message = err.to_string();
+        assert!(message.contains("base_url"), "got {message}");
+        assert!(message.contains("auth_token"), "got {message}");
+    }
+
+    #[test]
+    fn a_run_that_captured_nothing_prints_the_message_it_always_printed() {
+        // The clause is additive: nothing captured, nothing said about it.
+        let request = Request::from_yaml_str(
+            "method: GET
+url: '{{nope}}'
+",
+        )
+        .unwrap();
+        let message = environment(&[("base_url", "x")], &[])
+            .apply(&request)
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains("captured"), "got {message}");
+    }
+
+    #[test]
+    fn the_capture_block_is_carried_through_substitution_untouched() {
+        // Same rule as an assertion's JSON path keys and a script's source: a
+        // path selects *which* part of the response is read, and `--env` must
+        // not be able to redirect it.
+        let request = Request::from_yaml_str(
+            "method: GET
+url: '{{base_url}}'
+capture:
+  token: '$.{{field}}'
+",
+        )
+        .unwrap();
+        let environment = environment(&[("base_url", "https://example.com")], &[]);
+
+        let applied = environment
+            .apply(&request)
+            .expect("`{{field}}` is inside the capture block, which is not substituted");
+        assert_eq!(
+            applied.capture, request.capture,
+            "the block goes through verbatim"
+        );
+        assert_eq!(
+            applied.capture.as_ref().unwrap().entries()["token"],
+            "$.{{field}}"
         );
     }
 

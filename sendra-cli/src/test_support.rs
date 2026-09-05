@@ -1,7 +1,7 @@
 //! Fixtures shared by more than one module's tests: the hand-built responses,
 //! assertion reports and outcomes that stand in for a run without a socket.
 
-use sendra_core::{AssertionReport, Document, Response, ScriptOutcome};
+use sendra_core::{AssertionReport, CaptureReport, Document, Response, ScriptOutcome};
 
 use crate::exit::Outcome;
 use crate::output::{Detail, Format, Reporter};
@@ -51,6 +51,7 @@ pub(crate) fn responded(status: u16) -> Outcome {
         status,
         script: None,
         assertions: AssertionReport::default(),
+        capture: CaptureReport::default(),
     }
 }
 
@@ -61,6 +62,7 @@ pub(crate) fn checked(status: u16, assertions: AssertionReport) -> Outcome {
         status,
         script: None,
         assertions,
+        capture: CaptureReport::default(),
     }
 }
 
@@ -71,6 +73,7 @@ pub(crate) fn scripted(status: u16, script: ScriptOutcome) -> Outcome {
         status,
         script: Some(script),
         assertions: AssertionReport::default(),
+        capture: CaptureReport::default(),
     }
 }
 
@@ -105,6 +108,7 @@ pub(crate) fn all_passed_with_script(status: u16) -> Outcome {
         status,
         script: Some(ScriptOutcome::Passed),
         assertions,
+        capture: CaptureReport::default(),
     }
 }
 

@@ -3,7 +3,7 @@
 
 use std::process::ExitCode;
 
-use sendra_core::{AssertionReport, ScriptOutcome};
+use sendra_core::{AssertionReport, CaptureReport, ScriptOutcome};
 
 /// Sendra's exit-code convention, in one place, for every subcommand.
 ///
@@ -108,14 +108,24 @@ pub(crate) fn exit_for_status(status: u16, allow_error_status: bool) -> Exit {
 /// change what an existing `sendra run x && deploy.sh` means the moment a
 /// `post_request:` block is added to a file, which is exactly what
 /// `sendra test` exists to make unnecessary.
+///
+/// **A failed capture is discarded here too**, and the argument is the same one
+/// a third time: adding a `capture:` block to a file must not change what
+/// `sendra run x && deploy.sh` already meant. It is not silent — the failure is
+/// printed under the request that declared it, the same as a failed assertion —
+/// and it is not lost, because the request downstream that needed the variable
+/// gets a `VariableNotFound` and *that* is a [`Outcome::NoResponse`], which does
+/// reach `run`'s exit code. A capture that nothing downstream uses fails
+/// visibly and changes nothing, which is the correct amount for `run` to care.
 fn exit_for_response(
     status: u16,
     script: Option<&ScriptOutcome>,
     assertions: &AssertionReport,
+    capture: &CaptureReport,
     allow_error_status: bool,
 ) -> Exit {
     // Read and deliberately discarded: see above, and the `Exit` table.
-    let _ = (script, assertions);
+    let _ = (script, assertions, capture);
     exit_for_status(status, allow_error_status)
 }
 
@@ -191,6 +201,16 @@ pub(crate) enum Outcome {
         /// checked and it held".
         script: Option<ScriptOutcome>,
         assertions: AssertionReport,
+        /// What its `capture` block extracted, and what it could not. The
+        /// empty report for a request that declared no block — the same
+        /// convention `assertions` follows.
+        ///
+        /// Carried in the outcome rather than handed straight to the store
+        /// because both subcommands need to *report* it, and only the sending
+        /// loop needs to feed it forward. Keeping it a fact about the request,
+        /// like everything else here, is what lets the loop merge it and the
+        /// two verdicts read it without either knowing about the other.
+        capture: CaptureReport,
     },
 }
 
@@ -203,7 +223,14 @@ fn exit_for_outcome(outcome: &Outcome, allow_error_status: bool) -> Exit {
             status,
             script,
             assertions,
-        } => exit_for_response(*status, script.as_ref(), assertions, allow_error_status),
+            capture,
+        } => exit_for_response(
+            *status,
+            script.as_ref(),
+            assertions,
+            capture,
+            allow_error_status,
+        ),
     }
 }
 
@@ -255,6 +282,22 @@ pub(crate) fn exit_for_run(outcomes: &[Outcome], allow_error_status: bool) -> Ex
 ///   inside a helper function — and guessing wrong would file "your API is
 ///   broken" under "your script is broken". One reliable split beats two when
 ///   one of them is guesswork.
+/// - A request whose `capture` block could not produce a value it named is the
+///   same event by a third mechanism, and gets the same number. **This is the
+///   decision behind folding a capture failure into `failed` rather than into
+///   `no_response` or a category of its own.** It happens *after* a response
+///   arrived — the request was sent, the server answered, and the answer did
+///   not contain what the file said it would — which is exactly the shape of a
+///   failed assertion and of a `post_request` throw, and nothing like a refused
+///   connection. The alternative worth considering was making it more severe
+///   than a failed assertion on the grounds that it compounds: every downstream
+///   request needing the variable will now fail too. It is more severe, and
+///   that is already expressed — each of those downstream requests raises
+///   `VariableNotFound` and lands in `no_response`, which outranks `failed` in
+///   [`worst`], so a run whose capture broke a chain reports `1` and not `4`
+///   without anyone having to special-case it. Making the capture *itself*
+///   fatal would have said the same thing twice and hidden which request was
+///   the origin.
 /// - A request that never got a response cannot have its assertions evaluated,
 ///   so a run containing one cannot honestly say the expectations held. It is
 ///   [`Exit::Failure`], the same code `run` gives it, because it is the same
@@ -262,6 +305,16 @@ pub(crate) fn exit_for_run(outcomes: &[Outcome], allow_error_status: bool) -> Ex
 ///   expectations. In CI those two want different handling — one is "fix your
 ///   test setup", the other is "fix your API" — which is exactly why they get
 ///   different numbers instead of one generic non-zero.
+///
+/// **A capture that succeeds is not a check, so it does not make a request
+/// `passed`.** This is the asymmetry the type deliberately carries: a failed
+/// capture counts as `failed`, a successful one leaves the request wherever it
+/// already was, which for a login request that asserts nothing is
+/// `without_assertions`. A capture is not an expectation about the response —
+/// it is a dependency of the rest of the run — so counting a successful one as
+/// a pass would report a check that was never written, which is the one thing
+/// this summary exists to avoid. A run that only captures reads
+/// `2 requests: 1 passed, 1 without assertions`, and that is the true sentence.
 ///
 /// **`without_assertions` does not fail the run, whatever the status was.**
 /// This is the debatable one, so: a request with no `assertions` block that
@@ -297,7 +350,8 @@ pub(crate) struct Summary {
     /// or both — and everything it checked, held.
     pub(crate) passed: usize,
     /// Got a response and at least one of its checks did not hold: a failed
-    /// assertion, a `post_request` script that threw, or both.
+    /// assertion, a `post_request` script that threw, a `capture` entry that
+    /// produced no value, or any combination of them.
     pub(crate) failed: usize,
     /// Got a response and checked nothing about it: no assertions, no
     /// `post_request` script.
@@ -326,21 +380,31 @@ impl Summary {
 
         for outcome in outcomes {
             let Outcome::Responded {
-                script, assertions, ..
+                script,
+                assertions,
+                capture,
+                ..
             } = outcome
             else {
                 summary.no_response += 1;
                 continue;
             };
 
-            // A script that threw and an assertion that did not hold are the
-            // same event by two mechanisms; see the note on this type.
-            let failed =
-                script.as_ref().is_some_and(|script| !script.passed()) || !assertions.passed();
+            // A script that threw, an assertion that did not hold and a
+            // capture that produced nothing are the same event by three
+            // mechanisms; see the note on this type.
+            let failed = script.as_ref().is_some_and(|script| !script.passed())
+                || !assertions.passed()
+                || !capture.passed();
 
             // An empty report is a request that declared nothing, whether it
             // had no `assertions` key or an empty one — but a script that ran
             // is a check either way, so a request with one is never unchecked.
+            //
+            // A `capture` block is deliberately *not* in here. It is not a
+            // check, so a request that only captures was still not checked;
+            // see the note on this type for why the asymmetry with `failed`
+            // above is the honest reading rather than an oversight.
             let checked = script.is_some() || !assertions.is_empty();
 
             if failed {
@@ -512,7 +576,13 @@ assertions:
     fn failing_assertions_do_not_change_the_exit_code_of_a_successful_response() {
         // The intentional, temporary asymmetry: four failed assertions printed,
         // exit 0 all the same.
-        let exit = exit_for_response(200, None, &a_failing_report(200), false);
+        let exit = exit_for_response(
+            200,
+            None,
+            &a_failing_report(200),
+            &CaptureReport::default(),
+            false,
+        );
         assert_eq!(exit, Exit::Ok);
         assert_eq!(exit as u8, 0);
     }
@@ -522,11 +592,23 @@ assertions:
         // Nor do they promote a 404 to something else, or rescue it: the status
         // is still the only thing being read.
         assert_eq!(
-            exit_for_response(404, None, &a_failing_report(404), false),
+            exit_for_response(
+                404,
+                None,
+                &a_failing_report(404),
+                &CaptureReport::default(),
+                false
+            ),
             Exit::ErrorStatus
         );
         assert_eq!(
-            exit_for_response(404, None, &a_failing_report(404), true),
+            exit_for_response(
+                404,
+                None,
+                &a_failing_report(404),
+                &CaptureReport::default(),
+                true
+            ),
             Exit::Ok,
             "--allow-error-status still forgives the status, and nothing else"
         );
@@ -543,7 +625,7 @@ assertions:
         );
 
         assert_eq!(
-            exit_for_response(500, None, &report, false),
+            exit_for_response(500, None, &report, &CaptureReport::default(), false),
             Exit::ErrorStatus,
             "a 500 the file expected is still a 500"
         );
@@ -555,8 +637,20 @@ assertions:
         for status in [200, 301, 404, 500] {
             for allow in [false, true] {
                 assert_eq!(
-                    exit_for_response(status, None, &AssertionReport::default(), allow),
-                    exit_for_response(status, None, &a_failing_report(status), allow),
+                    exit_for_response(
+                        status,
+                        None,
+                        &AssertionReport::default(),
+                        &CaptureReport::default(),
+                        allow
+                    ),
+                    exit_for_response(
+                        status,
+                        None,
+                        &a_failing_report(status),
+                        &CaptureReport::default(),
+                        allow
+                    ),
                     "assertions changed the exit code for {status} (allow_error_status={allow})"
                 );
             }
@@ -849,7 +943,13 @@ assertions:
         // `post_request:` block to a file must not silently change what
         // `sendra run x && deploy.sh` means.
         let failed = script_failed();
-        let exit = exit_for_response(200, Some(&failed), &AssertionReport::default(), false);
+        let exit = exit_for_response(
+            200,
+            Some(&failed),
+            &AssertionReport::default(),
+            &CaptureReport::default(),
+            false,
+        );
 
         assert_eq!(exit, Exit::Ok);
         assert_eq!(exit as u8, 0);
@@ -860,11 +960,23 @@ assertions:
         let failed = script_failed();
 
         assert_eq!(
-            exit_for_response(404, Some(&failed), &AssertionReport::default(), false),
+            exit_for_response(
+                404,
+                Some(&failed),
+                &AssertionReport::default(),
+                &CaptureReport::default(),
+                false
+            ),
             Exit::ErrorStatus
         );
         assert_eq!(
-            exit_for_response(404, Some(&failed), &AssertionReport::default(), true),
+            exit_for_response(
+                404,
+                Some(&failed),
+                &AssertionReport::default(),
+                &CaptureReport::default(),
+                true
+            ),
             Exit::Ok,
             "--allow-error-status still forgives the status, and nothing else"
         );
@@ -879,12 +991,24 @@ assertions:
 
         for status in [200, 301, 404, 500] {
             for allow in [false, true] {
-                let without = exit_for_response(status, None, &AssertionReport::default(), allow);
+                let without = exit_for_response(
+                    status,
+                    None,
+                    &AssertionReport::default(),
+                    &CaptureReport::default(),
+                    allow,
+                );
 
                 for script in [None, Some(&passed), Some(&failed)] {
                     assert_eq!(
                         without,
-                        exit_for_response(status, script, &AssertionReport::default(), allow),
+                        exit_for_response(
+                            status,
+                            script,
+                            &AssertionReport::default(),
+                            &CaptureReport::default(),
+                            allow
+                        ),
                         "a script changed the exit code for {status} (allow_error_status={allow})"
                     );
                 }
@@ -966,6 +1090,7 @@ assertions:
             status: 200,
             script: Some(script_failed()),
             assertions,
+            capture: CaptureReport::default(),
         };
         assert_eq!(Summary::of(&[script_only]).failed, 1);
 
@@ -974,6 +1099,7 @@ assertions:
             status: 200,
             script: Some(ScriptOutcome::Passed),
             assertions: failing,
+            capture: CaptureReport::default(),
         };
         assert_eq!(Summary::of(&[assertions_only]).failed, 1);
     }

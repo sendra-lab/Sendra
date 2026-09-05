@@ -9,18 +9,20 @@ use std::cell::RefCell;
 use std::io::Write;
 
 use owo_colors::{OwoColorize, Stream};
-use sendra_core::{AssertionReport, Response, ScriptOutcome, ScriptOutput, SendraError};
+use sendra_core::{
+    AssertionReport, CaptureReport, Response, ScriptOutcome, ScriptOutput, SendraError,
+};
 
 use crate::exit::Summary;
 
 use self::errors::print_error_line;
 use self::human::{
-    print_assertions, print_no_assertions, print_post_request, print_response, print_status_line,
-    print_summary,
+    print_assertions, print_capture, print_no_assertions, print_post_request, print_response,
+    print_status_line, print_summary,
 };
 use self::json::{
-    error_message, AssertionsRecord, PostRequestRecord, RequestRecord, ResponseRecord, RunDocument,
-    SummaryRecord,
+    error_message, AssertionsRecord, CaptureRecord, PostRequestRecord, RequestRecord,
+    ResponseRecord, RunDocument, SummaryRecord,
 };
 
 pub(crate) use self::errors::{print_environment_error, print_error, reject_allow_error_status};
@@ -176,19 +178,25 @@ impl Reporter {
     ///
     /// `script` is what its `post_request` script decided, or `None` when it
     /// declared no script; `assertions` is its report, empty when it declared
-    /// none. Both are printed under the response, script first, because that is
-    /// the order they ran in.
+    /// none; `capture` is its capture report, empty when it declared no
+    /// `capture` block. All three are printed under the response in the order
+    /// they ran in: script, assertions, capture.
     pub(crate) fn responded(
         &self,
         response: &Response,
         script: Option<&ScriptOutcome>,
         assertions: &AssertionReport,
+        capture: &CaptureReport,
     ) {
         if self.recording() {
             self.with_current(|record| {
                 record.response = Some(ResponseRecord::from(response));
                 record.post_request = script.map(PostRequestRecord::from);
                 record.assertions = AssertionsRecord::from(assertions);
+                // Null for a request that declared no block, the way
+                // `post_request` is — an empty report is exactly that case,
+                // since a block with entries always produces a result per entry.
+                record.capture = (!capture.is_empty()).then(|| CaptureRecord::from(capture));
             });
             return;
         }
@@ -213,10 +221,20 @@ impl Reporter {
             // A request with a `post_request` script is not one of those: it
             // was checked, the block above says so, and the summary counts it
             // as a pass or a failure.
+            //
+            // A `capture` block does not suppress it either, and deliberately:
+            // a capture is not a check, the summary will count a request that
+            // only captures as one of the uncovered, and this marker is what
+            // that number points at.
             print_no_assertions();
         } else {
             print_assertions(assertions);
         }
+
+        // Last, after the checks: those are about this response, the capture is
+        // about the requests still to come. Nothing at all when the request
+        // declared no `capture` block.
+        print_capture(capture);
     }
 
     /// A request never got a response: it could not be built, or it could not
@@ -337,7 +355,7 @@ mod tests {
         let assertions =
             assertions_from("method: GET\nurl: https://example.com\nassertions:\n  status: 404\n")
                 .evaluate(&response);
-        reporter.responded(&response, None, &assertions);
+        reporter.responded(&response, None, &assertions, &CaptureReport::default());
 
         let document = document(&reporter, None);
 
@@ -410,7 +428,7 @@ mod tests {
             "method: GET\nurl: https://example.com\nassertions:\n  status: 200\n  json:\n    $.id: 1\n",
         )
         .evaluate(&response);
-        reporter.responded(&response, None, &assertions);
+        reporter.responded(&response, None, &assertions, &CaptureReport::default());
 
         let assertions = &document(&reporter, None)["requests"][0]["assertions"];
 
@@ -436,6 +454,7 @@ mod tests {
                 &response_with("text/plain", "ok"),
                 None,
                 &AssertionReport::default(),
+                &CaptureReport::default(),
             );
         }
 
@@ -456,7 +475,12 @@ mod tests {
 
         reporter.request_started("Get user");
         let response = response_with("application/json", r#"{"id":1}"#);
-        reporter.responded(&response, None, &AssertionReport::default());
+        reporter.responded(
+            &response,
+            None,
+            &AssertionReport::default(),
+            &CaptureReport::default(),
+        );
 
         let summary = Summary {
             total: 3,
@@ -501,6 +525,7 @@ mod tests {
             &response_with("text/plain", "ok"),
             None,
             &AssertionReport::default(),
+            &CaptureReport::default(),
         );
 
         let request = &document(&reporter, None)["requests"][0];
@@ -517,6 +542,7 @@ mod tests {
             &response_with("application/json", r#"{"id":1}"#),
             Some(&ScriptOutcome::Passed),
             &AssertionReport::default(),
+            &CaptureReport::default(),
         );
 
         let script = &document(&reporter, None)["requests"][0]["post_request"];
@@ -535,6 +561,7 @@ mod tests {
                 message: "expected 201, got 500".to_string(),
             }),
             &AssertionReport::default(),
+            &CaptureReport::default(),
         );
 
         let request = &document(&reporter, None)["requests"][0];
@@ -556,7 +583,12 @@ mod tests {
         let assertions =
             assertions_from("method: GET\nurl: https://example.com\nassertions:\n  status: 200\n")
                 .evaluate(&response);
-        reporter.responded(&response, Some(&ScriptOutcome::Passed), &assertions);
+        reporter.responded(
+            &response,
+            Some(&ScriptOutcome::Passed),
+            &assertions,
+            &CaptureReport::default(),
+        );
 
         let request = &document(&reporter, None)["requests"][0];
         assert_eq!(request["post_request"]["passed"], true);
@@ -590,8 +622,98 @@ mod tests {
             &response_with("text/plain", "ok"),
             None,
             &AssertionReport::default(),
+            &CaptureReport::default(),
         );
 
         assert!(reporter.requests.borrow().is_empty());
+    }
+    // --- `capture` in the `--json` document ------------------------------
+
+    /// The capture report a request declaring `capture` would produce against
+    /// `body`, with nothing in the environment to collide with.
+    fn capture_report(yaml: &str, body: &str) -> sendra_core::CaptureReport {
+        let response = response_with("application/json", body);
+        sendra_core::Document::from_yaml_str(yaml)
+            .expect("the test request should parse")
+            .requests()[0]
+            .capture
+            .as_ref()
+            .expect("the test request has a capture block")
+            .evaluate(&response, &sendra_core::Environment::default())
+    }
+
+    #[test]
+    fn a_request_that_declared_no_capture_block_reports_null() {
+        // The same distinction `post_request` draws: null is "nothing was
+        // declared", which is not the same as a block that captured nothing.
+        let reporter = Reporter::new(Format::Json, Detail::Full);
+        reporter.request_started("Get user");
+        reporter.responded(
+            &response_with("application/json", "{}"),
+            None,
+            &AssertionReport::default(),
+            &CaptureReport::default(),
+        );
+
+        let request = &document(&reporter, None)["requests"][0];
+        assert_eq!(request["capture"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_capture_reports_its_values_as_a_name_to_value_object() {
+        let reporter = Reporter::new(Format::Json, Detail::Full);
+        let body = r#"{"token":"abc123","user":{"id":42}}"#;
+        let capture = capture_report(
+            "method: POST\nurl: https://example.com\ncapture:\n  auth_token: $.token\n  user_id: $.user.id\n",
+            body,
+        );
+
+        reporter.request_started("Log in");
+        reporter.responded(
+            &response_with("application/json", body),
+            None,
+            &AssertionReport::default(),
+            &capture,
+        );
+
+        let capture = &document(&reporter, None)["requests"][0]["capture"];
+        // Directly addressable: `.capture.values.auth_token`, not a search
+        // through a list for the right `variable`.
+        assert_eq!(capture["values"]["auth_token"], "abc123");
+        // A JSON number captures as the text it will be substituted as.
+        assert_eq!(capture["values"]["user_id"], "42");
+        assert_eq!(capture["failures"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_failed_capture_reports_the_name_the_path_and_the_reason() {
+        let reporter = Reporter::new(Format::Json, Detail::Full);
+        let body = r#"{"token":"abc123"}"#;
+        let capture = capture_report(
+            "method: POST\nurl: https://example.com\ncapture:\n  auth_token: $.token\n  user_id: $.user.id\n",
+            body,
+        );
+
+        reporter.request_started("Log in");
+        reporter.responded(
+            &response_with("application/json", body),
+            None,
+            &AssertionReport::default(),
+            &capture,
+        );
+
+        let capture = &document(&reporter, None)["requests"][0]["capture"];
+        // The one that worked is still reported, beside the one that did not.
+        assert_eq!(capture["values"]["auth_token"], "abc123");
+        assert_eq!(capture["values"]["user_id"], serde_json::Value::Null);
+
+        let failures = capture["failures"].as_array().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["variable"], "user_id");
+        assert_eq!(failures[0]["path"], "$.user.id");
+        assert_eq!(
+            failures[0]["failure"],
+            "matched nothing in the response body"
+        );
     }
 }
