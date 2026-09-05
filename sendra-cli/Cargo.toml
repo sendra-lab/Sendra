@@ -13,8 +13,8 @@ path = "src/main.rs"
 sendra-core = { path = "../sendra-core" }
 clap = { workspace = true }
 owo-colors = { workspace = true }
-# `--json` output is built from view structs defined in `output.rs`, so the
-# derive macro is what turns them into the documented schema.
+# `--json` output is built from view structs defined in `output/json.rs`, so
+# the derive macro is what turns them into the documented schema.
 serde = { workspace = true }
 # Two jobs: emitting `--json`, and re-indenting a JSON response body in the
 # human output. "preserve_order" is for the second — pretty-printing must show
