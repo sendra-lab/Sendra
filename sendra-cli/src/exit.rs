@@ -3,7 +3,7 @@
 
 use std::process::ExitCode;
 
-use sendra_core::AssertionReport;
+use sendra_core::{AssertionReport, ScriptOutcome};
 
 /// Sendra's exit-code convention, in one place, for every subcommand.
 ///
@@ -100,9 +100,22 @@ pub(crate) fn exit_for_status(status: u16, allow_error_status: bool) -> Exit {
 /// decision with a test on it, in one place, instead of an absence nobody can
 /// point at. [`Summary::exit`] is the other half of the pair: the same report,
 /// read rather than discarded, for the command whose job is to read it.
-fn exit_for_response(status: u16, assertions: &AssertionReport, allow_error_status: bool) -> Exit {
+///
+/// **A failed `post_request` script is discarded here too, and for the same
+/// reason.** A script that throws is a check that did not hold — the same
+/// category of event as a failed assertion, decided by the same file, and it
+/// gets the same treatment. Wiring either into `run`'s exit code would silently
+/// change what an existing `sendra run x && deploy.sh` means the moment a
+/// `post_request:` block is added to a file, which is exactly what
+/// `sendra test` exists to make unnecessary.
+fn exit_for_response(
+    status: u16,
+    script: Option<&ScriptOutcome>,
+    assertions: &AssertionReport,
+    allow_error_status: bool,
+) -> Exit {
     // Read and deliberately discarded: see above, and the `Exit` table.
-    let _ = assertions;
+    let _ = (script, assertions);
     exit_for_status(status, allow_error_status)
 }
 
@@ -164,13 +177,19 @@ pub(crate) enum Outcome {
     /// assertion report, because neither of them exists without a response.
     NoResponse,
 
-    /// A response came back, and the request's assertions — if it declared any
-    /// — were evaluated against it.
+    /// A response came back, and the request's `post_request` script and
+    /// assertions — whichever of them it declared — were run against it.
     ///
-    /// The report is empty when the file declared none, which is a third thing
-    /// from "passed" and from "failed"; see [`Summary`].
+    /// Both are optional and both are checks, so both can be absent: a request
+    /// with neither was never checked at all, which is a third thing from
+    /// "passed" and from "failed". See [`Summary`].
     Responded {
         status: u16,
+        /// What the `post_request` script decided, or `None` when there was no
+        /// script. `None` and [`ScriptOutcome::Passed`] are deliberately
+        /// different: one is "nothing was checked", the other is "something was
+        /// checked and it held".
+        script: Option<ScriptOutcome>,
         assertions: AssertionReport,
     },
 }
@@ -180,9 +199,11 @@ pub(crate) enum Outcome {
 fn exit_for_outcome(outcome: &Outcome, allow_error_status: bool) -> Exit {
     match outcome {
         Outcome::NoResponse => Exit::Failure,
-        Outcome::Responded { status, assertions } => {
-            exit_for_response(*status, assertions, allow_error_status)
-        }
+        Outcome::Responded {
+            status,
+            script,
+            assertions,
+        } => exit_for_response(*status, script.as_ref(), assertions, allow_error_status),
     }
 }
 
@@ -197,8 +218,8 @@ pub(crate) fn exit_for_run(outcomes: &[Outcome], allow_error_status: bool) -> Ex
 /// derives from them.
 ///
 /// **Five numbers, and the middle three are separate categories on purpose.**
-/// A request that declared no assertions is not a pass and not a failure: it is
-/// a request nobody said anything about. Folding it into `passed` would make a
+/// A request that declared no checks is not a pass and not a failure: it is a
+/// request nobody said anything about. Folding it into `passed` would make a
 /// collection with no assertions anywhere report a perfect green run, which is
 /// the single most misleading thing a test command can do; folding it into
 /// `failed` would make adding a request to a collection break the build until
@@ -206,10 +227,34 @@ pub(crate) fn exit_for_run(outcomes: &[Outcome], allow_error_status: bool) -> Ex
 /// true thing — "these ran, and nothing was checked" — and leaves what to do
 /// about it to the person reading.
 ///
+/// **A request can be checked two ways, and the categories are about the
+/// checking, not about which mechanism did it.** An `assertions` block and a
+/// `post_request` script are independent features that both look at the same
+/// response, so `passed` means "everything this request checked, held",
+/// `failed` means "something it checked, did not", and `without_assertions`
+/// means "it checked nothing at all, either way". A request with a script and
+/// no `assertions` block is therefore a pass when the script is happy, not an
+/// unchecked request.
+///
 /// **What fails the run.** `failed` and `no_response`, and nothing else:
 ///
 /// - A request whose assertions did not all hold is the whole point of the
 ///   command. [`Exit::TestFailed`].
+/// - A request whose `post_request` script threw is the same event by the other
+///   mechanism, and gets the same number. **This is the decision behind
+///   folding it into `failed` rather than giving it a fifth category.** The two
+///   say the same thing to whoever is reading the run — "the response was not
+///   what this file said it should be" — and every consumer of a separate count
+///   would immediately add the two together. The distinction worth drawing is
+///   not "assertion or script" but "is the file wrong or is the API wrong", and
+///   that one is already drawn, reliably, one step earlier: a script that does
+///   not *compile* is a broken file and lands in `no_response`, because both
+///   hooks are compiled before the request is sent. Drawing it a second time at
+///   runtime would mean sorting a deliberate `throw` from an accidental type
+///   error, which Rhai can report but which blurs the moment a `throw` happens
+///   inside a helper function — and guessing wrong would file "your API is
+///   broken" under "your script is broken". One reliable split beats two when
+///   one of them is guesswork.
 /// - A request that never got a response cannot have its assertions evaluated,
 ///   so a run containing one cannot honestly say the expectations held. It is
 ///   [`Exit::Failure`], the same code `run` gives it, because it is the same
@@ -248,11 +293,19 @@ pub(crate) fn exit_for_run(outcomes: &[Outcome], allow_error_status: bool) -> Ex
 pub(crate) struct Summary {
     /// Every request the run attempted. Always the sum of the four below.
     pub(crate) total: usize,
-    /// Got a response, declared at least one assertion, and all of them held.
+    /// Got a response, checked it — with assertions, a `post_request` script,
+    /// or both — and everything it checked, held.
     pub(crate) passed: usize,
-    /// Got a response, declared assertions, and at least one did not hold.
+    /// Got a response and at least one of its checks did not hold: a failed
+    /// assertion, a `post_request` script that threw, or both.
     pub(crate) failed: usize,
-    /// Got a response and declared no assertions at all.
+    /// Got a response and checked nothing about it: no assertions, no
+    /// `post_request` script.
+    ///
+    /// The name is the one the `--json` schema and the printed summary have
+    /// always used, and it stays: every request it counts genuinely has no
+    /// assertions. It is now the narrower of the two readings — a request with
+    /// a script but no `assertions` block is counted as checked, above.
     pub(crate) without_assertions: usize,
     /// Never got a response, so there was nothing to evaluate against.
     pub(crate) no_response: usize,
@@ -260,6 +313,11 @@ pub(crate) struct Summary {
 
 impl Summary {
     /// Classify each outcome into exactly one of the four categories.
+    ///
+    /// Written as three questions asked in order — did anything fail, was
+    /// anything checked at all, otherwise it passed — rather than as one match
+    /// per shape, so that adding a third kind of check later is one clause in
+    /// each of `failed` and `checked` instead of a new combinatorial arm.
     pub(crate) fn of(outcomes: &[Outcome]) -> Self {
         let mut summary = Summary {
             total: outcomes.len(),
@@ -267,16 +325,30 @@ impl Summary {
         };
 
         for outcome in outcomes {
-            match outcome {
-                Outcome::NoResponse => summary.no_response += 1,
-                // An empty report is a request that declared nothing, whether
-                // it had no `assertions` key or an empty one. Either way there
-                // is nothing to have passed.
-                Outcome::Responded { assertions, .. } if assertions.is_empty() => {
-                    summary.without_assertions += 1
-                }
-                Outcome::Responded { assertions, .. } if assertions.passed() => summary.passed += 1,
-                Outcome::Responded { .. } => summary.failed += 1,
+            let Outcome::Responded {
+                script, assertions, ..
+            } = outcome
+            else {
+                summary.no_response += 1;
+                continue;
+            };
+
+            // A script that threw and an assertion that did not hold are the
+            // same event by two mechanisms; see the note on this type.
+            let failed =
+                script.as_ref().is_some_and(|script| !script.passed()) || !assertions.passed();
+
+            // An empty report is a request that declared nothing, whether it
+            // had no `assertions` key or an empty one — but a script that ran
+            // is a check either way, so a request with one is never unchecked.
+            let checked = script.is_some() || !assertions.is_empty();
+
+            if failed {
+                summary.failed += 1;
+            } else if checked {
+                summary.passed += 1;
+            } else {
+                summary.without_assertions += 1;
             }
         }
 
@@ -304,7 +376,10 @@ impl Summary {
 mod tests {
     use super::*;
 
-    use crate::test_support::{all_passed, assertions_from, checked, responded, response};
+    use crate::test_support::{
+        all_passed, all_passed_with_script, assertions_from, checked, responded, response,
+        script_failed, scripted,
+    };
 
     #[test]
     fn success_and_redirect_statuses_exit_zero() {
@@ -437,7 +512,7 @@ assertions:
     fn failing_assertions_do_not_change_the_exit_code_of_a_successful_response() {
         // The intentional, temporary asymmetry: four failed assertions printed,
         // exit 0 all the same.
-        let exit = exit_for_response(200, &a_failing_report(200), false);
+        let exit = exit_for_response(200, None, &a_failing_report(200), false);
         assert_eq!(exit, Exit::Ok);
         assert_eq!(exit as u8, 0);
     }
@@ -447,11 +522,11 @@ assertions:
         // Nor do they promote a 404 to something else, or rescue it: the status
         // is still the only thing being read.
         assert_eq!(
-            exit_for_response(404, &a_failing_report(404), false),
+            exit_for_response(404, None, &a_failing_report(404), false),
             Exit::ErrorStatus
         );
         assert_eq!(
-            exit_for_response(404, &a_failing_report(404), true),
+            exit_for_response(404, None, &a_failing_report(404), true),
             Exit::Ok,
             "--allow-error-status still forgives the status, and nothing else"
         );
@@ -468,7 +543,7 @@ assertions:
         );
 
         assert_eq!(
-            exit_for_response(500, &report, false),
+            exit_for_response(500, None, &report, false),
             Exit::ErrorStatus,
             "a 500 the file expected is still a 500"
         );
@@ -480,8 +555,8 @@ assertions:
         for status in [200, 301, 404, 500] {
             for allow in [false, true] {
                 assert_eq!(
-                    exit_for_response(status, &AssertionReport::default(), allow),
-                    exit_for_response(status, &a_failing_report(status), allow),
+                    exit_for_response(status, None, &AssertionReport::default(), allow),
+                    exit_for_response(status, None, &a_failing_report(status), allow),
                     "assertions changed the exit code for {status} (allow_error_status={allow})"
                 );
             }
@@ -697,18 +772,38 @@ assertions:
         assert_eq!(Summary::of(&outcomes).exit(), Exit::Failure);
     }
 
-    #[test]
-    fn every_outcome_lands_in_exactly_one_category() {
-        // The four counts are a partition, not four overlapping questions, so
-        // the printed line always adds up.
-        let outcomes = vec![
-            all_passed(200),
-            some_failed(200),
+    /// One outcome of every shape the classifier can be handed: both check
+    /// mechanisms, each present or absent, each passing or failing, plus the
+    /// two shapes that have no checks at all.
+    ///
+    /// Built as a function rather than a constant so each test gets its own,
+    /// and kept in one place so that adding a third kind of check means adding
+    /// it here and watching both properties below still hold.
+    fn one_of_every_shape() -> Vec<Outcome> {
+        vec![
+            // Nothing checked.
             responded(200),
             responded(404),
             Outcome::NoResponse,
+            // Assertions only.
+            all_passed(200),
             all_passed(500),
-        ];
+            some_failed(200),
+            // Script only.
+            scripted(200, ScriptOutcome::Passed),
+            scripted(500, script_failed()),
+            // Both.
+            all_passed_with_script(200),
+        ]
+    }
+
+    #[test]
+    fn every_outcome_lands_in_exactly_one_category() {
+        // The four counts are a partition, not four overlapping questions, so
+        // the printed line always adds up — including for the shapes that carry
+        // a `post_request` script, which is the property a fifth category would
+        // have had to preserve too.
+        let outcomes = one_of_every_shape();
         let summary = Summary::of(&outcomes);
 
         assert_eq!(summary.total, outcomes.len());
@@ -722,12 +817,177 @@ assertions:
     #[test]
     fn the_summary_does_not_depend_on_the_order_of_the_requests() {
         // Same reasoning as `worst`: reordering a collection must not change
-        // whether a script proceeds.
+        // whether a script proceeds. Over every shape, in both directions.
+        let mut backwards = one_of_every_shape();
+        backwards.reverse();
+
+        let forwards = Summary::of(&one_of_every_shape());
+        let backwards = Summary::of(&backwards);
+
+        assert_eq!(forwards, backwards);
+        assert_eq!(forwards.exit(), backwards.exit());
+
+        // And the narrower original case, spelled out, so a change to the list
+        // above cannot quietly make this vacuous.
         let forwards = Summary::of(&[all_passed(200), some_failed(200), responded(200)]);
         let backwards = Summary::of(&[responded(200), some_failed(200), all_passed(200)]);
 
         assert_eq!(forwards, backwards);
         assert_eq!(forwards.exit(), backwards.exit());
+    }
+
+    // --- `post_request` scripts, and where a failed one lands ------------
+    //
+    // The decision these pin: a `post_request` script that throws is treated
+    // exactly as a failed assertion is — invisible to `run`'s exit code,
+    // counted in `test`'s `failed`, with no fifth `Summary` category. See the
+    // note on `Summary` for the argument.
+
+    #[test]
+    fn a_failed_script_does_not_change_the_exit_code_of_a_successful_response() {
+        // The same asymmetry assertions have, for the same reason: adding a
+        // `post_request:` block to a file must not silently change what
+        // `sendra run x && deploy.sh` means.
+        let failed = script_failed();
+        let exit = exit_for_response(200, Some(&failed), &AssertionReport::default(), false);
+
+        assert_eq!(exit, Exit::Ok);
+        assert_eq!(exit as u8, 0);
+    }
+
+    #[test]
+    fn a_failed_script_does_not_change_the_exit_code_of_an_error_response_either() {
+        let failed = script_failed();
+
+        assert_eq!(
+            exit_for_response(404, Some(&failed), &AssertionReport::default(), false),
+            Exit::ErrorStatus
+        );
+        assert_eq!(
+            exit_for_response(404, Some(&failed), &AssertionReport::default(), true),
+            Exit::Ok,
+            "--allow-error-status still forgives the status, and nothing else"
+        );
+    }
+
+    #[test]
+    fn the_exit_code_is_the_same_with_and_without_a_post_request_script() {
+        // The no-op guarantee for scripts, at the level that decides the
+        // process's answer — the same test the assertions block has.
+        let failed = script_failed();
+        let passed = ScriptOutcome::Passed;
+
+        for status in [200, 301, 404, 500] {
+            for allow in [false, true] {
+                let without = exit_for_response(status, None, &AssertionReport::default(), allow);
+
+                for script in [None, Some(&passed), Some(&failed)] {
+                    assert_eq!(
+                        without,
+                        exit_for_response(status, script, &AssertionReport::default(), allow),
+                        "a script changed the exit code for {status} (allow_error_status={allow})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_script_is_counted_in_failed_alongside_failed_assertions() {
+        // The categorisation decision itself: no fifth number, and a run with
+        // one of each has two failures rather than one of each of two kinds.
+        let outcomes = vec![scripted(500, script_failed()), some_failed(200)];
+
+        assert_eq!(
+            Summary::of(&outcomes),
+            Summary {
+                total: 2,
+                failed: 2,
+                ..Summary::default()
+            }
+        );
+        assert_eq!(Summary::of(&outcomes).exit(), Exit::TestFailed);
+        assert_eq!(Exit::TestFailed as u8, 4);
+    }
+
+    #[test]
+    fn a_passing_script_is_a_pass_even_with_no_assertions_block() {
+        // A request that declared a script *was* checked, so it is not one of
+        // the uncovered. Folding it into `without_assertions` would report a
+        // run whose every expectation was written as a script as a run in which
+        // nothing was checked.
+        let outcomes = vec![scripted(200, ScriptOutcome::Passed)];
+        let summary = Summary::of(&outcomes);
+
+        assert_eq!(
+            summary,
+            Summary {
+                total: 1,
+                passed: 1,
+                ..Summary::default()
+            }
+        );
+        assert_eq!(summary.without_assertions, 0, "a script is a check");
+        assert_eq!(summary.exit(), Exit::Ok);
+    }
+
+    #[test]
+    fn a_request_with_neither_mechanism_is_still_uncovered() {
+        // The other side of the line: `without_assertions` still means "nothing
+        // was checked at all", and only that.
+        let outcomes = vec![responded(200), scripted(200, ScriptOutcome::Passed)];
+
+        assert_eq!(
+            Summary::of(&outcomes),
+            Summary {
+                total: 2,
+                passed: 1,
+                without_assertions: 1,
+                ..Summary::default()
+            }
+        );
+    }
+
+    #[test]
+    fn either_mechanism_failing_fails_the_request() {
+        // The two are independent, so all four combinations have to behave, and
+        // a pass on one must not rescue a failure on the other.
+        let failing = a_failing_report(200);
+
+        let both_pass = Summary::of(&[all_passed_with_script(200)]);
+        assert_eq!(both_pass.passed, 1);
+        assert_eq!(both_pass.exit(), Exit::Ok);
+
+        // Script fails, assertions pass.
+        let Outcome::Responded { assertions, .. } = all_passed(200) else {
+            unreachable!()
+        };
+        let script_only = Outcome::Responded {
+            status: 200,
+            script: Some(script_failed()),
+            assertions,
+        };
+        assert_eq!(Summary::of(&[script_only]).failed, 1);
+
+        // Assertions fail, script passes.
+        let assertions_only = Outcome::Responded {
+            status: 200,
+            script: Some(ScriptOutcome::Passed),
+            assertions: failing,
+        };
+        assert_eq!(Summary::of(&[assertions_only]).failed, 1);
+    }
+
+    #[test]
+    fn a_script_failure_does_not_outrank_a_request_that_never_got_a_response() {
+        // Same ranking as a failed assertion, because it is the same tier:
+        // "the API was not what the file said" is less serious than "the tool
+        // could not do its job".
+        let outcomes = vec![scripted(200, script_failed()), Outcome::NoResponse];
+        assert_eq!(Summary::of(&outcomes).exit(), Exit::Failure);
+
+        let outcomes = vec![Outcome::NoResponse, scripted(200, script_failed())];
+        assert_eq!(Summary::of(&outcomes).exit(), Exit::Failure);
     }
 
     #[test]

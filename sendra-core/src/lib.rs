@@ -16,10 +16,12 @@ use crate::environment::{describe_environment, describe_variables};
 pub mod assertions;
 pub mod config;
 pub mod environment;
+pub mod script;
 
 pub use assertions::{AssertionKind, AssertionReport, AssertionResult, Assertions};
 pub use config::Config;
 pub use environment::Environment;
+pub use script::{Hook, Script, ScriptOutcome, Scripts};
 
 /// Every way loading or sending a request can fail.
 ///
@@ -159,6 +161,41 @@ pub enum SendraError {
         variable: String,
         environment: Option<PathBuf>,
     },
+
+    /// A `pre_request` or `post_request` script does not parse.
+    ///
+    /// Its own variant, separate from [`ScriptFailed`](Self::ScriptFailed),
+    /// because they are different problems for a user to fix — the same reason
+    /// config and environment each split IO from Parse. A script that does not
+    /// compile is a broken *file*: nothing about the request or the response
+    /// could have changed the outcome, and the fix is a syntax error at a
+    /// position Rhai names. Both hooks are compiled before the request is sent,
+    /// so this is always raised with nothing having gone over the wire.
+    #[error("could not compile the `{hook}` script")]
+    ScriptParse {
+        hook: script::Hook,
+        #[source]
+        source: rhai::ParseError,
+    },
+
+    /// A script compiled, ran, and threw — or hit a runtime error.
+    ///
+    /// Only ever produced for `pre_request`. A `post_request` script that fails
+    /// is a statement about a response that did arrive, so it comes back as
+    /// [`ScriptOutcome::Failed`](script::ScriptOutcome::Failed) rather than as
+    /// an error; see the note on that type.
+    #[error("the `{hook}` script failed: {message}")]
+    ScriptFailed { hook: script::Hook, message: String },
+
+    /// A `pre_request` script ran without throwing but left `request` in a
+    /// state that is not a request: an unknown field, a value of the wrong
+    /// type, or an assignment to the read-only `method`.
+    ///
+    /// Separate from [`ScriptFailed`](Self::ScriptFailed) because the script
+    /// did not fail — it succeeded at doing something Sendra cannot act on, and
+    /// the fix is a line of the script rather than whatever it was checking.
+    #[error("the `pre_request` script left the request in a state it cannot be sent in: {reason}")]
+    ScriptRequest { reason: String },
 }
 
 /// HTTP methods Sendra can send. Deliberately a closed set for now — an
@@ -252,6 +289,42 @@ pub struct Request {
     /// module docs on [`assertions`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assertions: Option<Assertions>,
+
+    /// A script run against this request just before it is sent, as inline
+    /// Rhai source.
+    ///
+    /// Written as a YAML block scalar, which is what a multiline script needs
+    /// and the reason the file format is YAML rather than JSON or TOML:
+    ///
+    /// ```text
+    /// pre_request: |
+    ///   request.headers["X-Request-Id"] = "abc-123";
+    /// ```
+    ///
+    /// It runs *after* environment substitution and *after* the config is
+    /// applied, as the final mutation step before the wire. **Its own source is
+    /// never substituted** — a `{{var}}` inside a script is just those
+    /// characters. See the [`script`] module for both decisions and for what
+    /// the script can see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_request: Option<String>,
+
+    /// A script run against the response, before assertions are evaluated.
+    ///
+    /// ```text
+    /// post_request: |
+    ///   if response.status != 201 {
+    ///     throw "expected 201, got " + response.status;
+    ///   }
+    /// ```
+    ///
+    /// `throw` is how it reports a failure. Like an assertion, that failure is
+    /// visible in the output and decides `sendra test`'s verdict without
+    /// changing `sendra run`'s exit code. Compiled before the request is sent,
+    /// so a syntax error here stops the request rather than being discovered
+    /// after it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_request: Option<String>,
 }
 
 impl Request {
@@ -484,16 +557,39 @@ impl Response {
 /// waits for, not just time-to-first-byte.
 ///
 /// `config` is a parameter rather than something resolved in here, and is not
-/// optional, so that there is exactly one way to send a request and it is the
-/// one that applies configuration. Callers with nothing to apply pass
+/// optional, so that a caller cannot send a request without deciding what
+/// configuration applies to it. Callers with nothing to apply pass
 /// [`Config::default`], which is the same defaults resolution falls back to. It
 /// contributes two things: default headers, merged by [`Config::apply`] with
 /// the request winning ties, and the timeout the client is built with.
+///
+/// This is the whole pipeline in one call, for a caller that has no reason to
+/// step between the two halves. A caller that does — one running a
+/// `pre_request` script, which by definition is the *last* thing to touch the
+/// request — applies the config itself and calls [`send_prepared`]. That is the
+/// only reason the seam exists; see there.
 pub async fn send(request: &Request, config: &Config) -> Result<Response, SendraError> {
     // Everything below works from the merged request, so a config header is
     // validated and sent exactly like one written in the file.
-    let request = &config.apply(request);
+    send_prepared(&config.apply(request), config).await
+}
 
+/// Send a request that is already exactly what should go over the wire.
+///
+/// Identical to [`send`] except that [`Config::apply`] is the caller's job and
+/// has already happened: `config` is read here only for the timeout the client
+/// is built with.
+///
+/// It exists because of `pre_request`. The ordering the scripting feature is
+/// built on puts the script strictly after the config and strictly before the
+/// wire, and a script's most obvious use — *removing* a header the config
+/// injected — only works if nothing re-merges the config afterwards. So the
+/// seam has to be somewhere, and here it is named, still takes the `&Config` it
+/// needs, and says in its own signature that configuration is not its problem
+/// because it has already been handled.
+///
+/// Prefer [`send`] unless there is something to do in between.
+pub async fn send_prepared(request: &Request, config: &Config) -> Result<Response, SendraError> {
     let mut headers = reqwest::header::HeaderMap::new();
     for (name, value) in &request.headers {
         let header_name = reqwest::header::HeaderName::try_from(name.as_str()).map_err(|e| {
@@ -589,6 +685,8 @@ body: null
                 headers: expected_headers,
                 body: None,
                 assertions: None,
+                pre_request: None,
+                post_request: None,
             }
         );
     }
@@ -892,6 +990,8 @@ enviroment: staging
             headers: BTreeMap::from([("bad header".to_string(), "x".to_string())]),
             body: None,
             assertions: None,
+            pre_request: None,
+            post_request: None,
         };
         let err = send(&request, &Config::default())
             .await
@@ -914,6 +1014,8 @@ enviroment: staging
             headers: BTreeMap::new(),
             body: None,
             assertions: None,
+            pre_request: None,
+            post_request: None,
         };
         let config = Config {
             headers: BTreeMap::from([("bad header".to_string(), "x".to_string())]),

@@ -340,6 +340,8 @@ mod tests {
                 .collect(),
             body: None,
             assertions: None,
+            pre_request: None,
+            post_request: None,
         }
     }
 
@@ -625,11 +627,22 @@ mod tests {
             headers: BTreeMap::new(),
             body: Some("{}".to_string()),
             // Config merges headers and nothing else; assertions are checked
-            // against the response, which a default header cannot change.
+            // against the response, which a default header cannot change, and
+            // scripts run later still — the config has finished by then.
             assertions: Some(crate::Assertions {
                 status: Some(200),
                 ..crate::Assertions::default()
             }),
+            pre_request: Some(
+                "request.url = request.url;
+"
+                .to_string(),
+            ),
+            post_request: Some(
+                "// nothing
+"
+                .to_string(),
+            ),
         };
 
         let applied = config.apply(&request);
@@ -638,6 +651,8 @@ mod tests {
         assert_eq!(applied.method, request.method);
         assert_eq!(applied.url, request.url);
         assert_eq!(applied.body, request.body);
+        assert_eq!(applied.pre_request, request.pre_request);
+        assert_eq!(applied.post_request, request.post_request);
         assert_eq!(applied.assertions, request.assertions);
     }
 

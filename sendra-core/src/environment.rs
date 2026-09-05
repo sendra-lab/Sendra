@@ -228,6 +228,19 @@ impl Environment {
                 .as_ref()
                 .map(|assertions| self.apply_assertions(assertions))
                 .transpose()?,
+            // **Script source is not substituted**, and this is the line that
+            // says so. A `{{var}}` inside a script stays those five characters.
+            //
+            // Substitution is textual, and the reason it is confined to values
+            // is that a value must never be able to change the structure of the
+            // document around it. A script is not a value, it is *code*: the
+            // failure mode is not a malformed URL but a variable's contents
+            // being parsed as program text, which is the same problem one level
+            // worse. A script that needs an environment value reads it off the
+            // request it is handed, which arrives fully substituted by the time
+            // it runs.
+            pre_request: request.pre_request.clone(),
+            post_request: request.post_request.clone(),
         })
     }
 
@@ -629,6 +642,59 @@ assertions:
             assertions.json["$.nested"],
             serde_json::json!({"tenant": "acme", "tags": ["acme", "literal"]})
         );
+    }
+
+    #[test]
+    fn script_source_is_not_substituted() {
+        // The other line, one step further out than `assertion_keys_are_not_
+        // substituted`: an environment changes *values*, and a script is not a
+        // value, it is code. `{{secret}}` and `${SECRET}` inside a script are
+        // five and nine characters of Rhai source, not a placeholder.
+        //
+        // The reasoning is the one that made substitution value-only in the
+        // first place, one level worse: a value that could rewrite the document
+        // around it is a bug, and a value that could rewrite a *program* is the
+        // same bug where the document is executable. A script that needs an
+        // environment value reads it off the request it is handed, which by
+        // then has been fully substituted.
+        let request = Request::from_yaml_str(
+            "\
+method: GET
+url: 'https://example.com/{{tenant}}'
+pre_request: |
+  request.headers[\"X-Tenant\"] = \"{{tenant}}\";
+  request.headers[\"X-Secret\"] = \"${SECRET}\";
+post_request: |
+  if response.body != \"{{tenant}}\" { throw \"{{tenant}}\"; }
+",
+        )
+        .unwrap();
+        let environment = environment(&[("tenant", "acme")], &[]);
+
+        let applied = environment.apply(&request).unwrap();
+
+        // The url was substituted, so the environment is live and this is not
+        // passing by accident.
+        assert_eq!(applied.url, "https://example.com/acme");
+
+        // Both scripts came through byte for byte.
+        assert_eq!(applied.pre_request, request.pre_request);
+        assert_eq!(applied.post_request, request.post_request);
+
+        // `${SECRET}` is the case that would be loudest if this ever changed:
+        // nothing exports it, so a substituted script would have failed the
+        // whole request with `EnvVarNotSet` rather than quietly meaning
+        // something else.
+        assert!(applied
+            .pre_request
+            .as_deref()
+            .unwrap()
+            .contains("${SECRET}"));
+        assert!(applied
+            .pre_request
+            .as_deref()
+            .unwrap()
+            .contains("{{tenant}}"));
     }
 
     #[test]

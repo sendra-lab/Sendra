@@ -9,16 +9,18 @@ use std::cell::RefCell;
 use std::io::Write;
 
 use owo_colors::{OwoColorize, Stream};
-use sendra_core::{AssertionReport, Response, SendraError};
+use sendra_core::{AssertionReport, Response, ScriptOutcome, SendraError};
 
 use crate::exit::Summary;
 
 use self::errors::print_error_line;
 use self::human::{
-    print_assertions, print_no_assertions, print_response, print_status_line, print_summary,
+    print_assertions, print_no_assertions, print_post_request, print_response, print_status_line,
+    print_summary,
 };
 use self::json::{
-    error_message, AssertionsRecord, RequestRecord, ResponseRecord, RunDocument, SummaryRecord,
+    error_message, AssertionsRecord, PostRequestRecord, RequestRecord, ResponseRecord, RunDocument,
+    SummaryRecord,
 };
 
 pub(crate) use self::errors::{print_environment_error, print_error, reject_allow_error_status};
@@ -146,12 +148,22 @@ impl Reporter {
         }
     }
 
-    /// A request came back. `assertions` is its report, empty when the request
-    /// declared none.
-    pub(crate) fn responded(&self, response: &Response, assertions: &AssertionReport) {
+    /// A request came back.
+    ///
+    /// `script` is what its `post_request` script decided, or `None` when it
+    /// declared no script; `assertions` is its report, empty when it declared
+    /// none. Both are printed under the response, script first, because that is
+    /// the order they ran in.
+    pub(crate) fn responded(
+        &self,
+        response: &Response,
+        script: Option<&ScriptOutcome>,
+        assertions: &AssertionReport,
+    ) {
         if self.recording() {
             self.with_current(|record| {
                 record.response = Some(ResponseRecord::from(response));
+                record.post_request = script.map(PostRequestRecord::from);
                 record.assertions = AssertionsRecord::from(assertions);
             });
             return;
@@ -162,11 +174,21 @@ impl Reporter {
             Detail::StatusOnly => print_status_line(response),
         }
 
-        if assertions.is_empty() && self.detail == Detail::StatusOnly {
+        // Nothing at all when the request declared no script, so a file written
+        // before this feature existed still prints what it always printed.
+        if let Some(script) = script {
+            print_post_request(script);
+        }
+
+        if assertions.is_empty() && script.is_none() && self.detail == Detail::StatusOnly {
             // `run` says nothing here, and must keep saying nothing. Under
             // `test` the silence is the problem: the summary is about to count
             // this request as one of N "without assertions", and without a
             // marker there is nothing to match that number against.
+            //
+            // A request with a `post_request` script is not one of those: it
+            // was checked, the block above says so, and the summary counts it
+            // as a pass or a failure.
             print_no_assertions();
         } else {
             print_assertions(assertions);
@@ -260,6 +282,8 @@ impl Reporter {
 mod tests {
     use super::*;
 
+    use sendra_core::ScriptOutcome;
+
     use crate::test_support::{assertions_from, response_with};
 
     /// The document the reporter would have written to stdout, parsed back.
@@ -289,7 +313,7 @@ mod tests {
         let assertions =
             assertions_from("method: GET\nurl: https://example.com\nassertions:\n  status: 404\n")
                 .evaluate(&response);
-        reporter.responded(&response, &assertions);
+        reporter.responded(&response, None, &assertions);
 
         let document = document(&reporter, None);
 
@@ -362,7 +386,7 @@ mod tests {
             "method: GET\nurl: https://example.com\nassertions:\n  status: 200\n  json:\n    $.id: 1\n",
         )
         .evaluate(&response);
-        reporter.responded(&response, &assertions);
+        reporter.responded(&response, None, &assertions);
 
         let assertions = &document(&reporter, None)["requests"][0]["assertions"];
 
@@ -386,6 +410,7 @@ mod tests {
             reporter.request_started(label);
             reporter.responded(
                 &response_with("text/plain", "ok"),
+                None,
                 &AssertionReport::default(),
             );
         }
@@ -407,7 +432,7 @@ mod tests {
 
         reporter.request_started("Get user");
         let response = response_with("application/json", r#"{"id":1}"#);
-        reporter.responded(&response, &AssertionReport::default());
+        reporter.responded(&response, None, &AssertionReport::default());
 
         let summary = Summary {
             total: 3,
@@ -436,6 +461,85 @@ mod tests {
         assert_eq!(document["summary"]["no_response"], 1);
     }
 
+    // --- `post_request` in the document ----------------------------------
+
+    #[test]
+    fn a_request_with_no_script_reports_a_null_post_request() {
+        // The no-op guarantee in the schema: a file written before scripts
+        // existed produces the document it always produced, plus one key that
+        // is explicitly null rather than absent — so a consumer can read
+        // `.post_request` on every request without checking whether this build
+        // emits the key.
+        let reporter = Reporter::new(Format::Json, Detail::Full);
+
+        reporter.request_started("Get user");
+        reporter.responded(
+            &response_with("text/plain", "ok"),
+            None,
+            &AssertionReport::default(),
+        );
+
+        let request = &document(&reporter, None)["requests"][0];
+        assert_eq!(request["post_request"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_passing_script_reports_a_null_failure() {
+        // Same pair, in the same spelling, as a passing assertion result.
+        let reporter = Reporter::new(Format::Json, Detail::Full);
+
+        reporter.request_started("Create order");
+        reporter.responded(
+            &response_with("application/json", r#"{"id":1}"#),
+            Some(&ScriptOutcome::Passed),
+            &AssertionReport::default(),
+        );
+
+        let script = &document(&reporter, None)["requests"][0]["post_request"];
+        assert_eq!(script["passed"], true);
+        assert_eq!(script["failure"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_failed_script_carries_the_message_it_threw() {
+        let reporter = Reporter::new(Format::Json, Detail::Full);
+
+        reporter.request_started("Create order");
+        reporter.responded(
+            &response_with("application/json", "{}"),
+            Some(&ScriptOutcome::Failed {
+                message: "expected 201, got 500".to_string(),
+            }),
+            &AssertionReport::default(),
+        );
+
+        let request = &document(&reporter, None)["requests"][0];
+        assert_eq!(request["post_request"]["passed"], false);
+        // Core's own wording, verbatim — the same string the terminal shows.
+        assert_eq!(request["post_request"]["failure"], "expected 201, got 500");
+        // And the two mechanisms stay separate in the document as they do in
+        // the run: a failed script does not invent a failed assertion.
+        assert_eq!(request["assertions"]["total"], 0);
+        assert_eq!(request["assertions"]["failed"], 0);
+    }
+
+    #[test]
+    fn a_script_and_assertions_are_reported_side_by_side() {
+        let reporter = Reporter::new(Format::Json, Detail::StatusOnly);
+
+        reporter.request_started("Create order");
+        let response = response_with("application/json", r#"{"id":1}"#);
+        let assertions =
+            assertions_from("method: GET\nurl: https://example.com\nassertions:\n  status: 200\n")
+                .evaluate(&response);
+        reporter.responded(&response, Some(&ScriptOutcome::Passed), &assertions);
+
+        let request = &document(&reporter, None)["requests"][0];
+        assert_eq!(request["post_request"]["passed"], true);
+        assert_eq!(request["assertions"]["total"], 1);
+        assert_eq!(request["assertions"]["passed"], 1);
+    }
+
     #[test]
     fn a_run_that_sent_nothing_is_still_a_document() {
         // Nothing reaches this today — an empty collection is refused when the
@@ -460,6 +564,7 @@ mod tests {
         reporter.request_started("Get user");
         reporter.responded(
             &response_with("text/plain", "ok"),
+            None,
             &AssertionReport::default(),
         );
 
