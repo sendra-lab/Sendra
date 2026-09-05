@@ -1,0 +1,59 @@
+# A collection built for `sendra test`, with one request of every kind the
+# summary counts:
+#
+#   sendra test examples/test-collection.yaml
+#
+#   summary
+#     4 requests: 2 passed, 1 failed, 1 without assertions
+#
+# It exits 4 — "every request got a response, but at least one had a failing
+# assertion" — because of `Wrong expectation` alone. `Unasserted 404` comes back
+# 404 and does not affect the exit code: it declares no assertions, so there is
+# nothing for it to have failed. `sendra run` on the same file exits 3, for that
+# 404 and for nothing else. Two commands, two questions, two answers.
+name: Test tour
+requests:
+  # Passes: everything asserted is true of the response.
+  - name: Status and body
+    method: GET
+    url: https://httpbin.org/get
+    headers:
+      Accept: application/json
+    assertions:
+      status: 200
+      headers:
+        content-type: application/json
+      body_contains: '"url"'
+      json:
+        $.url: https://httpbin.org/get
+
+  # Fails: httpbin echoes the body back, and this asks for a value that is not
+  # the one that was sent. The `✗` line names both halves.
+  - name: Wrong expectation
+    method: POST
+    url: https://httpbin.org/post
+    headers:
+      Accept: application/json
+      Content-Type: application/json
+    body: |
+      {"project": "sendra", "stage": "test"}
+    assertions:
+      status: 200
+      json:
+        $.json.project: sendra
+        $.json.stage: collections # fails: the body above says `test`
+
+  # Neither: no `assertions` block, and a 404 to make the point that a status
+  # nobody asserted does not fail a test run. Prints `no assertions` under its
+  # status line, and is counted on its own in the summary.
+  - name: Unasserted 404
+    method: GET
+    url: https://httpbin.org/status/404
+
+  # Passes, and asserts an error status on purpose — the status is not ignored
+  # by `test`, it is only ever read through an assertion.
+  - name: Expected 500
+    method: GET
+    url: https://httpbin.org/status/500
+    assertions:
+      status: 500
