@@ -32,11 +32,13 @@ async fn main() -> ExitCode {
             request,
             env,
             allow_error_status,
+            json,
         } => run(
             &path,
             request.as_deref(),
             env.as_deref(),
             allow_error_status,
+            json,
         )
         .await
         .into(),
@@ -44,12 +46,13 @@ async fn main() -> ExitCode {
         Command::Test {
             path,
             env,
+            json,
             allow_error_status,
         } => {
             if allow_error_status {
                 reject_allow_error_status();
             }
-            test(&path, env.as_deref()).await.into()
+            test(&path, env.as_deref(), json).await.into()
         }
     }
 }
