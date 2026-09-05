@@ -127,7 +127,7 @@ fn exit_for_response(status: u16, assertions: &AssertionReport, allow_error_stat
 /// relative order is a convention rather than an observable. It is set the way
 /// it is because if they ever did meet, the explicit failed expectation is the
 /// more informative answer than the status nobody wrote down.
-fn worst(a: Exit, b: Exit) -> Exit {
+pub(crate) fn worst(a: Exit, b: Exit) -> Exit {
     // Rank by severity, not by the exit numbers: 3 (ErrorStatus) and 4
     // (TestFailed) are the milder outcomes, so the numeric order is the wrong
     // order.
@@ -155,6 +155,8 @@ fn worst(a: Exit, b: Exit) -> Exit {
 /// for `test`. Keeping the shared loop's output a fact rather than an exit code
 /// is what let the two commands share it at all: `test` needs to know *why* a
 /// request contributed a failure, and an `Exit` has already thrown that away.
+///
+/// [`run_requests`]: crate::run::run_requests
 #[derive(Debug)]
 pub(crate) enum Outcome {
     /// The request never got a response: a `{{variable}}` with nothing behind

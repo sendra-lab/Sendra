@@ -316,7 +316,9 @@ fn environment_for(
 /// loop — which is the whole of "one request failing does not stop the rest" —
 /// can be tested without a network, the way config resolution takes its
 /// directories as arguments instead of reading the real ones.
-async fn run_requests<S, F>(
+///
+/// [`worst`]: crate::exit::worst
+pub(crate) async fn run_requests<S, F>(
     requests: &[&Request],
     environment: &Environment,
     mut send_one: S,
