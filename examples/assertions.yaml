@@ -1,0 +1,38 @@
+# Declarative checks on the response, printed under it when the request runs:
+#
+#   sendra run examples/assertions.yaml
+#
+# Everything under `assertions` is optional, and a request without the block
+# behaves exactly as it did before assertions existed.
+#
+# The last assertion in each of the two lists below is meant to fail — `origin`
+# is whatever IP httpbin sees you from, and httpbin sends no `x-request-id` —
+# so one run shows both halves of the output. The run still exits 0: `sendra
+# run` reports assertions, it does not fail on them. That is `sendra test`.
+name: Assertions against httpbin
+method: GET
+url: https://httpbin.org/get
+headers:
+  Accept: application/json
+  X-Sendra-Example: assertions
+assertions:
+  # The exact status code, not a class.
+  status: 200
+
+  # A value asserts presence *and* an exact match; a null value asserts only
+  # that the header is there. Names are matched case-insensitively.
+  headers:
+    content-type: application/json
+    access-control-allow-origin: "*"
+    x-request-id: # fails: httpbin does not send one
+
+  # A plain substring of the body, matched case-sensitively.
+  body_contains: '"url"'
+
+  # JSON path to the value it must select. The path must select exactly one
+  # value; a body that is not JSON fails every path here with a message saying
+  # so, rather than stopping the run.
+  json:
+    $.url: https://httpbin.org/get
+    $.headers.Accept: application/json
+    $.origin: 203.0.113.1 # fails: whatever IP you are calling from

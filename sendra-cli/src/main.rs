@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use owo_colors::{OwoColorize, Stream};
 use sendra_core::environment::{environment_path, find_environment, DEFAULT_ENVIRONMENT_NAME};
-use sendra_core::{Config, Document, Environment, Request, Response, SendraError};
+use sendra_core::{AssertionReport, Config, Document, Environment, Request, Response, SendraError};
 
 /// Sendra's exit-code convention, in one place.
 ///
@@ -34,6 +34,15 @@ use sendra_core::{Config, Document, Environment, Request, Response, SendraError}
 /// status". Every exit path in the binary returns one of these variants rather
 /// than calling `std::process::exit` inline, so adding a code later means
 /// adding a row here and nothing else.
+///
+/// **A failed assertion is not in this table.** `sendra run` prints assertion
+/// results and ignores them when deciding what to return, so a run can report
+/// "1 failed" and still exit `0`. That is deliberate and temporary: `run` sends
+/// requests and reports what came back, and `sendra test` is the command whose
+/// job is to pass or fail on expectations. Wiring assertions into `run`'s exit
+/// code would silently change what every existing `sendra run x && deploy.sh`
+/// means the moment an `assertions` block is added to a file. See
+/// [`exit_for_response`], which is the single place that decision lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Exit {
     Ok = 0,
@@ -63,6 +72,24 @@ fn exit_for_status(status: u16, allow_error_status: bool) -> Exit {
     } else {
         Exit::ErrorStatus
     }
+}
+
+/// The outcome of a request that came back, assertions included — which is to
+/// say, assertions *excluded*.
+///
+/// This exists rather than calling [`exit_for_status`] directly at the call
+/// site so that "assertions do not affect the exit code" is a stated decision
+/// with a test on it, in one place, instead of an absence nobody can point at.
+/// `sendra test` is where the report starts counting; when it lands, this
+/// function is what it changes.
+fn exit_for_response(
+    response: &Response,
+    assertions: &AssertionReport,
+    allow_error_status: bool,
+) -> Exit {
+    // Read and deliberately discarded: see above, and the `Exit` table.
+    let _ = assertions;
+    exit_for_status(response.status, allow_error_status)
 }
 
 /// Fold the outcomes of several requests into the single code the process can
@@ -426,11 +453,26 @@ where
 ///
 /// The request arrives already substituted, and the `→` label has already been
 /// printed by [`run_requests`].
+///
+/// Assertions are evaluated here, against the response this request got, and
+/// printed under it — so in a collection run each block of results sits with
+/// the response it is about, rather than in a summary at the end that would
+/// have to name every request again. Aggregate reporting over a whole
+/// collection is `sendra test`'s job.
 async fn send(request: &Request, config: &Config, allow_error_status: bool) -> Exit {
     match sendra_core::send(request, config).await {
         Ok(response) => {
             print_response(&response);
-            exit_for_status(response.status, allow_error_status)
+            // No `assertions` block is the empty report, which prints nothing:
+            // a request written before this feature existed looks exactly as it
+            // did before it existed.
+            let assertions = request
+                .assertions
+                .as_ref()
+                .map(|assertions| assertions.evaluate(&response))
+                .unwrap_or_default();
+            print_assertions(&assertions);
+            exit_for_response(&response, &assertions, allow_error_status)
         }
         Err(err) => {
             print_error(&err);
@@ -473,6 +515,87 @@ fn print_response(response: &Response) {
     if !response.body.is_empty() {
         println!();
         println!("{}", response.body);
+    }
+}
+
+/// Print one request's assertion results under its response.
+///
+/// ```text
+/// assertions
+///   ✓ status is 200
+///   ✓ header `content-type` is `application/json`
+///   ✗ body contains `widget` — not found in the 429-byte body
+///   ✗ `$.json.count` is 3 — got 2
+///   2 passed, 2 failed
+/// ```
+///
+/// Green for a `✓` and for the pass count, red for a `✗`, its detail and the
+/// fail count.
+///
+/// An empty report prints nothing at all, so a request with no `assertions`
+/// block produces byte-for-byte the output it did before assertions existed.
+///
+/// This goes to stdout, with the response rather than with the `→` label on
+/// stderr: an assertion result is a statement *about the response*, produced
+/// only because the file asked for it, and belongs next to the thing it
+/// describes. The indented block under a dimmed `assertions` heading is what
+/// keeps it apart from the raw body above it — a body can end in anything,
+/// including a line that looks like a checkmark, so the separation is carried
+/// by a blank line and a heading rather than by the symbols alone.
+///
+/// The wording of each line comes from core, so a future TUI reports the same
+/// failure in the same words. Only the symbols, colour and layout are decided
+/// here.
+fn print_assertions(report: &AssertionReport) {
+    if report.is_empty() {
+        return;
+    }
+
+    println!();
+    println!(
+        "{}",
+        "assertions".if_supports_color(Stream::Stdout, |t| t.dimmed())
+    );
+
+    for result in report.results() {
+        match &result.failure {
+            None => println!(
+                "  {} {}",
+                "✓".if_supports_color(Stream::Stdout, |t| t.green()),
+                result.expectation
+            ),
+            // The detail is on the same line as the expectation it belongs to:
+            // "what I asked for" and "what I got" are one sentence, and reading
+            // them together is the whole reason the detail exists.
+            Some(detail) => println!(
+                "  {} {} {} {}",
+                "✗".if_supports_color(Stream::Stdout, |t| t.red()),
+                result.expectation,
+                "—".if_supports_color(Stream::Stdout, |t| t.dimmed()),
+                detail.if_supports_color(Stream::Stdout, |t| t.red())
+            ),
+        }
+    }
+
+    // A count line even for a single assertion: it is the one line worth
+    // grepping for, and a summary that appears only sometimes is worse to
+    // script against than one that is always there.
+    //
+    // Each half is coloured like the symbol it counts — green for the passes,
+    // red for the failures — rather than the line taking one colour from
+    // whether anything failed. Colouring the whole line red made "4 passed"
+    // read as bad news.
+    let passed = format!("{} passed", report.passed_count())
+        .if_supports_color(Stream::Stdout, |t| t.green())
+        .to_string();
+
+    if report.passed() {
+        println!("  {passed}");
+    } else {
+        let failed = format!("{} failed", report.failed_count())
+            .if_supports_color(Stream::Stdout, |t| t.red())
+            .to_string();
+        println!("  {passed}, {failed}");
     }
 }
 
@@ -988,6 +1111,172 @@ requests:
                 "https://staging.example/health",
                 "https://prod.example/health"
             ]
+        );
+    }
+
+    // --- assertions do not touch the exit code ---------------------------
+    //
+    // The non-goal of the issue that added assertions, tested rather than
+    // assumed. `sendra run` reports what came back; `sendra test` will be the
+    // command that passes or fails on expectations.
+
+    /// A response to hand [`exit_for_response`]. Built by hand: none of these
+    /// tests need a socket, and the field values other than `status` never
+    /// enter into the decision.
+    fn response(status: u16) -> Response {
+        Response {
+            status,
+            status_text: "Test".to_string(),
+            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            body: "body".to_string(),
+            elapsed: std::time::Duration::from_millis(1),
+        }
+    }
+
+    /// The `assertions` block of a request file, parsed the way a real run
+    /// parses it — through `Document`, rather than by reaching for a YAML
+    /// dependency this crate does not otherwise need.
+    fn assertions_from(yaml: &str) -> sendra_core::Assertions {
+        Document::from_yaml_str(yaml)
+            .expect("the test request should parse")
+            .requests()[0]
+            .assertions
+            .clone()
+            .expect("the test request has an assertions block")
+    }
+
+    /// A report in which everything that could fail, did.
+    fn a_failing_report(status: u16) -> AssertionReport {
+        let report = assertions_from(
+            "\
+method: GET
+url: https://example.com
+assertions:
+  status: 599
+  headers:
+    x-nope: whatever
+  body_contains: definitely-not-in-the-body
+  json:
+    $.nope: 1
+",
+        )
+        .evaluate(&response(status));
+
+        assert_eq!(report.failed_count(), 4, "all four should have failed");
+        report
+    }
+
+    #[test]
+    fn failing_assertions_do_not_change_the_exit_code_of_a_successful_response() {
+        // The intentional, temporary asymmetry: four failed assertions printed,
+        // exit 0 all the same.
+        let exit = exit_for_response(&response(200), &a_failing_report(200), false);
+        assert_eq!(exit, Exit::Ok);
+        assert_eq!(exit as u8, 0);
+    }
+
+    #[test]
+    fn failing_assertions_do_not_change_the_exit_code_of_an_error_response() {
+        // Nor do they promote a 404 to something else, or rescue it: the status
+        // is still the only thing being read.
+        assert_eq!(
+            exit_for_response(&response(404), &a_failing_report(404), false),
+            Exit::ErrorStatus
+        );
+        assert_eq!(
+            exit_for_response(&response(404), &a_failing_report(404), true),
+            Exit::Ok,
+            "--allow-error-status still forgives the status, and nothing else"
+        );
+    }
+
+    #[test]
+    fn passing_assertions_do_not_rescue_an_error_status_either() {
+        let report =
+            assertions_from("method: GET\nurl: https://example.com\nassertions:\n  status: 500\n")
+                .evaluate(&response(500));
+        assert!(
+            report.passed(),
+            "the assertion asked for exactly this status"
+        );
+
+        assert_eq!(
+            exit_for_response(&response(500), &report, false),
+            Exit::ErrorStatus,
+            "a 500 the file expected is still a 500"
+        );
+    }
+
+    #[test]
+    fn the_exit_code_is_the_same_with_and_without_an_assertions_block() {
+        // The no-op guarantee, at the level that decides the process's answer.
+        for status in [200, 301, 404, 500] {
+            for allow in [false, true] {
+                assert_eq!(
+                    exit_for_response(&response(status), &AssertionReport::default(), allow),
+                    exit_for_response(&response(status), &a_failing_report(status), allow),
+                    "assertions changed the exit code for {status} (allow_error_status={allow})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_assertions_block_parses_and_runs_unchanged() {
+        // A file written before assertions existed: it still parses, still
+        // carries no assertions, and still runs to exit 0.
+        let document =
+            Document::from_yaml_str("name: Plain\nmethod: GET\nurl: '{{base_url}}/plain'\n")
+                .unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+        assert!(requests[0].assertions.is_none());
+
+        let mut sent = Vec::new();
+        let exit = run_requests(&requests, &environment(), |request| {
+            assert!(
+                request.assertions.is_none(),
+                "substitution must not invent a block"
+            );
+            sent.push(request.url.clone());
+            async { Exit::Ok }
+        })
+        .await;
+
+        assert_eq!(sent, vec!["https://example.com/plain"]);
+        assert_eq!(exit, Exit::Ok);
+    }
+
+    #[tokio::test]
+    async fn an_assertions_block_reaches_the_send_step_substituted() {
+        // End to end minus the socket: the block survives the run loop, with
+        // its values resolved against the environment.
+        let document = Document::from_yaml_str(
+            "\
+name: Checked
+method: GET
+url: '{{base_url}}/thing'
+assertions:
+  status: 200
+  body_contains: '{{base_url}}'
+",
+        )
+        .unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+
+        let mut seen = Vec::new();
+        let exit = run_requests(&requests, &environment(), |request| {
+            seen.push(request.assertions.clone());
+            async { Exit::Ok }
+        })
+        .await;
+
+        assert_eq!(exit, Exit::Ok);
+        let assertions = seen.pop().flatten().expect("the block reached `send`");
+        assert_eq!(assertions.status, Some(200));
+        assert_eq!(
+            assertions.body_contains.as_deref(),
+            Some("https://example.com"),
+            "assertion values are substituted like everything else"
         );
     }
 

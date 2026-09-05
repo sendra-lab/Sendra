@@ -339,6 +339,7 @@ mod tests {
                 .map(|(name, value)| (name.to_string(), value.to_string()))
                 .collect(),
             body: None,
+            assertions: None,
         }
     }
 
@@ -623,6 +624,12 @@ mod tests {
             url: "https://example.com/things".to_string(),
             headers: BTreeMap::new(),
             body: Some("{}".to_string()),
+            // Config merges headers and nothing else; assertions are checked
+            // against the response, which a default header cannot change.
+            assertions: Some(crate::Assertions {
+                status: Some(200),
+                ..crate::Assertions::default()
+            }),
         };
 
         let applied = config.apply(&request);
@@ -631,6 +638,7 @@ mod tests {
         assert_eq!(applied.method, request.method);
         assert_eq!(applied.url, request.url);
         assert_eq!(applied.body, request.body);
+        assert_eq!(applied.assertions, request.assertions);
     }
 
     #[test]
