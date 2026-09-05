@@ -11,14 +11,16 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::environment::{describe_environment, describe_variables};
+use crate::environment::{describe_captured, describe_environment, describe_variables};
 
 pub mod assertions;
+pub mod capture;
 pub mod config;
 pub mod environment;
 pub mod script;
 
 pub use assertions::{AssertionKind, AssertionReport, AssertionResult, Assertions};
+pub use capture::{CaptureFailure, CaptureReport, CaptureResult, Captures};
 pub use config::Config;
 pub use environment::Environment;
 pub use script::{Hook, Script, ScriptOutcome, ScriptOutput, Scripts};
@@ -135,13 +137,27 @@ pub enum SendraError {
     /// way [`RequestNotFound`](Self::RequestNotFound) carries the request names
     /// a collection does have. Raised while the request is being built, so it
     /// happens before anything goes over the wire.
-    #[error("no variable named `{name}` in {}", describe_variables(.environment, .available))]
+    #[error(
+        "no variable named `{name}` in {}{}",
+        describe_variables(.environment, .available),
+        describe_captured(.captured)
+    )]
     VariableNotFound {
         name: String,
         available: Vec<String>,
         /// The environment file the variable was looked for in, or `None` when
         /// no environment file was found at all.
         environment: Option<PathBuf>,
+        /// The names captured by earlier requests in this run, which are looked
+        /// up alongside the file's own and so belong in the same message.
+        ///
+        /// Listed separately from `available` rather than merged into it
+        /// because they did not come from the file the message names, and a
+        /// list that claimed they did would send the reader to edit a file that
+        /// has never mentioned them. Empty for a single request, and for every
+        /// run of a collection that captures nothing — in which case the
+        /// message is exactly the one it has always been.
+        captured: Vec<String>,
     },
 
     /// An environment file value is `${VAR}` and `VAR` is not in the OS
@@ -325,6 +341,31 @@ pub struct Request {
     /// after it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_request: Option<String>,
+
+    /// Values to pull out of the response and hand to the requests after this
+    /// one, as variable name to JSON path:
+    ///
+    /// ```text
+    /// capture:
+    ///   auth_token: $.token
+    ///   user_id: $.user.id
+    /// ```
+    ///
+    /// Each name becomes usable as `{{name}}` in every request *after* this one
+    /// in file order, within the same `sendra run` or `sendra test`
+    /// invocation — nothing is written to disk and a fresh process starts with
+    /// nothing captured.
+    ///
+    /// `None` — no `capture:` key at all — is kept distinct from an empty
+    /// block on the way back out to YAML, the same way an `assertions` block
+    /// is. Neither changes how this request is sent: a capture is read after
+    /// the response, never before it. See the [`capture`] module for what a
+    /// path may select and for what happens when one does not match.
+    ///
+    /// **The block is not substituted.** A `{{var}}` in a capture path or name
+    /// stays those characters; see [`Environment::apply`](crate::Environment::apply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<Captures>,
 }
 
 impl Request {
@@ -460,6 +501,13 @@ impl Collection {
 /// failure into "data did not match any variant" with no position; picking the
 /// target first and then deserializing the original text keeps serde's real
 /// error message, line and column included.
+///
+/// The `Single` variant is not boxed, though it is several times the size of
+/// `Collection`. A `Document` is built once per invocation and read from where
+/// it sits — the requests are borrowed out of it, never moved through it — so
+/// the indirection would buy nothing and would cost every caller a deref to
+/// reach a request that is right there.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Document {
     Single(Request),
@@ -687,6 +735,7 @@ body: null
                 assertions: None,
                 pre_request: None,
                 post_request: None,
+                capture: None,
             }
         );
     }
@@ -762,6 +811,76 @@ assertions:
         let request = Request::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
         let yaml = serde_yaml::to_string(&request).expect("a request serialises");
         assert!(!yaml.contains("assertions"), "got {yaml}");
+    }
+
+    #[test]
+    fn parses_a_request_with_a_capture_block() {
+        let request = Request::from_yaml_str(
+            "method: POST
+url: https://api.example.com/login
+capture:
+  auth_token: $.token
+  user_id: $.user.id
+",
+        )
+        .expect("a capture block is part of the request shape");
+
+        let capture = request.capture.expect("the block parsed");
+        assert_eq!(capture.variables(), vec!["auth_token", "user_id"]);
+        assert_eq!(capture.entries()["auth_token"], "$.token");
+        assert_eq!(capture.entries()["user_id"], "$.user.id");
+    }
+
+    #[test]
+    fn an_empty_capture_block_is_kept_distinct_from_no_block_at_all() {
+        // Same rule as `assertions`: the file said something, and a round trip
+        // should not silently rewrite it into a different file.
+        let empty = Request::from_yaml_str(
+            "method: GET
+url: https://example.com
+capture: {}
+",
+        )
+        .unwrap();
+        assert!(empty.capture.as_ref().unwrap().is_empty());
+
+        let null = Request::from_yaml_str(
+            "method: GET
+url: https://example.com
+capture:
+",
+        )
+        .unwrap();
+        assert_eq!(null.capture, None);
+    }
+
+    #[test]
+    fn a_request_with_no_capture_block_serialises_without_the_key() {
+        let request = Request::from_yaml_str(
+            "method: GET
+url: https://example.com
+",
+        )
+        .unwrap();
+        let yaml = serde_yaml::to_string(&request).expect("a request serialises");
+        assert!(!yaml.contains("capture"), "got {yaml}");
+    }
+
+    #[test]
+    fn a_capture_path_is_not_validated_when_the_file_is_loaded() {
+        // Deliberate, and the same call `assertions` makes: loading a request
+        // file must never depend on the path grammar of the JSON path crate,
+        // or a stricter release would start rejecting files that used to load.
+        // A broken path is reported against the response instead.
+        let request = Request::from_yaml_str(
+            "method: GET
+url: https://example.com
+capture:
+  v: nonsense
+",
+        )
+        .expect("the file loads");
+        assert_eq!(request.capture.unwrap().entries()["v"], "nonsense");
     }
 
     #[test]
@@ -961,6 +1080,8 @@ enviroment: staging
             "environment-request.yaml",
             "assertions.yaml",
             "test-collection.yaml",
+            "scripted-request.yaml",
+            "capture-chain.yaml",
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("..")
@@ -992,6 +1113,7 @@ enviroment: staging
             assertions: None,
             pre_request: None,
             post_request: None,
+            capture: None,
         };
         let err = send(&request, &Config::default())
             .await
@@ -1016,6 +1138,7 @@ enviroment: staging
             assertions: None,
             pre_request: None,
             post_request: None,
+            capture: None,
         };
         let config = Config {
             headers: BTreeMap::from([("bad header".to_string(), "x".to_string())]),

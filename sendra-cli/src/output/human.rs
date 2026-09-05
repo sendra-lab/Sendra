@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 
 use owo_colors::{OwoColorize, Stream};
-use sendra_core::{AssertionReport, Response, ScriptOutcome};
+use sendra_core::{AssertionReport, CaptureReport, Response, ScriptOutcome};
 
 use crate::exit::Summary;
 
@@ -255,6 +255,67 @@ pub(super) fn print_post_request(outcome: &ScriptOutcome) {
             "✗".if_supports_color(Stream::Stdout, |t| t.red()),
             failure.if_supports_color(Stream::Stdout, |t| t.red())
         ),
+    }
+}
+
+/// Print what a request's `capture` block produced:
+///
+/// ```text
+/// capture
+///   ✓ auth_token from `$.token`
+///   ✗ user_id from `$.user.id` — matched nothing in the response body
+/// ```
+///
+/// Below the assertions rather than above them, which is the order the two ran
+/// in and also the order they are about: the checks concern this response, the
+/// capture concerns the requests still to come.
+///
+/// **The captured value is not printed.** Every other block here shows what it
+/// compared, so the omission is deliberate: a capture exists to carry a token,
+/// an id or a session cookie, and putting those on the terminal by default
+/// would be a decision the file's author never made — `sendra test` in CI
+/// prints no response body, and a captured bearer token appearing in a build
+/// log because someone added `capture:` is not a trade to make on their behalf.
+/// Nothing is actually hidden: under `sendra run` the body it came from is
+/// printed in full a few lines above, and `--json` carries the values because
+/// it already carries that same body verbatim.
+///
+/// The path is shown instead, because it is the half a reader needs when the
+/// capture went wrong, and the failure text is core's own — only the symbol,
+/// colour and layout are decided here.
+///
+/// Nothing at all is printed for a request with no `capture` block, so a file
+/// written before this feature existed looks exactly as it did before it
+/// existed.
+pub(super) fn print_capture(report: &CaptureReport) {
+    if report.is_empty() {
+        return;
+    }
+
+    println!();
+    println!(
+        "{}",
+        "capture".if_supports_color(Stream::Stdout, |t| t.dimmed())
+    );
+
+    for result in report.results() {
+        let from = format!("{} from `{}`", result.variable, result.path);
+        match result.failure() {
+            None => println!(
+                "  {} {}",
+                "✓".if_supports_color(Stream::Stdout, |t| t.green()),
+                from
+            ),
+            Some(failure) => println!(
+                "  {} {} {} {}",
+                "✗".if_supports_color(Stream::Stdout, |t| t.red()),
+                from,
+                "—".if_supports_color(Stream::Stdout, |t| t.dimmed()),
+                failure
+                    .to_string()
+                    .if_supports_color(Stream::Stdout, |t| t.red())
+            ),
+        }
     }
 }
 

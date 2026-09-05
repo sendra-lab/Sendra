@@ -1,0 +1,55 @@
+# Two requests where the second needs something only the first can tell it:
+# the shape every real API test eventually needs — log in, then use the token.
+#
+#   sendra run examples/capture-chain.yaml
+#   sendra test examples/capture-chain.yaml
+#
+# A `capture` block maps variable names to JSON paths, read from the response
+# body once it arrives. Every name it captures is usable as `{{name}}` in the
+# requests *after* it, in file order, through the same substitution an
+# environment file feeds.
+#
+# Nothing is written to disk. The captured values live for this one invocation
+# and no longer, so running the second request on its own fails with "no
+# variable named auth_token" rather than quietly using a stale one.
+#
+# httpbin's `/anything` echoes back whatever it was sent, which is what makes
+# this demonstrable end to end: request 1 "issues" a token, request 2 sends it
+# in a header, and httpbin echoing that header back is proof the captured value
+# really went over the wire.
+name: Capture and chain
+requests:
+  # Stands in for a login. The response body is this body, echoed back under
+  # `$.json`, so the two paths below have something real to read.
+  - name: Log in
+    method: POST
+    url: https://httpbin.org/anything
+    headers:
+      Accept: application/json
+      Content-Type: application/json
+    body: '{"token": "s3cret-abc123", "user": {"id": 42}}'
+    capture:
+      # A JSON string captures unquoted: `auth_token` is `s3cret-abc123`, not
+      # `"s3cret-abc123"`.
+      auth_token: $.json.token
+      # A number captures as the text it will be substituted as, so `user_id`
+      # is `42` and can be dropped straight into a URL path.
+      user_id: $.json.user.id
+    assertions:
+      status: 200
+
+  # Both captured values, one in the URL and one in a header.
+  - name: Fetch the user
+    method: GET
+    url: https://httpbin.org/anything/users/{{user_id}}
+    headers:
+      Accept: application/json
+      Authorization: Bearer {{auth_token}}
+    assertions:
+      status: 200
+      # httpbin echoes the request back, so these assert what actually arrived
+      # at the server — which is the whole point: they only pass if the capture
+      # in the request above resolved.
+      json:
+        $.url: https://httpbin.org/anything/users/42
+        $.headers.Authorization: Bearer s3cret-abc123

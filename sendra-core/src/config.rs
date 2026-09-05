@@ -342,6 +342,7 @@ mod tests {
             assertions: None,
             pre_request: None,
             post_request: None,
+            capture: None,
         }
     }
 
@@ -642,6 +643,11 @@ mod tests {
                 "// nothing
 "
                 .to_string(),
+            ),
+            capture: Some(
+                [("id".to_string(), "$.id".to_string())]
+                    .into_iter()
+                    .collect(),
             ),
         };
 

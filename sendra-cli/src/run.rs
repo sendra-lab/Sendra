@@ -1,6 +1,7 @@
 //! The pipeline both subcommands share — config, environment, file, then send
 //! each request — and the two command handlers built on top of it.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use sendra_core::environment::{find_environment, DEFAULT_ENVIRONMENT_NAME};
@@ -148,9 +149,12 @@ pub(crate) async fn run(
 
     let config = &config;
     let reporter = &Reporter::new(Format::for_json_flag(json), Detail::Full);
-    let outcomes = run_requests(&requests, &environment, reporter, |request| async move {
-        send(&request, config, reporter).await
-    })
+    let outcomes = run_requests(
+        &requests,
+        &environment,
+        reporter,
+        |request, environment| async move { send(&request, config, &environment, reporter).await },
+    )
     .await;
     reporter.finish_run();
 
@@ -193,9 +197,12 @@ pub(crate) async fn test(path: &Path, environment_name: Option<&str>, json: bool
 
     let config = &config;
     let reporter = &Reporter::new(Format::for_json_flag(json), Detail::StatusOnly);
-    let outcomes = run_requests(&requests, &environment, reporter, |request| async move {
-        send(&request, config, reporter).await
-    })
+    let outcomes = run_requests(
+        &requests,
+        &environment,
+        reporter,
+        |request, environment| async move { send(&request, config, &environment, reporter).await },
+    )
     .await;
 
     let summary = Summary::of(&outcomes);
@@ -313,7 +320,45 @@ fn environment_for(
 /// `send_one` is a parameter rather than a direct call to [`send`] so that this
 /// loop — which is the whole of "one request failing does not stop the rest" —
 /// can be tested without a network, the way config resolution takes its
-/// directories as arguments instead of reading the real ones.
+/// directories as arguments instead of reading the real ones. It is handed the
+/// environment view as well as the request, because a capture is evaluated
+/// against the environment it might collide with; see below.
+///
+/// # The accumulating store
+///
+/// This loop owns one `captured` map and grows it as it advances. Before each
+/// request it builds a **view** — [`Environment::with_captured`] — from the
+/// store *as it stands at that moment*, substitutes against the view, and after
+/// the request comes back merges whatever its `capture` block produced into the
+/// store for the requests still to come.
+///
+/// That arrangement, rather than a mutable `Environment` threaded through, is
+/// what makes file order real order structurally instead of by convention:
+///
+/// - Request 3 sees what requests 1 and 2 captured, because the store held them
+///   when its view was built.
+/// - Request 1 cannot see anything request 2 captured, because there is no
+///   `&mut Environment` for a later merge to reach an earlier substitution
+///   through — the view request 1 used is a value, already consumed.
+/// - The `Environment` this function was handed is never modified at all, so
+///   the caller's environment means the same thing after the run as before it.
+///
+/// A later capture of a name an earlier one already took **overwrites** it, and
+/// that is the only thing an ordered store can mean: re-logging in, or reading
+/// the next page's cursor, is a real flow, and "the most recent value wins" is
+/// exactly what the file order already says. A capture colliding with the
+/// *environment file* is the case that is refused instead — see
+/// [`CaptureFailure::Shadowed`](sendra_core::CaptureFailure::Shadowed) — because
+/// there the two names come from different kinds of source, and letting one win
+/// would make the same `{{name}}` mean the file's value before the capturing
+/// request and the captured value after it.
+///
+/// A request whose capture failed contributes nothing, so the downstream
+/// `{{name}}` is a `VariableNotFound` naming the variable rather than a request
+/// sent with an empty string in it. That downstream failure is a real second
+/// failure and the run keeps going through it, exactly as it does for every
+/// other per-request problem; the original capture failure is reported at its
+/// own request, which is what stops the later one from being the only clue.
 ///
 /// [`worst`]: crate::exit::worst
 pub(crate) async fn run_requests<S, F>(
@@ -323,10 +368,14 @@ pub(crate) async fn run_requests<S, F>(
     mut send_one: S,
 ) -> Vec<Outcome>
 where
-    S: FnMut(Request) -> F,
+    S: FnMut(Request, Environment) -> F,
     F: std::future::Future<Output = Outcome>,
 {
     let mut outcomes = Vec::with_capacity(requests.len());
+
+    // The store. Empty at the start of every invocation: captures do not
+    // persist across processes, and nothing here reads or writes a file.
+    let mut captured: BTreeMap<String, String> = BTreeMap::new();
 
     for (index, request) in requests.iter().enumerate() {
         // Blank line between results so a multi-request run stays readable.
@@ -335,6 +384,9 @@ where
             reporter.separate();
         }
 
+        // Built here, per request, from the store as it stands now — which is
+        // the whole of the ordering guarantee. See the note above.
+        let environment = environment.with_captured(&captured);
         let substituted = environment.apply(request);
 
         // Announced before the outcome either way, because in a collection run
@@ -345,13 +397,21 @@ where
         // is no such request, so it falls back to the label as written.
         reporter.request_started(&substituted.as_ref().unwrap_or(request).label());
 
-        outcomes.push(match substituted {
-            Ok(request) => send_one(request).await,
+        let outcome = match substituted {
+            Ok(request) => send_one(request, environment).await,
             Err(err) => {
                 reporter.request_failed(&err);
                 Outcome::NoResponse
             }
-        });
+        };
+
+        // Merged after the request is over, so nothing it captured could have
+        // reached its own substitution.
+        if let Outcome::Responded { capture, .. } = &outcome {
+            captured.extend(capture.values());
+        }
+
+        outcomes.push(outcome);
     }
 
     outcomes
@@ -388,6 +448,14 @@ where
 /// 6. **Evaluate assertions** against the same response. Whether a script ran,
 ///    and what it decided, changes nothing about them — the two mechanisms are
 ///    independent and neither can see the other.
+/// 7. **Evaluate the `capture` block** against the same response, last, because
+///    it is the only step that is about the requests *after* this one rather
+///    than about this one. Independent of the two above in both directions: a
+///    failed assertion does not stop a capture, and a failed capture does not
+///    fail an assertion. `environment` is read here and nowhere else in this
+///    function — a capture whose name the environment already defines is
+///    refused rather than allowed to shadow it, which is a fact about the pair
+///    and so has to be decided where both are in hand.
 ///
 /// # Where the results are printed
 ///
@@ -401,7 +469,12 @@ where
 /// assertions in exactly the same place. What they differ on — how much of the
 /// response is shown, and whether it is shown at all or recorded for `--json` —
 /// belongs to the [`Reporter`] they were given.
-async fn send(request: &Request, config: &Config, reporter: &Reporter) -> Outcome {
+async fn send(
+    request: &Request,
+    config: &Config,
+    environment: &Environment,
+    reporter: &Reporter,
+) -> Outcome {
     // Nothing goes over the wire until both scripts are known to parse.
     let scripts = match Scripts::compile(request) {
         Ok(scripts) => scripts,
@@ -454,12 +527,21 @@ async fn send(request: &Request, config: &Config, reporter: &Reporter) -> Outcom
                 .map(|assertions| assertions.evaluate(&response))
                 .unwrap_or_default();
 
-            reporter.responded(&response, script.as_ref(), &assertions);
+            // No `capture` block is the empty report, which prints nothing —
+            // the same rule as the assertion report above.
+            let capture = prepared
+                .capture
+                .as_ref()
+                .map(|capture| capture.evaluate(&response, environment))
+                .unwrap_or_default();
+
+            reporter.responded(&response, script.as_ref(), &assertions, &capture);
 
             Outcome::Responded {
                 status: response.status,
                 script,
                 assertions,
+                capture,
             }
         }
         Err(err) => {
@@ -477,7 +559,7 @@ mod tests {
 
     use std::collections::BTreeMap;
 
-    use sendra_core::ScriptOutcome;
+    use sendra_core::{AssertionReport, CaptureReport, ScriptOutcome};
 
     use crate::exit::exit_for_status;
     use crate::test_support::{all_passed, reporter, responded};
@@ -512,7 +594,7 @@ requests:
         // Stands in for the network: records what it was handed and reports a
         // clean response, so the substitution is the only failure in the run.
         let mut sent = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |request| {
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |request, _| {
             sent.push(request.url.clone());
             async { responded(200) }
         })
@@ -546,7 +628,7 @@ requests:
         // ...but it suppresses a *status*, and a request that was never built
         // has no status to forgive. Same treatment as a connection failure,
         // which the flag does not suppress either.
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |_| async {
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |_, _| async {
             responded(404)
         })
         .await;
@@ -672,7 +754,13 @@ requests:
                 "{yaml:?} should not have compiled"
             );
 
-            let outcome = send(&request, &Config::default(), &reporter()).await;
+            let outcome = send(
+                &request,
+                &Config::default(),
+                &Environment::default(),
+                &reporter(),
+            )
+            .await;
             assert!(
                 matches!(outcome, Outcome::NoResponse),
                 "{yaml:?} produced {outcome:?}"
@@ -683,7 +771,15 @@ requests:
         // `test`: the same category as a missing variable, for the same reason
         // — nothing went over the wire.
         let request = request("method: POST\nurl: https://127.0.0.1:1/\npre_request: |\n  ) (\n");
-        let outcomes = vec![send(&request, &Config::default(), &reporter()).await];
+        let outcomes = vec![
+            send(
+                &request,
+                &Config::default(),
+                &Environment::default(),
+                &reporter(),
+            )
+            .await,
+        ];
 
         assert_eq!(exit_for_run(&outcomes, false), Exit::Failure);
         assert_eq!(
@@ -701,7 +797,13 @@ requests:
         let request = request(
             "method: POST\nurl: https://127.0.0.1:1/\npre_request: |\n  throw \"no signing key\";\n",
         );
-        let outcome = send(&request, &Config::default(), &reporter()).await;
+        let outcome = send(
+            &request,
+            &Config::default(),
+            &Environment::default(),
+            &reporter(),
+        )
+        .await;
 
         assert!(matches!(outcome, Outcome::NoResponse), "{outcome:?}");
         assert_eq!(Summary::of(&[outcome]).no_response, 1);
@@ -739,6 +841,7 @@ requests:
             status: 200,
             script: Some(script),
             assertions,
+            capture: CaptureReport::default(),
         }];
         assert_eq!(Summary::of(&outcomes).failed, 1);
         assert_eq!(Summary::of(&outcomes).exit(), Exit::TestFailed);
@@ -754,7 +857,7 @@ requests:
 
         // Every sibling answers 500, so the run holds both kinds of failure at
         // once. "Never got a response" is the more serious of the two.
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |_| async {
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |_, _| async {
             responded(500)
         })
         .await;
@@ -771,7 +874,7 @@ requests:
         let request = document.get("Third").expect("`Third` is in the collection");
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&[request], &environment(), &reporter(), |request| {
+        let outcomes = run_requests(&[request], &environment(), &reporter(), |request, _| {
             sent.push(request.url.clone());
             async { responded(200) }
         })
@@ -789,7 +892,7 @@ requests:
             .expect("`Broken` is in the collection");
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&[request], &environment(), &reporter(), |request| {
+        let outcomes = run_requests(&[request], &environment(), &reporter(), |request, _| {
             sent.push(request.url.clone());
             async { responded(200) }
         })
@@ -816,7 +919,7 @@ requests:
         let requests: Vec<&Request> = document.requests().iter().collect();
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |request| {
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |request, _| {
             sent.push(request.url.clone());
             async { responded(200) }
         })
@@ -1009,7 +1112,7 @@ requests:
         let mut sent = Vec::new();
         for name in ["staging", "prod"] {
             let environment = environment_for(project.path(), Some(name)).expect("both exist");
-            let outcomes = run_requests(&requests, &environment, &reporter(), |request| {
+            let outcomes = run_requests(&requests, &environment, &reporter(), |request, _| {
                 sent.push(request.url.clone());
                 async { responded(200) }
             })
@@ -1037,7 +1140,7 @@ requests:
         assert!(requests[0].assertions.is_none());
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |request| {
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |request, _| {
             assert!(
                 request.assertions.is_none(),
                 "substitution must not invent a block"
@@ -1069,7 +1172,7 @@ assertions:
         let requests: Vec<&Request> = document.requests().iter().collect();
 
         let mut seen = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |request| {
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |request, _| {
             seen.push(request.assertions.clone());
             async { responded(200) }
         })
@@ -1095,7 +1198,7 @@ assertions:
         let requests: Vec<&Request> = document.requests().iter().collect();
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |request| {
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |request, _| {
             sent.push(request.url.clone());
             async { all_passed(200) }
         })
@@ -1144,7 +1247,7 @@ requests:
             &requests,
             &environment(),
             &reporter(),
-            |request| async move {
+            |request, _| async move {
                 if request.url.ends_with("/unreachable") {
                     Outcome::NoResponse
                 } else {
@@ -1185,7 +1288,7 @@ assertions:
         let requests: Vec<&Request> = document.requests().iter().collect();
         assert_eq!(requests.len(), 1);
 
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |_| async {
+        let outcomes = run_requests(&requests, &environment(), &reporter(), |_, _| async {
             all_passed(200)
         })
         .await;
@@ -1198,5 +1301,454 @@ assertions:
                 ..Summary::default()
             }
         );
+    }
+    // --- capture and chaining --------------------------------------------
+
+    /// A login that captures a token, then a request that uses it. The second
+    /// request also captures, so "request 1 does not see request 2" has
+    /// something to be false about.
+    const CHAIN: &str = "\
+requests:
+  - name: Log in
+    method: POST
+    url: '{{base_url}}/login'
+    capture:
+      auth_token: $.token
+  - name: Whoami
+    method: GET
+    url: '{{base_url}}/me'
+    headers:
+      Authorization: 'Bearer {{auth_token}}'
+    capture:
+      user_id: $.user.id
+  - name: Profile
+    method: GET
+    url: '{{base_url}}/users/{{user_id}}'
+";
+
+    /// A response whose body is `body`, for a fake `send_one`.
+    fn json_body(body: &'static str) -> sendra_core::Response {
+        sendra_core::Response {
+            status: 200,
+            status_text: "OK".to_string(),
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: body.to_string(),
+            elapsed: std::time::Duration::from_millis(1),
+        }
+    }
+
+    /// The outcome of a request that came back with `body` and had its own
+    /// `capture` block evaluated against it — what the real `send` does at
+    /// step 7, without a socket.
+    fn captured_from(request: &Request, environment: &Environment, body: &'static str) -> Outcome {
+        let response = json_body(body);
+        Outcome::Responded {
+            status: response.status,
+            script: None,
+            assertions: AssertionReport::default(),
+            capture: request
+                .capture
+                .as_ref()
+                .map(|capture| capture.evaluate(&response, environment))
+                .unwrap_or_default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_value_captured_by_one_request_resolves_in_the_next() {
+        let document = Document::from_yaml_str(CHAIN).unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+
+        let mut sent: Vec<(String, Option<String>)> = Vec::new();
+        let outcomes = run_requests(
+            &requests,
+            &environment(),
+            &reporter(),
+            |request, environment| {
+                // Each request answers with the body the next one reads from.
+                let body = if request.url.ends_with("/login") {
+                    r#"{"token": "abc123"}"#
+                } else {
+                    r#"{"user": {"id": 42}}"#
+                };
+                let outcome = captured_from(&request, &environment, body);
+                sent.push((
+                    request.url.clone(),
+                    request.headers.get("Authorization").cloned(),
+                ));
+                async move { outcome }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            sent,
+            vec![
+                ("https://example.com/login".to_string(), None),
+                (
+                    "https://example.com/me".to_string(),
+                    Some("Bearer abc123".to_string()),
+                ),
+                // Captured by request 2, resolved in request 3's URL: the
+                // store carries forward, not just one step.
+                ("https://example.com/users/42".to_string(), None),
+            ]
+        );
+        assert!(
+            outcomes.iter().all(|outcome| matches!(
+                outcome,
+                Outcome::Responded { capture, .. } if capture.passed()
+            )),
+            "every capture in the chain should have produced a value"
+        );
+        // No response status was an error and nothing failed a check.
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
+        assert_eq!(Summary::of(&outcomes).exit(), Exit::Ok);
+    }
+
+    #[tokio::test]
+    async fn a_request_cannot_see_what_a_later_request_captures() {
+        // File order is real order. Request 1 references `user_id`, which
+        // request 2 captures — so it must fail, and the failure must be
+        // `VariableNotFound` rather than a request sent with an empty string.
+        let document = Document::from_yaml_str(
+            "\
+requests:
+  - name: Too early
+    method: GET
+    url: '{{base_url}}/users/{{user_id}}'
+  - name: Captures it
+    method: GET
+    url: '{{base_url}}/me'
+    capture:
+      user_id: $.user.id
+",
+        )
+        .unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+
+        let mut sent = Vec::new();
+        let outcomes = run_requests(
+            &requests,
+            &environment(),
+            &reporter(),
+            |request, environment| {
+                let outcome = captured_from(&request, &environment, r#"{"user": {"id": 42}}"#);
+                sent.push(request.url.clone());
+                async move { outcome }
+            },
+        )
+        .await;
+
+        // The first request was never sent; the second still was.
+        assert_eq!(sent, vec!["https://example.com/me".to_string()]);
+        assert!(
+            matches!(outcomes[0], Outcome::NoResponse),
+            "{:?}",
+            outcomes[0]
+        );
+        // And the run reports it: a reference with nothing behind it is the
+        // same category as a refused connection, whichever direction it points.
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Failure);
+    }
+
+    #[tokio::test]
+    async fn the_store_starts_empty_on_every_invocation() {
+        // No persistence across processes, and none across calls either: two
+        // runs over the same requests behave identically, so a captured value
+        // cannot leak from one into the next.
+        let document = Document::from_yaml_str(
+            "requests:\n  - name: Uses it\n    method: GET\n    url: '{{auth_token}}'\n",
+        )
+        .unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+
+        for _ in 0..2 {
+            let outcomes = run_requests(&requests, &environment(), &reporter(), |_, _| async {
+                responded(200)
+            })
+            .await;
+            assert!(matches!(outcomes[0], Outcome::NoResponse));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_later_capture_of_the_same_name_overwrites_the_earlier_one() {
+        // Re-logging in, or reading the next page's cursor: the most recent
+        // value wins, which is the only thing an ordered store can mean.
+        let document = Document::from_yaml_str(
+            "\
+requests:
+  - name: First login
+    method: POST
+    url: '{{base_url}}/login'
+    capture:
+      auth_token: $.token
+  - name: Second login
+    method: POST
+    url: '{{base_url}}/login'
+    capture:
+      auth_token: $.token
+  - name: Uses it
+    method: GET
+    url: '{{base_url}}/me?t={{auth_token}}'
+",
+        )
+        .unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+
+        let mut nth = 0;
+        let mut sent = Vec::new();
+        let outcomes = run_requests(
+            &requests,
+            &environment(),
+            &reporter(),
+            |request, environment| {
+                nth += 1;
+                let body = if nth == 1 {
+                    r#"{"token": "first"}"#
+                } else {
+                    r#"{"token": "second"}"#
+                };
+                let outcome = captured_from(&request, &environment, body);
+                sent.push(request.url.clone());
+                async move { outcome }
+            },
+        )
+        .await;
+
+        assert_eq!(sent[2], "https://example.com/me?t=second");
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
+    }
+
+    #[tokio::test]
+    async fn a_capture_that_collides_with_the_environment_is_refused_and_the_file_value_stands() {
+        // The precedence decision, end to end. `base_url` is in the
+        // environment file; a request that tries to capture over it fails, and
+        // the request after it still sees the file's value.
+        let document = Document::from_yaml_str(
+            "\
+requests:
+  - name: Tries to shadow
+    method: GET
+    url: '{{base_url}}/login'
+    capture:
+      base_url: $.token
+  - name: After
+    method: GET
+    url: '{{base_url}}/me'
+",
+        )
+        .unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+
+        let mut sent = Vec::new();
+        let outcomes = run_requests(
+            &requests,
+            &environment(),
+            &reporter(),
+            |request, environment| {
+                let outcome =
+                    captured_from(&request, &environment, r#"{"token": "https://evil.test"}"#);
+                sent.push(request.url.clone());
+                async move { outcome }
+            },
+        )
+        .await;
+
+        let Outcome::Responded { capture, .. } = &outcomes[0] else {
+            panic!("the first request came back: {:?}", outcomes[0]);
+        };
+        assert!(!capture.passed(), "the collision must be reported");
+        assert!(
+            matches!(
+                capture.results()[0].failure(),
+                Some(sendra_core::CaptureFailure::Shadowed { .. })
+            ),
+            "got {:?}",
+            capture.results()[0].failure()
+        );
+
+        // Neither value silently won: the environment's `base_url` still
+        // resolved for the request after it.
+        assert_eq!(sent[1], "https://example.com/me");
+
+        // Reported as a failed check, not as a request that never happened.
+        assert_eq!(
+            Summary::of(&outcomes),
+            Summary {
+                total: 2,
+                failed: 1,
+                without_assertions: 1,
+                ..Summary::default()
+            }
+        );
+        assert_eq!(Summary::of(&outcomes).exit(), Exit::TestFailed);
+        // ...and `run`'s answer is unchanged: both requests came back fine.
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
+    }
+
+    #[tokio::test]
+    async fn a_capture_that_matches_nothing_fails_its_own_request_and_the_run_continues() {
+        // The categorisation decision, end to end: the capture failure is
+        // attributed to the request that declared it, the requests around it
+        // are still sent, and the downstream request that needed the variable
+        // fails on its own terms rather than being pre-empted.
+        let document = Document::from_yaml_str(
+            "\
+requests:
+  - name: Captures nothing
+    method: POST
+    url: '{{base_url}}/login'
+    capture:
+      auth_token: $.token
+  - name: Needs it
+    method: GET
+    url: '{{base_url}}/me?t={{auth_token}}'
+  - name: Independent
+    method: GET
+    url: '{{base_url}}/health'
+",
+        )
+        .unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+
+        let mut sent = Vec::new();
+        let outcomes = run_requests(
+            &requests,
+            &environment(),
+            &reporter(),
+            |request, environment| {
+                // The login answers 200 with a body that has no `token` in it.
+                let outcome = captured_from(&request, &environment, r#"{"error": "nope"}"#);
+                sent.push(request.url.clone());
+                async move { outcome }
+            },
+        )
+        .await;
+
+        // The capturing request was sent and came back; the one needing the
+        // variable was not; the one after it was.
+        assert_eq!(
+            sent,
+            vec![
+                "https://example.com/login".to_string(),
+                "https://example.com/health".to_string(),
+            ]
+        );
+
+        let Outcome::Responded { capture, .. } = &outcomes[0] else {
+            panic!("the login came back: {:?}", outcomes[0]);
+        };
+        assert_eq!(
+            capture.results()[0].failure(),
+            Some(&sendra_core::CaptureFailure::NoMatch)
+        );
+        assert!(matches!(outcomes[1], Outcome::NoResponse));
+
+        // `test` counts the capture failure as a failed check and the
+        // compounding one as a request that never happened...
+        assert_eq!(
+            Summary::of(&outcomes),
+            Summary {
+                total: 3,
+                failed: 1,
+                without_assertions: 1,
+                no_response: 1,
+                ..Summary::default()
+            }
+        );
+        // ...and "never got a response" outranks it, so the run reports 1.
+        assert_eq!(Summary::of(&outcomes).exit(), Exit::Failure);
+        // `run` reads only the statuses, and the one request that failed to be
+        // built is the reason it is not 0.
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Failure);
+    }
+
+    #[tokio::test]
+    async fn a_capture_and_the_checks_beside_it_do_not_see_each_other() {
+        // Independent in both directions: a failed assertion does not stop the
+        // capture, and a failed capture does not fail the assertion.
+        let request = request(
+            "method: GET\nurl: https://example.com\n\
+             assertions:\n  status: 500\n\
+             capture:\n  token: $.token\n",
+        );
+        let response = json_body(r#"{"token": "abc123"}"#);
+
+        let assertions = request.assertions.as_ref().unwrap().evaluate(&response);
+        let capture = request
+            .capture
+            .as_ref()
+            .unwrap()
+            .evaluate(&response, &Environment::default());
+
+        assert!(!assertions.passed(), "the response was 200, not 500");
+        assert!(
+            capture.passed(),
+            "a failed assertion does not stop the capture beside it"
+        );
+        assert_eq!(capture.values()["token"], "abc123");
+
+        // One request, counted once, whichever of the two was the reason.
+        let outcomes = vec![Outcome::Responded {
+            status: 200,
+            script: None,
+            assertions,
+            capture,
+        }];
+        assert_eq!(Summary::of(&outcomes).failed, 1);
+    }
+
+    #[tokio::test]
+    async fn a_successful_capture_is_not_a_check_and_does_not_make_a_request_pass() {
+        // The asymmetry stated on `Summary`: a login that captures a token and
+        // asserts nothing was still not checked.
+        let request = request("method: POST\nurl: https://example.com\ncapture:\n  t: $.token\n");
+        let capture = request
+            .capture
+            .as_ref()
+            .unwrap()
+            .evaluate(&json_body(r#"{"token": "abc"}"#), &Environment::default());
+        assert!(capture.passed());
+
+        let outcomes = vec![Outcome::Responded {
+            status: 200,
+            script: None,
+            assertions: AssertionReport::default(),
+            capture,
+        }];
+        assert_eq!(
+            Summary::of(&outcomes),
+            Summary {
+                total: 1,
+                without_assertions: 1,
+                ..Summary::default()
+            },
+            "a capture is a dependency of the run, not an expectation about the response"
+        );
+        assert_eq!(Summary::of(&outcomes).exit(), Exit::Ok);
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_capture_block_behaves_exactly_as_it_did_before() {
+        let request = request("method: GET\nurl: https://example.com\n");
+        assert_eq!(request.capture, None);
+
+        let outcomes = vec![Outcome::Responded {
+            status: 200,
+            script: None,
+            assertions: AssertionReport::default(),
+            capture: CaptureReport::default(),
+        }];
+        assert_eq!(
+            Summary::of(&outcomes),
+            Summary {
+                total: 1,
+                without_assertions: 1,
+                ..Summary::default()
+            }
+        );
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
     }
 }

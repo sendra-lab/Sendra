@@ -528,6 +528,11 @@ fn request_from_dynamic(original: &Request, value: Dynamic) -> Result<Request, S
         // ran, from the source in the file.
         pre_request: original.pre_request.clone(),
         post_request: original.post_request.clone(),
+        // Not exposed to the script and so not the script's to change. Letting
+        // a `pre_request` hook rewrite what the response will be read for is a
+        // feature in its own right — as is letting a script stash a value for
+        // later requests — and neither is this one.
+        capture: original.capture.clone(),
     })
 }
 
