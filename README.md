@@ -22,7 +22,11 @@ sendra/
     main.rs          `main()`, and the module declarations
     cli.rs           the clap definitions: subcommands, arguments, `--help` text
     run.rs           the pipeline both subcommands share, and the two handlers
-    output.rs        everything printed to the terminal
+    output/          everything printed to the terminal
+      mod.rs           `Reporter`, `Format`, `Detail`: which rendering a run gets
+      human.rs         the terminal rendering: response, assertions, summary
+      json.rs          the `--json` schema: the records the document is built from
+      errors.rs        `error:` and `hint:` lines, and the one clap usage error
     exit.rs          `Exit`, `Outcome`, `Summary`: exit-code policy, no I/O
     test_support.rs  fixtures shared by more than one module's tests
     tests/           integration tests that run the built binary and read its output

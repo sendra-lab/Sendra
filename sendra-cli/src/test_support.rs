@@ -19,6 +19,18 @@ pub(crate) fn response(status: u16) -> Response {
     }
 }
 
+/// A response carrying `content_type` and `body`, for the tests that are
+/// about how a body is rendered or reported rather than about its status.
+pub(crate) fn response_with(content_type: &str, body: &str) -> Response {
+    Response {
+        status: 200,
+        status_text: "OK".to_string(),
+        headers: vec![("content-type".to_string(), content_type.to_string())],
+        body: body.to_string(),
+        elapsed: std::time::Duration::from_millis(12),
+    }
+}
+
 /// The `assertions` block of a request file, parsed the way a real run
 /// parses it — through `Document`, rather than by reaching for a YAML
 /// dependency this crate does not otherwise need.
