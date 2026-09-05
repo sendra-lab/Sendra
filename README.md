@@ -10,14 +10,16 @@ shareable without exporting anything. A file holds either one request or a
 named collection of them, sent and printed, against variables from an
 environment file so the same request can point at staging or at production, and
 a file can declare what it expects the response to look like — which
-`sendra test` then passes or fails your build on. Scripting and an interactive
-TUI are both planned and deliberately absent for now.
+`sendra test` then passes or fails your build on. A request can also carry
+inline scripts that run just before it is sent and just after it comes back,
+with no Node.js or other runtime to install: the interpreter is in the binary.
+An interactive TUI is planned and deliberately absent for now.
 
 ## Layout
 
 ```
 sendra/
-  sendra-core/     library: request/response types, YAML loading, config, environments, HTTP execution
+  sendra-core/     library: request/response types, YAML loading, config, environments, scripting, HTTP execution
   sendra-cli/      binary `sendra`: argument parsing, output, exit codes, `run` and `test`
     main.rs          `main()`, and the module declarations
     cli.rs           the clap definitions: subcommands, arguments, `--help` text
@@ -51,6 +53,14 @@ body, and `examples/collection.yaml`, which holds four requests in one file:
 ```sh
 cargo run -p sendra-cli -- run examples/collection.yaml              # all four
 cargo run -p sendra-cli -- run examples/collection.yaml "Post JSON"  # just one
+```
+
+`examples/scripted-request.yaml` carries both hooks: a `pre_request` script that
+adds a header, and a `post_request` script that checks the response it comes
+back in.
+
+```sh
+cargo run -p sendra-cli -- run examples/scripted-request.yaml
 ```
 
 `examples/environment-request.yaml` uses variables instead of literals, and
@@ -110,6 +120,10 @@ headers: # optional
 body: null # optional, sent verbatim as a raw string
 assertions: # optional, checked against the response — see below
   status: 200
+pre_request: | # optional, runs just before the request is sent — see below
+  request.headers["X-Request-Id"] = "abc-123";
+post_request: | # optional, runs against the response
+  if response.status != 200 { throw "expected 200, got " + response.status; }
 ```
 
 Unknown top-level keys are rejected rather than silently ignored, so a typo in a
@@ -213,7 +227,8 @@ Three things differ:
   bodies would make the summary the hardest line to find in its own output. Use
   `sendra run` when you want to look at a response.
 - A summary of the whole run prints at the end.
-- The exit code comes from the assertions.
+- The exit code comes from the checks the file declared — its assertions and its
+  `post_request` script.
 
 `examples/test-collection.yaml`, run against httpbin, prints exactly this:
 
@@ -256,17 +271,40 @@ summary
 **Four categories, and they do not overlap.** Every request lands in exactly
 one, so the counts always add up to the total:
 
-| Category             | Meaning                                                   |
-| -------------------- | --------------------------------------------------------- |
-| `passed`             | Got a response, declared assertions, and all of them held. |
-| `failed`             | Got a response, declared assertions, one or more did not.  |
-| `without assertions` | Got a response and declared nothing to check.              |
+| Category             | Meaning                                                     |
+| -------------------- | ----------------------------------------------------------- |
+| `passed`             | Got a response, checked it, and everything it checked held.  |
+| `failed`             | Got a response and one or more of its checks did not hold.   |
+| `without assertions` | Got a response and checked nothing at all.                   |
 | `no response`        | Never got a response, so there was nothing to check against. |
 
 The last three are printed only when they are not zero, so a clean run reads
 `4 requests: 4 passed` and nothing competes with it. A request that declared
 nothing prints a dimmed `no assertions` where its results would have gone, so
 the `without assertions` count has something to point at.
+
+**A request can be checked two ways, and the categories are about the checking,
+not about which mechanism did it.** An `assertions` block and a `post_request`
+script are independent features that both look at the same response, so a
+request with a script and no assertions is a pass when the script is happy — not
+an unchecked one — and a `post_request` script that throws is counted in
+`failed` alongside a failed assertion.
+
+That is deliberate rather than convenient. A thrown script and a failed
+assertion say the same thing to whoever reads the run — "the response was not
+what this file said it should be" — so a fifth count would be a number every
+consumer immediately added to `failed`. The distinction actually worth drawing
+is "is the file wrong or is the API wrong", and it is already drawn one step
+earlier: a script that does not *compile* is a broken file and lands in
+`no response`, because both hooks are compiled before the request is sent.
+Drawing it a second time at runtime would mean sorting a deliberate `throw` from
+an accidental type error, which blurs the moment a `throw` happens inside a
+helper function — and guessing wrong would file "your API is broken" under "your
+script is broken". One reliable split beats two when one of them is guesswork.
+
+`without assertions` keeps its name, and every request it counts genuinely has
+no assertions; it is now the narrower of the two readings, since a request with
+a script is counted as checked.
 
 **A request with no assertions is not a pass.** It is a request nobody said
 anything about, and it gets its own count for that reason. Folding it into
@@ -299,6 +337,20 @@ second time with a different number. The safeguard against the decision hiding a
 problem is the summary itself: `without assertions` is printed, so a run whose
 expectations were never written is visibly not the same thing as a run that
 passed.
+
+**A `post_request` script that throws fails a test run** the same way a failed
+assertion does, and prints the message it threw:
+
+```text
+→ Create order
+500 Internal Server Error  212 ms
+
+post_request
+  ✗ expected 201, got 500
+
+summary
+  1 request: 0 passed, 1 failed
+```
 
 **`--allow-error-status` does not apply to `sendra test`,** and passing it is an
 error rather than a no-op:
@@ -361,6 +413,7 @@ is that nothing is printed until the run is over.
         "body": "{\"id\":7,\"name\":\"ada\"}"
       },
       "error": null,
+      "post_request": null,
       "assertions": {
         "total": 2,
         "passed": 1,
@@ -403,6 +456,15 @@ is that nothing is printed until the run is over.
   that declared none. `kind` is one of `status`, `header`, `body_contains` or
   `json_path` — the keys the `assertions` block is written with.
   `expectation` and `failure` are the same strings the terminal prints.
+- `post_request` — `null` for a request that declared no script, which is a
+  different thing from a script that ran and passed; otherwise
+  `{"passed": true, "failure": null}` or
+  `{"passed": false, "failure": "expected 201, got 500"}`. The same pair, in the
+  same spelling, that each assertion result carries, because it is the same kind
+  of statement about the same response. There is no matching `pre_request` key:
+  a `pre_request` script that fails means the request was never sent, which
+  `error` already says, and one that succeeds has nothing to report beyond the
+  request that went out.
 
 ### `sendra test --json`
 
@@ -424,8 +486,9 @@ ends with:
 
 Every count is present, zeroes included — the terminal leaves a zero out, and a
 script reading `.summary.failed` should not have to know that. The four
-categories are the ones described under [Testing](#testing), and they still add
-up to `total`.
+categories are the ones described under [Testing](#testing) — including the rule
+that a `post_request` failure is counted in `failed` — and they still add up to
+`total`.
 
 Two differences from the terminal output are worth stating:
 
@@ -749,6 +812,177 @@ a tenant, an id, a host — not which part of the response is being looked at. A
 missing variable in an assertion fails that request before it is sent, exactly
 like a missing variable in its URL.
 
+## Scripting
+
+A request can carry two inline scripts: `pre_request`, which runs just before it
+is sent, and `post_request`, which runs against the response. They are written
+as YAML block scalars (`|`) and the language is [Rhai].
+
+```yaml
+method: POST
+url: https://api.example.com/orders
+body: '{"widget": "sprocket"}'
+pre_request: |
+  request.headers["X-Request-Id"] = "abc-123";
+post_request: |
+  if response.status != 201 {
+    throw "expected 201, got " + response.status;
+  }
+```
+
+```sh
+sendra run examples/scripted-request.yaml
+sendra test examples/scripted-request.yaml
+```
+
+**No runtime to install.** The interpreter is linked into the `sendra` binary,
+so a scripted request works anywhere the binary does — which is the whole reason
+for Rhai over an embedded JavaScript engine.
+
+### What `pre_request` can see
+
+`request` is an object map. It arrives fully substituted and with any config
+defaults already merged in, so a script sees the request exactly as it would
+otherwise be sent, and whatever it leaves behind is what actually goes out.
+
+| Field             | Access     | Type                             |
+| ----------------- | ---------- | -------------------------------- |
+| `request.method`  | read       | string — `"POST"`                |
+| `request.url`     | read/write | string                           |
+| `request.headers` | read/write | object map, string to string     |
+| `request.body`    | read/write | string, or `()` for no body      |
+
+```rhai
+request.headers["X-Signature"] = sign(request.body);
+request.headers.remove("Authorization");
+request.url = request.url + "?dry_run=1";
+request.body = ();
+```
+
+**`method` is read-only.** A script may branch on it; assigning to it is an
+error, not a silent no-op. It is a closed enum in the schema, so a bad method is
+caught by serde today at parse time with a position in the file; the `→` label a
+run prints is `METHOD url`, printed before the script runs, so a script that
+changed it would make that line a lie about what went over the wire; and a call
+that needs to be both a GET and a POST is two requests, which is clearer written
+as two.
+
+Anything else is refused rather than ignored. `request.timeout = 5` names a
+field a request does not have and is an error, the same way an unknown key in
+the YAML is an error. Values are not coerced either: `request.headers["X"] = 5`
+is an error asking for `.to_string()`, because a header is a string on the wire
+and silently stringifying leaves what a float renders as up to the interpreter.
+
+Throwing in `pre_request` means the request is never sent.
+
+### What `post_request` can see
+
+`response` is read-only — assigning to it is an error rather than a change that
+goes nowhere.
+
+| Field                  | Type                                              |
+| ---------------------- | ------------------------------------------------- |
+| `response.status`      | integer — `201`                                   |
+| `response.status_text` | string — `"Created"`                              |
+| `response.headers`     | array of `#{name, value}`                         |
+| `response.body`        | string, as it came over the wire                  |
+| `response.elapsed_ms`  | integer                                           |
+
+Headers are a list rather than a map because HTTP lets one repeat
+(`set-cookie`), and wire order is worth keeping. Lookup is a one-liner:
+
+```rhai
+let ct = response.headers.find(|h| h.name.to_lower() == "content-type");
+if ct == () || !ct.value.contains("json") { throw "expected a JSON response"; }
+```
+
+**`throw` is how a check fails**, rather than a `fail()` function Sendra would
+have had to register. It is Rhai's own, it is the idiom anyone reading Rhai docs
+will already know, and choosing it means Sendra registers *nothing at all* into
+the interpreter — see [Sandboxing](#sandboxing).
+
+The message you throw is what gets printed, verbatim. A script that fails for
+some other reason — a method that does not exist, an index off the end of an
+array — keeps the interpreter's full error with a line number instead, because
+that is a bug in the script and the line is the point.
+
+### Ordering
+
+For one request, in order:
+
+1. Environment substitution (`{{variable}}`, `${OS_VAR}`).
+2. Config defaults applied.
+3. `pre_request`.
+4. The request is sent.
+5. `post_request`.
+6. `assertions` evaluated.
+
+**Script source is never substituted.** A `{{var}}` or `${VAR}` inside a script
+is not expanded — it is just those characters. Substitution is textual, and the
+reason it is confined to values is that a value must not be able to change the
+structure of the document around it; a script is not a value, it is code, so the
+failure mode would not be a malformed URL but a variable's contents being parsed
+as program text. A script that needs an environment value reads it off
+`request.url` or `request.headers`, which arrive substituted.
+
+**Scripts and assertions are independent.** Both look at the same response,
+neither can see the other, and both are reported. A request can use either, both
+or neither.
+
+### Both scripts are compiled before the request is sent
+
+A syntax error in `post_request` stops the `POST` that would have created an
+order, rather than being discovered after it. A script that does not compile is
+a broken file, and finding that out before anything goes over the wire is
+strictly better — the same argument that makes a collection with two
+identically-named requests an error at parse time.
+
+That split is also how Sendra tells "your script is wrong" from "your API is
+wrong":
+
+- **A script that does not compile** — either hook — is exit `1`, counted under
+  `no_response`. Nothing was sent, so it is the same category as a missing
+  variable or a refused connection.
+- **A `pre_request` script that throws** is exit `1` for the same reason: there
+  is no response and never will be.
+- **A `post_request` script that throws** is a failed check on a response that
+  did arrive, so it behaves exactly like a failed assertion: printed under the
+  response, invisible to `run`'s exit code, and a failure under `test`.
+
+### Sandboxing
+
+**A script cannot touch the filesystem or the network.** Sendra registers no
+functions, no types, no packages and no modules into the interpreter — the
+entire Sendra-shaped surface is the two variables above, holding strings,
+integers and arrays. There is nothing to audit because there is nothing
+registered.
+
+On top of that:
+
+- `import`, and the module system with it, is removed at compile time. This is
+  the one that matters: Rhai's *default* module resolver reads `.rhai` files off
+  disk, so `import` is the one filesystem path a stock engine has.
+- `eval` is disabled. Not a filesystem or network capability, but it would
+  defeat the guarantee that a script's syntax is checked before the request is
+  sent.
+- A script is stopped after ten million operations, so a `while true` nobody
+  meant to write gets a named error rather than hanging the process. This is a
+  backstop, not a defence against a hostile script: scripts come out of your own
+  request files.
+
+`print` and `debug` go to **stderr**, alongside the `→` labels and every error,
+so they do not end up inside the single JSON document `--json` promises stdout
+holds. A script that printed and then threw keeps its lines: they are usually
+the ones that explain the throw.
+
+That choice belongs to the CLI, not to the library. `sendra-core` has no
+`println!` or `eprintln!` anywhere in it — running a script returns the lines it
+printed alongside its verdict, and `sendra-cli` decides they are stderr. A
+`sendra-tui` reusing the same crate will put them somewhere a redrawn frame does
+not wipe out, without a library writing over its interface.
+
+[Rhai]: https://rhai.rs
+
 ## Exit codes
 
 One table for the whole binary, not one per subcommand: `run` and `test` answer
@@ -762,7 +996,7 @@ for anyone writing `case $? in` around either.
 | `1`  |   ·   |   ·    | Some request never got a response.                                  |
 | `2`  |   ·   |   ·    | Bad command-line usage (from clap).                                 |
 | `3`  |   ·   |        | `run` only: every request got a response, at least one was 4xx/5xx. |
-| `4`  |       |   ·    | `test` only: every request got a response, at least one had a failing assertion. |
+| `4`  |       |   ·    | `test` only: every request got a response, at least one failed a check. |
 
 - `0` — for `run`, every request was sent and no response status was an error
   (1xx, 2xx, 3xx). For `test`, every request got a response and every assertion
@@ -778,8 +1012,9 @@ for anyone writing `case $? in` around either.
   answered `4xx` or `5xx`. The responses print exactly as they would otherwise;
   only the exit code differs, so `sendra run req.yaml && deploy.sh` does not
   proceed on a 404.
-- `4` — `sendra test` only: every request got a response, but at least one had
-  an assertion that did not hold.
+- `4` — `sendra test` only: every request got a response, but at least one
+  failed a check it declared: an assertion that did not hold, or a
+  `post_request` script that threw.
 
 Codes `5` and up are free.
 
@@ -821,13 +1056,14 @@ surrounding script:
 sendra run examples/get-request.yaml --allow-error-status
 ```
 
-A failed assertion never enters `run`'s answer: `sendra run` prints assertion
-results and does not read them when deciding what to return, so a run that
-reports "2 failed" still exits `0`. That is permanent, not a stage on the way to
-unifying the two commands — wiring assertions into `run`'s exit code would
-silently change what every existing `sendra run req.yaml && deploy.sh` means the
-moment an `assertions` block is added to `req.yaml`, and `sendra test` exists so
-that nobody has to. See [Assertions](#assertions) for the whole argument, and
+A failed check never enters `run`'s answer: `sendra run` prints assertion
+results and `post_request` results and does not read either when deciding what
+to return, so a run that reports "2 failed" still exits `0`. That is permanent,
+not a stage on the way to unifying the two commands — wiring checks into `run`'s
+exit code would silently change what every existing
+`sendra run req.yaml && deploy.sh` means the moment an `assertions` block or a
+`post_request:` block is added to `req.yaml`, and `sendra test` exists so that
+nobody has to. See [Assertions](#assertions) for the whole argument, and
 `exit_for_response` in `sendra-cli/src/exit.rs` for the single place that
 decision lives.
 

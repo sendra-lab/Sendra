@@ -19,3 +19,7 @@ thiserror = "2"
 tokio = { version = "1", default-features = false }
 clap = { version = "4", features = ["derive"] }
 owo-colors = { version = "4", features = ["supports-colors"] }
+# "no_module" is a sandboxing decision, not a size one: it removes Rhai's
+# module system, and with it `import` and the filesystem-backed module
+# resolver that is otherwise the default. See the note on `script::engine`.
+rhai = { version = "1.26", features = ["no_module"] }

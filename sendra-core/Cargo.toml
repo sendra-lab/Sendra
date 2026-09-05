@@ -20,6 +20,11 @@ thiserror = { workspace = true }
 # Locating the global config directory per platform. `dirs`, not `directories`:
 # see the note on `config::global_config_path`.
 dirs = { workspace = true }
+# The `pre_request`/`post_request` scripting engine. Rust-native, so scripts
+# work with no runtime to install alongside sendra, and sandboxed by
+# construction: see the module docs on `script` for what is reachable from a
+# script and what is not.
+rhai = { workspace = true }
 
 [dev-dependencies]
 # Only the test harness needs a runtime here; the binary picks its own.

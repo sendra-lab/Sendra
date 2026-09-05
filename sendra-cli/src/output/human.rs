@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 
 use owo_colors::{OwoColorize, Stream};
-use sendra_core::{AssertionReport, Response};
+use sendra_core::{AssertionReport, Response, ScriptOutcome};
 
 use crate::exit::Summary;
 
@@ -204,6 +204,60 @@ pub(super) fn print_assertions(report: &AssertionReport) {
     }
 }
 
+/// Print what a request's `post_request` script decided, under its response.
+///
+/// ```text
+/// post_request
+///   ✓ passed
+/// ```
+///
+/// ```text
+/// post_request
+///   ✗ expected 201, got 500
+/// ```
+///
+/// Same shape as [`print_assertions`] — dimmed heading, indented results, green
+/// `✓` and red `✗` — because it is the same kind of statement: a check the file
+/// asked for, reported next to the response it is about. It goes *above* the
+/// assertions block, which is the order the two ran in.
+///
+/// A passing script prints a line rather than staying silent. The rule the
+/// assertions block follows is "nothing declared, nothing printed", and a
+/// script that ran is something declared: having asked for a check, the author
+/// should be able to see it happened. Nothing at all is printed for a request
+/// with no `post_request` block, so a file written before scripts existed looks
+/// exactly as it did before they existed — the caller decides that by not
+/// calling this.
+///
+/// The failure text is the script's own, straight from core: a thrown message
+/// verbatim, or Rhai's full error with a line number when the script had a bug
+/// rather than a complaint. Only the symbol, colour and layout are decided here.
+///
+/// `✓ passed` rather than repeating the script source: unlike an assertion,
+/// which core can render as the phrase `status is 200`, a script has no short
+/// form — the "expectation" is the whole block, it is in the file the reader
+/// just ran, and echoing it back would put a program in the middle of a run's
+/// output every single time it worked.
+pub(super) fn print_post_request(outcome: &ScriptOutcome) {
+    println!();
+    println!(
+        "{}",
+        "post_request".if_supports_color(Stream::Stdout, |t| t.dimmed())
+    );
+
+    match outcome.failure() {
+        None => println!(
+            "  {} passed",
+            "✓".if_supports_color(Stream::Stdout, |t| t.green())
+        ),
+        Some(failure) => println!(
+            "  {} {}",
+            "✗".if_supports_color(Stream::Stdout, |t| t.red()),
+            failure.if_supports_color(Stream::Stdout, |t| t.red())
+        ),
+    }
+}
+
 /// The `sendra test` counterpart to [`print_assertions`] for a request that
 /// declared none:
 ///
@@ -220,6 +274,11 @@ pub(super) fn print_assertions(report: &AssertionReport) {
 /// `sendra run` does not print it. A request with no assertions has always
 /// produced byte-for-byte the output it produced before assertions existed, and
 /// that stays true.
+///
+/// A request with a `post_request` script does not print it either, whatever
+/// its `assertions` block says: it *was* checked, the block above says how it
+/// went, and the summary counts it as a pass or a failure rather than as one of
+/// the uncovered.
 pub(super) fn print_no_assertions() {
     println!();
     println!(

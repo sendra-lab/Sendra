@@ -1,0 +1,63 @@
+# A request with both hooks: `pre_request` shapes what goes out, `post_request`
+# checks what comes back.
+#
+#   sendra run examples/scripted-request.yaml
+#   sendra test examples/scripted-request.yaml
+#
+# Scripts are Rhai, written inline as a YAML block scalar (`|`). They need
+# nothing installed alongside sendra — the interpreter is in the binary — and
+# they cannot touch the filesystem or the network.
+
+name: Scripted post
+method: POST
+url: https://httpbin.org/post
+headers:
+  Content-Type: application/json
+body: '{"widget": "sprocket", "count": 3}'
+
+# Runs last, after `{{variable}}` substitution and after any config defaults
+# have been merged in, so it sees the request exactly as it would otherwise be
+# sent — and anything it changes is what actually goes over the wire.
+#
+# Readable and writable: `url`, `headers`, `body` (a string, or `()` for none).
+# Readable only: `method`. Throwing here means the request is never sent.
+pre_request: |
+  // httpbin echoes back what it received, so the header this adds shows up in
+  // the response body — which is what the post_request check below reads.
+  request.headers["X-Widget-Count"] = "3";
+
+  // The request is fully substituted by now, so a script can inspect what is
+  // actually about to be sent rather than what the file says.
+  if !request.url.starts_with("https://") {
+    throw "refusing to send this body over plain http";
+  }
+
+# Runs against the response, before any `assertions` block is evaluated. The
+# response is read-only: `status`, `status_text`, `headers` (a list of
+# `#{name, value}`), `body`, `elapsed_ms`.
+#
+# `throw` is how a check fails. A failure is printed under the response and
+# counts as a failure under `sendra test`, exactly as a failed assertion does —
+# and, exactly as a failed assertion does, it leaves `sendra run`'s exit code
+# alone.
+post_request: |
+  if response.status != 200 {
+    throw "expected 200, got " + response.status + " " + response.status_text;
+  }
+
+  // Headers are a list rather than a map, because HTTP lets one repeat.
+  let content_type = response.headers.find(|h| h.name.to_lower() == "content-type");
+  if content_type == () || !content_type.value.contains("json") {
+    throw "expected a JSON response";
+  }
+
+  // The header the pre_request script added, echoed back by httpbin.
+  if !response.body.contains("X-Widget-Count") {
+    throw "the header pre_request added did not arrive";
+  }
+
+# Scripts and assertions are independent: both look at the same response,
+# neither can see the other, and both are reported.
+assertions:
+  status: 200
+  body_contains: sprocket

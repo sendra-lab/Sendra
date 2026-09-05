@@ -9,7 +9,7 @@
 //! and nested two-element arrays — instead of `elapsed_ms` and named header
 //! pairs. Nothing in core needed changing to add this.
 
-use sendra_core::{AssertionKind, AssertionReport, Response, SendraError};
+use sendra_core::{AssertionKind, AssertionReport, Response, ScriptOutcome, SendraError};
 use serde::Serialize;
 
 use crate::exit::Summary;
@@ -58,6 +58,13 @@ pub(super) struct RunDocument<'a> {
 /// `assertions` is always an object, with an empty `results` list for a request
 /// that declared none — the same thing the human output says by printing
 /// nothing.
+///
+/// `post_request` is null for a request that declared no script, which is a
+/// different thing from a script that ran and passed — the same distinction the
+/// terminal draws by printing nothing versus printing `✓ passed`. There is no
+/// matching `pre_request` key: a `pre_request` script that fails means the
+/// request was never sent, which `error` already says, and one that succeeds has
+/// nothing to report beyond the request that went out.
 #[derive(Debug, Serialize)]
 pub(super) struct RequestRecord {
     /// The request's `name`, or its URL when it has none — the same label the
@@ -66,6 +73,7 @@ pub(super) struct RequestRecord {
     pub(super) response: Option<ResponseRecord>,
     /// Why there was no response, message and causes joined with `: `.
     pub(super) error: Option<String>,
+    pub(super) post_request: Option<PostRequestRecord>,
     pub(super) assertions: AssertionsRecord,
 }
 
@@ -75,7 +83,33 @@ impl RequestRecord {
             label: label.to_string(),
             response: None,
             error: None,
+            post_request: None,
             assertions: AssertionsRecord::default(),
+        }
+    }
+}
+
+/// What a request's `post_request` script decided.
+///
+/// `passed` and `failure` rather than `failure` alone, so a consumer can read
+/// `.post_request.passed` without having to know that null means success —
+/// the same pair, in the same spelling, that each entry of `assertions.results`
+/// carries, because it is the same kind of statement about the same response.
+///
+/// `failure` is core's own wording: the message the script threw, verbatim, or
+/// Rhai's full error with a position when the script had a bug rather than a
+/// complaint about the response.
+#[derive(Debug, Serialize)]
+pub(super) struct PostRequestRecord {
+    passed: bool,
+    failure: Option<String>,
+}
+
+impl From<&ScriptOutcome> for PostRequestRecord {
+    fn from(outcome: &ScriptOutcome) -> Self {
+        Self {
+            passed: outcome.passed(),
+            failure: outcome.failure().map(str::to_owned),
         }
     }
 }
