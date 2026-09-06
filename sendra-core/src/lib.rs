@@ -61,6 +61,38 @@ pub enum SendraError {
         source: reqwest::Error,
     },
 
+    /// The request did not finish inside the configured timeout.
+    ///
+    /// Split out of [`Network`](Self::Network) because it is the one network
+    /// failure whose cause is a *Sendra setting*. Every other one — DNS,
+    /// refused connection, TLS — is a statement about the network or the
+    /// server, and the fix is out there; this one says the server was still
+    /// working when Sendra stopped waiting, and the fix may well be a line in
+    /// `.sendra/config.yaml`. Folded into `Network`, all a user got was
+    /// "request to `x` failed / caused by: operation timed out", which never
+    /// mentions that Sendra imposed the limit or what it was set to.
+    ///
+    /// Carries the limit that was actually applied — the resolved
+    /// [`Config::timeout`](crate::Config::timeout), not the raw
+    /// `timeout_seconds` key, which may not have been set at all — so the
+    /// message can name it whether it came from a config file or from
+    /// [`DEFAULT_TIMEOUT`](crate::config::DEFAULT_TIMEOUT).
+    ///
+    /// The whole-request timeout covers connect, send *and* body read, so this
+    /// is raised from either half of [`send_prepared`]: a server that accepts
+    /// the connection and then dribbles the body out too slowly times out here
+    /// exactly like one that never answers at all.
+    #[error("request to `{url}` timed out after {}s", .timeout.as_secs_f64())]
+    Timeout {
+        url: String,
+        /// The limit that was exceeded, as applied to the client.
+        timeout: Duration,
+        /// reqwest's own error, kept so the cause chain still shows where in
+        /// the request the clock ran out.
+        #[source]
+        source: reqwest::Error,
+    },
+
     /// The HTTP client itself could not be built, so nothing was sent and
     /// nothing will be: this is a failure of the run's configuration (a TLS
     /// backend that will not initialise, say), not of one request. Separate
@@ -783,6 +815,25 @@ pub struct Response {
     pub status: u16,
     pub status_text: String,
     pub headers: Vec<(String, String)>,
+    /// The response body, decoded from the bytes on the wire **lossily**:
+    /// any byte sequence that is not valid UTF-8 is replaced with U+FFFD
+    /// (`\u{fffd}`, the replacement character) rather than erroring.
+    ///
+    /// This is a deliberate contract, not an accident of the type. A body can
+    /// legitimately be a PNG or a protobuf, and a tool whose job is to show
+    /// you what came back should show you *something* rather than refuse the
+    /// whole response over its encoding — the status, the headers and the
+    /// elapsed time are all still true and all still worth seeing. So an
+    /// invalid body is never an error.
+    ///
+    /// The cost is that it is **not round-trippable**: `body.as_bytes()` is
+    /// not what the server sent, and the original bytes cannot be recovered
+    /// from here. Everything downstream that reads this — assertions,
+    /// captures, scripts, `--json` output — is reading the replaced text, so
+    /// a `body_contains` against a binary payload is comparing against U+FFFD
+    /// and will not match. Binary-safe bodies (keeping the raw bytes
+    /// alongside, and telling the user when a substitution happened) are a
+    /// later concern; today the substitution is silent.
     pub body: String,
     pub elapsed: Duration,
     /// Every redirect hop that led to this response, oldest first: empty when
@@ -853,6 +904,15 @@ pub struct HttpClient {
     /// See [`RedirectLog`] — in particular, its note on why this only works
     /// as long as sends through this client stay sequential.
     redirects: RedirectLog,
+    /// The whole-request timeout this client was built with, kept so that
+    /// [`SendraError::Timeout`] can name the limit it hit.
+    ///
+    /// Here rather than passed back down through [`send_prepared`] because
+    /// this is where the limit *is*: reqwest keeps its own copy inside
+    /// `inner` and will not hand it back, and `send_prepared` deliberately
+    /// takes no `&Config` (see its doc comment). The client enforces the
+    /// timeout, so the client is what remembers it.
+    timeout: Duration,
 }
 
 /// Build the HTTP client a run sends every one of its requests through.
@@ -919,7 +979,11 @@ pub fn build_client(config: &Config) -> Result<HttpClient, SendraError> {
         .build()
         .map_err(SendraError::Client)?;
 
-    Ok(HttpClient { inner, redirects })
+    Ok(HttpClient {
+        inner,
+        redirects,
+        timeout: config.timeout,
+    })
 }
 
 /// Raised by the custom redirect policy in [`build_client`] when a chain runs
@@ -1022,9 +1086,22 @@ pub async fn send_prepared(
         headers.append(header_name, header_value);
     }
 
-    let network_err = |source: reqwest::Error| SendraError::Network {
-        url: request.url.clone(),
-        source,
+    // Every failure below comes back as a `reqwest::Error`, and exactly one
+    // kind of it is worth its own variant: the timeout, because it is the
+    // only one Sendra itself caused. See `SendraError::Timeout`.
+    let send_err = |source: reqwest::Error| {
+        if source.is_timeout() {
+            SendraError::Timeout {
+                url: request.url.clone(),
+                timeout: client.timeout,
+                source,
+            }
+        } else {
+            SendraError::Network {
+                url: request.url.clone(),
+                source,
+            }
+        }
     };
 
     let mut builder = client
@@ -1043,7 +1120,7 @@ pub async fn send_prepared(
     client.redirects.lock().unwrap().clear();
 
     let started = Instant::now();
-    let response = builder.send().await.map_err(network_err)?;
+    let response = builder.send().await.map_err(send_err)?;
     let redirects = std::mem::take(&mut *client.redirects.lock().unwrap());
 
     let status = response.status();
@@ -1060,15 +1137,17 @@ pub async fn send_prepared(
             )
         })
         .collect();
-    let bytes = response.bytes().await.map_err(network_err)?;
+    let bytes = response.bytes().await.map_err(send_err)?;
     let elapsed = started.elapsed();
 
     Ok(Response {
         status: status.as_u16(),
         status_text: status.canonical_reason().unwrap_or("").to_owned(),
         headers: header_pairs,
-        // Lossy: a body can legitimately be binary, and this crate hands back a
-        // printable String for now. Binary-safe bodies are a later concern.
+        // Lossy by contract, and explicitly so: `.bytes()` then
+        // `from_utf8_lossy`, rather than reqwest's `.text()`, which reaches
+        // the same result by a route that reads like an accident. See the
+        // note on `Response::body`.
         body: String::from_utf8_lossy(&bytes).into_owned(),
         elapsed,
         redirects,
@@ -1924,6 +2003,303 @@ enviroment: staging
         );
         assert!(matching.iter().any(|l| l.contains("1.2.3.4")));
         assert!(matching.iter().any(|l| l.contains("5.6.7.8")));
+    }
+
+    // --- timeouts ----------------------------------------------------------
+
+    /// Where a slow server stops, relative to the response it owes.
+    ///
+    /// The configured timeout is a *whole-request* one — connect, send and
+    /// body read — and `send_prepared` can therefore fail at either of two
+    /// awaits. These are those two places, so both are exercised rather than
+    /// assumed equivalent.
+    enum Stall {
+        /// Read the request and then say nothing at all: what an overloaded
+        /// server that has not started work yet looks like.
+        BeforeResponding,
+        /// Send the status line and a `Content-Length` promising a body, then
+        /// stop without sending it: headers arrive, `bytes()` never finishes.
+        MidBody,
+    }
+
+    /// A server that reads a request and then goes quiet for `delay`.
+    ///
+    /// Hand-rolled over a blocking `TcpListener` on its own thread, like every
+    /// other mock server in this file. A mock-server crate would be a new
+    /// dependency for a behaviour that is one `thread::sleep` inside the
+    /// pattern already here — and what these tests need is a server that does
+    /// *not* obey HTTP's usual rhythm, which is the case a library built
+    /// around stubbing well-formed exchanges is least suited to.
+    ///
+    /// The sleep is on a std thread, not a tokio task, so it blocks nothing
+    /// the client under test is running on.
+    fn start_stalling_server(stall: Stall, delay: Duration) -> std::net::SocketAddr {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is free");
+        let addr = listener.local_addr().expect("the listener has an address");
+
+        std::thread::spawn(move || {
+            let Ok(stream) = listener.accept().map(|(s, _)| s) else {
+                return;
+            };
+            let mut writer = stream.try_clone().expect("the socket clones");
+            let mut reader = BufReader::new(stream);
+
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                return;
+            }
+            loop {
+                let mut header = String::new();
+                match reader.read_line(&mut header) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) if header == "\r\n" => break,
+                    Ok(_) => {}
+                }
+            }
+
+            if matches!(stall, Stall::MidBody) {
+                // A body is promised and never sent, so the client is left
+                // waiting inside the body read rather than inside the send.
+                let _ = writer.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\n",
+                );
+                let _ = writer.flush();
+            }
+
+            // Long enough that a test seeing a timeout has necessarily seen
+            // the client's clock rather than the server's.
+            std::thread::sleep(delay);
+            let _ = writer.write_all(b"too late");
+        });
+
+        addr
+    }
+
+    /// Comfortably longer than any timeout these tests configure: the server
+    /// is still holding the connection when the assertions run.
+    const STALL: Duration = Duration::from_secs(30);
+
+    #[tokio::test]
+    async fn a_server_slower_than_the_timeout_fails_with_a_timeout_error() {
+        // The timeout has only ever been checked as a resolved `Config` value.
+        // This is it applied: a server that never answers, and a client that
+        // stops waiting on its own.
+        let addr = start_stalling_server(Stall::BeforeResponding, STALL);
+        let config = Config {
+            timeout: Duration::from_millis(300),
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a client builds");
+        let url = format!("http://{addr}/");
+
+        let started = Instant::now();
+        let err = send(&get(&url), &client, &config)
+            .await
+            .expect_err("a server that never answers must not hang the run");
+        let waited = started.elapsed();
+
+        match &err {
+            SendraError::Timeout {
+                url: got, timeout, ..
+            } => {
+                assert_eq!(got, &url);
+                assert_eq!(
+                    *timeout,
+                    Duration::from_millis(300),
+                    "the error must name the limit that was actually applied"
+                );
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+
+        // The message a user sees, rather than only the variant a front-end
+        // matches on: "failed" alone would not tell them a setting caused it.
+        assert_eq!(
+            err.to_string(),
+            format!("request to `{url}` timed out after 0.3s")
+        );
+
+        // The clock that fired was the client's, not the server's: the server
+        // is still asleep, and has another twenty-nine-odd seconds to go.
+        assert!(
+            waited < STALL / 2,
+            "gave up after {waited:?}, which is not the configured 300ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_timeout_covers_the_body_read_not_just_the_response_headers() {
+        // The config calls this a whole-request timeout, so a server that
+        // sends its headers promptly and then stalls forever mid-body has to
+        // be caught too — a different await in `send_prepared`, and one that
+        // would quietly return `Network` if only the first were classified.
+        let addr = start_stalling_server(Stall::MidBody, STALL);
+        let config = Config {
+            timeout: Duration::from_millis(300),
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a client builds");
+
+        let started = Instant::now();
+        let err = send(&get(&format!("http://{addr}/")), &client, &config)
+            .await
+            .expect_err("a body that never arrives must time out like a response that never does");
+        let waited = started.elapsed();
+
+        assert!(
+            matches!(err, SendraError::Timeout { .. }),
+            "a stall after the headers is still a timeout, got {err:?}"
+        );
+        assert!(waited < STALL / 2, "gave up after {waited:?}");
+    }
+
+    #[tokio::test]
+    async fn a_timeout_from_a_config_file_is_the_one_that_is_enforced() {
+        // The half config-resolution tests cannot reach: that the number
+        // written in `.sendra/config.yaml` is the number the socket obeys.
+        // Resolved from a real file on disk, exactly as a run would, then put
+        // against a server that never answers.
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let project_dir = temp.path().join(".sendra");
+        std::fs::create_dir_all(&project_dir).expect("the project dir is created");
+        std::fs::write(project_dir.join("config.yaml"), "timeout_seconds: 1\n")
+            .expect("the config file writes");
+
+        let config = Config::resolve_from(temp.path(), None).expect("the config resolves");
+        assert_eq!(config.timeout, Duration::from_secs(1), "the file was read");
+
+        let addr = start_stalling_server(Stall::BeforeResponding, STALL);
+        let client = build_client(&config).expect("a client builds");
+
+        let started = Instant::now();
+        let err = send(&get(&format!("http://{addr}/")), &client, &config)
+            .await
+            .expect_err("the configured second must run out");
+        let waited = started.elapsed();
+
+        match err {
+            SendraError::Timeout { timeout, .. } => assert_eq!(timeout, Duration::from_secs(1)),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        assert!(
+            waited >= Duration::from_millis(900),
+            "gave up after {waited:?}, sooner than the second the file asked for"
+        );
+        assert!(waited < STALL / 2, "gave up after {waited:?}");
+    }
+
+    #[tokio::test]
+    async fn a_connection_failure_is_still_a_network_error_not_a_timeout() {
+        // The counterpart that makes the variant above worth having: if every
+        // failed send came back as `Timeout`, the split would say nothing. A
+        // port with nothing behind it refuses immediately, so this is a
+        // connection failure and cannot be a slow one.
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is free");
+        let addr = listener.local_addr().expect("the listener has an address");
+        drop(listener);
+
+        let config = Config {
+            timeout: Duration::from_secs(30),
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a client builds");
+        let err = send(&get(&format!("http://{addr}/")), &client, &config)
+            .await
+            .expect_err("nothing is listening on that port");
+
+        assert!(
+            matches!(err, SendraError::Network { .. }),
+            "a refused connection is a fact about the network, not about the timeout, got {err:?}"
+        );
+    }
+
+    // --- non-UTF-8 response bodies -----------------------------------------
+
+    /// A raw `200` whose body is exactly `body`, byte for byte.
+    ///
+    /// Separate from [`ok_response`] because that one takes a `&str` and so
+    /// cannot express a body that is not text — which is the entire subject
+    /// of the two tests below.
+    fn ok_bytes(content_type: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_in_a_body_is_replaced_rather_than_erroring() {
+        // `Response.body` is a `String`, so bytes that are not UTF-8 have to
+        // go somewhere. They are replaced, and this pins exactly what with:
+        // U+FFFD per invalid sequence, the surrounding text untouched, and no
+        // error — see the contract on `Response::body`.
+        //
+        // 0xFF and 0xFE cannot begin a UTF-8 sequence at all, and 0xE2 0x28 is
+        // a truncated three-byte sequence: the shape a body cut off at the
+        // wrong boundary actually has.
+        let body = b"ok \xff\xfe then \xe2\x28 end";
+        let addr = start_route_server(vec![("/", ok_bytes("text/plain", body))]);
+
+        let config = Config::default();
+        let client = build_client(&config).expect("a client builds");
+        let response = send(&get(&format!("http://{addr}/")), &client, &config)
+            .await
+            .expect("an undecodable body is not a failed request");
+
+        assert_eq!(response.status, 200, "the response itself is fine");
+        assert_eq!(
+            response.body, "ok \u{fffd}\u{fffd} then \u{fffd}( end",
+            "each invalid sequence becomes one replacement character, and the \
+             valid text around it survives unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wholly_binary_body_comes_back_as_a_response_not_an_error() {
+        // The everyday case: an endpoint that answers with an image. Status,
+        // headers and elapsed time are all still true and worth showing, so
+        // the response comes back rather than the request failing over its
+        // body's encoding.
+        //
+        // A PNG signature, whose second byte (0x50, 'P') is deliberately
+        // printable — proof the substitution is per invalid sequence and not a
+        // blanket rewrite of the whole body.
+        let body: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let addr = start_route_server(vec![("/", ok_bytes("image/png", body))]);
+
+        let config = Config::default();
+        let client = build_client(&config).expect("a client builds");
+        let response = send(&get(&format!("http://{addr}/")), &client, &config)
+            .await
+            .expect("a binary body is not a failed request");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|(name, _)| name == "content-type")
+                .map(|(_, value)| value.as_str()),
+            Some("image/png"),
+            "everything but the body is unaffected"
+        );
+        assert_eq!(response.body, "\u{fffd}PNG\r\n\u{1a}\n");
+
+        // Stated as a test rather than only as a doc comment, because it is
+        // the part that bites: what comes back is not what was sent, and no
+        // caller can recover the original bytes from here.
+        assert_ne!(
+            response.body.as_bytes(),
+            body,
+            "the conversion is lossy, and `Response.body` is not round-trippable"
+        );
     }
 
     // --- redirect handling -------------------------------------------------
