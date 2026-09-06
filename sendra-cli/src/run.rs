@@ -706,12 +706,12 @@ requests:
         let prepared = prepared.expect("the script runs");
 
         assert_eq!(
-            prepared.headers.get("X-From-Config").map(String::as_str),
+            prepared.header("X-From-Config"),
             Some("script"),
             "the script runs after the config and wins ties with it"
         );
         assert!(
-            !prepared.headers.contains_key("X-Doomed"),
+            prepared.header("X-Doomed").is_none(),
             "a header the script removed must stay removed: {:?}",
             prepared.headers
         );
@@ -757,10 +757,7 @@ requests:
         let (prepared, _) = run_pre_request(scripts.pre_request().unwrap(), &substituted);
         let prepared = prepared.expect("it runs");
 
-        assert_eq!(
-            prepared.headers.get("X").map(String::as_str),
-            Some("{{marker}} ${MARKER}")
-        );
+        assert_eq!(prepared.header("X"), Some("{{marker}} ${MARKER}"));
     }
 
     #[tokio::test]
@@ -1410,7 +1407,7 @@ requests:
                 let outcome = captured_from(&request, &environment, body);
                 sent.push((
                     request.url.clone(),
-                    request.headers.get("Authorization").cloned(),
+                    request.header("Authorization").map(str::to_string),
                 ));
                 async move { outcome }
             },

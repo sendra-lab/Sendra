@@ -139,6 +139,39 @@ capture: # optional, values handed to the requests after this one — see below
 Unknown top-level keys are rejected rather than silently ignored, so a typo in a
 field name is an error you see immediately.
 
+### Sending the same header more than once
+
+HTTP allows a header name to repeat, and some APIs need it: several
+`Set-Cookie`-shaped headers, several `X-Forwarded-For` values, or any
+API-specific header a client may send twice. A YAML mapping cannot have two
+keys of the same name, so a header value may be **either a scalar or a list of
+scalars** — a list sends one header per entry, in the order written:
+
+```yaml
+headers:
+  Accept: application/json # scalar → one header
+  X-Forwarded-For: # list → two headers, in this order
+    - 1.2.3.4
+    - 5.6.7.8
+```
+
+Header order is preserved exactly as written, both between different names and
+among the repeats of one name. Two entries with the same name *and* the same
+value are accepted rather than rejected: Sendra rejects ambiguity, not
+redundancy, and repeating a value is an explicit (if pointless) choice, not a
+thing it has to guess about.
+
+Two other consequences of headers being an ordered list rather than a map:
+
+- A **config default is still suppressed** by a request header of the same
+  name, compared case-insensitively, exactly as before — repetition is a
+  request-level choice, not licence for a config default to duplicate
+  something the request already set. See [Configuration](#configuration).
+- Two header names that only collide **after variable substitution**
+  (`{{prefix}}-Key` and `X-Key`, with `prefix` set to `X`) used to be an error,
+  because a map would have silently dropped one value. Both are now simply
+  sent, since nothing is lost.
+
 ## Collection file shape
 
 A collection is several named requests in one file — the endpoints of a single
@@ -1059,6 +1092,24 @@ field a request does not have and is an error, the same way an unknown key in
 the YAML is an error. Values are not coerced either: `request.headers["X"] = 5`
 is an error asking for `.to_string()`, because a header is a string on the wire
 and silently stringifying leaves what a float renders as up to the interpreter.
+
+**`request.headers` is a map, even though a request file can repeat a header
+name.** The map is what makes `request.headers["X"] = …` and `.remove("X")`
+mean the obvious thing, and a list-of-pairs API would make every script that
+touches a header pay in syntax for a case that is rare in a file and rarer in a
+script. Two costs follow, and they apply only to a request that *has* a
+`pre_request` script — one without a script never goes through this conversion
+and keeps every occurrence:
+
+- A header repeated in the file collapses to its **last** value, since a map
+  holds one entry per key.
+- A script cannot add a second occurrence of a name: assigning to the same key
+  twice is one write, not two headers. A genuinely repeated header has to be
+  written in the YAML file, using the list shape above.
+
+Header names a script passes through also come back sorted alphabetically
+rather than in file order, which is what they did before headers became an
+ordered list, so an existing script behaves exactly as it did.
 
 Throwing in `pre_request` means the request is never sent.
 

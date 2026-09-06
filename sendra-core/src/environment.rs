@@ -248,27 +248,25 @@ impl Environment {
     /// never a half-substituted request. The whole request is built before it is
     /// sent, so both failures land before any of its bytes go out.
     ///
+    /// Headers are substituted in place, entry by entry, so order is preserved
+    /// exactly as written in the file. Two header names that were distinct in
+    /// the file can collide once substituted (`{{prefix}}-Key` and `X-Key`,
+    /// say) — that used to be an error back when headers were a map and a
+    /// silent collision would have dropped a value, but `Request.headers` is a
+    /// `Vec` that allows a name to repeat, so a post-substitution collision is
+    /// now exactly that: two headers of the same name, sent as written.
+    ///
     /// Assertions are substituted for the same reason the rest of the file is:
     /// what a staging response should say is exactly as environment-dependent
     /// as what the request asks for, and `body_contains: '{{tenant}}'` would
     /// otherwise compare against the literal braces. See
     /// [`apply_assertions`](Self::apply_assertions) for the one line it draws.
     pub fn apply(&self, request: &Request) -> Result<Request, SendraError> {
-        let mut headers = BTreeMap::new();
+        let mut headers = Vec::with_capacity(request.headers.len());
         for (name, value) in &request.headers {
             let name = self.expand_templates(name)?;
             let value = self.expand_templates(value)?;
-            // Two header names that were distinct in the file can collide once
-            // substituted (`{{prefix}}-Key` and `X-Key`, say). A map insert
-            // would drop one value without a word; this says so instead.
-            if headers.insert(name.clone(), value).is_some() {
-                return Err(SendraError::InvalidHeader {
-                    name,
-                    reason: "two header names in this request resolve to it after variable \
-                             substitution, so one of the values would be dropped"
-                        .to_string(),
-                });
-            }
+            headers.push((name, value));
         }
 
         Ok(Request {
@@ -678,15 +676,9 @@ body: '{\"host\": \"{{base_url}}\"}'
         let applied = environment.apply(&request).expect("every variable is set");
 
         assert_eq!(applied.url, "https://staging.example.com/users/42");
-        assert_eq!(
-            applied.headers.get("Authorization").map(String::as_str),
-            Some("Bearer s3cret")
-        );
+        assert_eq!(applied.header("Authorization"), Some("Bearer s3cret"));
         // Header *names* are substituted too, not just values.
-        assert_eq!(
-            applied.headers.get("X-Tenant").map(String::as_str),
-            Some("fixed-value")
-        );
+        assert_eq!(applied.header("X-Tenant"), Some("fixed-value"));
         assert_eq!(
             applied.body.as_deref(),
             Some("{\"host\": \"https://staging.example.com\"}")
@@ -694,6 +686,42 @@ body: '{\"host\": \"{{base_url}}\"}'
         // The label is deliberately untouched: it is the run selector.
         assert_eq!(applied.name.as_deref(), Some("Templated"));
         assert_eq!(applied.method, Method::Post);
+    }
+
+    #[test]
+    fn substitution_preserves_header_order_including_a_repeated_name() {
+        let yaml = "\
+method: GET
+url: https://example.com
+headers:
+  Accept: application/json
+  X-Forwarded-For:
+    - '{{first}}'
+    - '{{second}}'
+  X-Tenant: '{{tenant}}'
+";
+        let request = Request::from_yaml_str(yaml).unwrap();
+        let environment = environment(
+            &[
+                ("first", "1.2.3.4"),
+                ("second", "5.6.7.8"),
+                ("tenant", "acme"),
+            ],
+            &[],
+        );
+
+        let applied = environment.apply(&request).expect("every variable is set");
+
+        assert_eq!(
+            applied.headers,
+            vec![
+                ("Accept".to_string(), "application/json".to_string()),
+                ("X-Forwarded-For".to_string(), "1.2.3.4".to_string()),
+                ("X-Forwarded-For".to_string(), "5.6.7.8".to_string()),
+                ("X-Tenant".to_string(), "acme".to_string()),
+            ],
+            "order among distinct names and among a repeated name must both survive"
+        );
     }
 
     /// A request whose every assertion carries a placeholder, in each of the
@@ -935,10 +963,7 @@ assertions:
 
         let applied = environment.apply(&request).unwrap();
 
-        assert_eq!(
-            applied.headers.get("Authorization").map(String::as_str),
-            Some("live-token")
-        );
+        assert_eq!(applied.header("Authorization"), Some("live-token"));
     }
 
     #[test]
@@ -950,10 +975,7 @@ assertions:
         let environment = environment(&[("auth", "Bearer ${API_KEY}!")], &[("API_KEY", "abc")]);
 
         let applied = environment.apply(&request).unwrap();
-        assert_eq!(
-            applied.headers.get("Authorization").map(String::as_str),
-            Some("Bearer abc!")
-        );
+        assert_eq!(applied.header("Authorization"), Some("Bearer abc!"));
     }
 
     #[test]
@@ -1051,10 +1073,7 @@ requests:
         assert_eq!(applied.requests[0].url, "https://staging.example.com/users");
         assert_eq!(applied.requests[1].url, "https://staging.example.com/users");
         assert_eq!(
-            applied.requests[1]
-                .headers
-                .get("Authorization")
-                .map(String::as_str),
+            applied.requests[1].header("Authorization"),
             Some("Bearer s3cret")
         );
         // Untemplated fields are carried through untouched.
@@ -1128,7 +1147,13 @@ requests:
     }
 
     #[test]
-    fn two_header_names_resolving_to_the_same_name_is_an_error_not_a_dropped_value() {
+    fn two_header_names_resolving_to_the_same_name_after_substitution_keeps_both() {
+        // Back when `Request.headers` was a map, two names colliding after
+        // substitution would silently drop one value, so this used to be a
+        // reported error. Now that a name is allowed to repeat, a
+        // post-substitution collision is just that: two headers under the
+        // same name, both sent — nothing is lost, so there is nothing to
+        // report.
         let yaml = "\
 method: GET
 url: https://example.com
@@ -1139,13 +1164,16 @@ headers:
         let request = Request::from_yaml_str(yaml).unwrap();
         let environment = environment(&[("name", "X-Key")], &[]);
 
-        let err = environment
+        let applied = environment
             .apply(&request)
-            .expect_err("one of the two values would be silently lost");
-        match err {
-            SendraError::InvalidHeader { name, .. } => assert_eq!(name, "X-Key"),
-            other => panic!("expected InvalidHeader, got {other:?}"),
-        }
+            .expect("a post-substitution collision is legal, not an error");
+        assert_eq!(
+            applied.headers,
+            vec![
+                ("X-Key".to_string(), "from-template".to_string()),
+                ("X-Key".to_string(), "from-literal".to_string()),
+            ]
+        );
     }
 
     #[test]

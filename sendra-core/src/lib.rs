@@ -290,8 +290,29 @@ impl std::fmt::Display for Method {
 ///   status: 200
 /// ```
 ///
-/// Everything but `method` and `url` is optional. Headers are a `BTreeMap` so
-/// iteration order is deterministic across runs.
+/// Everything but `method` and `url` is optional.
+///
+/// **Headers are a `Vec` of pairs, not a map** — matching [`Response::headers`]
+/// and for the same reason: HTTP allows a header name to repeat (multiple
+/// `Set-Cookie`-shaped headers, repeated `X-Forwarded-For` values), and a map
+/// cannot represent that. Order is preserved exactly as written in the file.
+///
+/// A standard YAML mapping still cannot have two keys with the same name, so
+/// writing a repeated header names it once with a *list* of values instead of
+/// a scalar:
+///
+/// ```text
+/// headers:
+///   Accept: application/json    # scalar: one header
+///   X-Forwarded-For:            # list: one header per entry, in order
+///     - 1.2.3.4
+///     - 5.6.7.8
+/// ```
+///
+/// Two entries with the same name *and* the same value are accepted rather
+/// than rejected: Sendra's stance elsewhere is to reject ambiguity, not
+/// redundancy, and a client is allowed to send the same header twice even
+/// when doing so is pointless.
 ///
 /// `Eq` is deliberately absent where `PartialEq` is derived: an expected JSON
 /// value in an [`Assertions`] block can be a float, and JSON floats are not
@@ -303,8 +324,13 @@ pub struct Request {
     pub name: Option<String>,
     pub method: Method,
     pub url: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub headers: BTreeMap<String, String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_headers",
+        serialize_with = "serialize_headers"
+    )]
+    pub headers: Vec<(String, String)>,
     /// Raw body, sent verbatim. Structured/multipart bodies come later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
@@ -407,6 +433,163 @@ impl Request {
             None => format!("{} {}", self.method, self.url),
         }
     }
+
+    /// The first header with exactly this name, if any.
+    ///
+    /// A convenience for callers that know (or only care about) at most one
+    /// occurrence; a header that may legitimately repeat should read
+    /// `.headers` directly rather than lose every occurrence but the first.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(existing, _)| existing == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Deserialize a `headers:` mapping into ordered `(name, value)` pairs.
+///
+/// A standard YAML mapping cannot have two keys with the same name, so a
+/// value may be either a scalar (one header) or a sequence of scalars (one
+/// header per entry, expanded in list order) — see the shape documented on
+/// [`Request::headers`]. Order among distinct names is preserved exactly as
+/// the underlying `MapAccess` yields it, which for `serde_yaml` is document
+/// order.
+fn deserialize_headers<'de, D>(deserializer: D) -> Result<Vec<(String, String)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{MapAccess, SeqAccess, Visitor};
+
+    enum HeaderValue {
+        Single(String),
+        Multiple(Vec<String>),
+    }
+
+    // Hand-written rather than `#[serde(untagged)]`, which reports every
+    // mistake as "data did not match any variant of untagged enum
+    // HeaderValue". This way a number where a value belongs is serde's own
+    // "invalid type: integer `5`, expected a string or a list of strings",
+    // naming what was found and what was wanted.
+    impl<'de> Deserialize<'de> for HeaderValue {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct HeaderValueVisitor;
+
+            impl<'de> Visitor<'de> for HeaderValueVisitor {
+                type Value = HeaderValue;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a string or a list of strings")
+                }
+
+                fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                    Ok(HeaderValue::Single(value.to_string()))
+                }
+
+                // An unquoted `X-Api-Version: 2` read as the header value "2"
+                // back when this field was a `BTreeMap<String, String>`, since
+                // that is what serde_yaml does for a plain scalar asked for as
+                // a string. Kept, so the type change does not quietly start
+                // rejecting files that have always worked.
+                fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                    Ok(HeaderValue::Single(value.to_string()))
+                }
+
+                fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                    Ok(HeaderValue::Single(value.to_string()))
+                }
+
+                fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                    Ok(HeaderValue::Single(value.to_string()))
+                }
+
+                fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                    Ok(HeaderValue::Single(value.to_string()))
+                }
+
+                fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+                where
+                    A: SeqAccess<'de>,
+                {
+                    let mut values = Vec::new();
+                    while let Some(value) = seq.next_element::<String>()? {
+                        values.push(value);
+                    }
+                    Ok(HeaderValue::Multiple(values))
+                }
+            }
+
+            deserializer.deserialize_any(HeaderValueVisitor)
+        }
+    }
+
+    struct HeadersVisitor;
+
+    impl<'de> Visitor<'de> for HeadersVisitor {
+        type Value = Vec<(String, String)>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a map of header name to a string or list of strings")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut headers = Vec::new();
+            while let Some((name, value)) = map.next_entry::<String, HeaderValue>()? {
+                match value {
+                    HeaderValue::Single(value) => headers.push((name, value)),
+                    HeaderValue::Multiple(values) => {
+                        headers.extend(values.into_iter().map(|value| (name.clone(), value)));
+                    }
+                }
+            }
+            Ok(headers)
+        }
+    }
+
+    deserializer.deserialize_map(HeadersVisitor)
+}
+
+/// Serialize ordered `(name, value)` pairs back into a `headers:` mapping.
+///
+/// The inverse of [`deserialize_headers`]: a name that occurs once is written
+/// as a scalar, one that occurs more than once is grouped under that name as
+/// a list, in the order its values first and subsequently appear. Grouping
+/// means two occurrences of the same name that were *not* adjacent in the
+/// original `Vec` come back out adjacent — the only place this round trip is
+/// lossy, and unobservable in practice since nothing else in Sendra cares
+/// where among same-named headers a value sits.
+fn serialize_headers<S>(headers: &[(String, String)], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+
+    let mut order: Vec<&str> = Vec::new();
+    let mut grouped: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for (name, value) in headers {
+        let values = grouped.entry(name.as_str()).or_default();
+        if values.is_empty() {
+            order.push(name.as_str());
+        }
+        values.push(value.as_str());
+    }
+
+    let mut map = serializer.serialize_map(Some(order.len()))?;
+    for name in order {
+        let values = &grouped[name];
+        if values.len() == 1 {
+            map.serialize_entry(name, values[0])?;
+        } else {
+            map.serialize_entry(name, values)?;
+        }
+    }
+    map.end()
 }
 
 /// A named group of requests living in one YAML file.
@@ -710,7 +893,10 @@ pub async fn send_prepared(
                 reason: e.to_string(),
             }
         })?;
-        headers.insert(header_name, header_value);
+        // `append`, not `insert`: `insert` replaces any existing value under
+        // that name, which would silently drop every occurrence but the last
+        // of a header this crate now allows to repeat.
+        headers.append(header_name, header_value);
     }
 
     let network_err = |source: reqwest::Error| SendraError::Network {
@@ -772,8 +958,7 @@ body: null
 ";
         let request = Request::from_yaml_str(yaml).expect("valid yaml should parse");
 
-        let mut expected_headers = BTreeMap::new();
-        expected_headers.insert("Accept".to_string(), "application/json".to_string());
+        let expected_headers = vec![("Accept".to_string(), "application/json".to_string())];
 
         assert_eq!(
             request,
@@ -789,6 +974,117 @@ body: null
                 capture: None,
             }
         );
+    }
+
+    #[test]
+    fn a_header_value_that_is_a_list_expands_to_one_header_per_entry() {
+        let request = Request::from_yaml_str(
+            "\
+method: GET
+url: https://example.com
+headers:
+  Accept: application/json
+  X-Forwarded-For:
+    - 1.2.3.4
+    - 5.6.7.8
+",
+        )
+        .expect("a list-valued header is part of the file contract");
+
+        assert_eq!(
+            request.headers,
+            vec![
+                ("Accept".to_string(), "application/json".to_string()),
+                ("X-Forwarded-For".to_string(), "1.2.3.4".to_string()),
+                ("X-Forwarded-For".to_string(), "5.6.7.8".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_identical_headers_are_kept_not_rejected() {
+        // Redundant, but not ambiguous: Sendra rejects ambiguity elsewhere, not
+        // a user's explicit (if pointless) choice to repeat a value.
+        let request = Request::from_yaml_str(
+            "\
+method: GET
+url: https://example.com
+headers:
+  X-Tag:
+    - same
+    - same
+",
+        )
+        .expect("identical repeated headers are allowed, not an error");
+
+        assert_eq!(
+            request.headers,
+            vec![
+                ("X-Tag".to_string(), "same".to_string()),
+                ("X-Tag".to_string(), "same".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unquoted_scalar_header_value_is_still_read_as_a_string() {
+        // What the field did when it was a `BTreeMap<String, String>`: a plain
+        // scalar is the header value spelled out. The type change must not
+        // start rejecting `X-Api-Version: 2`.
+        let request = Request::from_yaml_str(
+            "\
+method: GET
+url: https://example.com
+headers:
+  X-Api-Version: 2
+  X-Enabled: true
+",
+        )
+        .expect("an unquoted scalar is a header value, as it always was");
+
+        assert_eq!(request.header("X-Api-Version"), Some("2"));
+        assert_eq!(request.header("X-Enabled"), Some("true"));
+    }
+
+    #[test]
+    fn a_header_value_that_is_neither_a_scalar_nor_a_list_says_so() {
+        let err = Request::from_yaml_str(
+            "\
+method: GET
+url: https://example.com
+headers:
+  X:
+    nested: map
+",
+        )
+        .expect_err("a nested map is not a header value");
+
+        let message = std::error::Error::source(&err)
+            .expect("the serde error is the source")
+            .to_string();
+        assert!(
+            message.contains("expected a string or a list of strings"),
+            "the message should name the shape a header value may take: {message}"
+        );
+    }
+
+    #[test]
+    fn repeated_headers_round_trip_through_yaml() {
+        let request = Request::from_yaml_str(
+            "\
+method: GET
+url: https://example.com
+headers:
+  X-Forwarded-For:
+    - 1.2.3.4
+    - 5.6.7.8
+",
+        )
+        .unwrap();
+
+        let yaml = serde_yaml::to_string(&request).expect("a repeated header serialises");
+        let round_tripped = Request::from_yaml_str(&yaml).expect("and reparses");
+        assert_eq!(round_tripped.headers, request.headers, "got {yaml}");
     }
 
     #[test]
@@ -1159,7 +1455,7 @@ enviroment: staging
             // Port 1 on localhost: if we ever got as far as connecting, this
             // would surface as a Network error instead, which the assert catches.
             url: "http://127.0.0.1:1/".to_string(),
-            headers: BTreeMap::from([("bad header".to_string(), "x".to_string())]),
+            headers: vec![("bad header".to_string(), "x".to_string())],
             body: None,
             assertions: None,
             pre_request: None,
@@ -1186,7 +1482,7 @@ enviroment: staging
             name: None,
             method: Method::Get,
             url: "http://127.0.0.1:1/".to_string(),
-            headers: BTreeMap::new(),
+            headers: Vec::new(),
             body: None,
             assertions: None,
             pre_request: None,
@@ -1309,7 +1605,7 @@ enviroment: staging
             name: None,
             method: Method::Get,
             url: url.to_string(),
-            headers: BTreeMap::new(),
+            headers: Vec::new(),
             body: None,
             assertions: None,
             pre_request: None,
@@ -1428,5 +1724,72 @@ enviroment: staging
             response.body, "{\"hello\":\"world\"}",
             "the body must be the decompressed text, not the raw gzip bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn a_repeated_header_actually_goes_out_twice_on_the_wire() {
+        // Confirms the bytes a real server receives, not just that
+        // `Request.headers` holds two entries: `send_prepared` has to use
+        // `HeaderMap::append` rather than `insert`, or the second value would
+        // silently replace the first before anything hits a socket.
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is free");
+        let addr = listener.local_addr().expect("the listener has an address");
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let seen_in_thread = seen.clone();
+        std::thread::spawn(move || {
+            if let Ok(stream) = listener.accept().map(|(s, _)| s) {
+                let mut writer = stream.try_clone().expect("the socket clones");
+                let mut reader = BufReader::new(stream);
+
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("a request line arrives");
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) if header == "\r\n" => break,
+                        Ok(_) => seen_in_thread
+                            .lock()
+                            .unwrap()
+                            .push(header.trim_end().to_string()),
+                    }
+                }
+
+                writer
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .expect("status line and headers write");
+                writer.flush().expect("the response flushes");
+            }
+        });
+
+        let request = Request {
+            headers: vec![
+                ("X-Forwarded-For".to_string(), "1.2.3.4".to_string()),
+                ("X-Forwarded-For".to_string(), "5.6.7.8".to_string()),
+            ],
+            ..get(&format!("http://{addr}/"))
+        };
+        let config = Config::default();
+        let client = build_client(&config).expect("a client builds");
+        let response = send(&request, &client, &config)
+            .await
+            .expect("the mock server answers");
+        assert_eq!(response.status, 200);
+
+        let lines = seen.lock().unwrap().clone();
+        let matching: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.to_ascii_lowercase().starts_with("x-forwarded-for:"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            2,
+            "both values should have gone out as two separate header lines, got {lines:?}"
+        );
+        assert!(matching.iter().any(|l| l.contains("1.2.3.4")));
+        assert!(matching.iter().any(|l| l.contains("5.6.7.8")));
     }
 }

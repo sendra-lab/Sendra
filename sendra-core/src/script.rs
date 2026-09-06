@@ -76,7 +76,7 @@
 //! [`Environment::apply`]: crate::Environment::apply
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rhai::{Dynamic, Engine, Map, Scope, AST};
 
@@ -338,6 +338,33 @@ pub fn run_post_request(script: &Script, response: &Response) -> (ScriptOutcome,
 /// [`request_from_dynamic`], which rejects a key it does not know and a value
 /// of the wrong type rather than dropping either on the floor.
 ///
+/// **A script sees a map, even though `Request.headers` is a `Vec` that
+/// allows a name to repeat.** This is a deliberate simplicity-over-completeness
+/// call: map semantics are what makes an assignment or a `.remove()` mean the
+/// obvious thing with no getter/setter write-back subtleties, and giving that
+/// up in favour of a list-of-pairs API (as [`response_map`] uses, since a
+/// response is read-only and never needs `["name"] = value` sugar) would make
+/// every script that touches headers pay for the repeated-header case in
+/// syntax, when in practice a script adding one already-uncommon header a
+/// second time is rarer still.
+///
+/// A header name the file repeated therefore arrives here collapsed to its
+/// **last** value, since the map has one entry per key. That collapse is
+/// confined to what the script actually writes: the map is read back as a
+/// *diff* against the view it was handed, so a name the script left alone
+/// keeps every one of its original entries, in their original positions. See
+/// [`merge_script_headers`], which does that fold. What remains is the one
+/// irreducible cost of a map:
+///
+/// - A script that **writes** to a repeated name leaves one value there, the
+///   one it wrote. `request.headers["Set-Cookie"] = "a";` on a request whose
+///   file sent two `Set-Cookie` headers sends one afterwards, and
+///   `request.headers["Set-Cookie"] = "a"; request.headers["Set-Cookie"] =
+///   "b";` is one write of `"b"`, not two headers. A script cannot add a
+///   second occurrence of a name; a genuinely repeated header belongs in the
+///   YAML file, whose shape [`Request::headers`](crate::Request::headers)
+///   documents.
+///
 /// **`name` and `assertions` are not here.** `name` is what
 /// `sendra run <file> <name>` selects on, so a script-dependent label could not
 /// be typed on a command line — the same reason [`Environment::apply`] leaves
@@ -502,15 +529,16 @@ fn request_from_dynamic(original: &Request, value: Dynamic) -> Result<Request, S
         invalid("`request.headers` must be an object map of header name to string".to_string())
     })?;
 
-    let mut headers = BTreeMap::new();
+    let mut after = BTreeMap::new();
     for (name, value) in headers_map {
         let value = value.try_cast::<String>().ok_or_else(|| {
             invalid(format!(
                 "`request.headers[\"{name}\"]` must be a string; call `.to_string()` on it"
             ))
         })?;
-        headers.insert(name.to_string(), value);
+        after.insert(name.to_string(), value);
     }
+    let headers = merge_script_headers(&original.headers, &after);
 
     Ok(Request {
         // Not the script's to change: see `request_map`.
@@ -534,6 +562,79 @@ fn request_from_dynamic(original: &Request, value: Dynamic) -> Result<Request, S
         // later requests — and neither is this one.
         capture: original.capture.clone(),
     })
+}
+
+/// Fold the map a script left behind back into the request's ordered headers,
+/// keeping every repeat the script did not actually touch.
+///
+/// The problem this solves: a script is handed a *map* of headers (see
+/// [`request_map`]), and a map cannot hold two entries under one name, so a
+/// header the file repeated arrives at the script already collapsed to its
+/// last value. Writing that map straight back out would mean **any** script
+/// dropped **every** repeated header in the request, including names it never
+/// mentioned — a script that rewrites `X-Signature` has no business changing
+/// what happens to three `Set-Cookie` headers beside it.
+///
+/// So the map is treated as a diff rather than as the new truth. `before` is
+/// the collapsed view the script was handed, recomputed here from `original`
+/// (which is exactly what [`request_map`] built, since it is a pure function
+/// of the request), and each name in the map the script left behind falls into
+/// one of three cases:
+///
+/// - **Unchanged** — the value is what the script was handed. The script never
+///   wrote to this name, so its original entries are restored verbatim: every
+///   repeat, each at the position it held in the file.
+/// - **Changed, or new** — the script wrote here, so its single value is what
+///   goes out, at the position the name's first occurrence held (or appended,
+///   for a name the request did not have). This is the one place repetition is
+///   lost, and it is lost only for a name the script genuinely wrote to, which
+///   is the narrowest the cost can be while a script still sees a map at all.
+/// - **Absent** — the script removed the name, so every occurrence of it goes.
+///
+/// Names are matched exactly, not case-insensitively: the script's map is
+/// keyed by the string the file used, so `request.headers["accept"]` on a file
+/// that wrote `Accept` adds a second header rather than editing the first.
+/// That is what it did before this function existed, and changing it is a
+/// separate decision about the scripting surface.
+fn merge_script_headers(
+    original: &[(String, String)],
+    after: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    // The collapsed view the script was handed: last value wins, exactly as
+    // `request_map` builds it.
+    let mut before: BTreeMap<&str, &str> = BTreeMap::new();
+    for (name, value) in original {
+        before.insert(name.as_str(), value.as_str());
+    }
+
+    let mut merged = Vec::with_capacity(original.len());
+    let mut written: BTreeSet<&str> = BTreeSet::new();
+    for (name, value) in original {
+        let Some(script_value) = after.get(name.as_str()) else {
+            // Removed by the script, and it stays removed — every occurrence.
+            continue;
+        };
+
+        if before.get(name.as_str()).copied() == Some(script_value.as_str()) {
+            // Untouched: this exact entry, where it always was.
+            merged.push((name.clone(), value.clone()));
+        } else if written.insert(name.as_str()) {
+            // Written to: the script's one value, at the first position this
+            // name held. Later occurrences of it are dropped, because the
+            // script's map could not have described them.
+            merged.push((name.clone(), script_value.clone()));
+        }
+    }
+
+    // Names the script added. Appended in the map's own (alphabetical) order,
+    // after everything the file itself asked for.
+    for (name, value) in after {
+        if !before.contains_key(name.as_str()) {
+            merged.push((name.clone(), value.clone()));
+        }
+    }
+
+    merged
 }
 
 /// A `String`-or-`()` field of the script's `request` map.
@@ -819,15 +920,9 @@ mod tests {
         let request = with_pre_request(r#"request.headers["X-Signature"] = "abc";"#);
         let sent = run_pre(&request).expect("the script should run");
 
-        assert_eq!(
-            sent.headers.get("X-Signature").map(String::as_str),
-            Some("abc")
-        );
+        assert_eq!(sent.header("X-Signature"), Some("abc"));
         // And leaves everything else exactly as it was.
-        assert_eq!(
-            sent.headers.get("Accept").map(String::as_str),
-            Some("application/json")
-        );
+        assert_eq!(sent.header("Accept"), Some("application/json"));
         assert_eq!(sent.url, "https://example.com/orders");
         assert_eq!(sent.method, Method::Post);
         assert_eq!(sent.body.as_deref(), Some(r#"{"id":1}"#));
@@ -839,16 +934,135 @@ mod tests {
             "request.headers[\"Accept\"] = \"text/plain\";\nrequest.headers.remove(\"Nope\");",
         );
         let sent = run_pre(&request).expect("the script should run");
-        assert_eq!(
-            sent.headers.get("Accept").map(String::as_str),
-            Some("text/plain")
-        );
+        assert_eq!(sent.header("Accept"), Some("text/plain"));
 
         // Removing one that is there really removes it — the script is the last
         // thing to touch the request, so nothing puts it back.
         let request = with_pre_request(r#"request.headers.remove("Accept");"#);
         let sent = run_pre(&request).expect("the script should run");
         assert!(sent.headers.is_empty(), "{:?}", sent.headers);
+    }
+
+    #[test]
+    fn a_repeated_header_the_script_never_touched_survives_intact() {
+        // The regression that matters: a script writing to one header must not
+        // disturb a repeated header beside it. The map the script is handed
+        // cannot hold both values, so the fold back out has to treat that map
+        // as a diff rather than as the new truth.
+        let request = request(
+            "method: GET\n\
+             url: https://example.com\n\
+             headers:\n  \
+               Accept: application/json\n  \
+               X-Forwarded-For:\n    - 1.2.3.4\n    - 5.6.7.8\n  \
+               X-Trailing: last\n\
+             pre_request: |\n  request.headers[\"X-Signature\"] = \"abc\";\n",
+        );
+        let sent = run_pre(&request).expect("the script should run");
+
+        assert_eq!(
+            sent.headers,
+            vec![
+                ("Accept".to_string(), "application/json".to_string()),
+                ("X-Forwarded-For".to_string(), "1.2.3.4".to_string()),
+                ("X-Forwarded-For".to_string(), "5.6.7.8".to_string()),
+                ("X-Trailing".to_string(), "last".to_string()),
+                ("X-Signature".to_string(), "abc".to_string()),
+            ],
+            "an untouched repeated header keeps both values, in file order, \
+             and the script's own header is appended"
+        );
+    }
+
+    #[test]
+    fn a_repeated_header_collapses_only_when_the_script_writes_to_that_name() {
+        // The narrow, legitimate cost: writing to a name is a write of one
+        // value, because the script's map could not have described two. It
+        // applies to this name and no other — `X-Other` beside it is
+        // untouched and keeps both of its values.
+        let request = request(
+            "method: GET\n\
+             url: https://example.com\n\
+             headers:\n  \
+               X-Forwarded-For:\n    - 1.2.3.4\n    - 5.6.7.8\n  \
+               X-Other:\n    - a\n    - b\n\
+             pre_request: |\n  request.headers[\"X-Forwarded-For\"] = \"9.9.9.9\";\n",
+        );
+        let sent = run_pre(&request).expect("the script should run");
+
+        assert_eq!(
+            sent.headers,
+            vec![
+                ("X-Forwarded-For".to_string(), "9.9.9.9".to_string()),
+                ("X-Other".to_string(), "a".to_string()),
+                ("X-Other".to_string(), "b".to_string()),
+            ],
+            "the written name collapses to the script's value, at the position \
+             it held; the name beside it is untouched"
+        );
+    }
+
+    #[test]
+    fn removing_a_repeated_header_from_a_script_removes_every_occurrence() {
+        let request = request(
+            "method: GET\n\
+             url: https://example.com\n\
+             headers:\n  \
+               X-Forwarded-For:\n    - 1.2.3.4\n    - 5.6.7.8\n  \
+               Accept: application/json\n\
+             pre_request: |\n  request.headers.remove(\"X-Forwarded-For\");\n",
+        );
+        let sent = run_pre(&request).expect("the script should run");
+
+        assert_eq!(
+            sent.headers,
+            vec![("Accept".to_string(), "application/json".to_string())],
+            "a removed name goes entirely, not just its last occurrence"
+        );
+    }
+
+    #[test]
+    fn a_script_that_writes_back_the_value_it_was_handed_changes_nothing() {
+        // Assigning the same value is indistinguishable from not writing at
+        // all — the diff is by value, and there is nothing else a map could
+        // tell us. The repeated header survives, which is the useful reading:
+        // the wire is unchanged because the request is unchanged.
+        let request = request(
+            "method: GET\n\
+             url: https://example.com\n\
+             headers:\n  X-Tag:\n    - one\n    - two\n\
+             pre_request: |\n  request.headers[\"X-Tag\"] = request.headers[\"X-Tag\"];\n",
+        );
+        let sent = run_pre(&request).expect("the script should run");
+
+        assert_eq!(
+            sent.headers,
+            vec![
+                ("X-Tag".to_string(), "one".to_string()),
+                ("X-Tag".to_string(), "two".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pre_request_script_writing_a_name_twice_writes_one_header() {
+        // The same cost seen from the other side: two assignments to one name
+        // are two writes to one map entry, so the second is what goes out. A
+        // script cannot manufacture a repeated header, whether or not the file
+        // already had one under that name — that shape belongs in the YAML.
+        let request = with_pre_request(
+            "request.headers[\"Set-Cookie\"] = \"a\";\n\
+             request.headers[\"Set-Cookie\"] = \"b\";",
+        );
+        let sent = run_pre(&request).expect("the script should run");
+
+        let cookies: Vec<&str> = sent
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "Set-Cookie")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(cookies, vec!["b"], "a script cannot repeat a header name");
     }
 
     #[test]
@@ -886,7 +1100,7 @@ mod tests {
         let sent = run_pre(&request).expect("the script should run");
 
         assert_eq!(
-            sent.headers.get("X-Seen").map(String::as_str),
+            sent.header("X-Seen"),
             Some("POST https://example.com/orders 8")
         );
     }
