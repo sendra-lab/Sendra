@@ -1367,4 +1367,66 @@ enviroment: staging
             "a fresh client per request cannot reuse anything"
         );
     }
+
+    #[tokio::test]
+    async fn a_gzip_encoded_response_is_decompressed_before_reaching_response_body() {
+        // Many APIs compress their response regardless of what the client
+        // negotiated; without the "gzip" feature enabled on the client, this
+        // response body would be handed to `Response.body` as raw compressed
+        // bytes rather than the JSON text they hold.
+        use std::io::Write;
+
+        let body = b"{\"hello\":\"world\"}";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(body).expect("gzip encodes into memory");
+        let compressed = encoder.finish().expect("gzip stream finalises");
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is free");
+        let addr = listener.local_addr().expect("the listener has an address");
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+
+            if let Ok(stream) = listener.accept().map(|(s, _)| s) {
+                let mut writer = stream.try_clone().expect("the socket clones");
+                let mut reader = BufReader::new(stream);
+
+                let mut line = String::new();
+                reader.read_line(&mut line).expect("a request line arrives");
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).expect("headers keep coming");
+                    if header == "\r\n" {
+                        break;
+                    }
+                }
+
+                writer
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                            compressed.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .expect("status line and headers write");
+                writer
+                    .write_all(&compressed)
+                    .expect("the compressed body writes");
+                writer.flush().expect("the response flushes");
+            }
+        });
+
+        let config = Config::default();
+        let client = build_client(&config).expect("a client builds");
+        let response = send(&get(&format!("http://{addr}/")), &client, &config)
+            .await
+            .expect("the mock server answers");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.body, "{\"hello\":\"world\"}",
+            "the body must be the decompressed text, not the raw gzip bytes"
+        );
+    }
 }
