@@ -6,20 +6,25 @@ use std::path::{Path, PathBuf};
 
 use sendra_core::environment::{find_environment, DEFAULT_ENVIRONMENT_NAME};
 use sendra_core::script::{run_post_request, run_pre_request, Scripts};
-use sendra_core::{Config, Document, Environment, Request, SendraError};
+use sendra_core::{Config, Document, Environment, HttpClient, Request, SendraError};
 
 use crate::exit::{exit_for_run, Exit, Outcome, Summary};
 use crate::output::{print_environment_error, print_error, Detail, Format, Reporter};
 
 /// Everything both subcommands do before the first byte goes out: the config,
-/// the environment, and the file.
+/// the HTTP client the whole run sends through, the environment, and the file.
 struct Prepared {
     config: Config,
+    /// Built once here and borrowed by every send in the run, so a collection
+    /// hitting one host reuses its connection instead of handshaking again per
+    /// request. See [`sendra_core::build_client`].
+    client: HttpClient,
     environment: Environment,
     document: Document,
 }
 
-/// Resolve the config, the environment and the request file, in that order.
+/// Resolve the config, build the client, then resolve the environment and the
+/// request file, in that order.
 ///
 /// Returns `Err(Exit::Failure)` — having already printed the error — because
 /// there is nothing for the caller to add: these three failures are fatal to
@@ -34,6 +39,12 @@ struct Prepared {
 /// that does not exist joins them, for the reason given on
 /// [`environment_for`].
 ///
+/// The client joins them for the same reason and in the same category: it is
+/// built from the config, once for the whole run, and a client that cannot be
+/// built is not "this request failed" either. Building it here is also what
+/// makes the reuse real — one client, borrowed by every send in the
+/// invocation, rather than one per request.
+///
 /// Both subcommands share this because they must: `sendra test` that resolved
 /// config differently from `sendra run` would mean a request could pass under
 /// one and fail under the other for reasons neither prints.
@@ -43,6 +54,17 @@ fn prepare(path: &Path, environment_name: Option<&str>) -> Result<Prepared, Exit
     // of failing partway through it.
     let config = match Config::resolve() {
         Ok(config) => config,
+        Err(err) => {
+            print_error(&err);
+            return Err(Exit::Failure);
+        }
+    };
+
+    // One client for the whole invocation: every request below sends through
+    // this one, so the connection the first request opens is the connection the
+    // rest of them use.
+    let client = match sendra_core::build_client(&config) {
+        Ok(client) => client,
         Err(err) => {
             print_error(&err);
             return Err(Exit::Failure);
@@ -79,6 +101,7 @@ fn prepare(path: &Path, environment_name: Option<&str>) -> Result<Prepared, Exit
 
     Ok(Prepared {
         config,
+        client,
         environment,
         document,
     })
@@ -127,6 +150,7 @@ pub(crate) async fn run(
 ) -> Exit {
     let Prepared {
         config,
+        client,
         environment,
         document,
     } = match prepare(path, environment_name) {
@@ -148,12 +172,15 @@ pub(crate) async fn run(
     };
 
     let config = &config;
+    let client = &client;
     let reporter = &Reporter::new(Format::for_json_flag(json), Detail::Full);
     let outcomes = run_requests(
         &requests,
         &environment,
         reporter,
-        |request, environment| async move { send(&request, config, &environment, reporter).await },
+        |request, environment| async move {
+            send(&request, client, config, &environment, reporter).await
+        },
     )
     .await;
     reporter.finish_run();
@@ -184,6 +211,7 @@ pub(crate) async fn run(
 pub(crate) async fn test(path: &Path, environment_name: Option<&str>, json: bool) -> Exit {
     let Prepared {
         config,
+        client,
         environment,
         document,
     } = match prepare(path, environment_name) {
@@ -196,12 +224,15 @@ pub(crate) async fn test(path: &Path, environment_name: Option<&str>, json: bool
     let requests: Vec<&Request> = document.requests().iter().collect();
 
     let config = &config;
+    let client = &client;
     let reporter = &Reporter::new(Format::for_json_flag(json), Detail::StatusOnly);
     let outcomes = run_requests(
         &requests,
         &environment,
         reporter,
-        |request, environment| async move { send(&request, config, &environment, reporter).await },
+        |request, environment| async move {
+            send(&request, client, config, &environment, reporter).await
+        },
     )
     .await;
 
@@ -471,6 +502,7 @@ where
 /// belongs to the [`Reporter`] they were given.
 async fn send(
     request: &Request,
+    client: &HttpClient,
     config: &Config,
     environment: &Environment,
     reporter: &Reporter,
@@ -507,7 +539,8 @@ async fn send(
         None => configured,
     };
 
-    match sendra_core::send_prepared(&prepared, config).await {
+    // The run's one client, not a new one: see [`prepare`].
+    match sendra_core::send_prepared(&prepared, client).await {
         Ok(response) => {
             // No `post_request` block is `None`, which prints nothing — a
             // different thing from a script that ran and was happy. Same rule
@@ -562,7 +595,7 @@ mod tests {
     use sendra_core::{AssertionReport, CaptureReport, ScriptOutcome};
 
     use crate::exit::exit_for_status;
-    use crate::test_support::{all_passed, reporter, responded};
+    use crate::test_support::{all_passed, client, reporter, responded};
 
     /// Three requests, the middle one referencing a variable that does not
     /// exist. The broken request is in the middle so "the run carried on" and
@@ -756,6 +789,7 @@ requests:
 
             let outcome = send(
                 &request,
+                &client(),
                 &Config::default(),
                 &Environment::default(),
                 &reporter(),
@@ -774,6 +808,7 @@ requests:
         let outcomes = vec![
             send(
                 &request,
+                &client(),
                 &Config::default(),
                 &Environment::default(),
                 &reporter(),
@@ -799,6 +834,7 @@ requests:
         );
         let outcome = send(
             &request,
+            &client(),
             &Config::default(),
             &Environment::default(),
             &reporter(),

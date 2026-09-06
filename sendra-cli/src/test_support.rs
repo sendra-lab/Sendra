@@ -1,7 +1,9 @@
 //! Fixtures shared by more than one module's tests: the hand-built responses,
 //! assertion reports and outcomes that stand in for a run without a socket.
 
-use sendra_core::{AssertionReport, CaptureReport, Document, Response, ScriptOutcome};
+use sendra_core::{
+    AssertionReport, CaptureReport, Config, Document, HttpClient, Response, ScriptOutcome,
+};
 
 use crate::exit::Outcome;
 use crate::output::{Detail, Format, Reporter};
@@ -121,4 +123,15 @@ pub(crate) fn all_passed_with_script(status: u16) -> Outcome {
 /// back — see `output`'s tests.
 pub(crate) fn reporter() -> Reporter {
     Reporter::new(Format::Human, Detail::StatusOnly)
+}
+
+/// The client `send` needs in its signature, for the tests that never reach the
+/// wire.
+///
+/// A real run builds one per invocation in `prepare`; these tests are about
+/// what happens *before* a socket is opened — a script that will not compile,
+/// one that throws — so which client they hold makes no difference beyond
+/// having one to hand over.
+pub(crate) fn client() -> HttpClient {
+    sendra_core::build_client(&Config::default()).expect("a client builds")
 }

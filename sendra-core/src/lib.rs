@@ -23,6 +23,10 @@ pub use assertions::{AssertionKind, AssertionReport, AssertionResult, Assertions
 pub use capture::{CaptureFailure, CaptureReport, CaptureResult, Captures};
 pub use config::Config;
 pub use environment::Environment;
+/// The HTTP client [`send`] and [`send_prepared`] send through, re-exported so a
+/// front-end can build one with [`build_client`] and pass it around without
+/// taking a direct dependency on reqwest.
+pub use reqwest::Client as HttpClient;
 pub use script::{Hook, Script, ScriptOutcome, ScriptOutput, Scripts};
 
 /// Every way loading or sending a request can fail.
@@ -58,6 +62,15 @@ pub enum SendraError {
         #[source]
         source: reqwest::Error,
     },
+
+    /// The HTTP client itself could not be built, so nothing was sent and
+    /// nothing will be: this is a failure of the run's configuration (a TLS
+    /// backend that will not initialise, say), not of one request. Separate
+    /// from [`Network`](Self::Network) because there is no URL to name — the
+    /// client is built once for the whole run, before any request is looked
+    /// at.
+    #[error("could not build the HTTP client")]
+    Client(#[source] reqwest::Error),
 
     /// A named request was asked for, but the collection has no such name.
     ///
@@ -599,6 +612,37 @@ impl Response {
     }
 }
 
+/// Build the HTTP client a run sends every one of its requests through.
+///
+/// **Once per run, not once per request.** A `reqwest::Client` owns the
+/// connection pool: the TLS session, the kept-alive TCP connection and the
+/// resolved DNS for a host all live in it, and all of it is thrown away with
+/// the client. Building one per request means a collection of twenty requests
+/// against one API pays twenty TLS handshakes to send twenty requests, which is
+/// most of the wall clock for a run that does nothing else. Built once and
+/// borrowed by every send, the second request onwards reuses the connection the
+/// first opened.
+///
+/// It is a function taking a `&Config` rather than a method on `Config`
+/// because a client is not configuration: it holds sockets, it is cheap to
+/// clone and expensive to rebuild, and it belongs to a *run*, whereas the
+/// config it is built from is a resolved set of values that outlives any
+/// particular one. The config decides one thing here — the timeout — and
+/// nothing else about the client is configurable in v1; reqwest's own pool
+/// defaults are what a command-line tool wants.
+///
+/// Fails only when reqwest cannot construct a client at all (a TLS backend that
+/// will not initialise, say), which is fatal to the whole run and so is
+/// [`SendraError::Client`] rather than a per-request network error.
+pub fn build_client(config: &Config) -> Result<HttpClient, SendraError> {
+    // reqwest has no timeout of its own by default, so an unresponsive server
+    // would hang the process indefinitely; the config always supplies one.
+    HttpClient::builder()
+        .timeout(config.timeout)
+        .build()
+        .map_err(SendraError::Client)
+}
+
 /// Send `request` under `config` and collect the full response.
 ///
 /// The elapsed time covers connect, send and body read — i.e. what a user
@@ -608,36 +652,50 @@ impl Response {
 /// optional, so that a caller cannot send a request without deciding what
 /// configuration applies to it. Callers with nothing to apply pass
 /// [`Config::default`], which is the same defaults resolution falls back to. It
-/// contributes two things: default headers, merged by [`Config::apply`] with
-/// the request winning ties, and the timeout the client is built with.
+/// contributes one thing here — default headers, merged by [`Config::apply`]
+/// with the request winning ties. The other thing it decides, the timeout, was
+/// applied when `client` was built; see [`build_client`].
+///
+/// `client` is borrowed rather than built here so that a run sending more than
+/// one request sends them all down the same connection pool. See
+/// [`build_client`] for what that is worth and where the client should come
+/// from.
 ///
 /// This is the whole pipeline in one call, for a caller that has no reason to
 /// step between the two halves. A caller that does — one running a
 /// `pre_request` script, which by definition is the *last* thing to touch the
 /// request — applies the config itself and calls [`send_prepared`]. That is the
 /// only reason the seam exists; see there.
-pub async fn send(request: &Request, config: &Config) -> Result<Response, SendraError> {
+pub async fn send(
+    request: &Request,
+    client: &HttpClient,
+    config: &Config,
+) -> Result<Response, SendraError> {
     // Everything below works from the merged request, so a config header is
     // validated and sent exactly like one written in the file.
-    send_prepared(&config.apply(request), config).await
+    send_prepared(&config.apply(request), client).await
 }
 
 /// Send a request that is already exactly what should go over the wire.
 ///
 /// Identical to [`send`] except that [`Config::apply`] is the caller's job and
-/// has already happened: `config` is read here only for the timeout the client
-/// is built with.
+/// has already happened. There is no `&Config` here at all: the only thing this
+/// half ever read from it was the timeout, and that now lives in the `client`
+/// it is handed.
 ///
 /// It exists because of `pre_request`. The ordering the scripting feature is
 /// built on puts the script strictly after the config and strictly before the
 /// wire, and a script's most obvious use — *removing* a header the config
 /// injected — only works if nothing re-merges the config afterwards. So the
-/// seam has to be somewhere, and here it is named, still takes the `&Config` it
-/// needs, and says in its own signature that configuration is not its problem
-/// because it has already been handled.
+/// seam has to be somewhere, and here it is named, and says in its own
+/// signature that configuration is not its problem because it has already been
+/// handled.
 ///
 /// Prefer [`send`] unless there is something to do in between.
-pub async fn send_prepared(request: &Request, config: &Config) -> Result<Response, SendraError> {
+pub async fn send_prepared(
+    request: &Request,
+    client: &HttpClient,
+) -> Result<Response, SendraError> {
     let mut headers = reqwest::header::HeaderMap::new();
     for (name, value) in &request.headers {
         let header_name = reqwest::header::HeaderName::try_from(name.as_str()).map_err(|e| {
@@ -659,13 +717,6 @@ pub async fn send_prepared(request: &Request, config: &Config) -> Result<Respons
         url: request.url.clone(),
         source,
     };
-
-    // reqwest has no timeout of its own by default, so an unresponsive server
-    // would hang the process indefinitely; the config always supplies one.
-    let client = reqwest::Client::builder()
-        .timeout(config.timeout)
-        .build()
-        .map_err(network_err)?;
 
     let mut builder = client
         .request(request.method.into(), &request.url)
@@ -1115,7 +1166,9 @@ enviroment: staging
             post_request: None,
             capture: None,
         };
-        let err = send(&request, &Config::default())
+        let config = Config::default();
+        let client = build_client(&config).expect("a client builds");
+        let err = send(&request, &client, &config)
             .await
             .expect_err("invalid header must error");
         assert!(
@@ -1144,12 +1197,174 @@ enviroment: staging
             headers: BTreeMap::from([("bad header".to_string(), "x".to_string())]),
             ..Config::default()
         };
-        let err = send(&request, &config)
+        let client = build_client(&config).expect("a client builds");
+        let err = send(&request, &client, &config)
             .await
             .expect_err("invalid header must error");
         assert!(
             matches!(err, SendraError::InvalidHeader { .. }),
             "got {err:?}"
+        );
+    }
+    /// A server that counts the TCP connections it is asked to accept, so a
+    /// test can tell "sent twice down one connection" from "connected twice".
+    ///
+    /// Deliberately hand-rolled over a blocking `TcpListener` on its own
+    /// thread rather than pulled in as a mock-server dependency: what is being
+    /// observed here is below HTTP — whether a *socket* was opened — and the
+    /// whole protocol these tests need is "read a request, write a response,
+    /// keep the connection open", which is shorter than the configuration of a
+    /// library that does more.
+    struct CountingServer {
+        addr: std::net::SocketAddr,
+        connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CountingServer {
+        /// Start on an ephemeral loopback port and serve until the test ends.
+        ///
+        /// The thread is left running when the test finishes; it dies with the
+        /// process, which is the whole lifetime a test binary has.
+        fn start() -> Self {
+            use std::io::{BufRead, BufReader, Write};
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc;
+
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is free");
+            let addr = listener.local_addr().expect("the listener has an address");
+            let connections = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(AtomicUsize::new(0));
+
+            let (server_connections, server_requests) = (connections.clone(), requests.clone());
+            std::thread::spawn(move || {
+                // One connection at a time, which is all a sendra run ever
+                // opens: requests go out in file order, one after the other.
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    server_connections.fetch_add(1, Ordering::SeqCst);
+
+                    let mut writer = stream.try_clone().expect("the socket clones");
+                    let mut reader = BufReader::new(stream);
+
+                    // Keep reading requests off this connection until the
+                    // client hangs up: a client that is reusing the connection
+                    // sends its next request here rather than reconnecting.
+                    loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        // Drain the headers; these requests carry no body.
+                        loop {
+                            let mut header = String::new();
+                            match reader.read_line(&mut header) {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) if header == "\r\n" => break,
+                                Ok(_) => {}
+                            }
+                        }
+
+                        // Counted before the response is written, so a client
+                        // that has read its last response has necessarily been
+                        // counted by the time the test looks.
+                        server_requests.fetch_add(1, Ordering::SeqCst);
+                        if writer
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .is_err()
+                        {
+                            break;
+                        }
+                        let _ = writer.flush();
+                    }
+                }
+            });
+
+            Self {
+                addr,
+                connections,
+                requests,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}/", self.addr)
+        }
+
+        fn connections(&self) -> usize {
+            self.connections.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn requests(&self) -> usize {
+            self.requests.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A GET with nothing on it but a URL — what a collection of requests
+    /// against one host looks like once everything else is stripped away.
+    fn get(url: &str) -> Request {
+        Request {
+            name: None,
+            method: Method::Get,
+            url: url.to_string(),
+            headers: BTreeMap::new(),
+            body: None,
+            assertions: None,
+            pre_request: None,
+            post_request: None,
+            capture: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn one_client_sends_every_request_down_one_connection() {
+        // The point of `build_client` being per-run rather than per-request,
+        // stated as an observation a server can make: three requests, one
+        // handshake.
+        let server = CountingServer::start();
+        let config = Config::default();
+        let client = build_client(&config).expect("a client builds");
+
+        for _ in 0..3 {
+            let response = send(&get(&server.url()), &client, &config)
+                .await
+                .expect("the mock server answers");
+            assert_eq!(response.status, 200);
+        }
+
+        assert_eq!(server.requests(), 3, "all three requests were served");
+        assert_eq!(
+            server.connections(),
+            1,
+            "three requests through one client must reuse one connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_per_request_opens_a_connection_per_request() {
+        // The counterpart, and the reason the test above is worth anything: it
+        // is what the code did before the client was hoisted out of
+        // `send_prepared`, and it is what the counter looks like when a client
+        // is *not* reused. Without this, a server that closed connections on
+        // its own would make the assertion above pass for the wrong reason.
+        let server = CountingServer::start();
+        let config = Config::default();
+
+        for _ in 0..3 {
+            let client = build_client(&config).expect("a client builds");
+            let response = send(&get(&server.url()), &client, &config)
+                .await
+                .expect("the mock server answers");
+            assert_eq!(response.status, 200);
+        }
+
+        assert_eq!(server.requests(), 3, "all three requests were served");
+        assert_eq!(
+            server.connections(),
+            3,
+            "a fresh client per request cannot reuse anything"
         );
     }
 }
