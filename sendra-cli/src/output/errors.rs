@@ -55,15 +55,66 @@ pub(super) fn print_error_line(message: impl std::fmt::Display) {
 /// One dimmed `hint:` line under an error, suppressed when stderr is not a
 /// terminal: a hint is for a person reading the message, and a log or a pipe is
 /// neither helped by it nor able to act on it.
+///
+/// A hint may run to several lines — [`REQUEST_FILE_HINT`] carries a worked
+/// example — so every line after the first is indented to sit under the text
+/// of the first rather than starting back at column zero. Blank lines stay
+/// blank rather than becoming a row of trailing spaces.
 fn print_hint(message: impl std::fmt::Display) {
-    if std::io::stderr().is_terminal() {
-        eprintln!(
-            "  {} {}",
-            "hint:".if_supports_color(Stream::Stderr, |t| t.dimmed()),
-            message
-        );
+    if !std::io::stderr().is_terminal() {
+        return;
     }
+
+    let label = "hint:".if_supports_color(Stream::Stderr, |t| t.dimmed());
+    eprintln!("{}", render_hint(&label.to_string(), &message.to_string()));
 }
+
+/// The width of the `  hint: ` label, which every line after the first is
+/// indented by so that the whole hint reads as one block.
+const HINT_INDENT: &str = "        ";
+
+/// Lay a hint out under its label.
+///
+/// Pure, and separate from [`print_hint`], because printing is gated on stderr
+/// being a terminal and a test harness is not one — so this is the only part
+/// of a multi-line hint's layout a test can actually see. `label` arrives
+/// already styled, since its colour is not this function's business.
+fn render_hint(label: &str, message: &str) -> String {
+    let mut lines = message.lines();
+    let mut out = format!("  {label} {}", lines.next().unwrap_or_default());
+
+    for line in lines {
+        out.push('\n');
+        // A blank line stays blank rather than becoming a row of trailing
+        // spaces.
+        if !line.is_empty() {
+            out.push_str(HINT_INDENT);
+            out.push_str(line);
+        }
+    }
+
+    out
+}
+
+/// The hint under a request file that could not be read.
+///
+/// It inlines a whole request rather than naming a file to go and look at.
+/// The obvious thing to point at — `examples/get-request.yaml` — exists only
+/// in a clone of the source repository, so for anyone who installed a
+/// released binary it named a file that was never on their disk. A hint that
+/// sends its reader hunting for something that was never shipped is worse
+/// than no hint at all, and a link to hosted docs would be the same mistake
+/// today, there being no docs site yet.
+///
+/// So the example *is* the hint: two keys, which is everything a request
+/// cannot do without, and nothing that needs a second thing open to read.
+/// Indented by two so that [`print_hint`]'s own continuation indent nests it
+/// under the sentence introducing it.
+const REQUEST_FILE_HINT: &str = "\
+check the path. A request file is YAML, and needs only two keys:
+
+  method: GET
+  url: https://api.example.com/users/1";
 
 pub(crate) fn print_environment_error(err: &EnvironmentError) {
     match err {
@@ -103,9 +154,7 @@ pub(crate) fn print_error(err: &SendraError) {
 
     // One actionable hint, without turning this into a help system.
     match err {
-        SendraError::Io { .. } => {
-            print_hint("check the path, or see examples/get-request.yaml for the file shape")
-        }
+        SendraError::Io { .. } => print_hint(REQUEST_FILE_HINT),
         // The whole reason `Timeout` is its own variant: this is the one
         // network failure whose fix might be a Sendra setting rather than
         // something out on the network, and the error line has just named a
@@ -114,5 +163,72 @@ pub(crate) fn print_error(err: &SendraError) {
             print_hint("raise `timeout_seconds` in .sendra/config.yaml if the server is just slow")
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use sendra_core::{Method, Request};
+
+    #[test]
+    fn the_request_file_hint_teaches_a_file_sendra_can_actually_read() {
+        // The hint inlines a worked example precisely because there is no file
+        // to point at, which moves the risk: nothing else in the build reads
+        // this YAML, so a typo in it would ship as advice that does not load.
+        // Pull the indented lines back out and put them through the real
+        // parser, the same one `sendra run` would.
+        let example: String = REQUEST_FILE_HINT
+            .lines()
+            .filter_map(|line| line.strip_prefix("  "))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert!(
+            !example.is_empty(),
+            "the hint must carry a worked example, not just prose"
+        );
+
+        let request = Request::from_yaml_str(&example)
+            .expect("the example printed in the hint must parse as a request");
+        assert_eq!(request.method, Method::Get);
+        assert_eq!(request.url, "https://api.example.com/users/1");
+    }
+
+    #[test]
+    fn the_request_file_hint_renders_as_one_indented_block() {
+        // What the reader actually sees. Worth pinning because a worked
+        // example is only useful if it arrives laid out — continuation lines
+        // starting back at column zero would read as separate output rather
+        // than as part of the hint.
+        assert_eq!(
+            render_hint("hint:", REQUEST_FILE_HINT),
+            "  hint: check the path. A request file is YAML, and needs only two keys:\n\
+             \n\
+             \x20         method: GET\n\
+             \x20         url: https://api.example.com/users/1"
+        );
+    }
+
+    #[test]
+    fn a_single_line_hint_is_unchanged_by_the_multi_line_layout() {
+        // The other two hints are one-liners and must stay exactly as they
+        // were before hints learned to wrap.
+        assert_eq!(
+            render_hint("hint:", "create that file, or omit --env"),
+            "  hint: create that file, or omit --env"
+        );
+    }
+
+    #[test]
+    fn no_hint_sends_the_reader_to_a_file_that_ships_only_with_the_source() {
+        // The bug this replaced: a hint naming `examples/get-request.yaml`,
+        // which is in the repository and in no released binary. Anything a
+        // hint names has to be either something Sendra resolves at runtime and
+        // has just printed, or something the reader creates themselves.
+        assert!(
+            !REQUEST_FILE_HINT.contains("examples/"),
+            "the request-file hint must stand on its own: {REQUEST_FILE_HINT}"
+        );
     }
 }
