@@ -7,7 +7,7 @@ both of us rework.
 ## Getting set up
 
 ```
-git clone https://github.com/<org>/sendra.git
+git clone https://github.com/sendra-lab/Sendra.git
 cd sendra
 cargo build --workspace
 cargo test --workspace
@@ -42,7 +42,7 @@ locally first.
 
 ## Commit messages
 
-Explain *why*, not just *what*, especially for a design decision that
+Explain _why_, not just _what_, especially for a design decision that
 could reasonably have gone the other way. Future readers (including us)
 benefit far more from the reasoning than from a restated diff.
 
