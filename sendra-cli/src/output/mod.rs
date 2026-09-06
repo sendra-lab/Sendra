@@ -203,8 +203,8 @@ impl Reporter {
                 // Null for a request that declared no block, the way
                 // `post_request` is — an empty report is exactly that case,
                 // since a block with entries always produces a result per entry.
-                record.capture = (!capture.is_empty())
-                    .then(|| CaptureRecord::new(capture, self.show_captures));
+                record.capture =
+                    (!capture.is_empty()).then(|| CaptureRecord::new(capture, self.show_captures));
             });
             return;
         }
@@ -747,7 +747,11 @@ mod tests {
             // not — redacted or not, depending on the flag.
             assert_eq!(
                 capture["values"]["auth_token"],
-                if show_captures { "abc123" } else { "<redacted>" }
+                if show_captures {
+                    "abc123"
+                } else {
+                    "<redacted>"
+                }
             );
             assert_eq!(capture["values"]["user_id"], serde_json::Value::Null);
 

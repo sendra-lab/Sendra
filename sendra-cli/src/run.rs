@@ -235,7 +235,11 @@ pub(crate) async fn test(
 
     let config = &config;
     let client = &client;
-    let reporter = &Reporter::new(Format::for_json_flag(json), Detail::StatusOnly, show_captures);
+    let reporter = &Reporter::new(
+        Format::for_json_flag(json),
+        Detail::StatusOnly,
+        show_captures,
+    );
     let outcomes = run_requests(
         &requests,
         &environment,

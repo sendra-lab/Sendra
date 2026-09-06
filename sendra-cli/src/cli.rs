@@ -236,10 +236,16 @@ mod tests {
 
     #[test]
     fn show_captures_defaults_to_false_and_is_offered_by_both_subcommands() {
-        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml"])
-            .expect("`run` takes just a path");
+        let cli =
+            Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`run` takes just a path");
         assert!(
-            matches!(cli.command, Command::Run { show_captures: false, .. }),
+            matches!(
+                cli.command,
+                Command::Run {
+                    show_captures: false,
+                    ..
+                }
+            ),
             "captures are redacted by default under `run`"
         );
 
