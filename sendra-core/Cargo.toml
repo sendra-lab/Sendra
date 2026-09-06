@@ -32,3 +32,5 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 # Config resolution is tested against real directory trees, so the tests need
 # somewhere disposable to build them.
 tempfile = { workspace = true }
+# Encodes the gzip fixture body in the compression test.
+flate2 = { workspace = true }

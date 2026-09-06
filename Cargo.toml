@@ -14,7 +14,13 @@ dirs = "6"
 tempfile = "3"
 serde_yaml = "0.9"
 jsonpath-rust = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "http2",
+  "gzip",
+  "brotli",
+  "deflate",
+] }
 thiserror = "2"
 tokio = { version = "1", default-features = false }
 clap = { version = "4", features = ["derive"] }
@@ -23,3 +29,7 @@ owo-colors = { version = "4", features = ["supports-colors"] }
 # module system, and with it `import` and the filesystem-backed module
 # resolver that is otherwise the default. See the note on `script::engine`.
 rhai = { version = "1.26", features = ["no_module"] }
+# Test-only: used to build gzip-compressed fixture bodies for the compression
+# test in sendra-core. Already pulled in transitively by reqwest's "gzip"
+# feature, so this adds no new dependency to the tree.
+flate2 = "1"
