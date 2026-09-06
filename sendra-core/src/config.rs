@@ -233,8 +233,14 @@ impl Config {
     /// added only when the request does not already set one with that name,
     /// **compared case-insensitively**, because HTTP header names are
     /// case-insensitive: a config `User-Agent` and a request `user-agent` are
-    /// the same header, and keeping both as separate map keys would leave which
-    /// one survives up to the HTTP client rather than to the stated rule.
+    /// the same header, and adding both would give the request two entries
+    /// under a name it never repeated itself, rather than to the stated rule.
+    ///
+    /// This is still a suppression, not a merge: `Request.headers` allowing a
+    /// name to repeat is about what the *request* is allowed to say, not an
+    /// invitation for a config default to duplicate something the request
+    /// already set. A repeated header only happens when the request file (or
+    /// a script) asks for it.
     pub fn apply(&self, request: &Request) -> Request {
         let mut applied = request.clone();
         for (name, value) in &self.headers {
@@ -244,16 +250,16 @@ impl Config {
     }
 }
 
-/// Insert `name: value` unless a header with that name is already present
+/// Push `name: value` unless a header with that name is already present
 /// under any casing.
-fn insert_if_absent(headers: &mut BTreeMap<String, String>, name: &str, value: &str) {
+fn insert_if_absent(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
     if headers
-        .keys()
-        .any(|existing| existing.eq_ignore_ascii_case(name))
+        .iter()
+        .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
     {
         return;
     }
-    headers.insert(name.to_string(), value.to_string());
+    headers.push((name.to_string(), value.to_string()));
 }
 
 /// Insert `name: value`, dropping any header already present under a different
@@ -572,14 +578,8 @@ mod tests {
 
         let applied = config.apply(&request_with_headers(&[("Accept", "text/plain")]));
 
-        assert_eq!(
-            applied.headers.get("User-Agent").map(String::as_str),
-            Some("sendra")
-        );
-        assert_eq!(
-            applied.headers.get("Accept").map(String::as_str),
-            Some("text/plain")
-        );
+        assert_eq!(applied.header("User-Agent"), Some("sendra"));
+        assert_eq!(applied.header("Accept"), Some("text/plain"));
     }
 
     #[test]
@@ -591,10 +591,7 @@ mod tests {
 
         let applied = config.apply(&request_with_headers(&[("User-Agent", "from-request")]));
 
-        assert_eq!(
-            applied.headers.get("User-Agent").map(String::as_str),
-            Some("from-request")
-        );
+        assert_eq!(applied.header("User-Agent"), Some("from-request"));
     }
 
     #[test]
@@ -609,10 +606,61 @@ mod tests {
         // One header, and it is the request's: sending both and letting the
         // HTTP client pick would make the documented rule a coin flip.
         assert_eq!(applied.headers.len(), 1, "got {:?}", applied.headers);
+        assert_eq!(applied.header("user-agent"), Some("from-request"));
+    }
+
+    #[test]
+    fn a_config_default_is_suppressed_even_when_the_request_repeats_that_name() {
+        // Repetition is a request-level choice; a config default of the same
+        // name must still be suppressed rather than becoming a third value the
+        // request never asked for.
+        let config = Config {
+            headers: BTreeMap::from([("X-Tag".to_string(), "from-config".to_string())]),
+            ..Config::default()
+        };
+        let mut request = request_with_headers(&[]);
+        request.headers = vec![
+            ("X-Tag".to_string(), "one".to_string()),
+            ("X-Tag".to_string(), "two".to_string()),
+        ];
+
+        let applied = config.apply(&request);
+
         assert_eq!(
-            applied.headers.get("user-agent").map(String::as_str),
-            Some("from-request")
+            applied.headers,
+            vec![
+                ("X-Tag".to_string(), "one".to_string()),
+                ("X-Tag".to_string(), "two".to_string()),
+            ],
+            "got {:?}",
+            applied.headers
         );
+    }
+
+    #[test]
+    fn a_request_that_repeats_a_header_keeps_both_after_config_is_applied() {
+        // A config default of a *different* name must not disturb a request's
+        // own repeated header.
+        let config = Config {
+            headers: BTreeMap::from([("User-Agent".to_string(), "sendra".to_string())]),
+            ..Config::default()
+        };
+        let mut request = request_with_headers(&[]);
+        request.headers = vec![
+            ("X-Forwarded-For".to_string(), "1.2.3.4".to_string()),
+            ("X-Forwarded-For".to_string(), "5.6.7.8".to_string()),
+        ];
+
+        let applied = config.apply(&request);
+
+        let forwarded: Vec<&str> = applied
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "X-Forwarded-For")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(forwarded, vec!["1.2.3.4", "5.6.7.8"]);
+        assert_eq!(applied.header("User-Agent"), Some("sendra"));
     }
 
     #[test]
@@ -625,7 +673,7 @@ mod tests {
             name: Some("Create".to_string()),
             method: Method::Post,
             url: "https://example.com/things".to_string(),
-            headers: BTreeMap::new(),
+            headers: Vec::new(),
             body: Some("{}".to_string()),
             // Config merges headers and nothing else; assertions are checked
             // against the response, which a default header cannot change, and
