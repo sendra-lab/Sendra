@@ -102,7 +102,17 @@ pub(crate) fn print_error(err: &SendraError) {
     }
 
     // One actionable hint, without turning this into a help system.
-    if matches!(err, SendraError::Io { .. }) {
-        print_hint("check the path, or see examples/get-request.yaml for the file shape");
+    match err {
+        SendraError::Io { .. } => {
+            print_hint("check the path, or see examples/get-request.yaml for the file shape")
+        }
+        // The whole reason `Timeout` is its own variant: this is the one
+        // network failure whose fix might be a Sendra setting rather than
+        // something out on the network, and the error line has just named a
+        // limit the user may not know they can change.
+        SendraError::Timeout { .. } => {
+            print_hint("raise `timeout_seconds` in .sendra/config.yaml if the server is just slow")
+        }
+        _ => {}
     }
 }
