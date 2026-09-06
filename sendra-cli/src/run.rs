@@ -141,12 +141,17 @@ fn prepare(path: &Path, environment_name: Option<&str>) -> Result<Prepared, Exit
 /// failure in [`prepare`] returns before the reporter has anything to say, so
 /// `--json` writes nothing at all on stdout in that case — the run never
 /// started, and the error is on stderr with the exit code that says so.
+///
+/// `show_captures` reaches only the `--json` document, and only its
+/// `capture.values` — see [`Reporter`] and `output::json::CaptureRecord`. It
+/// changes nothing about which requests are sent or what they do.
 pub(crate) async fn run(
     path: &Path,
     name: Option<&str>,
     environment_name: Option<&str>,
     allow_error_status: bool,
     json: bool,
+    show_captures: bool,
 ) -> Exit {
     let Prepared {
         config,
@@ -173,7 +178,7 @@ pub(crate) async fn run(
 
     let config = &config;
     let client = &client;
-    let reporter = &Reporter::new(Format::for_json_flag(json), Detail::Full);
+    let reporter = &Reporter::new(Format::for_json_flag(json), Detail::Full, show_captures);
     let outcomes = run_requests(
         &requests,
         &environment,
@@ -208,7 +213,12 @@ pub(crate) async fn run(
 /// the document `test` writes carries the [`Summary`] the terminal output ends
 /// with. The counts, and the exit code they produce, are the same numbers in
 /// both renderings.
-pub(crate) async fn test(path: &Path, environment_name: Option<&str>, json: bool) -> Exit {
+pub(crate) async fn test(
+    path: &Path,
+    environment_name: Option<&str>,
+    json: bool,
+    show_captures: bool,
+) -> Exit {
     let Prepared {
         config,
         client,
@@ -225,7 +235,11 @@ pub(crate) async fn test(path: &Path, environment_name: Option<&str>, json: bool
 
     let config = &config;
     let client = &client;
-    let reporter = &Reporter::new(Format::for_json_flag(json), Detail::StatusOnly);
+    let reporter = &Reporter::new(
+        Format::for_json_flag(json),
+        Detail::StatusOnly,
+        show_captures,
+    );
     let outcomes = run_requests(
         &requests,
         &environment,

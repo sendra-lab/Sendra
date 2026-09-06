@@ -124,7 +124,7 @@ pub(crate) fn all_passed_with_script(status: u16) -> Outcome {
 /// that is about `--json` builds its own [`Reporter`] and reads the document
 /// back — see `output`'s tests.
 pub(crate) fn reporter() -> Reporter {
-    Reporter::new(Format::Human, Detail::StatusOnly)
+    Reporter::new(Format::Human, Detail::StatusOnly, false)
 }
 
 /// The client `send` needs in its signature, for the tests that never reach the
