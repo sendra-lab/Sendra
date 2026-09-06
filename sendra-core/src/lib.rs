@@ -1377,8 +1377,7 @@ enviroment: staging
         use std::io::Write;
 
         let body = b"{\"hello\":\"world\"}";
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(body).expect("gzip encodes into memory");
         let compressed = encoder.finish().expect("gzip stream finalises");
 
