@@ -62,6 +62,20 @@ pub(crate) enum Command {
         /// `jq` can read. Exit codes are exactly the same either way.
         #[arg(long)]
         json: bool,
+
+        /// Show captured values verbatim in `--json` output instead of
+        /// redacting them.
+        ///
+        /// A `capture` block often pulls an auth token or other sensitive
+        /// value out of a response, and `--json` is the format that ends up
+        /// piped into a CI log — a more structured, more attractive target
+        /// than the same value sitting inside an escaped response body.
+        /// `capture.values` entries are redacted by default; this flag opts
+        /// back into the original behaviour. `capture.failures` is never
+        /// affected: it names variables and paths, not the values captured
+        /// from them. Meaningless without `--json`; accepted either way.
+        #[arg(long)]
+        show_captures: bool,
     },
 
     /// Run every request in a YAML file and pass or fail on its assertions.
@@ -100,6 +114,12 @@ pub(crate) enum Command {
         /// reading the output has no such problem.
         #[arg(long)]
         json: bool,
+
+        /// Show captured values verbatim in `--json` output instead of
+        /// redacting them. See `run --help` for the reasoning; the same
+        /// default and the same flag apply here.
+        #[arg(long)]
+        show_captures: bool,
 
         /// Accepted only so that passing it can be refused with an
         /// explanation. Hidden from `--help`, rejected in `main`.
@@ -182,11 +202,13 @@ mod tests {
                 path,
                 env,
                 json,
+                show_captures,
                 allow_error_status,
             } => {
                 assert_eq!(path, PathBuf::from("collection.yaml"));
                 assert_eq!(env.as_deref(), Some("staging"));
                 assert!(!json, "the human output is what you get without --json");
+                assert!(!show_captures, "captures are redacted by default");
                 assert!(!allow_error_status);
             }
             _ => panic!("`sendra test` should have parsed as `Command::Test`"),
@@ -208,5 +230,37 @@ mod tests {
             Cli::try_parse_from(["sendra", "test", "collection.yaml", "One request"]).is_err(),
             "`test` takes no request name"
         );
+    }
+
+    // --- `--show-captures` -------------------------------------------------
+
+    #[test]
+    fn show_captures_defaults_to_false_and_is_offered_by_both_subcommands() {
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml"])
+            .expect("`run` takes just a path");
+        assert!(
+            matches!(cli.command, Command::Run { show_captures: false, .. }),
+            "captures are redacted by default under `run`"
+        );
+
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--show-captures"])
+            .expect("`--show-captures` is offered by `run`");
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                show_captures: true,
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--show-captures"])
+            .expect("`--show-captures` is offered by `test`");
+        assert!(matches!(
+            cli.command,
+            Command::Test {
+                show_captures: true,
+                ..
+            }
+        ));
     }
 }

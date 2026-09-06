@@ -107,26 +107,47 @@ impl RequestRecord {
 /// facts (which name, which path, what went wrong) and there is usually none of
 /// them.
 ///
-/// **The values are here even though the terminal does not print them.** The
-/// document already carries every response body verbatim under both
-/// subcommands, so a captured value is text that is in the output twice rather
-/// than a secret this key newly exposes; and a program reading `--json` has no
-/// equivalent of the "do not put it on a terminal someone is screenshotting"
-/// problem the human rendering is avoiding.
+/// **`values` is redacted by default.** A capture is often an auth token or
+/// other sensitive value pulled out of a response, and `--json` is the format
+/// that ends up piped straight into a CI log — a more structured, more
+/// attractive target there than the same value sitting inside an escaped
+/// response body. Unlike the body, `values` is not the server's response
+/// verbatim; it is a key Sendra itself chose to extract and name, so Sendra
+/// gets to choose what happens to it here without misrepresenting anything
+/// the server sent. `--show-captures` opts back into the raw values, for
+/// anyone who wants the pre-existing behaviour. `failures` is never redacted:
+/// a failure carries a variable name and a JSON path, both already visible in
+/// the source YAML, never the value that would have been captured.
 #[derive(Debug, Serialize)]
 pub(super) struct CaptureRecord {
-    /// Every name this request captured, and what it captured. Empty when
-    /// every entry failed.
+    /// Every name this request captured, and what it captured — or
+    /// [`REDACTED_CAPTURE_VALUE`] in place of each one, unless
+    /// `--show-captures` was given. Empty when every entry failed.
     values: std::collections::BTreeMap<String, String>,
     /// The entries that produced no value, in evaluation order. Empty when
     /// they all did.
     failures: Vec<CaptureFailureRecord>,
 }
 
-impl From<&CaptureReport> for CaptureRecord {
-    fn from(report: &CaptureReport) -> Self {
+/// What a redacted `capture.values` entry reads as: unambiguously "a value
+/// was captured and Sendra is choosing not to show it", not "capture failed"
+/// (that is a missing key, on `failures`) and not an empty string (that would
+/// look like a capture that genuinely produced nothing).
+pub(super) const REDACTED_CAPTURE_VALUE: &str = "<redacted>";
+
+impl CaptureRecord {
+    pub(super) fn new(report: &CaptureReport, show_captures: bool) -> Self {
+        let values = report.values();
+
         Self {
-            values: report.values(),
+            values: if show_captures {
+                values
+            } else {
+                values
+                    .into_keys()
+                    .map(|name| (name, REDACTED_CAPTURE_VALUE.to_string()))
+                    .collect()
+            },
             failures: report
                 .failures()
                 .map(|result| CaptureFailureRecord {

@@ -103,6 +103,12 @@ impl Format {
 pub(crate) struct Reporter {
     format: Format,
     detail: Detail,
+    /// Whether `capture.values` in `--json` output carries the values
+    /// Sendra captured, rather than [`json::REDACTED_CAPTURE_VALUE`] in
+    /// their place — `--show-captures`. Read only under [`Format::Json`];
+    /// meaningless, and unread, under [`Format::Human`], which never prints
+    /// captured values at all.
+    show_captures: bool,
     /// One entry per request the run announced, in file order. Stays empty
     /// under [`Format::Human`], which has nothing to record because it has
     /// already printed.
@@ -110,10 +116,11 @@ pub(crate) struct Reporter {
 }
 
 impl Reporter {
-    pub(crate) fn new(format: Format, detail: Detail) -> Self {
+    pub(crate) fn new(format: Format, detail: Detail, show_captures: bool) -> Self {
         Self {
             format,
             detail,
+            show_captures,
             requests: RefCell::new(Vec::new()),
         }
     }
@@ -196,7 +203,8 @@ impl Reporter {
                 // Null for a request that declared no block, the way
                 // `post_request` is — an empty report is exactly that case,
                 // since a block with entries always produces a result per entry.
-                record.capture = (!capture.is_empty()).then(|| CaptureRecord::from(capture));
+                record.capture = (!capture.is_empty())
+                    .then(|| CaptureRecord::new(capture, self.show_captures));
             });
             return;
         }
@@ -348,7 +356,7 @@ mod tests {
 
     #[test]
     fn run_reports_one_object_holding_every_request() {
-        let reporter = Reporter::new(Format::Json, Detail::Full);
+        let reporter = Reporter::new(Format::Json, Detail::Full, false);
 
         reporter.request_started("Get user");
         let response = response_with("application/json", r#"{"id":1}"#);
@@ -392,7 +400,7 @@ mod tests {
 
     #[test]
     fn a_request_that_never_got_a_response_carries_the_error_instead() {
-        let reporter = Reporter::new(Format::Json, Detail::Full);
+        let reporter = Reporter::new(Format::Json, Detail::Full, false);
 
         reporter.request_started("GET https://example.com");
         reporter.request_failed(&SendraError::Io {
@@ -420,7 +428,7 @@ mod tests {
 
     #[test]
     fn a_passing_assertion_reports_a_null_failure() {
-        let reporter = Reporter::new(Format::Json, Detail::Full);
+        let reporter = Reporter::new(Format::Json, Detail::Full, false);
 
         reporter.request_started("Get user");
         let response = response_with("application/json", r#"{"id":1}"#);
@@ -446,7 +454,7 @@ mod tests {
 
     #[test]
     fn every_request_appears_in_file_order() {
-        let reporter = Reporter::new(Format::Json, Detail::Full);
+        let reporter = Reporter::new(Format::Json, Detail::Full, false);
 
         for label in ["First", "Second", "Third"] {
             reporter.request_started(label);
@@ -471,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_reports_the_same_requests_plus_the_summary() {
-        let reporter = Reporter::new(Format::Json, Detail::StatusOnly);
+        let reporter = Reporter::new(Format::Json, Detail::StatusOnly, false);
 
         reporter.request_started("Get user");
         let response = response_with("application/json", r#"{"id":1}"#);
@@ -518,7 +526,7 @@ mod tests {
         // is explicitly null rather than absent — so a consumer can read
         // `.post_request` on every request without checking whether this build
         // emits the key.
-        let reporter = Reporter::new(Format::Json, Detail::Full);
+        let reporter = Reporter::new(Format::Json, Detail::Full, false);
 
         reporter.request_started("Get user");
         reporter.responded(
@@ -535,7 +543,7 @@ mod tests {
     #[test]
     fn a_passing_script_reports_a_null_failure() {
         // Same pair, in the same spelling, as a passing assertion result.
-        let reporter = Reporter::new(Format::Json, Detail::Full);
+        let reporter = Reporter::new(Format::Json, Detail::Full, false);
 
         reporter.request_started("Create order");
         reporter.responded(
@@ -552,7 +560,7 @@ mod tests {
 
     #[test]
     fn a_failed_script_carries_the_message_it_threw() {
-        let reporter = Reporter::new(Format::Json, Detail::Full);
+        let reporter = Reporter::new(Format::Json, Detail::Full, false);
 
         reporter.request_started("Create order");
         reporter.responded(
@@ -576,7 +584,7 @@ mod tests {
 
     #[test]
     fn a_script_and_assertions_are_reported_side_by_side() {
-        let reporter = Reporter::new(Format::Json, Detail::StatusOnly);
+        let reporter = Reporter::new(Format::Json, Detail::StatusOnly, false);
 
         reporter.request_started("Create order");
         let response = response_with("application/json", r#"{"id":1}"#);
@@ -601,7 +609,7 @@ mod tests {
         // Nothing reaches this today — an empty collection is refused when the
         // file is parsed — but `jq` should get a document rather than an empty
         // file if anything ever does.
-        let reporter = Reporter::new(Format::Json, Detail::Full);
+        let reporter = Reporter::new(Format::Json, Detail::Full, false);
 
         assert_eq!(
             document(&reporter, None)["requests"],
@@ -615,7 +623,7 @@ mod tests {
         // The two formats are one decision, made once: a human run keeps no
         // records, so there is no second code path that could disagree with
         // what was printed.
-        let reporter = Reporter::new(Format::Human, Detail::Full);
+        let reporter = Reporter::new(Format::Human, Detail::Full, false);
 
         reporter.request_started("Get user");
         reporter.responded(
@@ -646,7 +654,7 @@ mod tests {
     fn a_request_that_declared_no_capture_block_reports_null() {
         // The same distinction `post_request` draws: null is "nothing was
         // declared", which is not the same as a block that captured nothing.
-        let reporter = Reporter::new(Format::Json, Detail::Full);
+        let reporter = Reporter::new(Format::Json, Detail::Full, false);
         reporter.request_started("Get user");
         reporter.responded(
             &response_with("application/json", "{}"),
@@ -661,7 +669,11 @@ mod tests {
 
     #[test]
     fn a_capture_reports_its_values_as_a_name_to_value_object() {
-        let reporter = Reporter::new(Format::Json, Detail::Full);
+        // `show_captures: false` — Sendra's default — is exercised here: the
+        // names are the real names a consumer chains off of
+        // (`.capture.values.auth_token`), but the values behind them are
+        // redacted, not the auth token and user id the response carried.
+        let reporter = Reporter::new(Format::Json, Detail::Full, false);
         let body = r#"{"token":"abc123","user":{"id":42}}"#;
         let capture = capture_report(
             "method: POST\nurl: https://example.com\ncapture:\n  auth_token: $.token\n  user_id: $.user.id\n",
@@ -678,17 +690,20 @@ mod tests {
 
         let capture = &document(&reporter, None)["requests"][0]["capture"];
         // Directly addressable: `.capture.values.auth_token`, not a search
-        // through a list for the right `variable`.
-        assert_eq!(capture["values"]["auth_token"], "abc123");
-        // A JSON number captures as the text it will be substituted as.
-        assert_eq!(capture["values"]["user_id"], "42");
+        // through a list for the right `variable` — the name is real, only
+        // the value behind it is not.
+        assert_eq!(capture["values"]["auth_token"], "<redacted>");
+        assert_eq!(capture["values"]["user_id"], "<redacted>");
         assert_eq!(capture["failures"].as_array().unwrap().len(), 0);
     }
 
     #[test]
-    fn a_failed_capture_reports_the_name_the_path_and_the_reason() {
-        let reporter = Reporter::new(Format::Json, Detail::Full);
-        let body = r#"{"token":"abc123"}"#;
+    fn show_captures_opts_back_into_the_raw_values() {
+        // `--show-captures` — `false` was the shape every test above this one
+        // exercised before this issue; this is the flag that gets the
+        // pre-existing behaviour back.
+        let reporter = Reporter::new(Format::Json, Detail::Full, true);
+        let body = r#"{"token":"abc123","user":{"id":42}}"#;
         let capture = capture_report(
             "method: POST\nurl: https://example.com\ncapture:\n  auth_token: $.token\n  user_id: $.user.id\n",
             body,
@@ -703,17 +718,50 @@ mod tests {
         );
 
         let capture = &document(&reporter, None)["requests"][0]["capture"];
-        // The one that worked is still reported, beside the one that did not.
         assert_eq!(capture["values"]["auth_token"], "abc123");
-        assert_eq!(capture["values"]["user_id"], serde_json::Value::Null);
+        // A JSON number captures as the text it will be substituted as.
+        assert_eq!(capture["values"]["user_id"], "42");
+    }
 
-        let failures = capture["failures"].as_array().unwrap();
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0]["variable"], "user_id");
-        assert_eq!(failures[0]["path"], "$.user.id");
-        assert_eq!(
-            failures[0]["failure"],
-            "matched nothing in the response body"
-        );
+    #[test]
+    fn a_failed_capture_reports_the_name_the_path_and_the_reason_regardless_of_redaction() {
+        let body = r#"{"token":"abc123"}"#;
+
+        for show_captures in [false, true] {
+            let reporter = Reporter::new(Format::Json, Detail::Full, show_captures);
+            let capture = capture_report(
+                "method: POST\nurl: https://example.com\ncapture:\n  auth_token: $.token\n  user_id: $.user.id\n",
+                body,
+            );
+
+            reporter.request_started("Log in");
+            reporter.responded(
+                &response_with("application/json", body),
+                None,
+                &AssertionReport::default(),
+                &capture,
+            );
+
+            let capture = &document(&reporter, None)["requests"][0]["capture"];
+            // The one that worked is still reported, beside the one that did
+            // not — redacted or not, depending on the flag.
+            assert_eq!(
+                capture["values"]["auth_token"],
+                if show_captures { "abc123" } else { "<redacted>" }
+            );
+            assert_eq!(capture["values"]["user_id"], serde_json::Value::Null);
+
+            // `failures` never carries a value in the first place, so the flag
+            // changes nothing about it: variable names and paths were already
+            // visible in the source YAML.
+            let failures = capture["failures"].as_array().unwrap();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0]["variable"], "user_id");
+            assert_eq!(failures[0]["path"], "$.user.id");
+            assert_eq!(
+                failures[0]["failure"],
+                "matched nothing in the response body"
+            );
+        }
     }
 }

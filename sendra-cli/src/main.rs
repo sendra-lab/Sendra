@@ -33,12 +33,14 @@ async fn main() -> ExitCode {
             env,
             allow_error_status,
             json,
+            show_captures,
         } => run(
             &path,
             request.as_deref(),
             env.as_deref(),
             allow_error_status,
             json,
+            show_captures,
         )
         .await
         .into(),
@@ -47,12 +49,15 @@ async fn main() -> ExitCode {
             path,
             env,
             json,
+            show_captures,
             allow_error_status,
         } => {
             if allow_error_status {
                 reject_allow_error_status();
             }
-            test(&path, env.as_deref(), json).await.into()
+            test(&path, env.as_deref(), json, show_captures)
+                .await
+                .into()
         }
     }
 }
