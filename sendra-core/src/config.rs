@@ -50,6 +50,101 @@ const APP_DIR_NAME: &str = "sendra";
 /// one option a command-line tool should not have.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// reqwest's own default: up to 10 redirects in a chain before giving up.
+/// Sendra keeps this as its default too, so a config that never mentions
+/// `follow_redirects` behaves exactly as it always has.
+pub const DEFAULT_MAX_REDIRECTS: u32 = 10;
+
+/// How a run treats an HTTP redirect: follow up to some maximum number of
+/// hops, or not at all.
+///
+/// On disk this is the `follow_redirects` key, and it is deliberately
+/// bool-or-number rather than two separate keys:
+///
+/// ```text
+/// follow_redirects: false   # report the 3xx response itself, do not chase it
+/// follow_redirects: true    # follow, up to the default of 10 hops
+/// follow_redirects: 3       # follow, up to a custom maximum
+/// ```
+///
+/// Leaving the key out entirely is the same as `true`: [`Config::default`]
+/// resolves to [`FollowRedirects::Follow`] with [`DEFAULT_MAX_REDIRECTS`],
+/// matching reqwest's own default and so changing nothing for a config that
+/// does not touch this key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowRedirects {
+    /// Follow a redirect chain up to this many hops before it is an error.
+    Follow(u32),
+    /// Do not follow redirects at all: a 3xx response is reported as-is,
+    /// Location header and all, rather than chased.
+    Disabled,
+}
+
+impl Default for FollowRedirects {
+    fn default() -> Self {
+        FollowRedirects::Follow(DEFAULT_MAX_REDIRECTS)
+    }
+}
+
+/// Hand-written rather than `#[serde(untagged)]`, for the same reason as
+/// `Request`'s header values: a value of the wrong shape should say "expected
+/// `true`, `false`, or a number", not "data did not match any variant".
+impl<'de> Deserialize<'de> for FollowRedirects {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct FollowRedirectsVisitor;
+
+        impl serde::de::Visitor<'_> for FollowRedirectsVisitor {
+            type Value = FollowRedirects;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("`true`, `false`, or a maximum number of redirects to follow")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(if value {
+                    FollowRedirects::default()
+                } else {
+                    FollowRedirects::Disabled
+                })
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                u32::try_from(value)
+                    .map(FollowRedirects::Follow)
+                    .map_err(|_| E::custom("redirect limit is too large"))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                if value < 0 {
+                    return Err(E::custom("redirect limit cannot be negative"));
+                }
+                self.visit_u64(value as u64)
+            }
+        }
+
+        deserializer.deserialize_any(FollowRedirectsVisitor)
+    }
+}
+
+/// The inverse of the visitor above: `Disabled` writes back as `false`, and a
+/// maximum writes back as the plain number — `true` never round-trips as
+/// `true`, since a resolved maximum is exactly as meaningful and there is
+/// only one of these in a merged [`Config`] to write back out anyway.
+impl Serialize for FollowRedirects {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            FollowRedirects::Disabled => serializer.serialize_bool(false),
+            FollowRedirects::Follow(max) => serializer.serialize_u32(*max),
+        }
+    }
+}
+
 /// One config file, exactly as it appears on disk.
 ///
 /// Every field is optional, and stays optional after parsing, because that
@@ -85,6 +180,11 @@ pub struct ConfigFile {
     /// duration format is wanted later.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+
+    /// Whether to follow redirects, and how many hops to allow. See
+    /// [`FollowRedirects`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_redirects: Option<FollowRedirects>,
 }
 
 impl ConfigFile {
@@ -139,6 +239,7 @@ impl ConfigFile {
         Self {
             headers,
             timeout_seconds: self.timeout_seconds.or(base.timeout_seconds),
+            follow_redirects: self.follow_redirects.or(base.follow_redirects),
         }
     }
 }
@@ -153,18 +254,22 @@ pub struct Config {
     pub headers: BTreeMap<String, String>,
     /// Whole-request timeout: connect, send and body read.
     pub timeout: Duration,
+    /// Whether to follow redirects, and how many hops to allow.
+    pub redirects: FollowRedirects,
     /// The config files this was built from, in the order they were merged
     /// (global first). Empty when no config file was found anywhere.
     pub sources: Vec<PathBuf>,
 }
 
 impl Default for Config {
-    /// What Sendra does with no config file anywhere: no extra headers, and
-    /// [`DEFAULT_TIMEOUT`].
+    /// What Sendra does with no config file anywhere: no extra headers,
+    /// [`DEFAULT_TIMEOUT`], and redirects followed up to
+    /// [`DEFAULT_MAX_REDIRECTS`] — reqwest's own default.
     fn default() -> Self {
         Self {
             headers: BTreeMap::new(),
             timeout: DEFAULT_TIMEOUT,
+            redirects: FollowRedirects::default(),
             sources: Vec::new(),
         }
     }
@@ -221,6 +326,7 @@ impl Config {
             timeout: merged
                 .timeout_seconds
                 .map_or(DEFAULT_TIMEOUT, Duration::from_secs),
+            redirects: merged.follow_redirects.unwrap_or_default(),
             sources,
         })
     }
@@ -555,6 +661,86 @@ mod tests {
         let err = ConfigFile::from_yaml_str("timeout_seconds: soon\n")
             .expect_err("seconds must be a number");
         assert!(matches!(err, SendraError::ParseStr(_)), "got {err:?}");
+    }
+
+    // --- `follow_redirects` -----------------------------------------------
+
+    #[test]
+    fn no_follow_redirects_key_resolves_to_the_default_of_ten() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(temp.path(), "timeout_seconds: 5\n");
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        assert_eq!(
+            config.redirects,
+            FollowRedirects::Follow(DEFAULT_MAX_REDIRECTS)
+        );
+    }
+
+    #[test]
+    fn follow_redirects_false_disables_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(temp.path(), "follow_redirects: false\n");
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        assert_eq!(config.redirects, FollowRedirects::Disabled);
+    }
+
+    #[test]
+    fn follow_redirects_true_is_the_same_default_maximum() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(temp.path(), "follow_redirects: true\n");
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        assert_eq!(
+            config.redirects,
+            FollowRedirects::Follow(DEFAULT_MAX_REDIRECTS)
+        );
+    }
+
+    #[test]
+    fn follow_redirects_as_a_number_sets_a_custom_maximum() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(temp.path(), "follow_redirects: 3\n");
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        assert_eq!(config.redirects, FollowRedirects::Follow(3));
+    }
+
+    #[test]
+    fn a_project_follow_redirects_overrides_a_global_one_wholesale() {
+        // Unlike `headers`, there is nothing to merge one level down: the
+        // project's value replaces the global one entirely, the same way
+        // `timeout_seconds` does.
+        let temp = tempfile::tempdir().unwrap();
+        let global = global(temp.path(), "follow_redirects: false\n");
+        let root = project(temp.path(), "follow_redirects: 2\n");
+
+        let config = Config::resolve_from(&root, Some(&global)).unwrap();
+
+        assert_eq!(config.redirects, FollowRedirects::Follow(2));
+    }
+
+    #[test]
+    fn a_negative_follow_redirects_number_is_a_parse_error() {
+        let err = ConfigFile::from_yaml_str("follow_redirects: -1\n")
+            .expect_err("a negative redirect count makes no sense");
+        assert!(matches!(err, SendraError::ParseStr(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_follow_redirects_value_that_is_neither_bool_nor_number_says_so() {
+        let err = ConfigFile::from_yaml_str("follow_redirects: sometimes\n")
+            .expect_err("a string is not a valid value");
+        let message = err.to_string();
+        assert!(
+            message.contains("could not parse"),
+            "got {message}: {err:?}"
+        );
     }
 
     #[test]

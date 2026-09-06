@@ -7,10 +7,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::FollowRedirects;
 use crate::environment::{describe_captured, describe_environment, describe_variables};
 
 pub mod assertions;
@@ -23,10 +25,6 @@ pub use assertions::{AssertionKind, AssertionReport, AssertionResult, Assertions
 pub use capture::{CaptureFailure, CaptureReport, CaptureResult, Captures};
 pub use config::Config;
 pub use environment::Environment;
-/// The HTTP client [`send`] and [`send_prepared`] send through, re-exported so a
-/// front-end can build one with [`build_client`] and pass it around without
-/// taking a direct dependency on reqwest.
-pub use reqwest::Client as HttpClient;
 pub use script::{Hook, Script, ScriptOutcome, ScriptOutput, Scripts};
 
 /// Every way loading or sending a request can fail.
@@ -787,12 +785,58 @@ pub struct Response {
     pub headers: Vec<(String, String)>,
     pub body: String,
     pub elapsed: Duration,
+    /// Every redirect hop that led to this response, oldest first: empty when
+    /// the request was answered directly, when [`FollowRedirects::Disabled`]
+    /// left a 3xx response as this one, or when only one hop's worth of
+    /// following happened and it landed here without an intermediate stop.
+    ///
+    /// Each entry is the status of the response that redirected, and the
+    /// `Location` it pointed at (resolved to an absolute URL) — the same two
+    /// facts a `curl -v` trace would show for that hop. This response's own
+    /// status and headers are not repeated here.
+    pub redirects: Vec<RedirectHop>,
 }
 
 impl Response {
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
     }
+}
+
+/// One hop of a redirect chain, recorded on the way to a [`Response`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedirectHop {
+    /// The status of the response that redirected — `301`, `302`, and so on.
+    pub status: u16,
+    /// Where it pointed: the `Location` header, resolved against the URL that
+    /// received it, as an absolute URL.
+    pub location: String,
+}
+
+/// Redirect hops recorded during the request currently in flight through a
+/// given [`HttpClient`].
+///
+/// A `reqwest::redirect::Policy` closure has no way to hand its caller
+/// anything back directly — it only decides follow/stop/error — so this is
+/// the side channel: the policy pushes a hop here as it sees each one, and
+/// [`send_prepared`] drains it right after that request finishes. The client
+/// is built once per run and reused by every request in it (see
+/// [`build_client`]), so the log is cleared at the *start* of each send
+/// rather than trusted to be empty — nothing else empties it, and requests in
+/// a run are sent one at a time, never concurrently, so there is never more
+/// than one request's hops in it at once.
+type RedirectLog = Arc<Mutex<Vec<RedirectHop>>>;
+
+/// The HTTP client [`send`] and [`send_prepared`] send through.
+///
+/// A thin wrapper around `reqwest::Client` rather than a re-export of it, so
+/// that the redirect chain a request's `reqwest::redirect::Policy` observes
+/// has somewhere to be recorded and read back — see [`RedirectLog`]. A
+/// front-end builds one with [`build_client`] and passes it around without
+/// taking a direct dependency on reqwest.
+pub struct HttpClient {
+    inner: reqwest::Client,
+    redirects: RedirectLog,
 }
 
 /// Build the HTTP client a run sends every one of its requests through.
@@ -810,21 +854,84 @@ impl Response {
 /// because a client is not configuration: it holds sockets, it is cheap to
 /// clone and expensive to rebuild, and it belongs to a *run*, whereas the
 /// config it is built from is a resolved set of values that outlives any
-/// particular one. The config decides one thing here — the timeout — and
-/// nothing else about the client is configurable in v1; reqwest's own pool
-/// defaults are what a command-line tool wants.
+/// particular one. The config decides two things here — the timeout and the
+/// redirect policy — and nothing else about the client is configurable in v1;
+/// reqwest's own pool defaults are what a command-line tool wants.
 ///
 /// Fails only when reqwest cannot construct a client at all (a TLS backend that
 /// will not initialise, say), which is fatal to the whole run and so is
 /// [`SendraError::Client`] rather than a per-request network error.
 pub fn build_client(config: &Config) -> Result<HttpClient, SendraError> {
+    let redirects: RedirectLog = Arc::new(Mutex::new(Vec::new()));
+
+    let policy = match config.redirects {
+        // `Policy::none()` hands the 3xx response straight back rather than
+        // erroring: a redirect with following disabled is a normal,
+        // inspectable response, not a failure. Our custom policy below is
+        // never consulted in this case, so nothing is logged — which is
+        // exactly right, since there is no chain to show.
+        FollowRedirects::Disabled => reqwest::redirect::Policy::none(),
+
+        // Custom rather than `Policy::limited(max)`, because `limited` has no
+        // way to tell us what it saw: every attempt is a hop this crate wants
+        // to show, whether or not it ends up being followed.
+        FollowRedirects::Follow(max) => {
+            let log = redirects.clone();
+            reqwest::redirect::Policy::custom(move |attempt: reqwest::redirect::Attempt| {
+                log.lock().unwrap().push(RedirectHop {
+                    status: attempt.status().as_u16(),
+                    location: attempt.url().to_string(),
+                });
+
+                // `previous()` does not count the attempt now being decided,
+                // so this matches `Policy::limited`'s own rule: `max` hops are
+                // allowed, and the one that would make it `max + 1` errors.
+                if attempt.previous().len() as u32 >= max {
+                    attempt.error(TooManyRedirects { max })
+                } else {
+                    attempt.follow()
+                }
+            })
+        }
+    };
+
     // reqwest has no timeout of its own by default, so an unresponsive server
     // would hang the process indefinitely; the config always supplies one.
-    HttpClient::builder()
+    let inner = reqwest::Client::builder()
         .timeout(config.timeout)
+        .redirect(policy)
         .build()
-        .map_err(SendraError::Client)
+        .map_err(SendraError::Client)?;
+
+    Ok(HttpClient { inner, redirects })
 }
+
+/// Raised by the custom redirect policy in [`build_client`] when a chain runs
+/// past the configured maximum.
+///
+/// **Exceeding the limit is an error, the same as reqwest's own default
+/// behaviour today.** A response was never short of one — the chain simply
+/// did not resolve within the hops the config allows — so there is no single
+/// "last response reached" that would not misrepresent what happened, the way
+/// there would be for a hop that landed on a plain 3xx with redirects turned
+/// off entirely. This reaches the caller as [`SendraError::Network`], wrapping
+/// reqwest's own redirect error, exactly like a DNS or TLS failure.
+#[derive(Debug)]
+struct TooManyRedirects {
+    max: u32,
+}
+
+impl std::fmt::Display for TooManyRedirects {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "exceeded the configured maximum of {} redirect(s)",
+            self.max
+        )
+    }
+}
+
+impl std::error::Error for TooManyRedirects {}
 
 /// Send `request` under `config` and collect the full response.
 ///
@@ -905,14 +1012,21 @@ pub async fn send_prepared(
     };
 
     let mut builder = client
+        .inner
         .request(request.method.into(), &request.url)
         .headers(headers);
     if let Some(body) = &request.body {
         builder = builder.body(body.clone());
     }
 
+    // Cleared here rather than trusted to already be empty — see
+    // `RedirectLog`. `send_prepared` calls are never concurrent for one
+    // `HttpClient`, so nothing else could be writing to it right now.
+    client.redirects.lock().unwrap().clear();
+
     let started = Instant::now();
     let response = builder.send().await.map_err(network_err)?;
+    let redirects = std::mem::take(&mut *client.redirects.lock().unwrap());
 
     let status = response.status();
     let header_pairs = response
@@ -939,6 +1053,7 @@ pub async fn send_prepared(
         // printable String for now. Binary-safe bodies are a later concern.
         body: String::from_utf8_lossy(&bytes).into_owned(),
         elapsed,
+        redirects,
     })
 }
 
@@ -1791,5 +1906,254 @@ enviroment: staging
         );
         assert!(matching.iter().any(|l| l.contains("1.2.3.4")));
         assert!(matching.iter().any(|l| l.contains("5.6.7.8")));
+    }
+
+    // --- redirect handling -------------------------------------------------
+
+    /// A server that answers a fixed table of `path -> raw HTTP response`,
+    /// over as many requests on one connection as the client cares to send —
+    /// which is what following a redirect chain to the same host looks like
+    /// on the wire. Unmatched paths 404, so a route the test forgot to wire up
+    /// fails loudly instead of hanging.
+    fn start_route_server(routes: Vec<(&'static str, Vec<u8>)>) -> std::net::SocketAddr {
+        use std::io::{BufRead, BufReader, Write};
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is free");
+        let addr = listener.local_addr().expect("the listener has an address");
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let mut writer = stream.try_clone().expect("the socket clones");
+                let mut reader = BufReader::new(stream);
+
+                loop {
+                    let mut request_line = String::new();
+                    match reader.read_line(&mut request_line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {}
+                    }
+                    let path = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_string();
+
+                    loop {
+                        let mut header = String::new();
+                        match reader.read_line(&mut header) {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) if header == "\r\n" => break,
+                            Ok(_) => {}
+                        }
+                    }
+
+                    let response = routes
+                        .iter()
+                        .find(|(route, _)| *route == path)
+                        .map(|(_, body)| body.clone())
+                        .unwrap_or_else(|| {
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec()
+                        });
+
+                    if writer.write_all(&response).is_err() {
+                        return;
+                    }
+                    let _ = writer.flush();
+                }
+            }
+        });
+
+        addr
+    }
+
+    /// A raw `301 Moved Permanently` pointing at `location`, keep-alive so the
+    /// client's next request in the chain arrives on the same connection.
+    fn redirect_response(status: u16, reason: &str, location: &str) -> Vec<u8> {
+        format!("HTTP/1.1 {status} {reason}\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n")
+            .into_bytes()
+    }
+
+    fn ok_response(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_followed_and_the_chain_is_captured_on_the_final_response() {
+        let addr = start_route_server(vec![
+            (
+                "/start",
+                redirect_response(301, "Moved Permanently", "/next"),
+            ),
+            ("/next", redirect_response(302, "Found", "/end")),
+            ("/end", ok_response("done")),
+        ]);
+
+        let config = Config::default();
+        let client = build_client(&config).expect("a client builds");
+        let response = send(&get(&format!("http://{addr}/start")), &client, &config)
+            .await
+            .expect("the chain resolves");
+
+        // The final response is what Sendra reports as *the* response...
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "done");
+
+        // ...and the chain that got there is captured alongside it, oldest
+        // hop first, each carrying the status that redirected and the
+        // location it pointed at, resolved to an absolute URL.
+        assert_eq!(
+            response.redirects,
+            vec![
+                RedirectHop {
+                    status: 301,
+                    location: format!("http://{addr}/next"),
+                },
+                RedirectHop {
+                    status: 302,
+                    location: format!("http://{addr}/end"),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_redirect_reports_an_empty_chain() {
+        // The overwhelmingly common case: nothing about an ordinary response
+        // should look any different from before this feature existed.
+        let addr = start_route_server(vec![("/", ok_response("hello"))]);
+
+        let config = Config::default();
+        let client = build_client(&config).expect("a client builds");
+        let response = send(&get(&format!("http://{addr}/")), &client, &config)
+            .await
+            .expect("a plain response");
+
+        assert_eq!(response.status, 200);
+        assert!(response.redirects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabling_redirects_reports_the_3xx_response_itself_not_an_error() {
+        let addr = start_route_server(vec![
+            (
+                "/start",
+                redirect_response(301, "Moved Permanently", "/end"),
+            ),
+            ("/end", ok_response("done")),
+        ]);
+
+        let config = Config {
+            redirects: config::FollowRedirects::Disabled,
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a client builds");
+        let response = send(&get(&format!("http://{addr}/start")), &client, &config)
+            .await
+            .expect("a 3xx is a normal, inspectable response");
+
+        // The redirect itself is what came back — status, Location header and
+        // all — not the response at the far end of it.
+        assert_eq!(response.status, 301);
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+                .map(|(_, value)| value.as_str()),
+            Some("/end")
+        );
+        // No chain: this response is not the result of following anything.
+        assert!(response.redirects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_chain_longer_than_the_configured_maximum_is_an_error() {
+        // Three hops to reach `/end`; a maximum of one allows the first and
+        // must refuse the second.
+        let addr = start_route_server(vec![
+            ("/start", redirect_response(301, "Moved Permanently", "/a")),
+            ("/a", redirect_response(302, "Found", "/b")),
+            ("/b", redirect_response(303, "See Other", "/end")),
+            ("/end", ok_response("done")),
+        ]);
+
+        let config = Config {
+            redirects: config::FollowRedirects::Follow(1),
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a client builds");
+        let err = send(&get(&format!("http://{addr}/start")), &client, &config)
+            .await
+            .expect_err("a chain past the configured maximum must not resolve to a response");
+
+        match err {
+            SendraError::Network { source, .. } => {
+                let message = source.to_string();
+                assert!(
+                    message.contains("redirect") || std::error::Error::source(&source).is_some(),
+                    "expected a redirect-shaped error, got {message}"
+                );
+            }
+            other => panic!("expected Network, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_custom_maximum_higher_than_the_chain_still_resolves() {
+        // The other side of the same setting: a maximum generous enough for
+        // the chain still reaches the end and still reports every hop.
+        let addr = start_route_server(vec![
+            ("/start", redirect_response(301, "Moved Permanently", "/a")),
+            ("/a", redirect_response(302, "Found", "/end")),
+            ("/end", ok_response("done")),
+        ]);
+
+        let config = Config {
+            redirects: config::FollowRedirects::Follow(5),
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a client builds");
+        let response = send(&get(&format!("http://{addr}/start")), &client, &config)
+            .await
+            .expect("two hops is well within a maximum of five");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.redirects.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn each_request_through_a_reused_client_reports_only_its_own_chain() {
+        // The client — and its redirect log — is built once per run and
+        // reused by every request; a chain from an earlier request must not
+        // bleed into a later one that had none of its own.
+        let addr = start_route_server(vec![
+            (
+                "/redirected",
+                redirect_response(301, "Moved Permanently", "/plain"),
+            ),
+            ("/plain", ok_response("done")),
+        ]);
+
+        let config = Config::default();
+        let client = build_client(&config).expect("a client builds");
+
+        let redirected = send(&get(&format!("http://{addr}/redirected")), &client, &config)
+            .await
+            .expect("the redirect resolves");
+        assert_eq!(redirected.redirects.len(), 1);
+
+        let plain = send(&get(&format!("http://{addr}/plain")), &client, &config)
+            .await
+            .expect("a direct hit on the same client");
+        assert!(
+            plain.redirects.is_empty(),
+            "the previous request's chain must not leak into this one"
+        );
     }
 }

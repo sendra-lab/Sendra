@@ -195,6 +195,11 @@ pub(super) struct ResponseRecord {
     elapsed_ms: u64,
     headers: Vec<HeaderRecord>,
     body: String,
+    /// Every redirect hop that led to this response, oldest first — the same
+    /// chain the human output prints as `→ 301 https://...` lines, empty for
+    /// the overwhelming majority of responses that were not redirected at
+    /// all.
+    redirects: Vec<RedirectHopRecord>,
 }
 
 impl From<&Response> for ResponseRecord {
@@ -212,8 +217,24 @@ impl From<&Response> for ResponseRecord {
                 })
                 .collect(),
             body: response.body.clone(),
+            redirects: response
+                .redirects
+                .iter()
+                .map(|hop| RedirectHopRecord {
+                    status: hop.status,
+                    location: hop.location.clone(),
+                })
+                .collect(),
         }
     }
+}
+
+/// One redirect hop: the status that redirected, and the (already resolved to
+/// absolute) `Location` it pointed at.
+#[derive(Debug, Serialize)]
+struct RedirectHopRecord {
+    status: u16,
+    location: String,
 }
 
 /// One response header. A list of `{name, value}` objects rather than one
