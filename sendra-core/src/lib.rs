@@ -825,6 +825,20 @@ pub struct RedirectHop {
 /// rather than trusted to be empty — nothing else empties it, and requests in
 /// a run are sent one at a time, never concurrently, so there is never more
 /// than one request's hops in it at once.
+///
+/// **This assumes strictly sequential sends through one [`HttpClient`].**
+/// There is exactly one log per client, shared by every request that client
+/// ever sends, and a hop is attributed to "whatever is currently between the
+/// clear in `send_prepared` and the drain right after it" — not to any
+/// particular request. Two requests sent concurrently through the same
+/// client would race on that log and could easily come back with each
+/// other's redirect hops, or a merged chain that belongs to neither. Nothing
+/// today does that — `run_requests` in `sendra-cli` awaits each request
+/// before starting the next — but if a future feature sends requests from
+/// one client in parallel (a `--repeat`/retry feature that fires several at
+/// once, say, or any other parallel send path), this mechanism has to change
+/// with it: most likely one log per in-flight request rather than one per
+/// client, or a channel instead of a shared `Vec`.
 type RedirectLog = Arc<Mutex<Vec<RedirectHop>>>;
 
 /// The HTTP client [`send`] and [`send_prepared`] send through.
@@ -836,6 +850,8 @@ type RedirectLog = Arc<Mutex<Vec<RedirectHop>>>;
 /// taking a direct dependency on reqwest.
 pub struct HttpClient {
     inner: reqwest::Client,
+    /// See [`RedirectLog`] — in particular, its note on why this only works
+    /// as long as sends through this client stay sequential.
     redirects: RedirectLog,
 }
 
@@ -1020,8 +1036,10 @@ pub async fn send_prepared(
     }
 
     // Cleared here rather than trusted to already be empty — see
-    // `RedirectLog`. `send_prepared` calls are never concurrent for one
-    // `HttpClient`, so nothing else could be writing to it right now.
+    // `RedirectLog`. This assumes `send_prepared` calls through one
+    // `HttpClient` never overlap; a concurrent send through the same client
+    // would race on this log and misattribute hops between requests. See
+    // `RedirectLog`'s doc comment before changing that.
     client.redirects.lock().unwrap().clear();
 
     let started = Instant::now();
