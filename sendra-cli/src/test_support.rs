@@ -18,6 +18,7 @@ pub(crate) fn response(status: u16) -> Response {
         headers: vec![("content-type".to_string(), "text/plain".to_string())],
         body: "body".to_string(),
         elapsed: std::time::Duration::from_millis(1),
+        redirects: Vec::new(),
     }
 }
 
@@ -30,6 +31,7 @@ pub(crate) fn response_with(content_type: &str, body: &str) -> Response {
         headers: vec![("content-type".to_string(), content_type.to_string())],
         body: body.to_string(),
         elapsed: std::time::Duration::from_millis(12),
+        redirects: Vec::new(),
     }
 }
 

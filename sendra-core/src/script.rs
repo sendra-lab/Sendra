@@ -910,6 +910,7 @@ mod tests {
             ],
             body: r#"{"id":7,"name":"ada"}"#.to_string(),
             elapsed: Duration::from_millis(12),
+            redirects: Vec::new(),
         }
     }
 

@@ -1367,6 +1367,7 @@ requests:
             headers: vec![("content-type".to_string(), "application/json".to_string())],
             body: body.to_string(),
             elapsed: std::time::Duration::from_millis(1),
+            redirects: Vec::new(),
         }
     }
 

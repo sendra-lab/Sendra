@@ -5,9 +5,39 @@
 use std::borrow::Cow;
 
 use owo_colors::{OwoColorize, Stream};
-use sendra_core::{AssertionReport, CaptureReport, Response, ScriptOutcome};
+use sendra_core::{AssertionReport, CaptureReport, RedirectHop, Response, ScriptOutcome};
 
 use crate::exit::Summary;
+
+/// Print the redirect chain that led to a response, one line per hop:
+///
+/// ```text
+/// → 301 https://example.com/old
+/// → 302 https://example.com/mid
+/// ```
+///
+/// Above the status line, in the order the hops actually happened, so a
+/// redirected request reads as the chain it was rather than presenting only
+/// the response it ended on. Nothing is printed for a response that was not
+/// redirected — most of them — so a run that touches nothing new looks exactly
+/// as it always has.
+///
+/// The same dimmed `→` the `→ <label>` line on stderr uses, but on stdout and
+/// coloured differently: this is part of the response, not the announcement of
+/// a request, and belongs in [`Reporter::responded`](super::Reporter::responded)'s
+/// output rather than alongside it.
+fn print_redirects(redirects: &[RedirectHop]) {
+    for hop in redirects {
+        println!(
+            "{} {} {}",
+            "→".if_supports_color(Stream::Stdout, |t| t.dimmed()),
+            hop.status
+                .to_string()
+                .if_supports_color(Stream::Stdout, |t| t.yellow()),
+            hop.location
+        );
+    }
+}
 
 /// The one line every response gets, whichever subcommand asked for it:
 /// `200 OK  412 ms`.
@@ -15,8 +45,13 @@ use crate::exit::Summary;
 /// Split out of [`print_response`] so that `sendra test`, which prints no
 /// headers and no body, still says which response the assertions under it are
 /// about — and says it in the same words and the same colours, rather than in a
-/// second rendering of the same fact.
+/// second rendering of the same fact. Both callers get the redirect chain too,
+/// since it printed here rather than in [`print_response`] alone: a chain is
+/// as much a fact about what "the response the checks below it are about"
+/// took to arrive as the status line is.
 pub(super) fn print_status_line(response: &Response) {
+    print_redirects(&response.redirects);
+
     let status_line = format!("{} {}", response.status, response.status_text);
     let status_line = status_line.trim_end().to_string();
 

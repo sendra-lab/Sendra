@@ -445,6 +445,7 @@ mod tests {
                 .collect(),
             body: body.to_string(),
             elapsed: Duration::from_millis(1),
+            redirects: Vec::new(),
         }
     }
 
