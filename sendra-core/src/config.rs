@@ -228,8 +228,8 @@ impl Config {
     /// Apply this config to `request`, returning the request as it will be
     /// sent.
     ///
-    /// Only the headers show up on a [`Request`]; the timeout is applied by
-    /// [`send`](crate::send) when it builds the client. A config header is
+    /// Only the headers show up on a [`Request`]; the timeout is applied to the
+    /// client [`build_client`](crate::build_client) makes for the run. A config header is
     /// added only when the request does not already set one with that name,
     /// **compared case-insensitively**, because HTTP header names are
     /// case-insensitive: a config `User-Agent` and a request `user-agent` are
