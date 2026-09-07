@@ -71,6 +71,14 @@ substituted into the next request's header and URL.
 cargo run -p sendra-cli -- run examples/capture-chain.yaml
 ```
 
+`examples/capture-header-status.yaml` extends that into three requests to show
+the two other `capture:` sources — a response header and the status code —
+chained alongside the original JSON-path form.
+
+```sh
+cargo run -p sendra-cli -- run examples/capture-header-status.yaml
+```
+
 `examples/environment-request.yaml` uses variables instead of literals, and
 needs a secret in your shell to run:
 
@@ -1014,14 +1022,39 @@ substitute:
 `null` has no text form that is not a guess between `""` and `null`. An array or
 an object has one, compact JSON, but the reason substitution is safe at all is
 that a substituted value cannot change the shape of what it lands in, and
-pushing `{"a":1}` into a URL is exactly that hazard. Capturing from response
-headers or the status code is not supported either; both are natural additions
-and neither is here yet.
+pushing `{"a":1}` into a URL is exactly that hazard.
 
 Numbers going through `serde_json` means `1.50` in a body captures as `1.5` —
 the value, not the spelling. That differs from an environment file, where
 `port: 8080` is the *string* `8080` and nothing is normalised. An endpoint whose
 exact digits matter should send them as a JSON string.
+
+**A bare string is not the only source.** It is the default, and unchanged,
+but a `capture` entry can also be an object naming a response header or the
+status code instead of a JSON path:
+
+```yaml
+capture:
+  auth_token: $.token          # unchanged: bare string = JSON path
+  session_id:
+    header: Set-Cookie          # a response header, matched case-insensitively
+  request_status:
+    status: true                 # the numeric status, as a string
+```
+
+A `header:` capture reads from the *final* response only — the one `capture`
+always evaluates against — so with `follow_redirects` on, a `Set-Cookie` set
+by an intermediate hop is not reachable this way; disable `follow_redirects`
+to capture it from the 3xx response itself. A header name that repeats in the
+response (`Set-Cookie` is the common case) is a capture failure rather than a
+first-or-last guess, the same rule a JSON path selecting several values
+already follows — a capture binds a name to *one* value, and silently picking
+between repeats would make the same file behave differently depending on
+header order a server happens to send in.
+
+```sh
+sendra run examples/capture-header-status.yaml    # header and status capture, chained
+```
 
 ### When a capture does not work
 

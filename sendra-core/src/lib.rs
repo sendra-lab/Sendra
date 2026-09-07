@@ -2219,6 +2219,7 @@ enviroment: staging
             "test-collection.yaml",
             "scripted-request.yaml",
             "capture-chain.yaml",
+            "capture-header-status.yaml",
             "repeated-headers.yaml",
             "structured-bodies.yaml",
             "query-params.yaml",

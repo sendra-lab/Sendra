@@ -1,0 +1,65 @@
+# A three-request chain that captures all three `capture:` sources in one
+# flow: a JSON path (the original, bare-string form), a response header, and
+# the status code itself.
+#
+#   sendra run examples/capture-header-status.yaml
+#   sendra test examples/capture-header-status.yaml
+#
+# capture: still defaults to a JSON path when its value is a bare string —
+# that form is unchanged from examples/capture-chain.yaml. The two additive
+# forms are objects: `header: <name>` reads a response header (matched
+# case-insensitively), and `status: true` reads the numeric status code as a
+# string. Both, like the JSON-path form, become `{{name}}` in every request
+# after the one that captured them.
+#
+# httpbin's `/response-headers` endpoint echoes back whatever headers it was
+# asked to set, both on the wire and in its JSON body, which is what makes
+# the header capture demonstrable end to end: request 2 asks for a header
+# carrying request 1's captured token, captures that header straight back
+# out, and request 3 sends it on to prove the round trip.
+name: Capture from headers and status
+requests:
+  # A JSON path capture, exactly as examples/capture-chain.yaml does it —
+  # unaffected by the two new forms below.
+  - name: Log in
+    method: POST
+    url: https://httpbin.org/anything
+    headers:
+      Accept: application/json
+      Content-Type: application/json
+    body: '{"token": "s3cret-abc123"}'
+    capture:
+      auth_token: $.json.token
+    assertions:
+      status: 200
+
+  # httpbin sends back exactly the header this URL asks for, so the response
+  # carries an `X-Session-Token` header worth capturing — and a status code,
+  # which every response has, worth capturing alongside it.
+  - name: Start a session
+    method: GET
+    url: https://httpbin.org/response-headers?X-Session-Token={{auth_token}}
+    capture:
+      session_token:
+        header: X-Session-Token
+      session_status:
+        status: true
+    assertions:
+      status: 200
+      headers:
+        X-Session-Token: '{{auth_token}}'
+
+  # Both values captured from request 2's envelope, sent on to prove they
+  # really came from the header and the status line rather than being typed
+  # into this file.
+  - name: Use the session
+    method: GET
+    url: https://httpbin.org/anything
+    headers:
+      Authorization: Bearer {{session_token}}
+      X-Previous-Status: '{{session_status}}'
+    assertions:
+      status: 200
+      json:
+        $.headers.Authorization: Bearer s3cret-abc123
+        $.headers['X-Previous-Status']: '200'
