@@ -5,13 +5,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use sendra_core::config::{find_project_config, global_config_path};
 use sendra_core::environment::{find_environment, DEFAULT_ENVIRONMENT_NAME};
 use sendra_core::script::{run_post_request, run_pre_request, Scripts};
 use sendra_core::{Config, Document, Environment, HttpClient, Request, SendraError};
 
 use crate::cli::OutputMode;
 use crate::exit::{exit_for_run, Exit, Outcome, Summary};
-use crate::output::{print_environment_error, print_error, Format, Reporter};
+use crate::output::{print_environment_error, print_error, print_provenance, Format, Reporter};
 
 /// Everything both subcommands do before the first byte goes out: the config,
 /// the HTTP client the whole run sends through, the environment, and the file.
@@ -23,6 +24,15 @@ struct Prepared {
     client: HttpClient,
     environment: Environment,
     document: Document,
+    /// The project config file this run actually used, or `None` — for
+    /// `-v`/`--verbose` alone. Recomputed independently of `config.sources`
+    /// (which does not distinguish project from global) via the same
+    /// [`find_project_config`] call [`Config::resolve_from`] itself makes,
+    /// against the same `start_dir`.
+    project_config: Option<PathBuf>,
+    /// The global config file this run actually used, or `None` — for
+    /// `-v`/`--verbose` alone. See [`project_config`](Self::project_config).
+    global_config: Option<PathBuf>,
 }
 
 /// Resolve the config, build the client, then resolve the environment and the
@@ -63,10 +73,35 @@ fn prepare(
     var_overrides: &[(String, String)],
     timeout_override: Option<u64>,
 ) -> Result<Prepared, Exit> {
+    // Computed first, and reused below for both config and the environment,
+    // rather than each resolving the working directory on its own: one
+    // `current_dir()` call means `-v`/`--verbose`'s report of *which* project
+    // config was found is guaranteed to be the same search `Config` itself
+    // just ran, not a second call that could in principle see a different
+    // directory. The walk-up looking for the environment needs `start_dir`
+    // explicitly anyway, because a `--env` that finds nothing has to be able
+    // to say *where* it looked; `CurrentDir` is the same error core would
+    // have raised for the same reason.
+    let start_dir = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            print_error(&SendraError::CurrentDir(err));
+            return Err(Exit::Failure);
+        }
+    };
+
+    // Recomputed independently of `Config::resolve_from`'s own internal
+    // search — see `Prepared::project_config` — rather than threading
+    // provenance out of core: `find_project_config`/`global_config_path` are
+    // already `pub`, and a second, cheap call here keeps `Config` itself
+    // free of a field that only `-v` ever reads.
+    let project_config = find_project_config(&start_dir);
+    let global_config = global_config_path().filter(|path| path.is_file());
+
     // Resolved once for the whole run: every request in a collection is sent
     // under the same defaults, and a broken config file stops the run instead
     // of failing partway through it.
-    let mut config = match Config::resolve() {
+    let mut config = match Config::resolve_from(&start_dir, global_config.as_deref()) {
         Ok(config) => config,
         Err(err) => {
             print_error(&err);
@@ -91,18 +126,6 @@ fn prepare(
         Ok(client) => client,
         Err(err) => {
             print_error(&err);
-            return Err(Exit::Failure);
-        }
-    };
-
-    // The walk-up looking for the environment starts here rather than inside
-    // `Environment::resolve`, because a `--env` that finds nothing has to be
-    // able to say *where* it looked. `CurrentDir` is the same error core would
-    // have raised for the same reason.
-    let start_dir = match std::env::current_dir() {
-        Ok(dir) => dir,
-        Err(err) => {
-            print_error(&SendraError::CurrentDir(err));
             return Err(Exit::Failure);
         }
     };
@@ -145,6 +168,8 @@ fn prepare(
         client,
         environment,
         document,
+        project_config,
+        global_config,
     })
 }
 
@@ -212,6 +237,14 @@ fn prepare(
 /// `reject_quiet_with_output` for the case where an explicit `output`
 /// disagreed — so what reaches here is only the half `output` cannot
 /// express: suppressing the `→` labels via [`Reporter::with_quiet`].
+///
+/// `verbose` is `-v`/`--verbose`: `main` has already refused it together
+/// with `quiet` — see `reject_verbose_with_quiet` — so the two are never
+/// both true here. When true, [`prepare`]'s provenance
+/// (`project_config`/`global_config`/`environment.source`) is printed once,
+/// via `output::print_provenance`, before the sending loop starts —
+/// stderr-only and unaffected by `json`, per its own doc comment in
+/// `cli.rs`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     path: &Path,
@@ -226,16 +259,30 @@ pub(crate) async fn run(
     dry_run: bool,
     output: Option<OutputMode>,
     quiet: bool,
+    verbose: bool,
 ) -> Exit {
     let Prepared {
         config,
         client,
         environment,
         document,
+        project_config,
+        global_config,
     } = match prepare(path, environment_name, vars, timeout) {
         Ok(prepared) => prepared,
         Err(exit) => return exit,
     };
+
+    if verbose {
+        print_provenance(
+            project_config.as_deref(),
+            global_config.as_deref(),
+            environment_name.unwrap_or(DEFAULT_ENVIRONMENT_NAME),
+            environment.source.as_deref(),
+            vars,
+            headers,
+        );
+    }
 
     let requests: Vec<&Request> = match name {
         Some(name) => match document.get(name) {
@@ -309,6 +356,8 @@ pub(crate) async fn run(
 /// [`OutputMode::Status`] rather than `run`'s [`OutputMode::Full`].
 ///
 /// `quiet` behaves exactly as it does on `run` — see there.
+///
+/// `verbose` behaves exactly as it does on `run` — see there.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn test(
     path: &Path,
@@ -322,16 +371,30 @@ pub(crate) async fn test(
     junit: Option<PathBuf>,
     output: Option<OutputMode>,
     quiet: bool,
+    verbose: bool,
 ) -> Exit {
     let Prepared {
         config,
         client,
         environment,
         document,
+        project_config,
+        global_config,
     } = match prepare(path, environment_name, vars, timeout) {
         Ok(prepared) => prepared,
         Err(exit) => return exit,
     };
+
+    if verbose {
+        print_provenance(
+            project_config.as_deref(),
+            global_config.as_deref(),
+            environment_name.unwrap_or(DEFAULT_ENVIRONMENT_NAME),
+            environment.source.as_deref(),
+            vars,
+            headers,
+        );
+    }
 
     let requests: Vec<&Request> = match name {
         Some(name) => match document.get(name) {
