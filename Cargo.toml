@@ -23,6 +23,8 @@ reqwest = { version = "0.12", default-features = false, features = [
   "deflate",
 ] }
 thiserror = "2"
+# `auth.basic` base64-encodes `user:pass` into the `Authorization` header.
+base64 = "0.22"
 tokio = { version = "1", default-features = false }
 clap = { version = "4", features = ["derive"] }
 owo-colors = { version = "4", features = ["supports-colors"] }
