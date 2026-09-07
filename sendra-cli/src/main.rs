@@ -5,6 +5,7 @@
 
 mod cli;
 mod exit;
+mod init;
 mod output;
 mod run;
 #[cfg(test)]
@@ -15,6 +16,7 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use crate::cli::{Cli, Command};
+use crate::init::init;
 use crate::output::reject_allow_error_status;
 use crate::run::{run, test};
 
@@ -76,5 +78,7 @@ async fn main() -> ExitCode {
             .await
             .into()
         }
+
+        Command::Init => init().into(),
     }
 }
