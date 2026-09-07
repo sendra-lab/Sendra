@@ -19,7 +19,7 @@ jobs:
 
       - name: Run Sendra tests
         run: |
-          ./target/release/sendra test examples/collection.yaml --junit report.xml
+          ./target/release/sendra test examples/test-collection.yaml --junit report.xml
         continue-on-error: true
 
       - name: Publish JUnit report
