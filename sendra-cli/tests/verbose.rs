@@ -59,6 +59,58 @@ fn write_plain_request(dir: &Path) {
     .unwrap();
 }
 
+/// Pull the value off a `"  <label>: <value>"` line in `-v`'s provenance
+/// report.
+///
+/// Used only for the config lines (`project config:`/`global config:`),
+/// whose value is the whole rest of the line. The environment line has its
+/// own extractor below, since its value follows a name and an arrow rather
+/// than starting right after the label.
+fn provenance_field<'a>(stderr: &'a str, label: &str) -> &'a str {
+    let prefix = format!("  {label}: ");
+    stderr
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no `{prefix}` line in stderr: {stderr}"))
+}
+
+/// Pull the resolved file path off `-v`'s `"  environment: <name> → <path>"`
+/// line, given the `<name>` already known to the caller.
+fn provenance_environment_path<'a>(stderr: &'a str, name: &str) -> &'a str {
+    let prefix = format!("  environment: {name} → ");
+    stderr
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no `{prefix}` line in stderr: {stderr}"))
+}
+
+/// Assert that a path `-v` printed actually names `expected_suffix` inside
+/// the directory the test created — without requiring the whole absolute
+/// path to match byte-for-byte.
+///
+/// **Why not a full-path comparison**: the printed path comes from
+/// `find_project_config`/`find_environment`, both of which walk up from
+/// `std::env::current_dir()` inside the spawned `sendra` process — and on
+/// macOS, `current_dir()` reports the working directory *with* `/var`
+/// resolved to its real location, `/private/var`, because `/var` is a
+/// symlink there. `tempfile::tempdir()`'s own `.path()`, by contrast, is
+/// built from `$TMPDIR` and is never resolved through that symlink. The two
+/// disagree only in that one path segment, only on macOS (Linux has no such
+/// symlink in its temp path, and Windows has no such symlink at all) — a
+/// platform quirk in *which absolute prefix* the OS reports for the same
+/// real file, not a disagreement about *which file* was found. Comparing
+/// suffixes sidesteps it instead of trying to predict the OS-specific
+/// canonical form (which `std::fs::canonicalize` cannot safely stand in
+/// for here either — on Windows it prepends the verbatim `\\?\` prefix,
+/// which `current_dir()` itself never returns, so canonicalizing the
+/// expected side would trade a macOS-only failure for a Windows-only one).
+fn assert_provenance_path_ends_with(printed: &str, expected_suffix: &Path) {
+    assert!(
+        Path::new(printed).ends_with(expected_suffix),
+        "expected a path ending in {expected_suffix:?}, got {printed:?}"
+    );
+}
+
 // --- config provenance: project / global / both / neither ----------------
 
 #[test]
@@ -91,10 +143,9 @@ fn verbose_reports_a_project_config_alone() {
     assert_success(&output);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let expected_path = dir.path().join(".sendra").join("config.yaml");
-    assert!(
-        stderr.contains(&format!("project config: {}", expected_path.display())),
-        "{stderr}"
+    assert_provenance_path_ends_with(
+        provenance_field(&stderr, "project config"),
+        &Path::new(".sendra").join("config.yaml"),
     );
     assert!(stderr.contains("global config: none found"), "{stderr}");
 }
@@ -149,12 +200,16 @@ fn verbose_reports_both_config_files_when_both_apply() {
     assert_success(&output);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let project_path = dir.path().join(".sendra").join("config.yaml");
-    let global_path = global_config_dir.join("config.yaml");
-    assert!(
-        stderr.contains(&format!("project config: {}", project_path.display())),
-        "{stderr}"
+    // The project path is compared by suffix, not exact match — see
+    // `assert_provenance_path_ends_with`'s doc comment. The global path is
+    // compared exactly: it comes straight from the `XDG_CONFIG_HOME` value
+    // this test passed in as a literal environment variable, never through
+    // `current_dir()`, so it carries none of that ambiguity.
+    assert_provenance_path_ends_with(
+        provenance_field(&stderr, "project config"),
+        &Path::new(".sendra").join("config.yaml"),
     );
+    let global_path = global_config_dir.join("config.yaml");
     assert!(
         stderr.contains(&format!("global config: {}", global_path.display())),
         "{stderr}"
@@ -183,17 +238,11 @@ fn verbose_reports_the_named_environment_and_its_file() {
     assert_success(&output);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let expected_path = dir
-        .path()
-        .join(".sendra")
-        .join("environments")
-        .join("staging.yaml");
-    assert!(
-        stderr.contains(&format!(
-            "environment: staging → {}",
-            expected_path.display()
-        )),
-        "{stderr}"
+    assert_provenance_path_ends_with(
+        provenance_environment_path(&stderr, "staging"),
+        &Path::new(".sendra")
+            .join("environments")
+            .join("staging.yaml"),
     );
 }
 
@@ -213,17 +262,11 @@ fn verbose_reports_the_default_environment_fallback() {
     assert_success(&output);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let expected_path = dir
-        .path()
-        .join(".sendra")
-        .join("environments")
-        .join("default.yaml");
-    assert!(
-        stderr.contains(&format!(
-            "environment: default → {}",
-            expected_path.display()
-        )),
-        "{stderr}"
+    assert_provenance_path_ends_with(
+        provenance_environment_path(&stderr, "default"),
+        &Path::new(".sendra")
+            .join("environments")
+            .join("default.yaml"),
     );
 }
 
