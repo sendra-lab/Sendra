@@ -60,7 +60,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::assertions::Assertions;
+use crate::assertions::{Assertions, NotAssertions};
 use crate::config::PROJECT_DIR_NAME;
 use crate::{Auth, BasicAuth, Collection, Document, MultipartPart, Request, SendraError};
 
@@ -407,32 +407,79 @@ impl Environment {
     /// never collapse two entries into one, so no assertion can go missing on
     /// the way to being checked.
     ///
-    /// `status` is a number and has nothing to substitute.
+    /// `status`, `status_in` and `elapsed_ms_under` are numbers and have
+    /// nothing to substitute.
     fn apply_assertions(&self, assertions: &Assertions) -> Result<Assertions, SendraError> {
-        let mut headers = BTreeMap::new();
-        for (name, expected) in &assertions.headers {
-            let expected = expected
-                .as_deref()
-                .map(|value| self.expand_templates(value))
-                .transpose()?;
-            headers.insert(name.clone(), expected);
-        }
-
-        let mut json = BTreeMap::new();
-        for (path, expected) in &assertions.json {
-            json.insert(path.clone(), self.expand_json(expected)?);
-        }
-
         Ok(Assertions {
             status: assertions.status,
-            headers,
+            status_in: assertions.status_in.clone(),
+            headers: self.apply_assertion_headers(&assertions.headers)?,
             body_contains: assertions
                 .body_contains
                 .as_deref()
                 .map(|body| self.expand_templates(body))
                 .transpose()?,
-            json,
+            body_matches: assertions
+                .body_matches
+                .as_deref()
+                .map(|pattern| self.expand_templates(pattern))
+                .transpose()?,
+            elapsed_ms_under: assertions.elapsed_ms_under,
+            json: self.apply_assertion_json(&assertions.json)?,
+            not: assertions
+                .not
+                .as_ref()
+                .map(|not| self.apply_not_assertions(not))
+                .transpose()?,
         })
+    }
+
+    /// [`apply_assertions`](Self::apply_assertions) for the `not:` block,
+    /// which carries the same substitutable fields.
+    fn apply_not_assertions(&self, not: &NotAssertions) -> Result<NotAssertions, SendraError> {
+        Ok(NotAssertions {
+            status: not.status,
+            status_in: not.status_in.clone(),
+            headers: self.apply_assertion_headers(&not.headers)?,
+            body_contains: not
+                .body_contains
+                .as_deref()
+                .map(|body| self.expand_templates(body))
+                .transpose()?,
+            body_matches: not
+                .body_matches
+                .as_deref()
+                .map(|pattern| self.expand_templates(pattern))
+                .transpose()?,
+            elapsed_ms_under: not.elapsed_ms_under,
+            json: self.apply_assertion_json(&not.json)?,
+        })
+    }
+
+    fn apply_assertion_headers(
+        &self,
+        headers: &BTreeMap<String, Option<String>>,
+    ) -> Result<BTreeMap<String, Option<String>>, SendraError> {
+        let mut expanded = BTreeMap::new();
+        for (name, expected) in headers {
+            let expected = expected
+                .as_deref()
+                .map(|value| self.expand_templates(value))
+                .transpose()?;
+            expanded.insert(name.clone(), expected);
+        }
+        Ok(expanded)
+    }
+
+    fn apply_assertion_json(
+        &self,
+        json: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<BTreeMap<String, serde_json::Value>, SendraError> {
+        let mut expanded = BTreeMap::new();
+        for (path, expected) in json {
+            expanded.insert(path.clone(), self.expand_json(expected)?);
+        }
+        Ok(expanded)
     }
 
     /// Substitute into every string *value* of an expected JSON value,

@@ -21,7 +21,7 @@ pub mod config;
 pub mod environment;
 pub mod script;
 
-pub use assertions::{AssertionKind, AssertionReport, AssertionResult, Assertions};
+pub use assertions::{AssertionKind, AssertionReport, AssertionResult, Assertions, NotAssertions};
 pub use capture::{CaptureFailure, CaptureReport, CaptureResult, Captures};
 pub use config::Config;
 pub use environment::Environment;
@@ -2206,6 +2206,7 @@ enviroment: staging
             // string value, and substitution is a separate pass afterwards.
             "environment-request.yaml",
             "assertions.yaml",
+            "richer-assertions.yaml",
             "test-collection.yaml",
             "scripted-request.yaml",
             "capture-chain.yaml",

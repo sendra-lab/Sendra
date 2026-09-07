@@ -1,0 +1,53 @@
+# Everything `assertions.yaml` does not cover: an acceptable set of status
+# codes, a body pattern, a timing budget, negation, and the `json:` operators
+# beyond equality.
+#
+#   sendra run examples/richer-assertions.yaml
+#
+# The last entry in each new block is meant to fail, the same convention
+# `assertions.yaml` uses, so one run shows both a `✓` and a `✗` of each kind.
+# The run still exits 0 — `sendra run` reports assertions, it does not fail on
+# them. That is `sendra test`.
+name: Richer assertions against httpbin
+method: GET
+url: https://httpbin.org/get
+headers:
+  Accept: application/json
+  X-Sendra-Example: richer-assertions
+assertions:
+  # Passes if the status is any of these, rather than exactly one.
+  status_in: [200, 201, 204]
+
+  # A regular expression matched anywhere in the body, not anchored to all of
+  # it — the same reach as `body_contains`, with a pattern instead of a
+  # literal.
+  body_matches: '"url":\s*"https://httpbin\.org'
+
+  # httpbin over a plain connection is rarely this slow; generous on purpose
+  # so the example does not flap.
+  elapsed_ms_under: 5000
+
+  # `not:` takes the same keys as the block above and inverts every one of
+  # them independently. A malformed path or a type mismatch underneath is not
+  # something `not:` can turn into a pass — see the module docs on
+  # `sendra_core::assertions`.
+  not:
+    status: 404
+    body_contains: '"error"'
+
+  json:
+    # A bare value is still equality, unchanged from `assertions.yaml`.
+    $.url: https://httpbin.org/get
+
+    # Beyond equality: substring/membership, length, numeric comparison, and
+    # a path-scoped regex, each as a single-key operator object alongside the
+    # bare values above.
+    $.headers.Accept: { contains: json }
+    $.origin: { length: { greater_than_or_equal: 7 } } # an IPv4 is at least this long
+
+    # `matches` is `body_matches` scoped to one path's string value, rather
+    # than searched for across the whole body.
+    $.headers['Accept-Encoding']: { matches: '^gzip' }
+
+    # Fails: httpbin's own `Host` header is `httpbin.org`, not this.
+    $.headers.Host: { contains: example.com }

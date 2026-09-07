@@ -15,6 +15,9 @@ serde_json = { workspace = true }
 # JSON path evaluation for `assertions.json`. See the note on
 # `assertions::Assertions::json` for why this crate and not another.
 jsonpath-rust = { workspace = true }
+# `assertions.body_matches`. See the note on `assertions::Assertions::body_matches`
+# for why this crate and not another.
+regex = { workspace = true }
 # `form:` bodies are URL-encoded the same way a browser encodes an HTML form
 # (`application/x-www-form-urlencoded`); this is the standard crate for it
 # rather than a hand-written percent-encoder.

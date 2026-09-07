@@ -889,6 +889,76 @@ a tenant, an id, a host — not which part of the response is being looked at. A
 missing variable in an assertion fails that request before it is sent, exactly
 like a missing variable in its URL.
 
+### Richer assertions: acceptable sets, patterns, timing, negation, comparisons
+
+Beyond exact status, exact header value, body substring and JSON equality,
+`assertions` also has:
+
+```yaml
+assertions:
+  status_in: [200, 201, 204] # passes if the status is any of these
+  body_matches: '"id":\s*\d+' # a regex matched anywhere in the body
+  elapsed_ms_under: 2000 # strictly faster than this many milliseconds
+  not:
+    status: 404 # every key above, inverted — see below
+  json:
+    $.count: { greater_than: 5 }
+```
+
+```sh
+sendra run examples/richer-assertions.yaml    # every one of these against httpbin
+```
+
+**`not:` wraps a whole assertions block, not one assertion.** It takes the same
+keys as the top level (minus `not` itself — `not: {not: {...}}` is a parse
+error, not a double negative) and negates each one independently:
+`not: {status: 404, body_contains: error}` means "status is not 404" *and*
+"body does not contain `error`", not the pair negated together. Reported
+wording is symmetric in both directions:
+
+```text
+  ✓ status is not 404
+  ✗ body does not contain `error` — found in the 214-byte body
+```
+
+**A hard error is not something `not:` can turn into a pass.** A malformed
+JSON path, an invalid regular expression, a body that is not JSON, a path
+selecting zero or several values, a comparison or `length` operator applied to
+a value of the wrong type — these are facts about the request or the file, not
+a condition to be true or false, so they fail the same way whether or not
+they are wrapped in `not:`.
+
+**`json:` takes operators beyond equality, alongside the bare values it
+already supports.** A path's value is read as an operator instead of a plain
+equality check when it is a YAML mapping with exactly one of these keys:
+
+```yaml
+json:
+  $.count: { greater_than: 5 } # numeric, and greater_than_or_equal,
+  $.count: { less_than: 5 } #  less_than, less_than_or_equal
+  $.tags: { contains: b } # substring of a string, or array membership
+  $.tags: { length: 2 } # array/string length — equality,
+  $.tags: { length: { greater_than: 1 } } #   or a nested comparison
+  $.id: { matches: '^[0-9a-f-]{36}$' } # regex against this one string value
+```
+
+A multi-key object (`{id: 1, name: ada}`) is never ambiguous and is always
+equality — only a single-key mapping using one of the names above is read as
+an operator. That means a *literal* expected value shaped like `{greater_than:
+5}` is not expressible; in exchange, a path's value never needs a second key
+to say which kind of check it is. There is no `not_equal`: `not: {json:
+{$.count: 5}}` already says "not equal to 5" precisely, and a dedicated
+operator would only be a shorter spelling of that — unlike the comparison
+operators, which `not:` cannot reach at all (negating `greater_than` gives
+`less_than_or_equal`, not `less_than`, and there is no way to spell "less than
+5" purely through negation).
+
+`matches` is `body_matches` narrowed to one selected value instead of the
+whole body — useful when the pattern only means something at a specific
+path (`$.user.email` looks like an email; `$.id` looks like a UUID) and
+searching the entire body for it would risk a false match somewhere else in
+the response.
+
 ## Capturing values and chaining requests
 
 A request can pull values out of its response and hand them to the requests
