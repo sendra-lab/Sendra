@@ -61,6 +61,7 @@ async fn main() -> ExitCode {
             timeout,
             json,
             show_captures,
+            junit,
             allow_error_status,
         } => {
             if allow_error_status {
@@ -74,6 +75,7 @@ async fn main() -> ExitCode {
                 timeout,
                 json,
                 show_captures,
+                junit,
             )
             .await
             .into()

@@ -4,9 +4,12 @@
 mod errors;
 mod human;
 mod json;
+mod junit;
 
 use std::cell::RefCell;
 use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use owo_colors::{OwoColorize, Stream};
 use sendra_core::{
@@ -114,6 +117,33 @@ pub(crate) struct Reporter {
     /// under [`Format::Human`], which has nothing to record because it has
     /// already printed.
     requests: RefCell<Vec<RequestRecord>>,
+    /// Where to write a JUnit XML report when the run is over, `--junit`'s
+    /// path — or `None`, the overwhelming majority of runs, in which case
+    /// nothing below is ever read.
+    ///
+    /// A field set by [`with_junit`](Self::with_junit) after construction
+    /// rather than a fourth [`new`](Self::new) parameter: `--junit` is
+    /// `test`'s alone, `run` never has one to pass, and every one of
+    /// `Reporter::new`'s many existing call sites — most of them tests —
+    /// would otherwise have had to learn about a flag that does not apply to
+    /// them.
+    junit_path: Option<PathBuf>,
+    /// One entry per request the run announced, built independently of
+    /// `requests` above and only when `junit_path` is set: `--junit` is its
+    /// own promise about its own file format, built from the same inputs
+    /// `--json`'s records are, not by reaching into `--json`'s. See
+    /// `output/junit.rs`.
+    junit_cases: RefCell<Vec<junit::Case>>,
+    /// The label of the request currently being reported on, kept so
+    /// [`responded`](Self::responded) and [`request_failed`](Self::request_failed)
+    /// can name the JUnit case they build without `request_started` having to
+    /// know whether `--junit` is in play. Cheap to keep unconditionally;
+    /// only ever read when `junit_path` is `Some`.
+    current_label: RefCell<String>,
+    /// When this run started, for the JUnit report's `<testsuite time="...">`
+    /// — the run's wall-clock elapsed time, read only if `junit_path` is
+    /// `Some`.
+    started: Instant,
 }
 
 impl Reporter {
@@ -123,7 +153,18 @@ impl Reporter {
             detail,
             show_captures,
             requests: RefCell::new(Vec::new()),
+            junit_path: None,
+            junit_cases: RefCell::new(Vec::new()),
+            current_label: RefCell::new(String::new()),
+            started: Instant::now(),
         }
+    }
+
+    /// Opt this reporter into also writing a JUnit XML report to `path` when
+    /// the run is over — `sendra test --junit <path>`. See [`junit_path`].
+    pub(crate) fn with_junit(mut self, path: PathBuf) -> Self {
+        self.junit_path = Some(path);
+        self
     }
 
     fn recording(&self) -> bool {
@@ -156,6 +197,9 @@ impl Reporter {
         if self.recording() {
             self.requests.borrow_mut().push(RequestRecord::new(label));
         }
+
+        // Kept whether or not `--junit` is in play — see `current_label`.
+        *self.current_label.borrow_mut() = label.to_string();
     }
 
     /// Whatever a script printed with `print` or `debug`, one line at a time.
@@ -196,6 +240,15 @@ impl Reporter {
         assertions: &AssertionReport,
         capture: &CaptureReport,
     ) {
+        if self.junit_path.is_some() {
+            let label = self.current_label.borrow().clone();
+            self.junit_cases
+                .borrow_mut()
+                .push(junit::Case::from_response(
+                    label, response, script, assertions, capture,
+                ));
+        }
+
         if self.recording() {
             self.with_current(|record| {
                 record.response = Some(ResponseRecord::from(response));
@@ -255,6 +308,13 @@ impl Reporter {
     pub(crate) fn request_failed(&self, err: &SendraError) {
         print_error(err);
 
+        if self.junit_path.is_some() {
+            let label = self.current_label.borrow().clone();
+            self.junit_cases
+                .borrow_mut()
+                .push(junit::Case::from_error(label, err));
+        }
+
         if self.recording() {
             let message = error_message(err);
             self.with_current(|record| record.error = Some(message));
@@ -275,6 +335,12 @@ impl Reporter {
             self.emit(Some(summary));
         } else {
             print_summary(summary);
+        }
+
+        if let Some(path) = &self.junit_path {
+            if let Err(err) = self.write_junit(path, summary) {
+                print_error_line(format!("could not write --junit output: {err}"));
+            }
         }
     }
 
@@ -326,6 +392,19 @@ impl Reporter {
             .expect("the record types hold nothing that can fail to serialise");
 
         writeln!(out, "{json}")
+    }
+
+    /// Write the JUnit XML report to `path`, once the run is over.
+    ///
+    /// A write that fails — the directory does not exist, permissions — is
+    /// reported and changes nothing else: `--junit` is a second serialisation
+    /// of a result `test` has already reached, the same relationship
+    /// `--json`'s own `emit` has to the exit code, so a report that could not
+    /// be written must not change what the process returns.
+    fn write_junit(&self, path: &Path, summary: &Summary) -> std::io::Result<()> {
+        let cases = self.junit_cases.borrow();
+        let xml = junit::render(&cases, summary, self.started.elapsed());
+        std::fs::write(path, xml)
     }
 }
 
@@ -636,6 +715,96 @@ mod tests {
 
         assert!(reporter.requests.borrow().is_empty());
     }
+
+    // --- `--junit` ----------------------------------------------------------
+
+    #[test]
+    fn junit_is_written_alongside_human_output() {
+        // The coexistence decision: `--junit` with no `--json` still prints
+        // the ordinary terminal output, and writes the report as well.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.xml");
+
+        let reporter =
+            Reporter::new(Format::Human, Detail::StatusOnly, false).with_junit(path.clone());
+        reporter.request_started("Get user");
+        reporter.responded(
+            &response_with("text/plain", "ok"),
+            None,
+            &AssertionReport::default(),
+            &CaptureReport::default(),
+        );
+        reporter.finish_test(&Summary {
+            total: 1,
+            without_assertions: 1,
+            ..Summary::default()
+        });
+
+        // Human recording is still off — `--junit` is not `--json`.
+        assert!(reporter.requests.borrow().is_empty());
+
+        let xml = std::fs::read_to_string(&path).expect("the report was written");
+        assert!(xml.contains("<testsuites>"), "{xml}");
+        assert!(xml.contains("name=\"Get user\""), "{xml}");
+        assert!(xml.contains("<skipped/>"), "{xml}");
+    }
+
+    #[test]
+    fn junit_and_json_can_both_be_requested_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.xml");
+
+        let reporter =
+            Reporter::new(Format::Json, Detail::StatusOnly, false).with_junit(path.clone());
+        reporter.request_started("Get user");
+        let response = response_with("application/json", r#"{"id":1}"#);
+        let assertions =
+            assertions_from("method: GET\nurl: https://example.com\nassertions:\n  status: 404\n")
+                .evaluate(&response);
+        reporter.responded(&response, None, &assertions, &CaptureReport::default());
+
+        let summary = Summary {
+            total: 1,
+            failed: 1,
+            ..Summary::default()
+        };
+        // `finish_test` is what actually writes the report — see `document`'s
+        // own doc comment, which calls `write_json` directly and so would
+        // never trigger it.
+        reporter.finish_test(&summary);
+        let document = document(&reporter, Some(&summary));
+        assert_eq!(
+            document["summary"]["failed"], 1,
+            "the --json document is unaffected"
+        );
+
+        let xml = std::fs::read_to_string(&path).expect("the report was written");
+        assert!(xml.contains("<failure"), "{xml}");
+        assert!(xml.contains("got 200"), "{xml}");
+    }
+
+    #[test]
+    fn a_reporter_with_no_junit_path_writes_nothing() {
+        let reporter = Reporter::new(Format::Human, Detail::StatusOnly, false);
+        reporter.request_started("Get user");
+        reporter.responded(
+            &response_with("text/plain", "ok"),
+            None,
+            &AssertionReport::default(),
+            &CaptureReport::default(),
+        );
+        reporter.finish_test(&Summary {
+            total: 1,
+            without_assertions: 1,
+            ..Summary::default()
+        });
+
+        assert!(
+            reporter.junit_cases.borrow().is_empty(),
+            "nothing should have been recorded for a report nobody asked for"
+        );
+    }
+
     // --- `capture` in the `--json` document ------------------------------
 
     /// The capture report a request declaring `capture` would produce against

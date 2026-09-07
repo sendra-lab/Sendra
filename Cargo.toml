@@ -36,3 +36,9 @@ rhai = { version = "1.26", features = ["no_module"] }
 # test in sendra-core. Already pulled in transitively by reqwest's "gzip"
 # feature, so this adds no new dependency to the tree.
 flate2 = "1"
+# Test-only: verifies `--junit`'s hand-rolled XML actually parses under a
+# real parser, not just under the eyes of whoever wrote the escaping. Small,
+# pure-Rust, no transitive dependencies of its own — chosen over pulling in
+# an XML writer for production use, since the report itself needs nothing
+# more than string formatting and five characters of escaping.
+roxmltree = "0.21"

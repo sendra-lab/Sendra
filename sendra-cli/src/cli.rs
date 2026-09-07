@@ -220,6 +220,26 @@ pub(crate) enum Command {
         #[arg(long)]
         show_captures: bool,
 
+        /// Write a JUnit XML report to this path, in addition to the normal
+        /// output.
+        ///
+        /// One `<testcase>` per request, named after its label. A request
+        /// whose checks all held is a plain pass; one that failed a check —
+        /// a failing assertion, a `post_request` throw, or a capture that
+        /// produced nothing — carries a `<failure>` with every failure's
+        /// message; one that never got a response carries an `<error>`
+        /// instead, since the tool could not run the test rather than the
+        /// test not holding; one that declared no `assertions` block and no
+        /// `post_request` script is `<skipped>`. The `<testsuite>` counts
+        /// match the summary this run ends with either way.
+        ///
+        /// Every major CI system (GitHub Actions, GitLab, Jenkins) renders
+        /// JUnit XML natively as inline pass/fail annotations, which is what
+        /// this is for — the terminal or `--json` output still happens, so
+        /// this is additive rather than a replacement.
+        #[arg(long, value_name = "PATH")]
+        junit: Option<PathBuf>,
+
         /// Accepted only so that passing it can be refused with an
         /// explanation. Hidden from `--help`, rejected in `main`.
         #[arg(long, hide = true)]
@@ -317,6 +337,7 @@ mod tests {
                 timeout,
                 json,
                 show_captures,
+                junit,
                 allow_error_status,
             } => {
                 assert_eq!(path, PathBuf::from("collection.yaml"));
@@ -326,6 +347,7 @@ mod tests {
                 assert_eq!(timeout, None, "no --timeout was passed");
                 assert!(!json, "the human output is what you get without --json");
                 assert!(!show_captures, "captures are redacted by default");
+                assert_eq!(junit, None, "no --junit was passed");
                 assert!(!allow_error_status);
             }
             _ => panic!("`sendra test` should have parsed as `Command::Test`"),
@@ -385,6 +407,27 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // --- `--junit` -----------------------------------------------------------
+
+    #[test]
+    fn junit_is_optional_and_offered_by_test_only() {
+        let cli =
+            Cli::try_parse_from(["sendra", "test", "req.yaml"]).expect("`--junit` is optional");
+        assert!(matches!(cli.command, Command::Test { junit: None, .. }));
+
+        let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--junit", "report.xml"])
+            .expect("`--junit` takes a path");
+        assert!(matches!(
+            cli.command,
+            Command::Test { junit: Some(ref path), .. } if path == &PathBuf::from("report.xml")
+        ));
+
+        // `run` produces no verdict, so it has nothing for a JUnit report to
+        // say — the flag is `test`'s alone, per the issue's explicit non-goal.
+        let err = expect_cli_error(&["sendra", "run", "req.yaml", "--junit", "report.xml"]);
+        assert_eq!(err.exit_code(), 2, "`run --junit` is a usage error");
     }
 
     // --- `-H`/`--header` ----------------------------------------------------

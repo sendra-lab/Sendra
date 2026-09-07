@@ -263,6 +263,13 @@ pub(crate) async fn run(
 /// the document `test` writes carries the [`Summary`] the terminal output ends
 /// with. The counts, and the exit code they produce, are the same numbers in
 /// both renderings.
+///
+/// `junit` is `--junit <path>`: a JUnit XML report written to that path, in
+/// addition to whatever `json` already chose — a `--junit` run with no
+/// `--json` still prints the ordinary terminal output, since someone reading
+/// a CI log wants both the machine-readable report and something to read
+/// when it fails. `run` has no verdict for a JUnit report to carry, so the
+/// flag is `test`'s alone; see [`Reporter::with_junit`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn test(
     path: &Path,
@@ -272,6 +279,7 @@ pub(crate) async fn test(
     timeout: Option<u64>,
     json: bool,
     show_captures: bool,
+    junit: Option<PathBuf>,
 ) -> Exit {
     let Prepared {
         config,
@@ -289,11 +297,15 @@ pub(crate) async fn test(
 
     let config = &config;
     let client = &client;
-    let reporter = &Reporter::new(
+    let mut reporter = Reporter::new(
         Format::for_json_flag(json),
         Detail::StatusOnly,
         show_captures,
     );
+    if let Some(path) = junit {
+        reporter = reporter.with_junit(path);
+    }
+    let reporter = &reporter;
     let outcomes = run_requests(
         &requests,
         base_dir(path),
