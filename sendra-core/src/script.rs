@@ -547,6 +547,17 @@ fn request_from_dynamic(original: &Request, value: Dynamic) -> Result<Request, S
         url,
         headers,
         body: string_field(&map, "body")?,
+        // Not exposed to the script (see the allow-list above) and carried
+        // through untouched — by the time a `pre_request` script runs,
+        // `Request::resolve_body` has already turned whichever of these was
+        // set into the plain `body` string above, so all four are already
+        // `None`/empty here regardless of which field the request file used.
+        // A script that wants to change the body changes `request.body`,
+        // exactly as it always has.
+        json: original.json.clone(),
+        body_file: original.body_file.clone(),
+        form: original.form.clone(),
+        multipart: original.multipart.clone(),
         // The other mechanism that reads this response, carried through
         // untouched. Scripts and assertions do not see each other.
         assertions: original.assertions.clone(),
