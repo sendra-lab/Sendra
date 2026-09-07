@@ -1981,6 +1981,8 @@ enviroment: staging
             "test-collection.yaml",
             "scripted-request.yaml",
             "capture-chain.yaml",
+            "repeated-headers.yaml",
+            "structured-bodies.yaml",
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("..")

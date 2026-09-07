@@ -117,6 +117,24 @@ Four requests: two that pass, one whose assertion is wrong on purpose, and one
 that asserts nothing and comes back `404`. It exits `4` — see
 [Testing](#testing).
 
+`examples/repeated-headers.yaml` sends a header more than once — a list of
+values instead of a scalar, since a YAML mapping cannot repeat a key — beside
+an ordinary one, against httpbin.org/headers, which echoes both back:
+
+```sh
+cargo run -p sendra-cli -- run examples/repeated-headers.yaml
+```
+
+`examples/structured-bodies.yaml` is a collection of four requests, one for
+each structured way to specify a body — `json`, `body_file`, `form` and
+`multipart` — instead of a hand-escaped `body:` string. Each posts to
+httpbin.org/post, which echoes back exactly what it received:
+
+```sh
+cargo run -p sendra-cli -- run examples/structured-bodies.yaml               # all four
+cargo run -p sendra-cli -- run examples/structured-bodies.yaml "JSON body"   # just one
+```
+
 ## Request file shape
 
 ```yaml
