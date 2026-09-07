@@ -224,6 +224,16 @@ pub(crate) enum Command {
         #[arg(long, hide = true)]
         allow_error_status: bool,
     },
+
+    /// Scaffold `.sendra/config.yaml` and `.sendra/environments/default.yaml`
+    /// in the current directory.
+    ///
+    /// Both files are written with every known field present but commented
+    /// out, showing the shape a config and an environment file can take
+    /// without imposing any values of its own. Refuses, without writing
+    /// anything, if `.sendra/` already exists — see `sendra init --help` in
+    /// the README for the reasoning.
+    Init,
 }
 
 #[cfg(test)]

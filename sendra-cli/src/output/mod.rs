@@ -15,7 +15,6 @@ use sendra_core::{
 
 use crate::exit::Summary;
 
-use self::errors::print_error_line;
 use self::human::{
     print_assertions, print_capture, print_no_assertions, print_post_request, print_response,
     print_status_line, print_summary,
@@ -25,7 +24,9 @@ use self::json::{
     ResponseRecord, RunDocument, SummaryRecord,
 };
 
-pub(crate) use self::errors::{print_environment_error, print_error, reject_allow_error_status};
+pub(crate) use self::errors::{
+    print_environment_error, print_error, print_error_line, reject_allow_error_status,
+};
 
 /// How much of a response the human-readable output shows.
 ///

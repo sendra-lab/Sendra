@@ -47,7 +47,7 @@ pub(crate) fn reject_allow_error_status() -> ! {
 }
 
 /// The red `error:` line every failure starts with.
-pub(super) fn print_error_line(message: impl std::fmt::Display) {
+pub(crate) fn print_error_line(message: impl std::fmt::Display) {
     let label = "error:".if_supports_color(Stream::Stderr, |t| t.red());
     eprintln!("{} {}", label, message);
 }
