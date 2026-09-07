@@ -96,8 +96,8 @@ pub(crate) enum Command {
         /// reassigns it rather than appending to it, not as a deliberate
         /// multi-value header.
         ///
-        /// See the README's "Precedence, start to finish" section for where
-        /// this sits among every other layer.
+        /// See the docs for the full precedence chain, start to finish.
+        // TODO: link the docs site here once it exists.
         #[arg(short = 'H', long = "header", value_name = "NAME:VALUE", value_parser = parse_header_override)]
         header: Vec<(String, String)>,
 
@@ -109,9 +109,10 @@ pub(crate) enum Command {
         /// headers. It is treated as if it were part of the environment file
         /// itself rather than as a separate, higher layer: in particular, a
         /// `capture` block naming the same variable a `--var` already set is
-        /// refused exactly as it would be for a name the file defines — see
-        /// the README for why letting a capture silently win, or silently
-        /// lose, would both be worse than an error.
+        /// refused exactly as it would be for a name the file defines, rather
+        /// than letting a capture silently win or silently lose. See the docs
+        /// for the full reasoning.
+        // TODO: link the docs site here once it exists.
         #[arg(long = "var", value_name = "NAME=VALUE", value_parser = parse_var_override)]
         var: Vec<(String, String)>,
 

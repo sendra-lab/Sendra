@@ -32,6 +32,8 @@ const DEFAULT_ENVIRONMENT_FILE_NAME: &str = "default.yaml";
 /// the file parses as an empty config (a fully-commented file is YAML null,
 /// which core already treats as "nothing set yet") while still showing the
 /// shape each key takes.
+// TODO: the "see the docs" line below should link the docs site once it
+// exists, rather than staying vague.
 const CONFIG_TEMPLATE: &str = "\
 # Sendra project configuration.
 #
