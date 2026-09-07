@@ -9,8 +9,9 @@ use sendra_core::environment::{find_environment, DEFAULT_ENVIRONMENT_NAME};
 use sendra_core::script::{run_post_request, run_pre_request, Scripts};
 use sendra_core::{Config, Document, Environment, HttpClient, Request, SendraError};
 
+use crate::cli::OutputMode;
 use crate::exit::{exit_for_run, Exit, Outcome, Summary};
-use crate::output::{print_environment_error, print_error, Detail, Format, Reporter};
+use crate::output::{print_environment_error, print_error, Format, Reporter};
 
 /// Everything both subcommands do before the first byte goes out: the config,
 /// the HTTP client the whole run sends through, the environment, and the file.
@@ -199,6 +200,12 @@ fn prepare(
 /// they are resolved, only whether the last step — the actual network call —
 /// happens, which is why it is threaded through as one more argument to the
 /// same loop rather than a separate code path.
+///
+/// `output` is `-o`/`--output`: `None` (the flag was omitted) keeps `run`'s
+/// long-standing default of [`OutputMode::Full`]; `Some(mode)` is the
+/// caller's explicit choice. `main` has already refused `-o status` together
+/// with `dry_run`, and `output` together with `json`, before this is called —
+/// see `reject_output_status_with_dry_run` and `reject_output_with_json`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     path: &Path,
@@ -211,6 +218,7 @@ pub(crate) async fn run(
     json: bool,
     show_captures: bool,
     dry_run: bool,
+    output: Option<OutputMode>,
 ) -> Exit {
     let Prepared {
         config,
@@ -237,7 +245,11 @@ pub(crate) async fn run(
 
     let config = &config;
     let client = &client;
-    let reporter = &Reporter::new(Format::for_json_flag(json), Detail::Full, show_captures);
+    let reporter = &Reporter::new(
+        Format::for_json_flag(json),
+        output.unwrap_or(OutputMode::Full),
+        show_captures,
+    );
     let outcomes = run_requests(
         &requests,
         base_dir(path),
@@ -283,6 +295,10 @@ pub(crate) async fn run(
 /// a CI log wants both the machine-readable report and something to read
 /// when it fails. `run` has no verdict for a JUnit report to carry, so the
 /// flag is `test`'s alone; see [`Reporter::with_junit`].
+///
+/// `output` behaves exactly as it does on `run` — see there — except `None`
+/// (the flag was omitted) keeps `test`'s long-standing default of
+/// [`OutputMode::Status`] rather than `run`'s [`OutputMode::Full`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn test(
     path: &Path,
@@ -294,6 +310,7 @@ pub(crate) async fn test(
     json: bool,
     show_captures: bool,
     junit: Option<PathBuf>,
+    output: Option<OutputMode>,
 ) -> Exit {
     let Prepared {
         config,
@@ -322,7 +339,7 @@ pub(crate) async fn test(
     let client = &client;
     let mut reporter = Reporter::new(
         Format::for_json_flag(json),
-        Detail::StatusOnly,
+        output.unwrap_or(OutputMode::Status),
         show_captures,
     );
     if let Some(path) = junit {
@@ -825,7 +842,7 @@ mod tests {
     use sendra_core::{AssertionReport, CaptureReport, ScriptOutcome};
 
     use crate::exit::exit_for_status;
-    use crate::test_support::{all_passed, client, reporter, responded};
+    use crate::test_support::{all_passed, client, dry_run_reporter, reporter, responded};
 
     /// Three requests, the middle one referencing a variable that does not
     /// exist. The broken request is in the middle so "the run carried on" and
@@ -2210,7 +2227,7 @@ requests:
             let request =
                 request("method: GET\nurl: https://127.0.0.1:1/\nheaders:\n  X-Test: value\n");
 
-            let outcome = dry_run_one(&request, &Config::default(), &[], &reporter());
+            let outcome = dry_run_one(&request, &Config::default(), &[], &dry_run_reporter());
 
             assert!(matches!(outcome, Outcome::DryRun), "{outcome:?}");
             assert_eq!(exit_for_run(&[outcome], false), Exit::Ok);
@@ -2253,7 +2270,7 @@ requests:
                 "method: GET\nurl: https://example.com\npre_request: |\n  throw \"no signing key\";\n",
             );
 
-            let outcome = dry_run_one(&request, &Config::default(), &[], &reporter());
+            let outcome = dry_run_one(&request, &Config::default(), &[], &dry_run_reporter());
 
             assert!(matches!(outcome, Outcome::NoResponse), "{outcome:?}");
             assert_eq!(exit_for_run(&[outcome], false), Exit::Failure);
@@ -2270,7 +2287,7 @@ requests:
                  post_request: |\n  throw \"post_request must never run under --dry-run\";\n",
             );
 
-            let outcome = dry_run_one(&request, &Config::default(), &[], &reporter());
+            let outcome = dry_run_one(&request, &Config::default(), &[], &dry_run_reporter());
 
             assert!(matches!(outcome, Outcome::DryRun), "{outcome:?}");
         }
@@ -2290,8 +2307,8 @@ requests:
                 &requests,
                 Path::new("."),
                 &environment(),
-                &reporter(),
-                |request, _| async move { dry_run_one(&request, config, &[], &reporter()) },
+                &dry_run_reporter(),
+                |request, _| async move { dry_run_one(&request, config, &[], &dry_run_reporter()) },
             )
             .await;
 
@@ -2315,8 +2332,8 @@ requests:
                 &requests,
                 Path::new("."),
                 &environment(),
-                &reporter(),
-                |request, _| async move { dry_run_one(&request, config, &[], &reporter()) },
+                &dry_run_reporter(),
+                |request, _| async move { dry_run_one(&request, config, &[], &dry_run_reporter()) },
             )
             .await;
 

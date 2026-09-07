@@ -39,6 +39,19 @@ pub(super) fn print_resolved_request(request: &Request) {
         request.url
     );
 
+    print_resolved_headers(request);
+
+    if let Some(body) = request.body.as_deref().filter(|body| !body.is_empty()) {
+        println!();
+        println!("{body}");
+    }
+}
+
+/// `-o headers` under `--dry-run`: the resolved request's headers alone, no
+/// method/URL line and no body. Also the header-printing half of
+/// [`print_resolved_request`], which prints these between the method/URL
+/// line and the body.
+pub(super) fn print_resolved_headers(request: &Request) {
     for (name, value) in &request.headers {
         println!(
             "{}: {}",
@@ -46,9 +59,13 @@ pub(super) fn print_resolved_request(request: &Request) {
             value
         );
     }
+}
 
+/// `-o body` under `--dry-run`: the resolved request's body alone, no
+/// method/URL line and no headers. Nothing at all when the request declared
+/// no body, the same silence [`print_resolved_request`] keeps for one.
+pub(super) fn print_resolved_body(request: &Request) {
     if let Some(body) = request.body.as_deref().filter(|body| !body.is_empty()) {
-        println!();
         println!("{body}");
     }
 }
@@ -133,6 +150,26 @@ pub(super) fn print_response(response: &Response) {
     if !response.body.is_empty() {
         println!();
         println!("{}", body_for_display(response));
+    }
+}
+
+/// `-o body`: the response body alone, no status line and no headers — for
+/// piping into another tool (`sendra run x.yaml -o body | jq .`). Nothing at
+/// all for an empty body, the same silence [`print_response`] keeps for one.
+pub(super) fn print_body_only(response: &Response) {
+    if !response.body.is_empty() {
+        println!("{}", body_for_display(response));
+    }
+}
+
+/// `-o headers`: the response headers alone, no status line and no body.
+pub(super) fn print_headers_only(response: &Response) {
+    for (name, value) in &response.headers {
+        println!(
+            "{}: {}",
+            name.if_supports_color(Stream::Stdout, |t| t.cyan()),
+            value
+        );
     }
 }
 
