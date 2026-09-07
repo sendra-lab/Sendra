@@ -1653,7 +1653,7 @@ capture:
         );
         assert_eq!(
             applied.capture.as_ref().unwrap().entries()["token"],
-            "$.{{field}}"
+            crate::CaptureSource::JsonPath("$.{{field}}".to_string())
         );
     }
 
