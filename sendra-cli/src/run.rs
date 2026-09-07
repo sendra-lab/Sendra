@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sendra_core::environment::{find_environment, DEFAULT_ENVIRONMENT_NAME};
 use sendra_core::script::{run_post_request, run_pre_request, Scripts};
@@ -48,17 +49,39 @@ struct Prepared {
 /// Both subcommands share this because they must: `sendra test` that resolved
 /// config differently from `sendra run` would mean a request could pass under
 /// one and fail under the other for reasons neither prints.
-fn prepare(path: &Path, environment_name: Option<&str>) -> Result<Prepared, Exit> {
+///
+/// `var_overrides` and `timeout_override` are `--var` and `--timeout`: the two
+/// CLI overrides that land here rather than in [`send`], because they change
+/// *what gets resolved* rather than the already-substituted request `send`
+/// sees. `-H`/`--header` is not one of the arguments — see [`send`], where it
+/// is applied instead, and the module doc comment for the full precedence
+/// chain this and `send` together implement.
+fn prepare(
+    path: &Path,
+    environment_name: Option<&str>,
+    var_overrides: &[(String, String)],
+    timeout_override: Option<u64>,
+) -> Result<Prepared, Exit> {
     // Resolved once for the whole run: every request in a collection is sent
     // under the same defaults, and a broken config file stops the run instead
     // of failing partway through it.
-    let config = match Config::resolve() {
+    let mut config = match Config::resolve() {
         Ok(config) => config,
         Err(err) => {
             print_error(&err);
             return Err(Exit::Failure);
         }
     };
+
+    // `--timeout` wins over both the global and the project config — the
+    // highest-precedence layer, applied last, exactly like `--var` below and
+    // `-H` in `send`. Overwriting the resolved `Config` here, before
+    // `build_client` ever sees it, means the override reaches the one place
+    // a timeout actually takes effect without `build_client` needing to know
+    // CLI overrides exist at all.
+    if let Some(seconds) = timeout_override {
+        config.timeout = Duration::from_secs(seconds);
+    }
 
     // One client for the whole invocation: every request below sends through
     // this one, so the connection the first request opens is the connection the
@@ -83,13 +106,30 @@ fn prepare(path: &Path, environment_name: Option<&str>) -> Result<Prepared, Exit
         }
     };
 
-    let environment = match environment_for(&start_dir, environment_name) {
+    let mut environment = match environment_for(&start_dir, environment_name) {
         Ok(environment) => environment,
         Err(err) => {
             print_environment_error(&err);
             return Err(Exit::Failure);
         }
     };
+
+    // `--var` overrides the environment file's own value for the same name —
+    // "most specific wins", the same reasoning `--timeout` above and `-H` in
+    // `send` both follow. It is folded directly into `variables` rather than
+    // kept as a separate layer, which is a deliberate choice and not just a
+    // shortcut: every consumer of `Environment` — substitution, and the
+    // shadow check a `capture` block runs — already treats `variables` as
+    // "what the active environment defines", and a `--var` value is exactly
+    // that for this one invocation. The consequence, stated plainly: a
+    // `capture` naming a variable a `--var` already set is refused the same
+    // way one naming a file-defined variable is, as
+    // `CaptureFailure::Shadowed`. That is not a special case added for
+    // `--var` — it falls out of `--var` being indistinguishable, by the time
+    // anything downstream looks, from a value the file itself defined.
+    for (name, value) in var_overrides {
+        environment.variables.insert(name.clone(), value.clone());
+    }
 
     let document = match Document::from_path(path) {
         Ok(document) => document,
@@ -145,10 +185,19 @@ fn prepare(path: &Path, environment_name: Option<&str>) -> Result<Prepared, Exit
 /// `show_captures` reaches only the `--json` document, and only its
 /// `capture.values` — see [`Reporter`] and `output::json::CaptureRecord`. It
 /// changes nothing about which requests are sent or what they do.
+///
+/// `headers`, `vars` and `timeout` are `-H`, `--var` and `--timeout` — the
+/// highest-precedence layer, applied last, over everything below it. See the
+/// module doc comment for the full chain and [`prepare`]/[`send`] for where
+/// each one is actually applied.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     path: &Path,
     name: Option<&str>,
     environment_name: Option<&str>,
+    headers: &[(String, String)],
+    vars: &[(String, String)],
+    timeout: Option<u64>,
     allow_error_status: bool,
     json: bool,
     show_captures: bool,
@@ -158,7 +207,7 @@ pub(crate) async fn run(
         client,
         environment,
         document,
-    } = match prepare(path, environment_name) {
+    } = match prepare(path, environment_name, vars, timeout) {
         Ok(prepared) => prepared,
         Err(exit) => return exit,
     };
@@ -185,7 +234,7 @@ pub(crate) async fn run(
         &environment,
         reporter,
         |request, environment| async move {
-            send(&request, client, config, &environment, reporter).await
+            send(&request, client, config, &environment, headers, reporter).await
         },
     )
     .await;
@@ -214,9 +263,13 @@ pub(crate) async fn run(
 /// the document `test` writes carries the [`Summary`] the terminal output ends
 /// with. The counts, and the exit code they produce, are the same numbers in
 /// both renderings.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn test(
     path: &Path,
     environment_name: Option<&str>,
+    headers: &[(String, String)],
+    vars: &[(String, String)],
+    timeout: Option<u64>,
     json: bool,
     show_captures: bool,
 ) -> Exit {
@@ -225,7 +278,7 @@ pub(crate) async fn test(
         client,
         environment,
         document,
-    } = match prepare(path, environment_name) {
+    } = match prepare(path, environment_name, vars, timeout) {
         Ok(prepared) => prepared,
         Err(exit) => return exit,
     };
@@ -247,7 +300,7 @@ pub(crate) async fn test(
         &environment,
         reporter,
         |request, environment| async move {
-            send(&request, client, config, &environment, reporter).await
+            send(&request, client, config, &environment, headers, reporter).await
         },
     )
     .await;
@@ -517,15 +570,26 @@ where
 ///    which is what step 3 requires: a `pre_request` script that *removes* a
 ///    config-injected header only works if nothing re-merges the config after
 ///    it. That is what [`sendra_core::send_prepared`] is for.
-/// 3. **Run `pre_request`**, the last thing to touch the request. A script that
+/// 3. **Apply `-H`/`--header` overrides.** Right after the config, and for the
+///    same structural reason: this is the layer nothing above it should be
+///    able to re-add over. By this point the request already carries its own
+///    `headers:`, whatever config added, and the `Authorization` header a
+///    resolved `auth:` produced (that happened earlier, in
+///    [`run_requests`]) — so applying `-H` here, replacing any header of the
+///    same name (case-insensitively) rather than adding to it, is what makes
+///    it the highest-precedence layer the module doc comment promises. A
+///    `pre_request` script still runs after this and can still change or
+///    remove what `-H` set, the same way it can a config header — `-H` is not
+///    given special protection from a script the request file itself wrote.
+/// 4. **Run `pre_request`**, the last thing to touch the request. A script that
 ///    throws, or that leaves the request in a state that cannot be sent, is
 ///    again [`Outcome::NoResponse`]: there is no response and never will be.
-/// 4. **Send.**
-/// 5. **Run `post_request`** against the response.
-/// 6. **Evaluate assertions** against the same response. Whether a script ran,
+/// 5. **Send.**
+/// 6. **Run `post_request`** against the response.
+/// 7. **Evaluate assertions** against the same response. Whether a script ran,
 ///    and what it decided, changes nothing about them — the two mechanisms are
 ///    independent and neither can see the other.
-/// 7. **Evaluate the `capture` block** against the same response, last, because
+/// 8. **Evaluate the `capture` block** against the same response, last, because
 ///    it is the only step that is about the requests *after* this one rather
 ///    than about this one. Independent of the two above in both directions: a
 ///    failed assertion does not stop a capture, and a failed capture does not
@@ -551,6 +615,7 @@ async fn send(
     client: &HttpClient,
     config: &Config,
     environment: &Environment,
+    header_overrides: &[(String, String)],
     reporter: &Reporter,
 ) -> Outcome {
     // Nothing goes over the wire until both scripts are known to parse.
@@ -562,9 +627,10 @@ async fn send(
         }
     };
 
-    // Config first, then the script, then the wire — see the numbered list
-    // above for why this is here and not inside `sendra_core::send`.
+    // Config, then `-H`, then the script, then the wire — see the numbered
+    // list above for why each is here and not inside `sendra_core::send`.
     let configured = config.apply(request);
+    let configured = apply_header_overrides(configured, header_overrides);
     let prepared = match scripts.pre_request() {
         Some(script) => {
             let (result, output) = run_pre_request(script, &configured);
@@ -628,6 +694,35 @@ async fn send(
             Outcome::NoResponse
         }
     }
+}
+
+/// Apply `-H`/`--header` overrides to `request`, returning the request as it
+/// will be sent.
+///
+/// For each override, in the order given on the command line, every header of
+/// the same name (**compared case-insensitively**, matching
+/// [`Config::apply`]) is dropped and the override's value is pushed in its
+/// place. Two consequences fall out of doing it this way, both deliberate:
+///
+/// - It replaces rather than adds, so it overrides — not merges with — a
+///   header the request, the config, or a resolved `auth:` already set,
+///   including a repeated header the request file wrote more than once. That
+///   is what makes `-H` a genuine override rather than one more source a
+///   header can repeat from.
+/// - Applying overrides in order means passing the same name to `-H` more
+///   than once keeps only the *last* value: the second override drops the
+///   header the first one just added before pushing its own. A repeated `-H`
+///   reads as "I meant to change it", not as a deliberate multi-value header,
+///   which is the opposite of what a repeated `headers:` entry in a request
+///   file means — that one is authored once and meant to stay a list.
+fn apply_header_overrides(mut request: Request, overrides: &[(String, String)]) -> Request {
+    for (name, value) in overrides {
+        request
+            .headers
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        request.headers.push((name.clone(), value.clone()));
+    }
+    request
 }
 
 #[cfg(test)]
@@ -890,6 +985,7 @@ requests:
                 &client(),
                 &Config::default(),
                 &Environment::default(),
+                &[],
                 &reporter(),
             )
             .await;
@@ -909,6 +1005,7 @@ requests:
                 &client(),
                 &Config::default(),
                 &Environment::default(),
+                &[],
                 &reporter(),
             )
             .await,
@@ -935,6 +1032,7 @@ requests:
             &client(),
             &Config::default(),
             &Environment::default(),
+            &[],
             &reporter(),
         )
         .await;
