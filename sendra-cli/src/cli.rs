@@ -229,6 +229,30 @@ pub(crate) enum Command {
         /// and `status` is refused — a dry run never has a status line.
         #[arg(short = 'o', long = "output", value_enum, value_name = "MODE")]
         output: Option<OutputMode>,
+
+        /// Suppress everything that is not the answer to "did this work":
+        /// the `→ <label>` lines (stderr) and the response rendering
+        /// (stdout, as `-o none` — see `--output`). Assertions, `capture`
+        /// results and the summary still print, since those are the actual
+        /// pass/fail information `-q` exists to make easier to find, not
+        /// something it hides.
+        ///
+        /// Implies `-o none`; combining `-q` with an explicit `-o <mode>`
+        /// other than `none` is refused as a real conflict — quiet mode
+        /// asked for no response, a specific mode asked for one, and
+        /// guessing which one you meant is not a trade Sendra makes on your
+        /// behalf. `-q -o none` is accepted, since the two agree.
+        ///
+        /// Has no effect on `--json`'s document, which is data rather than
+        /// narration and carries the full response regardless — but it
+        /// still suppresses the `→` labels `--json` prints to stderr
+        /// alongside it, so `-q --json` is not meaningless and is not
+        /// refused.
+        ///
+        /// Applies to `--dry-run` the same way it applies to a real
+        /// response: the resolved request is not printed either.
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
     },
 
     /// Run every request in a YAML file, or one named request, and pass or
@@ -330,6 +354,13 @@ pub(crate) enum Command {
         /// reasoning, including the `--json` refusal.
         #[arg(short = 'o', long = "output", value_enum, value_name = "MODE")]
         output: Option<OutputMode>,
+
+        /// Suppress the `→ <label>` lines and the response rendering,
+        /// leaving assertions/capture/summary — the pass/fail information —
+        /// intact. Behaves exactly as it does on `run`, including the
+        /// `-o`/`--dry-run` interactions; see `run --help`.
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
     },
 
     /// Scaffold `.sendra/config.yaml` and `.sendra/environments/default.yaml`
@@ -427,6 +458,7 @@ mod tests {
                 junit,
                 allow_error_status,
                 output,
+                quiet,
             } => {
                 assert_eq!(path, PathBuf::from("collection.yaml"));
                 assert_eq!(request, None, "no request name was passed");
@@ -439,6 +471,7 @@ mod tests {
                 assert_eq!(junit, None, "no --junit was passed");
                 assert!(!allow_error_status);
                 assert_eq!(output, None, "no -o was passed");
+                assert!(!quiet, "no -q was passed");
             }
             _ => panic!("`sendra test` should have parsed as `Command::Test`"),
         }
@@ -724,6 +757,22 @@ mod tests {
             err.to_string().contains("bogus"),
             "clap should name the bad value: {err}"
         );
+    }
+
+    // --- `-q`/`--quiet` ----------------------------------------------------
+
+    #[test]
+    fn quiet_defaults_to_false_and_is_offered_by_both_subcommands() {
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`-q` is optional");
+        assert!(matches!(cli.command, Command::Run { quiet: false, .. }));
+
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "-q"])
+            .expect("`-q` is offered by `run`");
+        assert!(matches!(cli.command, Command::Run { quiet: true, .. }));
+
+        let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--quiet"])
+            .expect("`--quiet` is offered by `test`");
+        assert!(matches!(cli.command, Command::Test { quiet: true, .. }));
     }
 
     // --- `--timeout` -----------------------------------------------------

@@ -206,6 +206,12 @@ fn prepare(
 /// caller's explicit choice. `main` has already refused `-o status` together
 /// with `dry_run`, and `output` together with `json`, before this is called —
 /// see `reject_output_status_with_dry_run` and `reject_output_with_json`.
+///
+/// `quiet` is `-q`/`--quiet`. `main` has already folded its `-o none`
+/// implication into `output` — see `output`'s own doc above and
+/// `reject_quiet_with_output` for the case where an explicit `output`
+/// disagreed — so what reaches here is only the half `output` cannot
+/// express: suppressing the `→` labels via [`Reporter::with_quiet`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     path: &Path,
@@ -219,6 +225,7 @@ pub(crate) async fn run(
     show_captures: bool,
     dry_run: bool,
     output: Option<OutputMode>,
+    quiet: bool,
 ) -> Exit {
     let Prepared {
         config,
@@ -249,7 +256,8 @@ pub(crate) async fn run(
         Format::for_json_flag(json),
         output.unwrap_or(OutputMode::Full),
         show_captures,
-    );
+    )
+    .with_quiet(quiet);
     let outcomes = run_requests(
         &requests,
         base_dir(path),
@@ -299,6 +307,8 @@ pub(crate) async fn run(
 /// `output` behaves exactly as it does on `run` — see there — except `None`
 /// (the flag was omitted) keeps `test`'s long-standing default of
 /// [`OutputMode::Status`] rather than `run`'s [`OutputMode::Full`].
+///
+/// `quiet` behaves exactly as it does on `run` — see there.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn test(
     path: &Path,
@@ -311,6 +321,7 @@ pub(crate) async fn test(
     show_captures: bool,
     junit: Option<PathBuf>,
     output: Option<OutputMode>,
+    quiet: bool,
 ) -> Exit {
     let Prepared {
         config,
@@ -341,7 +352,8 @@ pub(crate) async fn test(
         Format::for_json_flag(json),
         output.unwrap_or(OutputMode::Status),
         show_captures,
-    );
+    )
+    .with_quiet(quiet);
     if let Some(path) = junit {
         reporter = reporter.with_junit(path);
     }
