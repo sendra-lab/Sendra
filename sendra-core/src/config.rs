@@ -455,6 +455,7 @@ mod tests {
                 .iter()
                 .map(|(name, value)| (name.to_string(), value.to_string()))
                 .collect(),
+            query: Vec::new(),
             body: None,
             json: None,
             body_file: None,
@@ -869,6 +870,7 @@ mod tests {
             method: Method::Post,
             url: "https://example.com/things".to_string(),
             headers: Vec::new(),
+            query: Vec::new(),
             body: Some("{}".to_string()),
             json: None,
             body_file: None,

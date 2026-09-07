@@ -453,12 +453,14 @@ where
         let environment = environment.with_captured(&captured);
         // Substitution, then — while `{{var}}`s are already resolved but
         // before the config or a `pre_request` script ever sees the request —
-        // resolving whichever of `body`/`json`/`body_file`/`form`/`multipart`
-        // was set down to the final `body` string. Both failures are the same
-        // category: the request could not be built, so there is nothing to
-        // send. See `Request::resolve_body`.
+        // merging `query` into `url` and resolving whichever of
+        // `body`/`json`/`body_file`/`form`/`multipart` was set down to the
+        // final `body` string. All three failures are the same category: the
+        // request could not be built, so there is nothing to send. See
+        // `Request::resolve_query` and `Request::resolve_body`.
         let substituted = environment
             .apply(request)
+            .and_then(|request| request.resolve_query())
             .and_then(|request| request.resolve_body(base_dir));
 
         // Announced before the outcome either way, because in a collection run
