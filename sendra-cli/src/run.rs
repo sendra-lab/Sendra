@@ -253,11 +253,10 @@ pub(crate) async fn run(
 /// shared code is the whole pipeline rather than an abstraction invented to
 /// hold two similar things together.
 ///
-/// **No name argument, unlike `run`.** `run <file> <name>` exists to send one
-/// request out of a collection and look at it; `test` produces a verdict over a
-/// file, and a verdict over one hand-picked request out of a collection is a
-/// different, narrower thing that nothing has yet asked for. It can be added
-/// later without changing anything here.
+/// **Takes an optional request name, exactly like `run`.** Omit it and every
+/// request in the file is tested, in file order, same as before; name one and
+/// only it is tested, with the same `RequestNotFound` error `run` already
+/// raises for the equivalent case when the name does not exist.
 ///
 /// `json` behaves exactly as it does on `run` — see there — with one addition:
 /// the document `test` writes carries the [`Summary`] the terminal output ends
@@ -273,6 +272,7 @@ pub(crate) async fn run(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn test(
     path: &Path,
+    name: Option<&str>,
     environment_name: Option<&str>,
     headers: &[(String, String)],
     vars: &[(String, String)],
@@ -291,9 +291,18 @@ pub(crate) async fn test(
         Err(exit) => return exit,
     };
 
-    // Every request in the file, in file order — a single-request file is a
-    // run of one.
-    let requests: Vec<&Request> = document.requests().iter().collect();
+    let requests: Vec<&Request> = match name {
+        Some(name) => match document.get(name) {
+            Ok(request) => vec![request],
+            Err(err) => {
+                print_error(&err);
+                return Exit::Failure;
+            }
+        },
+        // No name: every request in the file, in file order — a
+        // single-request file is a run of one.
+        None => document.requests().iter().collect(),
+    };
 
     let config = &config;
     let client = &client;
@@ -1595,6 +1604,52 @@ assertions:
                 passed: 1,
                 ..Summary::default()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn selecting_one_request_by_name_produces_a_summary_of_one() {
+        // `test`'s name selection is `document.get`, the same call `run`
+        // already makes — this pins the summary/exit behaviour that falls
+        // out of feeding just that one request into the same `run_requests`
+        // and `Summary` machinery every other `test` run uses.
+        let document = Document::from_yaml_str(COLLECTION_WITH_A_BROKEN_VARIABLE).unwrap();
+        let request = document.get("Third").expect("`Third` is in the collection");
+
+        let outcomes = run_requests(
+            &[request],
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |_, _| async { all_passed(200) },
+        )
+        .await;
+
+        assert_eq!(
+            Summary::of(&outcomes),
+            Summary {
+                total: 1,
+                passed: 1,
+                ..Summary::default()
+            },
+            "a named single request is a test run of one, exactly like an \
+             unnamed single-request file"
+        );
+    }
+
+    #[test]
+    fn naming_a_request_that_does_not_exist_is_the_same_error_run_uses() {
+        // `test` reuses `run`'s `document.get`, so a nonexistent name must
+        // fail the same way here as it does for `run` — see
+        // `sendra_core::Document::get`'s own tests for the error's shape.
+        let document = Document::from_yaml_str(COLLECTION_WITH_A_BROKEN_VARIABLE).unwrap();
+
+        let err = document
+            .get("Nonexistent")
+            .expect_err("no request has this name");
+        assert!(
+            matches!(err, SendraError::RequestNotFound { ref name, .. } if name == "Nonexistent"),
+            "expected RequestNotFound, got {err:?}"
         );
     }
     // --- capture and chaining --------------------------------------------

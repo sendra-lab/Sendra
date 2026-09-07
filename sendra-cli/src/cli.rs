@@ -161,7 +161,8 @@ pub(crate) enum Command {
         show_captures: bool,
     },
 
-    /// Run every request in a YAML file and pass or fail on its assertions.
+    /// Run every request in a YAML file, or one named request, and pass or
+    /// fail on its assertions.
     ///
     /// Sends the same requests `run` sends, under the same config and the same
     /// environment, and prints the same per-request assertion results — then a
@@ -172,9 +173,17 @@ pub(crate) enum Command {
         /// Path to the request or collection file.
         ///
         /// A single-request file and a collection are both accepted, and a
-        /// collection runs every request in it, in file order. There is no
-        /// name argument: `test`'s answer is a verdict over the whole file.
+        /// collection runs every request in it, in file order, unless
+        /// `request` names one to run alone.
         path: PathBuf,
+
+        /// Name of one request to test, when the file is a collection.
+        ///
+        /// Behaves exactly as it does on `run`: omit it to test every request
+        /// in the collection, in file order; naming a request that does not
+        /// exist is an error; naming one in a file that holds a single
+        /// request is an error, since there is nothing to choose between.
+        request: Option<String>,
 
         /// Name of the environment to substitute `{{variable}}` values from.
         ///
@@ -324,13 +333,14 @@ mod tests {
     }
 
     #[test]
-    fn test_takes_a_path_and_an_env_and_no_request_name() {
+    fn test_takes_a_path_and_an_env_and_an_optional_request_name() {
         let cli = Cli::try_parse_from(["sendra", "test", "collection.yaml", "--env", "staging"])
-            .expect("path and --env are the whole surface");
+            .expect("path and --env are the whole surface when no name is given");
 
         match cli.command {
             Command::Test {
                 path,
+                request,
                 env,
                 header,
                 var,
@@ -341,6 +351,7 @@ mod tests {
                 allow_error_status,
             } => {
                 assert_eq!(path, PathBuf::from("collection.yaml"));
+                assert_eq!(request, None, "no request name was passed");
                 assert_eq!(env.as_deref(), Some("staging"));
                 assert!(header.is_empty(), "no -H was passed");
                 assert!(var.is_empty(), "no --var was passed");
@@ -362,12 +373,13 @@ mod tests {
             "`--json` must reach `main`"
         );
 
-        // A second positional is `run`'s, not `test`'s: a verdict over one
-        // hand-picked request is a different thing, and is not offered rather
-        // than being offered and ignored.
+        // A second positional is now `test`'s too, mirroring `run`: a verdict
+        // over one hand-picked request.
+        let cli = Cli::try_parse_from(["sendra", "test", "collection.yaml", "One request"])
+            .expect("`test` now takes a request name, like `run`");
         assert!(
-            Cli::try_parse_from(["sendra", "test", "collection.yaml", "One request"]).is_err(),
-            "`test` takes no request name"
+            matches!(cli.command, Command::Test { request: Some(ref name), .. } if name == "One request"),
+            "the request name must reach `main`"
         );
     }
 
