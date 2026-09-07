@@ -22,7 +22,7 @@ pub mod environment;
 pub mod script;
 
 pub use assertions::{AssertionKind, AssertionReport, AssertionResult, Assertions, NotAssertions};
-pub use capture::{CaptureFailure, CaptureReport, CaptureResult, Captures};
+pub use capture::{CaptureFailure, CaptureReport, CaptureResult, CaptureSource, Captures};
 pub use config::Config;
 pub use environment::Environment;
 pub use script::{Hook, Script, ScriptOutcome, ScriptOutput, Scripts};
@@ -1954,8 +1954,14 @@ capture:
 
         let capture = request.capture.expect("the block parsed");
         assert_eq!(capture.variables(), vec!["auth_token", "user_id"]);
-        assert_eq!(capture.entries()["auth_token"], "$.token");
-        assert_eq!(capture.entries()["user_id"], "$.user.id");
+        assert_eq!(
+            capture.entries()["auth_token"],
+            CaptureSource::JsonPath("$.token".to_string())
+        );
+        assert_eq!(
+            capture.entries()["user_id"],
+            CaptureSource::JsonPath("$.user.id".to_string())
+        );
     }
 
     #[test]
@@ -2007,7 +2013,10 @@ capture:
 ",
         )
         .expect("the file loads");
-        assert_eq!(request.capture.unwrap().entries()["v"], "nonsense");
+        assert_eq!(
+            request.capture.unwrap().entries()["v"],
+            CaptureSource::JsonPath("nonsense".to_string())
+        );
     }
 
     #[test]
@@ -2210,6 +2219,7 @@ enviroment: staging
             "test-collection.yaml",
             "scripted-request.yaml",
             "capture-chain.yaml",
+            "capture-header-status.yaml",
             "repeated-headers.yaml",
             "structured-bodies.yaml",
             "query-params.yaml",

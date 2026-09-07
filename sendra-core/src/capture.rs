@@ -1,17 +1,59 @@
 //! Values a request pulls out of its response and hands to the requests after
 //! it.
 //!
-//! A request file may carry a `capture` block: variable names mapped to JSON
-//! paths, evaluated against the response body once it arrives.
+//! A request file may carry a `capture` block: variable names mapped to a
+//! source to read from the response once it arrives. The default source,
+//! and the only one issue 10 (batch 1) shipped, is a JSON path evaluated
+//! against the response body — a bare string still means exactly that, for
+//! every file already written against it. Two more sources are read from a
+//! response's envelope rather than its body: a named header, and the status
+//! code itself.
 //!
 //! ```yaml
 //! name: Log in
 //! method: POST
 //! url: https://api.example.com/login
 //! capture:
-//!   auth_token: $.token
+//!   auth_token: $.token          # JSON path (default, bare string)
 //!   user_id: $.user.id
+//!   session_id:
+//!     header: Set-Cookie          # a response header
+//!   request_status:
+//!     status: true                # the numeric status, as a string
 //! ```
+//!
+//! # Header capture and repeated headers
+//!
+//! Header names are matched case-insensitively, the way [`assertions`
+//! matches them](crate::assertions). A header that does not repeat captures
+//! its one value. A header that repeats (`Set-Cookie` is the common case) is
+//! **ambiguous** rather than resolved by taking the first or the last: this
+//! mirrors the JSON-path rule that a path selecting more than one value is a
+//! failure rather than a silent pick (see [`CaptureFailure::Ambiguous`]).
+//! An assertion checking `headers: { set-cookie: ... }` passes if *any*
+//! repeated value matches, because it is testing a predicate; a capture
+//! binds a name to *one* value that later requests will substitute, and
+//! guessing which repeat that should be would make the same file behave
+//! differently depending on header order a server happens to send in. A
+//! file that wants one specific cookie out of several should be more
+//! specific than `header: Set-Cookie` can be today — see the module-level
+//! non-goal note below.
+//!
+//! # Only the final response's headers
+//!
+//! With `follow_redirects` on, header capture reads the headers of the
+//! response `evaluate` is called with — the *final* response in the chain.
+//! [`Response::redirects`](crate::Response) records each intermediate hop's
+//! status and the `Location` it pointed at, but deliberately does not carry
+//! that hop's full header set (see the type's own docs), so there is no
+//! intermediate `Set-Cookie` or other header for this to reach even if the
+//! schema grew a way to ask for one. Capturing the *final* hop's `Location`
+//! is possible today (a response that redirected already exposes its own
+//! `Location` if it is itself 3xx and redirects were disabled or exhausted),
+//! but reaching into an earlier hop is out of scope here: it would need
+//! `RedirectHop` extended to carry headers, which is a bigger, separate
+//! change. Documented as a non-goal rather than a partial `hop:` key that
+//! could only ever address the one field `RedirectHop` already has.
 //!
 //! Every name captured this way becomes usable as `{{auth_token}}` in **every
 //! request after this one, in file order**, through the same substitution pass
@@ -61,8 +103,77 @@ use serde::{Deserialize, Serialize};
 use crate::environment::describe_environment;
 use crate::{Environment, Response};
 
+/// Where one `capture` entry reads its value from.
+///
+/// A bare string is the default and only form issue 10 (batch 1) shipped: a
+/// JSON path into the response body. The two additive forms are objects, so
+/// a bare string can never be confused with them: `header: Set-Cookie` reads
+/// a response header, and `status: true` reads the numeric status code.
+///
+/// `status: false` is rejected at parse time (a request file that says it
+/// does not want the status captured this way is not saying anything a
+/// schema should represent) rather than left to fail silently at evaluate
+/// time — the same call [`FollowRedirects`](crate::config::FollowRedirects)
+/// makes for a negative hop count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum CaptureSource {
+    /// The default, bare-string form: a JSON path into the response body.
+    JsonPath(String),
+    /// An object form: `header: <name>`. Matched case-insensitively against
+    /// [`Response::headers`](crate::Response), the way
+    /// [`assertions`](crate::assertions) matches header names.
+    Header { header: String },
+    /// An object form: `status: true`. Captures the response's numeric
+    /// status code, rendered as a string (`"404"`, not `404`).
+    Status { status: bool },
+}
+
+impl<'de> Deserialize<'de> for CaptureSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // An intermediate shape so `status: false` can be told apart from
+        // `status: true` before committing to `CaptureSource::Status`, which
+        // (deliberately) has no way to spell "false" — see the type's docs.
+        #[derive(Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum Raw {
+            JsonPath(String),
+            Header { header: String },
+            Status { status: bool },
+        }
+
+        match Raw::deserialize(deserializer)? {
+            Raw::JsonPath(path) => Ok(CaptureSource::JsonPath(path)),
+            Raw::Header { header } => Ok(CaptureSource::Header { header }),
+            Raw::Status { status: true } => Ok(CaptureSource::Status { status: true }),
+            Raw::Status { status: false } => Err(serde::de::Error::custom(
+                "`status: false` does not capture anything; use `status: true` or remove this \
+                 entry",
+            )),
+        }
+    }
+}
+
+impl CaptureSource {
+    /// The label a report shows for this entry — the path text unchanged
+    /// for the default JSON-path form (so [`CaptureResult::path`] and
+    /// everything reading it, `--json` output included, is untouched for
+    /// every file written against issue 10 batch 1), and a short description
+    /// of the source for the two new forms.
+    fn label(&self) -> String {
+        match self {
+            CaptureSource::JsonPath(path) => path.clone(),
+            CaptureSource::Header { header } => format!("header `{header}`"),
+            CaptureSource::Status { .. } => "status".to_string(),
+        }
+    }
+}
+
 /// The `capture` block of a request, exactly as it appears on disk: variable
-/// name to JSON path.
+/// name to [`CaptureSource`].
 ///
 /// A map with author-chosen keys, so unlike every *struct* in Sendra's schema
 /// there is no `deny_unknown_fields` to apply — every key here is data. The
@@ -77,7 +188,7 @@ use crate::{Environment, Response};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Captures {
-    entries: BTreeMap<String, String>,
+    entries: BTreeMap<String, CaptureSource>,
 }
 
 impl Captures {
@@ -91,8 +202,8 @@ impl Captures {
         self.entries.keys().cloned().collect()
     }
 
-    /// The name-to-path pairs, sorted by name.
-    pub fn entries(&self) -> &BTreeMap<String, String> {
+    /// The name-to-source pairs, sorted by name.
+    pub fn entries(&self) -> &BTreeMap<String, CaptureSource> {
         &self.entries
     }
 
@@ -119,16 +230,16 @@ impl Captures {
             results: self
                 .entries
                 .iter()
-                .map(|(variable, path)| {
-                    capture_one(variable, path, body.as_ref(), response, environment)
+                .map(|(variable, source)| {
+                    capture_one(variable, source, body.as_ref(), response, environment)
                 })
                 .collect(),
         }
     }
 }
 
-impl FromIterator<(String, String)> for Captures {
-    fn from_iter<T: IntoIterator<Item = (String, String)>>(iter: T) -> Self {
+impl FromIterator<(String, CaptureSource)> for Captures {
+    fn from_iter<T: IntoIterator<Item = (String, CaptureSource)>>(iter: T) -> Self {
         Self {
             entries: iter.into_iter().collect(),
         }
@@ -170,8 +281,13 @@ pub enum CaptureFailure {
     /// The path is valid and the body is JSON, and the path selected nothing.
     NoMatch,
 
-    /// The path selected more than one value, so there is no single value to
-    /// bind the name to.
+    /// The source selected more than one value, so there is no single value
+    /// to bind the name to. Raised for a JSON path matching several values,
+    /// and — the same philosophy applied to a second source — for a header
+    /// capture whose name repeats in the response (`Set-Cookie` is the
+    /// common case). See the module docs for why a capture does not resolve
+    /// a repeated header by taking the first or last value, the way an
+    /// assertion checking the same header does.
     Ambiguous {
         count: usize,
         /// The first few matches, rendered, for the message.
@@ -183,6 +299,15 @@ pub enum CaptureFailure {
     NotAScalar {
         /// `null`, `an array`, `an object`.
         kind: &'static str,
+    },
+
+    /// A `header:` capture named a header the response does not carry.
+    HeaderNotFound {
+        header: String,
+        /// The header names the response does carry, for the same reason a
+        /// missing assertion header lists them: the answer is usually a
+        /// casing or spelling difference, visible once both are on screen.
+        present: Vec<String>,
     },
 }
 
@@ -209,13 +334,22 @@ impl std::fmt::Display for CaptureFailure {
             CaptureFailure::NoMatch => f.write_str("matched nothing in the response body"),
             CaptureFailure::Ambiguous { count, sample } => write!(
                 f,
-                "matched {count} values ({}); a capture needs a path that selects exactly one",
+                "matched {count} values ({}); a capture needs a source that selects exactly one",
                 sample.join(", ")
             ),
             CaptureFailure::NotAScalar { kind } => write!(
                 f,
                 "matched {kind}, which has no text form to substitute; capture a string, \
                  number or boolean"
+            ),
+            CaptureFailure::HeaderNotFound { header, present } => write!(
+                f,
+                "no `{header}` header in the response{}",
+                if present.is_empty() {
+                    "; the response carries no headers at all".to_string()
+                } else {
+                    format!(" (the response has: {})", present.join(", "))
+                }
             ),
         }
     }
@@ -230,7 +364,10 @@ impl std::fmt::Display for CaptureFailure {
 pub struct CaptureResult {
     /// The variable name this entry defines.
     pub variable: String,
-    /// The JSON path it was read from, as written in the file.
+    /// Where it was read from: the JSON path text, unchanged, for the
+    /// default form; a short description (`` header `Set-Cookie` ``,
+    /// `status`) for the two additive ones. See
+    /// [`CaptureSource::label`](CaptureSource).
     pub path: String,
     value: Option<String>,
     failure: Option<CaptureFailure>,
@@ -341,18 +478,37 @@ impl CaptureReport {
 /// matched nothing is a fact about the two together.
 fn capture_one(
     variable: &str,
-    path: &str,
+    source: &CaptureSource,
     body: Result<&serde_json::Value, &serde_json::Error>,
     response: &Response,
     environment: &Environment,
 ) -> CaptureResult {
-    let fail = |failure| CaptureResult::fail(variable, path, failure);
+    let label = source.label();
+    let fail = |failure| CaptureResult::fail(variable, &label, failure);
 
     if environment.variables.contains_key(variable) {
         return fail(CaptureFailure::Shadowed {
             environment: environment.source.clone(),
         });
     }
+
+    match source {
+        CaptureSource::JsonPath(path) => capture_json_path(variable, path, body, response),
+        CaptureSource::Header { header } => capture_header(variable, header, response),
+        CaptureSource::Status { .. } => {
+            CaptureResult::captured(variable, &label, response.status.to_string())
+        }
+    }
+}
+
+/// The JSON-path source: unchanged from issue 10 batch 1.
+fn capture_json_path(
+    variable: &str,
+    path: &str,
+    body: Result<&serde_json::Value, &serde_json::Error>,
+    response: &Response,
+) -> CaptureResult {
+    let fail = |failure| CaptureResult::fail(variable, path, failure);
 
     // Checked here rather than when the file is loaded, even though it could
     // be, for the reason `assertions` gives: loading a request file should
@@ -396,6 +552,38 @@ fn capture_one(
                 .take(3)
                 .map(|value| serde_json::to_string(value).unwrap_or_else(|_| value.to_string()))
                 .collect(),
+        }),
+    }
+}
+
+/// The `header:` source. Names are matched case-insensitively, the way
+/// [`assertions`](crate::assertions) matches them; a name that repeats in the
+/// response is [`CaptureFailure::Ambiguous`] rather than a first-or-last
+/// pick — see the module docs.
+fn capture_header(variable: &str, header: &str, response: &Response) -> CaptureResult {
+    let label = format!("header `{header}`");
+    let fail = |failure| CaptureResult::fail(variable, &label, failure);
+
+    let matches: Vec<&str> = response
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(header))
+        .map(|(_, value)| value.as_str())
+        .collect();
+
+    match matches.as_slice() {
+        [only] => CaptureResult::captured(variable, &label, only.to_string()),
+        [] => fail(CaptureFailure::HeaderNotFound {
+            header: header.to_string(),
+            present: response
+                .headers
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect(),
+        }),
+        many => fail(CaptureFailure::Ambiguous {
+            count: many.len(),
+            sample: many.iter().take(3).map(|value| value.to_string()).collect(),
         }),
     }
 }
@@ -662,5 +850,143 @@ mod tests {
         assert!(report.is_empty());
         assert!(report.passed(), "vacuously");
         assert!(report.values().is_empty());
+    }
+
+    // --- issue 15 (batch 2): header and status capture ---------------------
+
+    #[test]
+    fn a_bare_string_still_means_a_json_path_unchanged() {
+        // The regression the whole issue turns on: `entries()` used to map
+        // straight to a path `String`; it now maps to a `CaptureSource`, and
+        // a bare-string entry must still deserialise to `JsonPath` holding
+        // that exact text, byte for byte.
+        let parsed = captures("auth_token: $.token\n");
+        assert_eq!(
+            parsed.entries()["auth_token"],
+            CaptureSource::JsonPath("$.token".to_string())
+        );
+
+        let report = report("auth_token: $.token\nuser_id: $.user.id\n");
+        assert_eq!(
+            report.values(),
+            BTreeMap::from([
+                ("auth_token".to_string(), "abc123".to_string()),
+                ("user_id".to_string(), "42".to_string()),
+            ])
+        );
+        // The label shown in a report is the path text, unchanged, for
+        // `--json` output and everything else that reads `CaptureResult::path`.
+        assert_eq!(
+            only(&captures("v: $.token\n").evaluate(&json_response(), &Environment::default()))
+                .path,
+            "$.token"
+        );
+    }
+
+    #[test]
+    fn captures_a_response_header_case_insensitively() {
+        let response = response(&[("X-Request-Id", "abc-123")], "{}");
+        let report =
+            captures("id: { header: x-request-id }\n").evaluate(&response, &Environment::default());
+        assert_eq!(only(&report).value(), Some("abc-123"));
+        assert!(report.passed());
+    }
+
+    #[test]
+    fn a_missing_header_is_a_reported_failure_naming_what_is_there() {
+        let response = response(&[("Content-Type", "application/json")], "{}");
+        let report =
+            captures("id: { header: x-request-id }\n").evaluate(&response, &Environment::default());
+        match only(&report).failure() {
+            Some(CaptureFailure::HeaderNotFound { header, present }) => {
+                assert_eq!(header, "x-request-id");
+                assert_eq!(present, &["Content-Type".to_string()]);
+            }
+            other => panic!("expected HeaderNotFound, got {other:?}"),
+        }
+        let message = only(&report).failure().unwrap().to_string();
+        assert!(message.contains("Content-Type"), "got {message}");
+    }
+
+    #[test]
+    fn a_repeated_header_is_ambiguous_rather_than_first_or_last_wins() {
+        // Same philosophy as a JSON path matching several values: a capture
+        // binds a name to one value, and picking silently between repeats
+        // would make the same file behave differently depending on header
+        // order. This deliberately differs from how `assertions` treats a
+        // repeated header (passes if any value matches) because an
+        // assertion checks a predicate and a capture commits to an identity.
+        let response = response(&[("Set-Cookie", "a=1"), ("Set-Cookie", "b=2")], "{}");
+        let report = captures("session: { header: Set-Cookie }\n")
+            .evaluate(&response, &Environment::default());
+        match only(&report).failure() {
+            Some(CaptureFailure::Ambiguous { count, sample }) => {
+                assert_eq!(*count, 2);
+                assert_eq!(sample, &["a=1".to_string(), "b=2".to_string()]);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        assert!(report.values().is_empty());
+    }
+
+    #[test]
+    fn captures_the_status_code_as_a_string() {
+        let response = response(&[], "{}");
+        let report =
+            captures("code: { status: true }\n").evaluate(&response, &Environment::default());
+        assert_eq!(only(&report).value(), Some("200"));
+        assert!(report.passed());
+    }
+
+    #[test]
+    fn status_false_is_rejected_when_the_file_is_loaded() {
+        // A structural nonsense, not a fact about any particular response —
+        // rejected at parse time, the same call `follow_redirects: -1` makes,
+        // rather than surfacing as a per-response capture failure.
+        let err = serde_yaml::from_str::<Captures>("code: { status: false }\n").unwrap_err();
+        assert!(err.to_string().contains("status: false"), "got {err}");
+    }
+
+    #[test]
+    fn an_object_capture_with_neither_header_nor_status_fails_to_parse() {
+        let err = serde_yaml::from_str::<Captures>("v: { nonsense: true }\n").unwrap_err();
+        // Not asserting exact wording (that's serde's untagged-enum message),
+        // only that the file does not load silently with an empty source.
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn header_and_status_capture_are_shadowed_the_same_as_json_path() {
+        let environment = Environment::from_yaml_str("session: from-the-file\n").unwrap();
+        let response = response(&[("Set-Cookie", "a=1")], "{}");
+        let report =
+            captures("session: { header: Set-Cookie }\n").evaluate(&response, &environment);
+        assert!(
+            matches!(
+                only(&report).failure(),
+                Some(CaptureFailure::Shadowed { .. })
+            ),
+            "got {:?}",
+            only(&report).failure()
+        );
+    }
+
+    #[test]
+    fn a_capture_block_mixing_all_three_sources_evaluates_each_independently() {
+        let response = response(&[("X-Trace-Id", "trace-1")], r#"{"token": "abc123"}"#);
+        let report = captures(
+            "auth_token: $.token\ntrace: { header: x-trace-id }\ncode: { status: true }\n",
+        )
+        .evaluate(&response, &Environment::default());
+        assert_eq!(report.len(), 3);
+        assert!(report.passed());
+        assert_eq!(
+            report.values(),
+            BTreeMap::from([
+                ("auth_token".to_string(), "abc123".to_string()),
+                ("trace".to_string(), "trace-1".to_string()),
+                ("code".to_string(), "200".to_string()),
+            ])
+        );
     }
 }

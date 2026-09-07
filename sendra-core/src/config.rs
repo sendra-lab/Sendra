@@ -896,9 +896,12 @@ mod tests {
                 .to_string(),
             ),
             capture: Some(
-                [("id".to_string(), "$.id".to_string())]
-                    .into_iter()
-                    .collect(),
+                [(
+                    "id".to_string(),
+                    crate::CaptureSource::JsonPath("$.id".to_string()),
+                )]
+                .into_iter()
+                .collect(),
             ),
         };
 
