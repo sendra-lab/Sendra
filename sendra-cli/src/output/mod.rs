@@ -5,6 +5,7 @@ mod errors;
 mod human;
 mod json;
 mod junit;
+mod provenance;
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -32,7 +33,9 @@ use self::json::{
 pub(crate) use self::errors::{
     print_environment_error, print_error, print_error_line, reject_allow_error_status,
     reject_output_status_with_dry_run, reject_output_with_json, reject_quiet_with_output,
+    reject_verbose_with_quiet,
 };
+pub(crate) use self::provenance::print_provenance;
 
 /// Which rendering a run produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

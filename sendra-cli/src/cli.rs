@@ -253,6 +253,36 @@ pub(crate) enum Command {
         /// response: the resolved request is not printed either.
         #[arg(short = 'q', long = "quiet")]
         quiet: bool,
+
+        /// Print, to stderr and before any request runs, which config and
+        /// environment files this invocation actually resolved: the project
+        /// config path (or that none was found), the global config path (or
+        /// that none was found), the environment selected by name and its
+        /// file (or that none was found), and whether `--var`/`-H`
+        /// overrides were passed.
+        ///
+        /// A fixed, specific report — not a general debug log. `--var`/`-H`
+        /// entries are named, not valued: an override often carries a token
+        /// or a password meant for a request field, and the name already
+        /// answers the question `-v` exists to answer ("did my override
+        /// apply?") without putting a secret on screen, in shell history, or
+        /// in a captured CI log. `--dry-run` already exists, and does show
+        /// values in full, for the case that needs them.
+        ///
+        /// Refused together with `-q`/`--quiet`: the two disagree about the
+        /// same stream, one asking for more narration and one for less, and
+        /// Sendra will not guess which one you meant.
+        ///
+        /// Unaffected by `--json`: the report is stderr-only regardless,
+        /// since `--json`'s stdout contract is about the result a run
+        /// produced, not about how the pipeline resolved to it.
+        ///
+        /// Works under `--dry-run` exactly as it does otherwise — both go
+        /// through the same resolution, and `-v` reports on it before
+        /// `--dry-run`'s own resolved-request output, which it leaves
+        /// unchanged.
+        #[arg(short = 'v', long = "verbose")]
+        verbose: bool,
     },
 
     /// Run every request in a YAML file, or one named request, and pass or
@@ -361,6 +391,13 @@ pub(crate) enum Command {
         /// `-o`/`--dry-run` interactions; see `run --help`.
         #[arg(short = 'q', long = "quiet")]
         quiet: bool,
+
+        /// Print, to stderr and before any request runs, which config and
+        /// environment files this invocation actually resolved. Behaves
+        /// exactly as it does on `run`, including the `-q` refusal and the
+        /// `--json` and `--var`/`-H` reasoning; see `run --help`.
+        #[arg(short = 'v', long = "verbose")]
+        verbose: bool,
     },
 
     /// Scaffold `.sendra/config.yaml` and `.sendra/environments/default.yaml`
@@ -459,6 +496,7 @@ mod tests {
                 allow_error_status,
                 output,
                 quiet,
+                verbose,
             } => {
                 assert_eq!(path, PathBuf::from("collection.yaml"));
                 assert_eq!(request, None, "no request name was passed");
@@ -472,6 +510,7 @@ mod tests {
                 assert!(!allow_error_status);
                 assert_eq!(output, None, "no -o was passed");
                 assert!(!quiet, "no -q was passed");
+                assert!(!verbose, "no -v was passed");
             }
             _ => panic!("`sendra test` should have parsed as `Command::Test`"),
         }
@@ -773,6 +812,22 @@ mod tests {
         let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--quiet"])
             .expect("`--quiet` is offered by `test`");
         assert!(matches!(cli.command, Command::Test { quiet: true, .. }));
+    }
+
+    // --- `-v`/`--verbose` ----------------------------------------------------
+
+    #[test]
+    fn verbose_defaults_to_false_and_is_offered_by_both_subcommands() {
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`-v` is optional");
+        assert!(matches!(cli.command, Command::Run { verbose: false, .. }));
+
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "-v"])
+            .expect("`-v` is offered by `run`");
+        assert!(matches!(cli.command, Command::Run { verbose: true, .. }));
+
+        let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--verbose"])
+            .expect("`--verbose` is offered by `test`");
+        assert!(matches!(cli.command, Command::Test { verbose: true, .. }));
     }
 
     // --- `--timeout` -----------------------------------------------------

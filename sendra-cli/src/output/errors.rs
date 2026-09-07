@@ -119,6 +119,33 @@ pub(crate) fn reject_output_status_with_dry_run() -> ! {
         .exit()
 }
 
+/// Refuse `-v`/`--verbose` combined with `-q`/`--quiet`, and say why.
+///
+/// The two ask for opposite things about the same stream: `-v` adds a
+/// provenance report to stderr before anything else prints, `-q` suppresses
+/// everything on stderr that is not the `→` labels' replacement for
+/// narration. Neither reading — `-v` winning and printing anyway, or `-q`
+/// winning and silently swallowing the report `-v` asked for — is a trade
+/// Sendra makes on your behalf; see [`reject_quiet_with_output`] for the
+/// same shape of conflict drawn between `-q` and `-o`.
+pub(crate) fn reject_verbose_with_quiet() -> ! {
+    use clap::CommandFactory;
+
+    Cli::command()
+        .error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "`-v`/`--verbose` does not apply together with `-q`/`--quiet`.\n\n  \
+             `-v` asks for more narration — a report of which config and \
+             environment files this run resolved, printed to stderr before \
+             anything else. `-q` asks for less: it suppresses everything on \
+             stderr that is not the pass/fail answer. The two flags disagree \
+             about the same stream, and Sendra will not guess which one you \
+             meant.\n\n  \
+             Drop one of the two.",
+        )
+        .exit()
+}
+
 /// The red `error:` line every failure starts with.
 pub(crate) fn print_error_line(message: impl std::fmt::Display) {
     let label = "error:".if_supports_color(Stream::Stderr, |t| t.red());

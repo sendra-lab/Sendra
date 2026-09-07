@@ -19,7 +19,7 @@ use crate::cli::{Cli, Command, OutputMode};
 use crate::init::init;
 use crate::output::{
     reject_allow_error_status, reject_output_status_with_dry_run, reject_output_with_json,
-    reject_quiet_with_output,
+    reject_quiet_with_output, reject_verbose_with_quiet,
 };
 use crate::run::{run, test};
 
@@ -67,7 +67,11 @@ async fn main() -> ExitCode {
             dry_run,
             output,
             quiet,
+            verbose,
         } => {
+            if verbose && quiet {
+                reject_verbose_with_quiet();
+            }
             if output.is_some() && json {
                 reject_output_with_json();
             }
@@ -88,6 +92,7 @@ async fn main() -> ExitCode {
                 dry_run,
                 output,
                 quiet,
+                verbose,
             )
             .await
             .into()
@@ -106,9 +111,13 @@ async fn main() -> ExitCode {
             allow_error_status,
             output,
             quiet,
+            verbose,
         } => {
             if allow_error_status {
                 reject_allow_error_status();
+            }
+            if verbose && quiet {
+                reject_verbose_with_quiet();
             }
             if output.is_some() && json {
                 reject_output_with_json();
@@ -126,6 +135,7 @@ async fn main() -> ExitCode {
                 junit,
                 output,
                 quiet,
+                verbose,
             )
             .await
             .into()
