@@ -16,11 +16,13 @@ use sendra_core::{
     AssertionReport, CaptureReport, Request, Response, ScriptOutcome, ScriptOutput, SendraError,
 };
 
+use crate::cli::OutputMode;
 use crate::exit::Summary;
 
 use self::human::{
-    print_assertions, print_capture, print_no_assertions, print_post_request,
-    print_resolved_request, print_response, print_status_line, print_summary,
+    print_assertions, print_body_only, print_capture, print_headers_only, print_no_assertions,
+    print_post_request, print_resolved_body, print_resolved_headers, print_resolved_request,
+    print_response, print_status_line, print_summary,
 };
 use self::json::{
     error_message, AssertionsRecord, CaptureRecord, PostRequestRecord, RequestRecord,
@@ -29,28 +31,8 @@ use self::json::{
 
 pub(crate) use self::errors::{
     print_environment_error, print_error, print_error_line, reject_allow_error_status,
+    reject_output_status_with_dry_run, reject_output_with_json,
 };
-
-/// How much of a response the human-readable output shows.
-///
-/// The two subcommands print the same *assertion* block — issue 6's format,
-/// unchanged, because a second way to render a passed check would be a second
-/// thing to learn — and differ only in how much of the response they put above
-/// it. `run` exists to show you what came back, so it shows all of it. `test`
-/// answers a yes/no question about a whole collection, and burying that answer
-/// under four JSON bodies would make the summary the hardest line to find in
-/// its own output; it prints the status line, which is one line, carries the
-/// timing, and says which response the checks below it are about.
-///
-/// This is a fact about the *human* rendering only. `--json` carries the whole
-/// response either way — see [`Format::Json`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Detail {
-    /// Status line, headers and body.
-    Full,
-    /// The status line alone.
-    StatusOnly,
-}
 
 /// Which rendering a run produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,10 +51,12 @@ pub(crate) enum Format {
     /// the honest trade for output that is parseable as a whole.
     ///
     /// Every request carries its full response — status, headers, body, elapsed
-    /// — under both subcommands, so [`Detail`] does not apply. `test` printing
-    /// less than `run` is a decision about what is *readable* on a terminal,
-    /// and a program reading the output has no such problem; a script that
-    /// wants only the status can select it.
+    /// — under both subcommands, so [`OutputMode`] does not apply, and is
+    /// refused together with `--json` — see
+    /// [`reject_output_with_json`](self::errors::reject_output_with_json).
+    /// `test` printing less than `run` is a decision about what is
+    /// *readable* on a terminal, and a program reading the output has no
+    /// such problem; a script that wants only the status can select it.
     Json,
 }
 
@@ -106,7 +90,13 @@ impl Format {
 /// runs on one thread.
 pub(crate) struct Reporter {
     format: Format,
-    detail: Detail,
+    /// How much of a response — or, under `--dry-run`, the resolved request
+    /// — the human rendering shows. `-o`/`--output`, defaulted per
+    /// subcommand by the caller when the flag was omitted. Read only under
+    /// [`Format::Human`]; [`Format::Json`] always carries the whole response,
+    /// and the two are refused together before a `Reporter` is even built —
+    /// see [`reject_output_with_json`](self::errors::reject_output_with_json).
+    output: OutputMode,
     /// Whether `capture.values` in `--json` output carries the values
     /// Sendra captured, rather than [`json::REDACTED_CAPTURE_VALUE`] in
     /// their place — `--show-captures`. Read only under [`Format::Json`];
@@ -147,10 +137,10 @@ pub(crate) struct Reporter {
 }
 
 impl Reporter {
-    pub(crate) fn new(format: Format, detail: Detail, show_captures: bool) -> Self {
+    pub(crate) fn new(format: Format, output: OutputMode, show_captures: bool) -> Self {
         Self {
             format,
-            detail,
+            output,
             show_captures,
             requests: RefCell::new(Vec::new()),
             junit_path: None,
@@ -263,9 +253,12 @@ impl Reporter {
             return;
         }
 
-        match self.detail {
-            Detail::Full => print_response(response),
-            Detail::StatusOnly => print_status_line(response),
+        match self.output {
+            OutputMode::Full => print_response(response),
+            OutputMode::Status => print_status_line(response),
+            OutputMode::Body => print_body_only(response),
+            OutputMode::Headers => print_headers_only(response),
+            OutputMode::None => {}
         }
 
         // Nothing at all when the request declared no script, so a file written
@@ -274,7 +267,7 @@ impl Reporter {
             print_post_request(script);
         }
 
-        if assertions.is_empty() && script.is_none() && self.detail == Detail::StatusOnly {
+        if assertions.is_empty() && script.is_none() && self.output == OutputMode::Status {
             // `run` says nothing here, and must keep saying nothing. Under
             // `test` the silence is the problem: the summary is about to count
             // this request as one of N "without assertions", and without a
@@ -314,6 +307,14 @@ impl Reporter {
     /// interactive inspection of what Sendra is about to send, not a log
     /// that accumulates over many runs, so the `--show-captures` redaction
     /// threat model does not apply here.
+    ///
+    /// `-o`/`--output` applies the same way it does to a real response, with
+    /// method/URL standing in for the status line: `full` (the default)
+    /// prints method/URL, headers and body; `body`/`headers` print only that
+    /// part; `none` prints nothing. `main` refuses `-o status` together with
+    /// `--dry-run` before a `Reporter` is ever built, since a dry run has no
+    /// status line — see
+    /// [`reject_output_status_with_dry_run`](self::errors::reject_output_status_with_dry_run).
     pub(crate) fn dry_run(&self, request: &Request) {
         if self.recording() {
             self.with_current(|record| {
@@ -322,7 +323,16 @@ impl Reporter {
             return;
         }
 
-        print_resolved_request(request);
+        match self.output {
+            OutputMode::Full => print_resolved_request(request),
+            OutputMode::Body => print_resolved_body(request),
+            OutputMode::Headers => print_resolved_headers(request),
+            OutputMode::None => {}
+            // Refused in `main` before a dry run ever reaches a `Reporter`.
+            OutputMode::Status => {
+                unreachable!("`-o status --dry-run` is refused in `main` before this is called")
+            }
+        }
     }
 
     /// A request never got a response: it could not be built, or it could not
@@ -462,7 +472,7 @@ mod tests {
 
     #[test]
     fn run_reports_one_object_holding_every_request() {
-        let reporter = Reporter::new(Format::Json, Detail::Full, false);
+        let reporter = Reporter::new(Format::Json, OutputMode::Full, false);
 
         reporter.request_started("Get user");
         let response = response_with("application/json", r#"{"id":1}"#);
@@ -506,7 +516,7 @@ mod tests {
 
     #[test]
     fn a_request_that_never_got_a_response_carries_the_error_instead() {
-        let reporter = Reporter::new(Format::Json, Detail::Full, false);
+        let reporter = Reporter::new(Format::Json, OutputMode::Full, false);
 
         reporter.request_started("GET https://example.com");
         reporter.request_failed(&SendraError::Io {
@@ -534,7 +544,7 @@ mod tests {
 
     #[test]
     fn a_passing_assertion_reports_a_null_failure() {
-        let reporter = Reporter::new(Format::Json, Detail::Full, false);
+        let reporter = Reporter::new(Format::Json, OutputMode::Full, false);
 
         reporter.request_started("Get user");
         let response = response_with("application/json", r#"{"id":1}"#);
@@ -560,7 +570,7 @@ mod tests {
 
     #[test]
     fn every_request_appears_in_file_order() {
-        let reporter = Reporter::new(Format::Json, Detail::Full, false);
+        let reporter = Reporter::new(Format::Json, OutputMode::Full, false);
 
         for label in ["First", "Second", "Third"] {
             reporter.request_started(label);
@@ -585,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_reports_the_same_requests_plus_the_summary() {
-        let reporter = Reporter::new(Format::Json, Detail::StatusOnly, false);
+        let reporter = Reporter::new(Format::Json, OutputMode::Status, false);
 
         reporter.request_started("Get user");
         let response = response_with("application/json", r#"{"id":1}"#);
@@ -632,7 +642,7 @@ mod tests {
         // is explicitly null rather than absent — so a consumer can read
         // `.post_request` on every request without checking whether this build
         // emits the key.
-        let reporter = Reporter::new(Format::Json, Detail::Full, false);
+        let reporter = Reporter::new(Format::Json, OutputMode::Full, false);
 
         reporter.request_started("Get user");
         reporter.responded(
@@ -649,7 +659,7 @@ mod tests {
     #[test]
     fn a_passing_script_reports_a_null_failure() {
         // Same pair, in the same spelling, as a passing assertion result.
-        let reporter = Reporter::new(Format::Json, Detail::Full, false);
+        let reporter = Reporter::new(Format::Json, OutputMode::Full, false);
 
         reporter.request_started("Create order");
         reporter.responded(
@@ -666,7 +676,7 @@ mod tests {
 
     #[test]
     fn a_failed_script_carries_the_message_it_threw() {
-        let reporter = Reporter::new(Format::Json, Detail::Full, false);
+        let reporter = Reporter::new(Format::Json, OutputMode::Full, false);
 
         reporter.request_started("Create order");
         reporter.responded(
@@ -690,7 +700,7 @@ mod tests {
 
     #[test]
     fn a_script_and_assertions_are_reported_side_by_side() {
-        let reporter = Reporter::new(Format::Json, Detail::StatusOnly, false);
+        let reporter = Reporter::new(Format::Json, OutputMode::Status, false);
 
         reporter.request_started("Create order");
         let response = response_with("application/json", r#"{"id":1}"#);
@@ -715,7 +725,7 @@ mod tests {
         // Nothing reaches this today — an empty collection is refused when the
         // file is parsed — but `jq` should get a document rather than an empty
         // file if anything ever does.
-        let reporter = Reporter::new(Format::Json, Detail::Full, false);
+        let reporter = Reporter::new(Format::Json, OutputMode::Full, false);
 
         assert_eq!(
             document(&reporter, None)["requests"],
@@ -729,7 +739,7 @@ mod tests {
         // The two formats are one decision, made once: a human run keeps no
         // records, so there is no second code path that could disagree with
         // what was printed.
-        let reporter = Reporter::new(Format::Human, Detail::Full, false);
+        let reporter = Reporter::new(Format::Human, OutputMode::Full, false);
 
         reporter.request_started("Get user");
         reporter.responded(
@@ -752,7 +762,7 @@ mod tests {
         let path = dir.path().join("report.xml");
 
         let reporter =
-            Reporter::new(Format::Human, Detail::StatusOnly, false).with_junit(path.clone());
+            Reporter::new(Format::Human, OutputMode::Status, false).with_junit(path.clone());
         reporter.request_started("Get user");
         reporter.responded(
             &response_with("text/plain", "ok"),
@@ -781,7 +791,7 @@ mod tests {
         let path = dir.path().join("report.xml");
 
         let reporter =
-            Reporter::new(Format::Json, Detail::StatusOnly, false).with_junit(path.clone());
+            Reporter::new(Format::Json, OutputMode::Status, false).with_junit(path.clone());
         reporter.request_started("Get user");
         let response = response_with("application/json", r#"{"id":1}"#);
         let assertions =
@@ -811,7 +821,7 @@ mod tests {
 
     #[test]
     fn a_reporter_with_no_junit_path_writes_nothing() {
-        let reporter = Reporter::new(Format::Human, Detail::StatusOnly, false);
+        let reporter = Reporter::new(Format::Human, OutputMode::Status, false);
         reporter.request_started("Get user");
         reporter.responded(
             &response_with("text/plain", "ok"),
@@ -850,7 +860,7 @@ mod tests {
     fn a_request_that_declared_no_capture_block_reports_null() {
         // The same distinction `post_request` draws: null is "nothing was
         // declared", which is not the same as a block that captured nothing.
-        let reporter = Reporter::new(Format::Json, Detail::Full, false);
+        let reporter = Reporter::new(Format::Json, OutputMode::Full, false);
         reporter.request_started("Get user");
         reporter.responded(
             &response_with("application/json", "{}"),
@@ -869,7 +879,7 @@ mod tests {
         // names are the real names a consumer chains off of
         // (`.capture.values.auth_token`), but the values behind them are
         // redacted, not the auth token and user id the response carried.
-        let reporter = Reporter::new(Format::Json, Detail::Full, false);
+        let reporter = Reporter::new(Format::Json, OutputMode::Full, false);
         let body = r#"{"token":"abc123","user":{"id":42}}"#;
         let capture = capture_report(
             "method: POST\nurl: https://example.com\ncapture:\n  auth_token: $.token\n  user_id: $.user.id\n",
@@ -898,7 +908,7 @@ mod tests {
         // `--show-captures` — `false` was the shape every test above this one
         // exercised before this issue; this is the flag that gets the
         // pre-existing behaviour back.
-        let reporter = Reporter::new(Format::Json, Detail::Full, true);
+        let reporter = Reporter::new(Format::Json, OutputMode::Full, true);
         let body = r#"{"token":"abc123","user":{"id":42}}"#;
         let capture = capture_report(
             "method: POST\nurl: https://example.com\ncapture:\n  auth_token: $.token\n  user_id: $.user.id\n",
@@ -924,7 +934,7 @@ mod tests {
         let body = r#"{"token":"abc123"}"#;
 
         for show_captures in [false, true] {
-            let reporter = Reporter::new(Format::Json, Detail::Full, show_captures);
+            let reporter = Reporter::new(Format::Json, OutputMode::Full, show_captures);
             let capture = capture_report(
                 "method: POST\nurl: https://example.com\ncapture:\n  auth_token: $.token\n  user_id: $.user.id\n",
                 body,

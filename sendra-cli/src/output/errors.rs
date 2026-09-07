@@ -46,6 +46,53 @@ pub(crate) fn reject_allow_error_status() -> ! {
         .exit()
 }
 
+/// Refuse `-o`/`--output` combined with `--json`, and say why.
+///
+/// `--json` already carries the whole response — status, headers and body —
+/// regardless of what a human-mode filter would have shown, so `-o` would be
+/// a no-op under it. Sendra does not have silently-ignored inputs; see
+/// [`reject_allow_error_status`] for the same reasoning applied to a
+/// different flag.
+pub(crate) fn reject_output_with_json() -> ! {
+    use clap::CommandFactory;
+
+    Cli::command()
+        .error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "`-o`/`--output` does not apply together with `--json`.\n\n  \
+             `--json` already writes the whole response — status, headers \
+             and body — regardless of what `-o` would have filtered, so the \
+             two flags would conflict rather than compose: `-o` would either \
+             have to silently do nothing under `--json`, or silently change \
+             what `--json` documents, and neither is a trade Sendra makes on \
+             your behalf.\n\n  \
+             Drop `--json` to use `-o`, or drop `-o` and read the field you \
+             want out of the `--json` document instead (`jq .requests[0].response.body`, say).",
+        )
+        .exit()
+}
+
+/// Refuse `sendra run --dry-run -o status`, and say why.
+///
+/// A dry run never sends the request, so there is no status line for
+/// `-o status` to select — every other mode (`full`, `body`, `headers`,
+/// `none`) has a sensible reading against the resolved request `--dry-run`
+/// prints, but `status` has nothing to point at.
+pub(crate) fn reject_output_status_with_dry_run() -> ! {
+    use clap::CommandFactory;
+
+    Cli::command()
+        .error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "`-o status` does not apply together with `--dry-run`.\n\n  \
+             A dry run never sends the request, so there is no status line \
+             for `-o status` to show — only the resolved request itself. \
+             Use `-o full` (the default), `-o body`, `-o headers` or \
+             `-o none` instead.",
+        )
+        .exit()
+}
+
 /// The red `error:` line every failure starts with.
 pub(crate) fn print_error_line(message: impl std::fmt::Display) {
     let label = "error:".if_supports_color(Stream::Stderr, |t| t.red());

@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Parse one `-H`/`--header` value: `Name: value`.
 ///
@@ -40,6 +40,31 @@ fn parse_var_override(raw: &str) -> Result<(String, String), String> {
         return Err(format!("variable name is empty in `{raw}`"));
     }
     Ok((name.to_string(), value.to_string()))
+}
+
+/// How much of the response — or, under `--dry-run`, the resolved request —
+/// the human-readable output shows: `-o`/`--output`.
+///
+/// `run` defaults to `Full` and `test` defaults to `Status` when the flag is
+/// omitted, preserving each subcommand's output exactly as it was before this
+/// flag existed. This is a fact about the *human* rendering only: `--json`
+/// already carries the whole response regardless of what this would filter,
+/// which is why the two are refused together rather than one silently
+/// overriding the other — see `reject_output_with_json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum OutputMode {
+    /// Status line, headers and body.
+    Full,
+    /// The status line alone.
+    Status,
+    /// The body alone — no status line, no headers. For piping into another
+    /// tool: `sendra run x.yaml -o body | jq .`.
+    Body,
+    /// The headers alone — no status line, no body.
+    Headers,
+    /// Nothing: suppress the response (or resolved-request) rendering
+    /// entirely, for when only the assertions/summary below it matter.
+    None,
 }
 
 #[derive(Parser)]
@@ -183,6 +208,27 @@ pub(crate) enum Command {
         /// every selected request is resolved and printed in turn.
         #[arg(long)]
         dry_run: bool,
+
+        /// How much of the response the human-readable output shows: `full`
+        /// (the default), `status`, `body`, `headers` or `none`.
+        ///
+        /// Omit it and `run` prints exactly what it always has — status
+        /// line, headers and body. `-o body` is for piping a response into
+        /// another tool without `--json`'s structure around it:
+        /// `sendra run x.yaml -o body | jq .`. The assertions/capture/summary
+        /// output below the response is unaffected either way.
+        ///
+        /// Refused together with `--json`, which already carries the whole
+        /// response regardless of what this would filter — a flag that
+        /// looked like it worked but silently did nothing would be worse
+        /// than an error.
+        ///
+        /// Under `--dry-run`, applies the same way to the printed resolved
+        /// request instead: `full` is method/URL, headers and body (today's
+        /// `--dry-run` output), `body`/`headers`/`none` show only that part,
+        /// and `status` is refused — a dry run never has a status line.
+        #[arg(short = 'o', long = "output", value_enum, value_name = "MODE")]
+        output: Option<OutputMode>,
     },
 
     /// Run every request in a YAML file, or one named request, and pass or
@@ -277,6 +323,13 @@ pub(crate) enum Command {
         /// explanation. Hidden from `--help`, rejected in `main`.
         #[arg(long, hide = true)]
         allow_error_status: bool,
+
+        /// How much of the response the human-readable output shows: `full`,
+        /// `status` (the default), `body`, `headers` or `none`. Behaves
+        /// exactly as it does on `run` — see `run --help` for the full
+        /// reasoning, including the `--json` refusal.
+        #[arg(short = 'o', long = "output", value_enum, value_name = "MODE")]
+        output: Option<OutputMode>,
     },
 
     /// Scaffold `.sendra/config.yaml` and `.sendra/environments/default.yaml`
@@ -373,6 +426,7 @@ mod tests {
                 show_captures,
                 junit,
                 allow_error_status,
+                output,
             } => {
                 assert_eq!(path, PathBuf::from("collection.yaml"));
                 assert_eq!(request, None, "no request name was passed");
@@ -384,6 +438,7 @@ mod tests {
                 assert!(!show_captures, "captures are redacted by default");
                 assert_eq!(junit, None, "no --junit was passed");
                 assert!(!allow_error_status);
+                assert_eq!(output, None, "no -o was passed");
             }
             _ => panic!("`sendra test` should have parsed as `Command::Test`"),
         }
@@ -616,6 +671,59 @@ mod tests {
         // advertised and then had to explain away.
         let err = expect_cli_error(&["sendra", "test", "req.yaml", "--dry-run"]);
         assert_eq!(err.exit_code(), 2);
+    }
+
+    // --- `-o`/`--output` ---------------------------------------------------
+
+    #[test]
+    fn output_defaults_to_none_and_is_offered_by_both_subcommands() {
+        let cli =
+            Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`-o` is optional on `run`");
+        assert!(matches!(cli.command, Command::Run { output: None, .. }));
+
+        let cli = Cli::try_parse_from(["sendra", "test", "req.yaml"])
+            .expect("`-o` is optional on `test`");
+        assert!(matches!(cli.command, Command::Test { output: None, .. }));
+
+        for (flag, mode) in [
+            ("-o", OutputMode::Full),
+            ("--output", OutputMode::Status),
+            ("-o", OutputMode::Body),
+            ("-o", OutputMode::Headers),
+            ("-o", OutputMode::None),
+        ] {
+            let value = match mode {
+                OutputMode::Full => "full",
+                OutputMode::Status => "status",
+                OutputMode::Body => "body",
+                OutputMode::Headers => "headers",
+                OutputMode::None => "none",
+            };
+
+            let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", flag, value])
+                .unwrap_or_else(|err| panic!("`{flag} {value}` should parse on `run`: {err}"));
+            assert!(matches!(
+                cli.command,
+                Command::Run { output: Some(got), .. } if got == mode
+            ));
+
+            let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", flag, value])
+                .unwrap_or_else(|err| panic!("`{flag} {value}` should parse on `test`: {err}"));
+            assert!(matches!(
+                cli.command,
+                Command::Test { output: Some(got), .. } if got == mode
+            ));
+        }
+    }
+
+    #[test]
+    fn an_invalid_output_mode_is_a_clear_cli_error() {
+        let err = expect_cli_error(&["sendra", "run", "req.yaml", "-o", "bogus"]);
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains("bogus"),
+            "clap should name the bad value: {err}"
+        );
     }
 
     // --- `--timeout` -----------------------------------------------------

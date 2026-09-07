@@ -15,9 +15,11 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, OutputMode};
 use crate::init::init;
-use crate::output::reject_allow_error_status;
+use crate::output::{
+    reject_allow_error_status, reject_output_status_with_dry_run, reject_output_with_json,
+};
 use crate::run::{run, test};
 
 // Current-thread runtime: a collection is sent sequentially, in file order, so
@@ -40,20 +42,30 @@ async fn main() -> ExitCode {
             json,
             show_captures,
             dry_run,
-        } => run(
-            &path,
-            request.as_deref(),
-            env.as_deref(),
-            &header,
-            &var,
-            timeout,
-            allow_error_status,
-            json,
-            show_captures,
-            dry_run,
-        )
-        .await
-        .into(),
+            output,
+        } => {
+            if output.is_some() && json {
+                reject_output_with_json();
+            }
+            if dry_run && output == Some(OutputMode::Status) {
+                reject_output_status_with_dry_run();
+            }
+            run(
+                &path,
+                request.as_deref(),
+                env.as_deref(),
+                &header,
+                &var,
+                timeout,
+                allow_error_status,
+                json,
+                show_captures,
+                dry_run,
+                output,
+            )
+            .await
+            .into()
+        }
 
         Command::Test {
             path,
@@ -66,9 +78,13 @@ async fn main() -> ExitCode {
             show_captures,
             junit,
             allow_error_status,
+            output,
         } => {
             if allow_error_status {
                 reject_allow_error_status();
+            }
+            if output.is_some() && json {
+                reject_output_with_json();
             }
             test(
                 &path,
@@ -80,6 +96,7 @@ async fn main() -> ExitCode {
                 json,
                 show_captures,
                 junit,
+                output,
             )
             .await
             .into()

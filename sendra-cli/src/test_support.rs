@@ -5,8 +5,9 @@ use sendra_core::{
     AssertionReport, CaptureReport, Config, Document, HttpClient, Response, ScriptOutcome,
 };
 
+use crate::cli::OutputMode;
 use crate::exit::Outcome;
-use crate::output::{Detail, Format, Reporter};
+use crate::output::{Format, Reporter};
 
 /// A response to hand [`exit_for_response`]. Built by hand: none of these
 /// tests need a socket, and the field values other than `status` never
@@ -124,7 +125,18 @@ pub(crate) fn all_passed_with_script(status: u16) -> Outcome {
 /// that is about `--json` builds its own [`Reporter`] and reads the document
 /// back — see `output`'s tests.
 pub(crate) fn reporter() -> Reporter {
-    Reporter::new(Format::Human, Detail::StatusOnly, false)
+    Reporter::new(Format::Human, OutputMode::Status, false)
+}
+
+/// A reporter for tests that call [`Reporter::dry_run`] directly.
+///
+/// `OutputMode::Status` — [`reporter`]'s default — has nothing to show a dry
+/// run, since a dry run never has a status line; `main` refuses that
+/// combination before it ever reaches a `Reporter`. These tests are about the
+/// sending loop, not about `-o`, so they get the mode `--dry-run` actually
+/// defaults to instead.
+pub(crate) fn dry_run_reporter() -> Reporter {
+    Reporter::new(Format::Human, OutputMode::Full, false)
 }
 
 /// The client `send` needs in its signature, for the tests that never reach the
