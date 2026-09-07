@@ -13,18 +13,18 @@ use std::time::Instant;
 
 use owo_colors::{OwoColorize, Stream};
 use sendra_core::{
-    AssertionReport, CaptureReport, Response, ScriptOutcome, ScriptOutput, SendraError,
+    AssertionReport, CaptureReport, Request, Response, ScriptOutcome, ScriptOutput, SendraError,
 };
 
 use crate::exit::Summary;
 
 use self::human::{
-    print_assertions, print_capture, print_no_assertions, print_post_request, print_response,
-    print_status_line, print_summary,
+    print_assertions, print_capture, print_no_assertions, print_post_request,
+    print_resolved_request, print_response, print_status_line, print_summary,
 };
 use self::json::{
     error_message, AssertionsRecord, CaptureRecord, PostRequestRecord, RequestRecord,
-    ResponseRecord, RunDocument, SummaryRecord,
+    ResolvedRequestRecord, ResponseRecord, RunDocument, SummaryRecord,
 };
 
 pub(crate) use self::errors::{
@@ -297,6 +297,32 @@ impl Reporter {
         // about the requests still to come. Nothing at all when the request
         // declared no `capture` block.
         print_capture(capture);
+    }
+
+    /// A request resolved fully under `--dry-run` and was never sent.
+    ///
+    /// Parallel to [`responded`](Self::responded): announced the same way, by
+    /// [`request_started`](Self::request_started), and reported here once
+    /// resolution — substitution, config, `-H`, `pre_request` — has finished
+    /// with nothing left to do but the network call `--dry-run` skips. There
+    /// is no response, so nothing downstream of the wire (`post_request`,
+    /// assertions, capture) has anything to report; `run.rs::prepare_request`
+    /// is what stops exactly there.
+    ///
+    /// Headers and the body are shown in full, secrets included — see the
+    /// reasoning on `--dry-run` in `cli.rs`: this is a deliberate, single,
+    /// interactive inspection of what Sendra is about to send, not a log
+    /// that accumulates over many runs, so the `--show-captures` redaction
+    /// threat model does not apply here.
+    pub(crate) fn dry_run(&self, request: &Request) {
+        if self.recording() {
+            self.with_current(|record| {
+                record.resolved = Some(ResolvedRequestRecord::from(request));
+            });
+            return;
+        }
+
+        print_resolved_request(request);
     }
 
     /// A request never got a response: it could not be built, or it could not

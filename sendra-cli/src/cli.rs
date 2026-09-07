@@ -159,6 +159,30 @@ pub(crate) enum Command {
         /// from them. Meaningless without `--json`; accepted either way.
         #[arg(long)]
         show_captures: bool,
+
+        /// Resolve the request fully and print what would be sent, without
+        /// sending it.
+        ///
+        /// Runs every resolution step exactly as an ordinary `run` does —
+        /// environment substitution, config header merging, query/body/auth
+        /// resolution, `pre_request` — and stops immediately before the
+        /// network call. Prints the method, the final URL with `query`
+        /// merged in, every header (config-injected and auth-resolved ones,
+        /// after `pre_request` has run), and the final body: exactly what
+        /// would go on the wire. `post_request` never runs — there is no
+        /// response for it to see.
+        ///
+        /// Headers and bodies are shown in full, secrets included: this is a
+        /// deliberate, single, interactive inspection of what Sendra is
+        /// about to do, not a log that accumulates over many CI runs, so the
+        /// redaction `--show-captures` guards against does not apply here.
+        ///
+        /// A resolution failure — a missing `{{variable}}`, a script that
+        /// throws — is reported exactly as it would be without the flag,
+        /// since no network call ever happens either way. For a collection,
+        /// every selected request is resolved and printed in turn.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Run every request in a YAML file, or one named request, and pass or
@@ -572,6 +596,26 @@ mod tests {
 
         let err = expect_cli_error(&["sendra", "run", "req.yaml", "--var", "=novalue"]);
         assert!(err.to_string().contains("variable name is empty"));
+    }
+
+    // --- `--dry-run` -----------------------------------------------------
+
+    #[test]
+    fn dry_run_defaults_to_false_and_is_offered_only_by_run() {
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`run` takes a path");
+        assert!(matches!(cli.command, Command::Run { dry_run: false, .. }));
+
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--dry-run"])
+            .expect("`--dry-run` is offered by `run`");
+        assert!(matches!(cli.command, Command::Run { dry_run: true, .. }));
+
+        // `test` never offers it: a "dry test" has no response to check
+        // expectations against, so the flag is `run`-only. Clap's ordinary
+        // unknown-argument error is enough of an explanation here — unlike
+        // `--allow-error-status` on `test`, this was never a flag `test`
+        // advertised and then had to explain away.
+        let err = expect_cli_error(&["sendra", "test", "req.yaml", "--dry-run"]);
+        assert_eq!(err.exit_code(), 2);
     }
 
     // --- `--timeout` -----------------------------------------------------

@@ -10,7 +10,7 @@
 //! pairs. Nothing in core needed changing to add this.
 
 use sendra_core::{
-    AssertionKind, AssertionReport, CaptureReport, Response, ScriptOutcome, SendraError,
+    AssertionKind, AssertionReport, CaptureReport, Request, Response, ScriptOutcome, SendraError,
 };
 use serde::Serialize;
 
@@ -78,6 +78,13 @@ pub(super) struct RequestRecord {
     pub(super) post_request: Option<PostRequestRecord>,
     pub(super) assertions: AssertionsRecord,
     pub(super) capture: Option<CaptureRecord>,
+    /// The fully-resolved request `--dry-run` produced instead of a
+    /// response — null on every ordinary run, since nothing but `--dry-run`
+    /// ever calls [`Reporter::dry_run`](super::Reporter::dry_run). Present
+    /// unconditionally, the same way `response` and `error` are always both
+    /// keys, so a consumer can read `.resolved` on every request without
+    /// knowing whether this run used the flag.
+    pub(super) resolved: Option<ResolvedRequestRecord>,
 }
 
 impl RequestRecord {
@@ -89,6 +96,43 @@ impl RequestRecord {
             post_request: None,
             assertions: AssertionsRecord::default(),
             capture: None,
+            resolved: None,
+        }
+    }
+}
+
+/// The request `--dry-run` resolved, in the same shape `--dry-run --json`
+/// promises: method, the final URL with `query` already merged in, every
+/// header in wire order, and the final body — exactly what
+/// [`print_resolved_request`](super::human::print_resolved_request) shows on
+/// a terminal, structured for a program instead of laid out for a screen.
+///
+/// Unredacted, like the human rendering: see the reasoning on
+/// [`Reporter::dry_run`](super::Reporter::dry_run).
+#[derive(Debug, Serialize)]
+pub(super) struct ResolvedRequestRecord {
+    method: String,
+    url: String,
+    headers: Vec<HeaderRecord>,
+    /// `null` for a request with no body, not an empty string — the same
+    /// distinction `Request::body` itself draws.
+    body: Option<String>,
+}
+
+impl From<&Request> for ResolvedRequestRecord {
+    fn from(request: &Request) -> Self {
+        Self {
+            method: request.method.to_string(),
+            url: request.url.clone(),
+            headers: request
+                .headers
+                .iter()
+                .map(|(name, value)| HeaderRecord {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            body: request.body.clone(),
         }
     }
 }

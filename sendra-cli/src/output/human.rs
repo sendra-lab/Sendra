@@ -5,9 +5,53 @@
 use std::borrow::Cow;
 
 use owo_colors::{OwoColorize, Stream};
-use sendra_core::{AssertionReport, CaptureReport, RedirectHop, Response, ScriptOutcome};
+use sendra_core::{AssertionReport, CaptureReport, RedirectHop, Request, Response, ScriptOutcome};
 
 use crate::exit::Summary;
+
+/// Print a request `--dry-run` resolved, laid out like the real HTTP request
+/// it would have become:
+///
+/// ```text
+/// GET https://api.example.com/search?q=coffee
+/// Authorization: Bearer abc123
+/// Content-Type: application/json
+///
+/// {"filter":"active"}
+/// ```
+///
+/// Method and URL on one line — the URL already carries `query` merged in, by
+/// the time this is called — then every header in the order the request
+/// carries them (config-injected and auth-resolved ones, after `pre_request`
+/// has run), then a blank line and the body if there is one. This is the
+/// whole value of `--dry-run`: it has to read as a real, sendable request, not
+/// as a report about one.
+///
+/// Headers and the body are shown in full, unredacted — see the reasoning on
+/// [`Reporter::dry_run`](super::Reporter::dry_run).
+pub(super) fn print_resolved_request(request: &Request) {
+    println!(
+        "{} {}",
+        request
+            .method
+            .to_string()
+            .if_supports_color(Stream::Stdout, |t| t.bold()),
+        request.url
+    );
+
+    for (name, value) in &request.headers {
+        println!(
+            "{}: {}",
+            name.if_supports_color(Stream::Stdout, |t| t.cyan()),
+            value
+        );
+    }
+
+    if let Some(body) = request.body.as_deref().filter(|body| !body.is_empty()) {
+        println!();
+        println!("{body}");
+    }
+}
 
 /// Print the redirect chain that led to a response, one line per hop:
 ///

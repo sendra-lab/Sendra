@@ -212,6 +212,17 @@ pub(crate) enum Outcome {
         /// two verdicts read it without either knowing about the other.
         capture: CaptureReport,
     },
+
+    /// `--dry-run`: the request resolved fully — substitution, config,
+    /// `-H`, `pre_request` — but was never sent. `run`-only; `test` never
+    /// produces this variant, so [`Summary::of`] never has to classify it.
+    ///
+    /// Counts as success for `run`'s exit code: there is no status to be
+    /// bad and no response for a check to fail, so reaching this variant at
+    /// all means resolution already succeeded. A resolution failure along
+    /// the way is [`Outcome::NoResponse`] instead, exactly as it is without
+    /// the flag.
+    DryRun,
 }
 
 /// `run`'s verdict on one outcome. Assertions are carried through and ignored;
@@ -231,6 +242,7 @@ fn exit_for_outcome(outcome: &Outcome, allow_error_status: bool) -> Exit {
             capture,
             allow_error_status,
         ),
+        Outcome::DryRun => Exit::Ok,
     }
 }
 
