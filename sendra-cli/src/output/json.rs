@@ -306,8 +306,10 @@ impl From<&AssertionReport> for AssertionsRecord {
 /// however it is consumed.
 #[derive(Debug, Serialize)]
 struct AssertionRecord {
-    /// Which kind of check this was: `status`, `header`, `body_contains` or
-    /// `json_path`.
+    /// Which kind of check this was: `status`, `status_in`, `header`,
+    /// `body_contains`, `body_matches`, `elapsed_ms_under` or `json_path`. A
+    /// negated (`not:`) assertion reports the same kind as its unnegated
+    /// form — see [`AssertionKind`].
     kind: &'static str,
     expectation: String,
     passed: bool,
@@ -323,8 +325,11 @@ struct AssertionRecord {
 fn kind_name(kind: AssertionKind) -> &'static str {
     match kind {
         AssertionKind::Status => "status",
+        AssertionKind::StatusIn => "status_in",
         AssertionKind::Header => "header",
         AssertionKind::BodyContains => "body_contains",
+        AssertionKind::BodyMatches => "body_matches",
+        AssertionKind::ElapsedMsUnder => "elapsed_ms_under",
         AssertionKind::JsonPath => "json_path",
     }
 }

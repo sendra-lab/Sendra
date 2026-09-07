@@ -14,6 +14,10 @@ dirs = "6"
 tempfile = "3"
 serde_yaml = "0.9"
 jsonpath-rust = "1"
+# `assertions.body_matches`. Already pulled in transitively by jsonpath-rust,
+# so this adds no new dependency to the tree — see the note on
+# `assertions::Assertions::body_matches`.
+regex = "1"
 serde_urlencoded = "0.7"
 reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",

@@ -1284,6 +1284,7 @@ dependencies = [
  "dirs",
  "flate2",
  "jsonpath-rust",
+ "regex",
  "reqwest",
  "rhai",
  "serde",
