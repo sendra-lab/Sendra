@@ -36,9 +36,8 @@ const CONFIG_TEMPLATE: &str = "\
 # Sendra project configuration.
 #
 # Every field is optional; a project config overrides a global one key by
-# key, not file by file. See the README's \"Precedence, start to finish\"
-# section for where this sits among CLI overrides, the request file, and an
-# active environment.
+# key, not file by file. See the docs for where this sits among CLI
+# overrides, the request file, and an active environment.
 
 # Headers merged into every request. A header the request itself sets wins.
 # headers:

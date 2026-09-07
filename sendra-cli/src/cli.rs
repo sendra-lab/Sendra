@@ -231,8 +231,10 @@ pub(crate) enum Command {
     /// Both files are written with every known field present but commented
     /// out, showing the shape a config and an environment file can take
     /// without imposing any values of its own. Refuses, without writing
-    /// anything, if `.sendra/` already exists — see `sendra init --help` in
-    /// the README for the reasoning.
+    /// anything, if `.sendra/` already exists, rather than filling in
+    /// whichever of the two files is missing.
+    // TODO: point at the docs site here once it exists, instead of leaving
+    // the reasoning implicit.
     Init,
 }
 
