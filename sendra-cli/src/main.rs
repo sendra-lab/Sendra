@@ -39,6 +39,7 @@ async fn main() -> ExitCode {
             allow_error_status,
             json,
             show_captures,
+            dry_run,
         } => run(
             &path,
             request.as_deref(),
@@ -49,6 +50,7 @@ async fn main() -> ExitCode {
             allow_error_status,
             json,
             show_captures,
+            dry_run,
         )
         .await
         .into(),

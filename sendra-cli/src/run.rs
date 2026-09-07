@@ -190,6 +190,15 @@ fn prepare(
 /// highest-precedence layer, applied last, over everything below it. See the
 /// module doc comment for the full chain and [`prepare`]/[`send`] for where
 /// each one is actually applied.
+///
+/// `dry_run` is `--dry-run`: every resolution step still runs — substitution
+/// in [`run_requests`], then config/`-H`/`pre_request` in
+/// [`prepare_request`] — and the pipeline stops there instead of calling
+/// [`send`]. `run`-only; see the module doc comment on why `test` does not
+/// offer it. It changes nothing about *which* requests are selected or how
+/// they are resolved, only whether the last step — the actual network call —
+/// happens, which is why it is threaded through as one more argument to the
+/// same loop rather than a separate code path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     path: &Path,
@@ -201,6 +210,7 @@ pub(crate) async fn run(
     allow_error_status: bool,
     json: bool,
     show_captures: bool,
+    dry_run: bool,
 ) -> Exit {
     let Prepared {
         config,
@@ -234,7 +244,11 @@ pub(crate) async fn run(
         &environment,
         reporter,
         |request, environment| async move {
-            send(&request, client, config, &environment, headers, reporter).await
+            if dry_run {
+                dry_run_one(&request, config, headers, reporter)
+            } else {
+                send(&request, client, config, &environment, headers, reporter).await
+            }
         },
     )
     .await;
@@ -568,6 +582,112 @@ where
     outcomes
 }
 
+/// Everything done to a request before it is ready for the wire: compile both
+/// scripts, apply the config, apply `-H`/`--header` overrides, run
+/// `pre_request`. Shared by [`send`] and [`dry_run_one`], which is exactly
+/// this and nothing else — `--dry-run` stops precisely where this function
+/// already stops, one step before [`sendra_core::send_prepared`].
+///
+/// The request arrives already substituted, with `query`/`body`/`auth`
+/// already resolved — that happened earlier, in [`run_requests`].
+///
+/// # The order, and why it is fixed
+///
+/// 1. **Compile both scripts.** Before anything else, and before the wire: a
+///    `post_request` script that does not parse stops the `POST` that would
+///    have created an order, rather than being discovered after it. A compile
+///    failure is `None` — nothing was sent, so it is the same category as a
+///    missing variable.
+/// 2. **Apply the config.** Done here rather than inside `sendra_core::send`,
+///    which is what step 3 requires: a `pre_request` script that *removes* a
+///    config-injected header only works if nothing re-merges the config after
+///    it. That is what [`sendra_core::send_prepared`] is for.
+/// 3. **Apply `-H`/`--header` overrides.** Right after the config, and for the
+///    same structural reason: this is the layer nothing above it should be
+///    able to re-add over. By this point the request already carries its own
+///    `headers:`, whatever config added, and the `Authorization` header a
+///    resolved `auth:` produced — so applying `-H` here, replacing any header
+///    of the same name (case-insensitively) rather than adding to it, is what
+///    makes it the highest-precedence layer the module doc comment promises.
+///    A `pre_request` script still runs after this and can still change or
+///    remove what `-H` set, the same way it can a config header — `-H` is not
+///    given special protection from a script the request file itself wrote.
+/// 4. **Run `pre_request`**, the last thing to touch the request. A script that
+///    throws, or that leaves the request in a state that cannot be sent, is
+///    again `None`: there is no response and never will be.
+///
+/// Returns the compiled [`Scripts`] alongside the request because [`send`]
+/// still needs `post_request` out of them; [`dry_run_one`] just drops that
+/// half — a `post_request` script has no response to run against, so it never
+/// runs under `--dry-run`, and that is true simply because nothing after this
+/// function ever calls it, not because of anything special-cased here.
+fn prepare_request(
+    request: &Request,
+    config: &Config,
+    header_overrides: &[(String, String)],
+    reporter: &Reporter,
+) -> Option<(Request, Scripts)> {
+    // Nothing goes over the wire until both scripts are known to parse.
+    let scripts = match Scripts::compile(request) {
+        Ok(scripts) => scripts,
+        Err(err) => {
+            reporter.request_failed(&err);
+            return None;
+        }
+    };
+
+    // Config, then `-H`, then the script — see the numbered list above for
+    // why each is here and not inside `sendra_core::send`.
+    let configured = config.apply(request);
+    let configured = apply_header_overrides(configured, header_overrides);
+    let prepared = match scripts.pre_request() {
+        Some(script) => {
+            let (result, output) = run_pre_request(script, &configured);
+
+            // Printed before the verdict is acted on, and whether or not the
+            // script succeeded: a script that printed and then threw usually
+            // printed the reason.
+            reporter.script_output(&output);
+
+            match result {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    reporter.request_failed(&err);
+                    return None;
+                }
+            }
+        }
+        None => configured,
+    };
+
+    Some((prepared, scripts))
+}
+
+/// Resolve one request through every step short of the network call, and
+/// report the result instead of sending it — `--dry-run`'s whole
+/// contribution to the pipeline.
+///
+/// Everything before this is unchanged: substitution and `query`/`body`/`auth`
+/// resolution already happened in [`run_requests`], and [`prepare_request`]
+/// runs the config, `-H` and `pre_request` exactly as [`send`] does. A
+/// resolution failure at any of those steps is reported the same way it would
+/// be without the flag, via [`Outcome::NoResponse`] — `--dry-run` changes
+/// nothing about what counts as a failure, only what happens after success.
+fn dry_run_one(
+    request: &Request,
+    config: &Config,
+    header_overrides: &[(String, String)],
+    reporter: &Reporter,
+) -> Outcome {
+    match prepare_request(request, config, header_overrides, reporter) {
+        Some((prepared, _scripts)) => {
+            reporter.dry_run(&prepared);
+            Outcome::DryRun
+        }
+        None => Outcome::NoResponse,
+    }
+}
+
 /// Send one request, print whatever came back, and report what happened.
 ///
 /// A failure is printed and returned rather than propagated: in a collection
@@ -577,34 +697,12 @@ where
 /// The request arrives already substituted, and the `→` label has already been
 /// printed by [`run_requests`].
 ///
-/// # The whole pipeline for one request, in order
+/// # The pipeline for one request, in order
 ///
-/// Substitution has happened; the rest is here, and the order is fixed because
-/// it decides what an existing file means:
+/// Everything up to and including `pre_request` is [`prepare_request`], shared
+/// with `--dry-run`'s [`dry_run_one`]. What is left here is the half that only
+/// runs once something is actually going over the wire:
 ///
-/// 1. **Compile both scripts.** Before anything else, and before the wire: a
-///    `post_request` script that does not parse stops the `POST` that would
-///    have created an order, rather than being discovered after it. A compile
-///    failure is [`Outcome::NoResponse`] — nothing was sent, so it is the same
-///    category as a missing variable.
-/// 2. **Apply the config.** Done here rather than inside `sendra_core::send`,
-///    which is what step 3 requires: a `pre_request` script that *removes* a
-///    config-injected header only works if nothing re-merges the config after
-///    it. That is what [`sendra_core::send_prepared`] is for.
-/// 3. **Apply `-H`/`--header` overrides.** Right after the config, and for the
-///    same structural reason: this is the layer nothing above it should be
-///    able to re-add over. By this point the request already carries its own
-///    `headers:`, whatever config added, and the `Authorization` header a
-///    resolved `auth:` produced (that happened earlier, in
-///    [`run_requests`]) — so applying `-H` here, replacing any header of the
-///    same name (case-insensitively) rather than adding to it, is what makes
-///    it the highest-precedence layer the module doc comment promises. A
-///    `pre_request` script still runs after this and can still change or
-///    remove what `-H` set, the same way it can a config header — `-H` is not
-///    given special protection from a script the request file itself wrote.
-/// 4. **Run `pre_request`**, the last thing to touch the request. A script that
-///    throws, or that leaves the request in a state that cannot be sent, is
-///    again [`Outcome::NoResponse`]: there is no response and never will be.
 /// 5. **Send.**
 /// 6. **Run `post_request`** against the response.
 /// 7. **Evaluate assertions** against the same response. Whether a script ran,
@@ -639,37 +737,9 @@ async fn send(
     header_overrides: &[(String, String)],
     reporter: &Reporter,
 ) -> Outcome {
-    // Nothing goes over the wire until both scripts are known to parse.
-    let scripts = match Scripts::compile(request) {
-        Ok(scripts) => scripts,
-        Err(err) => {
-            reporter.request_failed(&err);
-            return Outcome::NoResponse;
-        }
-    };
-
-    // Config, then `-H`, then the script, then the wire — see the numbered
-    // list above for why each is here and not inside `sendra_core::send`.
-    let configured = config.apply(request);
-    let configured = apply_header_overrides(configured, header_overrides);
-    let prepared = match scripts.pre_request() {
-        Some(script) => {
-            let (result, output) = run_pre_request(script, &configured);
-
-            // Printed before the verdict is acted on, and whether or not the
-            // script succeeded: a script that printed and then threw usually
-            // printed the reason.
-            reporter.script_output(&output);
-
-            match result {
-                Ok(prepared) => prepared,
-                Err(err) => {
-                    reporter.request_failed(&err);
-                    return Outcome::NoResponse;
-                }
-            }
-        }
-        None => configured,
+    let Some((prepared, scripts)) = prepare_request(request, config, header_overrides, reporter)
+    else {
+        return Outcome::NoResponse;
     };
 
     // The run's one client, not a new one: see [`prepare`].
@@ -2110,5 +2180,132 @@ requests:
             }
         );
         assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
+    }
+
+    // --- `--dry-run` -------------------------------------------------------
+
+    #[tokio::test]
+    async fn dry_run_never_calls_send_and_reports_dry_run() {
+        // `dry_run_one` takes the same request `send` would, but a socket
+        // pointed at a port nothing listens on: if this reached the wire, the
+        // outcome would be `NoResponse` (a refused connection), not
+        // `DryRun`.
+        let request =
+            request("method: GET\nurl: https://127.0.0.1:1/\nheaders:\n  X-Test: value\n");
+
+        let outcome = dry_run_one(&request, &Config::default(), &[], &reporter());
+
+        assert!(matches!(outcome, Outcome::DryRun), "{outcome:?}");
+        assert_eq!(exit_for_run(&[outcome], false), Exit::Ok);
+    }
+
+    #[test]
+    fn dry_run_applies_config_then_header_overrides_then_pre_request() {
+        // The same ordering `send` guarantees, exercised through
+        // `prepare_request` directly: config first, `-H` next (replacing a
+        // config header rather than adding to it), and the script last,
+        // still able to see and change what came before it.
+        let config = Config {
+            headers: BTreeMap::from([("X-From-Config".to_string(), "config".to_string())]),
+            ..Config::default()
+        };
+        let request = request(
+            "method: GET\nurl: https://example.com\npre_request: |\n  \
+             if request.headers[\"X-From-Config\"] != \"overridden\" { throw \"override missing\"; }\n  \
+             request.headers[\"X-From-Config\"] = \"script\";\n",
+        );
+
+        let (prepared, _scripts) = prepare_request(
+            &request,
+            &config,
+            &[("X-From-Config".to_string(), "overridden".to_string())],
+            &reporter(),
+        )
+        .expect("resolution succeeds");
+
+        assert_eq!(prepared.header("X-From-Config"), Some("script"));
+    }
+
+    #[tokio::test]
+    async fn a_resolution_failure_under_dry_run_is_no_response_not_dry_run() {
+        // A `pre_request` script that throws never gets as far as
+        // `Outcome::DryRun` — the same `NoResponse` category a compile
+        // failure or a missing variable already gets, with or without the
+        // flag.
+        let request = request(
+            "method: GET\nurl: https://example.com\npre_request: |\n  throw \"no signing key\";\n",
+        );
+
+        let outcome = dry_run_one(&request, &Config::default(), &[], &reporter());
+
+        assert!(matches!(outcome, Outcome::NoResponse), "{outcome:?}");
+        assert_eq!(exit_for_run(&[outcome], false), Exit::Failure);
+    }
+
+    #[tokio::test]
+    async fn dry_run_never_runs_post_request() {
+        // There is no response for `post_request` to see, and the pipeline
+        // structure is what makes that true rather than a special case:
+        // `dry_run_one` never reads `scripts.post_request()` at all. Pinned
+        // here by a script that would fail the test if it ever ran.
+        let request = request(
+            "method: GET\nurl: https://example.com\n\
+             post_request: |\n  throw \"post_request must never run under --dry-run\";\n",
+        );
+
+        let outcome = dry_run_one(&request, &Config::default(), &[], &reporter());
+
+        assert!(matches!(outcome, Outcome::DryRun), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_collection_dry_run_resolves_every_request_and_all_succeed() {
+        let document = Document::from_yaml_str(
+            "requests:\n  \
+               - name: First\n    method: GET\n    url: '{{base_url}}/first'\n  \
+               - name: Second\n    method: GET\n    url: '{{base_url}}/second'\n",
+        )
+        .unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+
+        let config = &Config::default();
+        let outcomes = run_requests(
+            &requests,
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |request, _| async move { dry_run_one(&request, config, &[], &reporter()) },
+        )
+        .await;
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, Outcome::DryRun)),
+            "{outcomes:?}"
+        );
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
+    }
+
+    #[tokio::test]
+    async fn a_broken_request_in_a_dry_run_collection_does_not_stop_its_siblings() {
+        let document = Document::from_yaml_str(COLLECTION_WITH_A_BROKEN_VARIABLE).unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+
+        let config = &Config::default();
+        let outcomes = run_requests(
+            &requests,
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |request, _| async move { dry_run_one(&request, config, &[], &reporter()) },
+        )
+        .await;
+
+        assert!(matches!(outcomes[0], Outcome::DryRun));
+        assert!(matches!(outcomes[1], Outcome::NoResponse));
+        assert!(matches!(outcomes[2], Outcome::DryRun));
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Failure);
     }
 }
