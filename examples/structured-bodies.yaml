@@ -1,0 +1,54 @@
+# The four structured ways to specify a body, as alternatives to a hand-escaped
+# `body:` string — see the request file shape docs. A request may set at most
+# one of `body`/`json`/`body_file`/`form`/`multipart`; combining two is a
+# parse-time error.
+#
+#   cargo run -p sendra-cli -- run examples/structured-bodies.yaml           # all four
+#   cargo run -p sendra-cli -- run examples/structured-bodies.yaml "..."     # just one
+#
+# Every request posts to httpbin.org/post, which echoes back what it actually
+# received — `data`/`json`/`form`/`files` in the response body — so each run
+# shows the body arrived the way the request file described it, not just that
+# the file parsed.
+name: Structured bodies against httpbin
+requests:
+  - name: JSON body
+    method: POST
+    url: https://httpbin.org/post
+    # A YAML mapping, serialized to JSON automatically. `Content-Type:
+    # application/json` is set for you, since nothing else told Sendra the
+    # body was something else.
+    json:
+      project: sendra
+      tags: [structured, bodies]
+
+  - name: Body from a file
+    method: POST
+    url: https://httpbin.org/post
+    # `./payload.json` resolves relative to *this file's own directory*
+    # (examples/), not wherever `sendra` was run from. `body_file` sets no
+    # content-type on its own — Sendra cannot know what an arbitrary file
+    # holds — so it is named explicitly here.
+    body_file: ./payload.json
+    headers:
+      Content-Type: application/json
+
+  - name: Form body
+    method: POST
+    url: https://httpbin.org/post
+    # URL-encoded and sent as application/x-www-form-urlencoded, the same
+    # encoding an HTML form submission uses.
+    form:
+      username: ada lovelace
+      remember_me: "true"
+
+  - name: Multipart body
+    method: POST
+    url: https://httpbin.org/post
+    # Named parts, each either inline text (`value`) or a file (`path`,
+    # resolved the same way `body_file`'s is). Sent as multipart/form-data.
+    multipart:
+      - name: description
+        value: a photo of my cat
+      - name: photo
+        path: ./cat.txt

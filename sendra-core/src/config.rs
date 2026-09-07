@@ -358,7 +358,12 @@ impl Config {
 
 /// Push `name: value` unless a header with that name is already present
 /// under any casing.
-fn insert_if_absent(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
+///
+/// `pub(crate)` rather than private: [`Request::resolve_body`](crate::Request::resolve_body)
+/// reuses this exact rule for the `Content-Type` a structured body implies —
+/// set only when the request has not already said one itself, compared the
+/// same case-insensitive way.
+pub(crate) fn insert_if_absent(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
     if headers
         .iter()
         .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
@@ -451,6 +456,10 @@ mod tests {
                 .map(|(name, value)| (name.to_string(), value.to_string()))
                 .collect(),
             body: None,
+            json: None,
+            body_file: None,
+            form: Vec::new(),
+            multipart: Vec::new(),
             assertions: None,
             pre_request: None,
             post_request: None,
@@ -861,6 +870,10 @@ mod tests {
             url: "https://example.com/things".to_string(),
             headers: Vec::new(),
             body: Some("{}".to_string()),
+            json: None,
+            body_file: None,
+            form: Vec::new(),
+            multipart: Vec::new(),
             // Config merges headers and nothing else; assertions are checked
             // against the response, which a default header cannot change, and
             // scripts run later still — the config has finished by then.

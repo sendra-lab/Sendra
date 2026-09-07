@@ -15,6 +15,10 @@ serde_json = { workspace = true }
 # JSON path evaluation for `assertions.json`. See the note on
 # `assertions::Assertions::json` for why this crate and not another.
 jsonpath-rust = { workspace = true }
+# `form:` bodies are URL-encoded the same way a browser encodes an HTML form
+# (`application/x-www-form-urlencoded`); this is the standard crate for it
+# rather than a hand-written percent-encoder.
+serde_urlencoded = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
 # Locating the global config directory per platform. `dirs`, not `directories`:

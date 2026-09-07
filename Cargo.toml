@@ -14,6 +14,7 @@ dirs = "6"
 tempfile = "3"
 serde_yaml = "0.9"
 jsonpath-rust = "1"
+serde_urlencoded = "0.7"
 reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
   "http2",

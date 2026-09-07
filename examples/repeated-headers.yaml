@@ -1,0 +1,23 @@
+# A header name written once but sent more than once: give it a list of
+# values instead of a scalar. A standard YAML mapping cannot repeat a key, so
+# this is the only way to write a repeated header — see `Request::headers`.
+#
+#   cargo run -p sendra-cli -- run examples/repeated-headers.yaml
+#
+# httpbin.org/headers echoes back what it received, so the response shows
+# `X-Sendra-Tag` carrying both values (httpbin joins repeated header lines
+# into one comma-separated string when it renders them back) alongside the
+# ordinary scalar header beside it, which is untouched by any of this.
+#
+# `X-Forwarded-For` is deliberately not the example here: it is the one
+# header name httpbin's own front-end proxy rewrites before the app ever sees
+# it, so a request repeating it would demonstrate the proxy, not Sendra.
+name: A header sent more than once
+method: GET
+url: https://httpbin.org/headers
+headers:
+  Accept: application/json
+  X-Sendra-Tag:
+    - alpha
+    - beta
+  X-Sendra-Example: repeated-headers

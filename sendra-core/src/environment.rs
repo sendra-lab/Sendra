@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 
 use crate::assertions::Assertions;
 use crate::config::PROJECT_DIR_NAME;
-use crate::{Collection, Document, Request, SendraError};
+use crate::{Collection, Document, MultipartPart, Request, SendraError};
 
 /// Directory holding environment files, under a project's `.sendra/`.
 const ENVIRONMENTS_DIR_NAME: &str = "environments";
@@ -282,6 +282,52 @@ impl Environment {
                 .as_deref()
                 .map(|body| self.expand_templates(body))
                 .transpose()?,
+            // `{{var}}` reaches every string value here, the same way it
+            // reaches `body` above — a JSON body wanting a substituted field
+            // is exactly as ordinary a case as a substituted plain body.
+            // `expand_json` already exists for `assertions.json`; the rule is
+            // the same, values only, nothing about keys.
+            json: request
+                .json
+                .as_ref()
+                .map(|value| self.expand_json(value))
+                .transpose()?,
+            // The path itself is a value like any other and is substituted;
+            // what it points to is not. See `Request::resolve_body`, which is
+            // where that file is actually read, well after this runs.
+            body_file: request
+                .body_file
+                .as_deref()
+                .map(|path| self.expand_templates(path))
+                .transpose()?,
+            form: request
+                .form
+                .iter()
+                .map(|(name, value)| {
+                    Ok((self.expand_templates(name)?, self.expand_templates(value)?))
+                })
+                .collect::<Result<_, SendraError>>()?,
+            multipart: request
+                .multipart
+                .iter()
+                .map(|part| {
+                    Ok(MultipartPart {
+                        name: self.expand_templates(&part.name)?,
+                        value: part
+                            .value
+                            .as_deref()
+                            .map(|value| self.expand_templates(value))
+                            .transpose()?,
+                        // Same rule as `body_file`: the path is a value and is
+                        // substituted, the file it names is not.
+                        path: part
+                            .path
+                            .as_deref()
+                            .map(|path| self.expand_templates(path))
+                            .transpose()?,
+                    })
+                })
+                .collect::<Result<_, SendraError>>()?,
             assertions: request
                 .assertions
                 .as_ref()
@@ -686,6 +732,75 @@ body: '{\"host\": \"{{base_url}}\"}'
         // The label is deliberately untouched: it is the run selector.
         assert_eq!(applied.name.as_deref(), Some("Templated"));
         assert_eq!(applied.method, Method::Post);
+    }
+
+    #[test]
+    fn substitution_reaches_json_form_and_multipart_values_but_not_a_body_files_content() {
+        let yaml = "\
+method: POST
+url: https://example.com
+";
+        // Three requests, one per structured body field, each with a
+        // `{{tenant}}` inside a *value* — the case the issue asks for
+        // explicitly: a JSON/form/multipart body wanting a substituted field
+        // is exactly as ordinary as a substituted plain `body`.
+        let json_request = Request::from_yaml_str(&format!(
+            "{yaml}json:\n  tenant: '{{{{tenant}}}}'\n  nested:\n    id: '{{{{tenant}}}}'\n"
+        ))
+        .unwrap();
+        let form_request =
+            Request::from_yaml_str(&format!("{yaml}form:\n  tenant: '{{{{tenant}}}}'\n")).unwrap();
+        let multipart_request = Request::from_yaml_str(&format!(
+            "{yaml}multipart:\n  - name: '{{{{tenant}}}}'\n    value: '{{{{tenant}}}}'\n"
+        ))
+        .unwrap();
+
+        let environment = environment(&[("tenant", "acme")], &[]);
+
+        let applied_json = environment.apply(&json_request).expect("tenant is set");
+        assert_eq!(
+            applied_json.json,
+            Some(serde_json::json!({"tenant": "acme", "nested": {"id": "acme"}}))
+        );
+
+        let applied_form = environment.apply(&form_request).expect("tenant is set");
+        assert_eq!(
+            applied_form.form,
+            vec![("tenant".to_string(), "acme".to_string())]
+        );
+
+        let applied_multipart = environment
+            .apply(&multipart_request)
+            .expect("tenant is set");
+        assert_eq!(applied_multipart.multipart[0].name, "acme");
+        assert_eq!(
+            applied_multipart.multipart[0].value.as_deref(),
+            Some("acme")
+        );
+
+        // `body_file`'s *path* is a value like any other and is substituted...
+        let body_file_request =
+            Request::from_yaml_str(&format!("{yaml}body_file: './{{{{tenant}}}}.json'\n")).unwrap();
+        let applied_body_file = environment
+            .apply(&body_file_request)
+            .expect("tenant is set");
+        assert_eq!(applied_body_file.body_file.as_deref(), Some("./acme.json"));
+
+        // ...but what a `body_file` or multipart file *path points to* is
+        // never read here at all — substitution is a pass over the parsed
+        // document, and a file on disk is not part of it. A placeholder
+        // inside the file's actual content survives untouched all the way to
+        // `Request::resolve_body`, which reads the file only after this runs.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("acme.json"), "{{tenant}}").unwrap();
+        let resolved = applied_body_file
+            .resolve_body(dir.path())
+            .expect("the file is there");
+        assert_eq!(
+            resolved.body.as_deref(),
+            Some("{{tenant}}"),
+            "a placeholder inside the file's content must not be substituted"
+        );
     }
 
     #[test]

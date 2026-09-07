@@ -125,6 +125,27 @@ pub enum SendraError {
     #[error("invalid collection: {reason}")]
     InvalidCollection { reason: String },
 
+    /// A single request broke a rule serde cannot express: at most one of
+    /// `body`/`json`/`body_file`/`form`/`multipart` may be set, and each
+    /// `multipart` part needs exactly one of `value`/`path`. Raised at parse
+    /// time — for a collection, wrapped into [`InvalidCollection`](Self::InvalidCollection)
+    /// with which request it was, the same way a duplicate name is.
+    #[error("invalid request: {reason}")]
+    InvalidRequest { reason: String },
+
+    /// A `body_file` (or a multipart `path`) named a file that could not be
+    /// read, or one whose content is not valid UTF-8. Distinct from
+    /// [`Io`](Self::Io), which is about the request *file itself* not being
+    /// readable — this is about a file the request *references*, resolved
+    /// relative to the request file's own directory. See
+    /// [`Request::resolve_body`].
+    #[error("could not read request body file `{path}`")]
+    BodyFileIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// A config file was found but could not be read. Separate from [`Io`](Self::Io)
     /// so a front-end can say "your config is broken" rather than "your request
     /// file is broken" — the user did not name this path on the command line
@@ -361,9 +382,93 @@ pub struct Request {
         serialize_with = "serialize_headers"
     )]
     pub headers: Vec<(String, String)>,
-    /// Raw body, sent verbatim. Structured/multipart bodies come later.
+    /// Raw body, sent verbatim.
+    ///
+    /// One of five ways to specify a body — `body`, [`json`](Self::json),
+    /// [`body_file`](Self::body_file), [`form`](Self::form) or
+    /// [`multipart`](Self::multipart) — and a request may set at most one of
+    /// them; [`Request::validate`] rejects any other combination at parse
+    /// time. By the time a `pre_request` script or [`send_prepared`] sees a
+    /// request, whichever of the five was set has already been resolved down
+    /// to this field by [`Request::resolve_body`] — see there for exactly
+    /// what each one becomes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// A body given as YAML — a mapping, a list, a string, whatever value —
+    /// serialized to JSON and sent as `application/json`.
+    ///
+    /// ```text
+    /// json:
+    ///   name: ada
+    ///   roles: [admin, user]
+    /// ```
+    ///
+    /// [`Request::resolve_body`] sets `Content-Type: application/json` only
+    /// when the request has not already set that header itself — an explicit
+    /// header always wins. See [`Request::body`] for how this relates to the
+    /// other four ways of specifying a body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json: Option<serde_json::Value>,
+    /// A body read from a file, verbatim, sent exactly as `body` would be.
+    ///
+    /// ```text
+    /// body_file: ./payload.json
+    /// ```
+    ///
+    /// The path is resolved relative to the *request file's own directory*,
+    /// not the process's current working directory — see
+    /// [`Request::resolve_body`] for why. Unlike [`json`](Self::json) and
+    /// [`form`](Self::form), no `Content-Type` is set automatically: Sendra
+    /// cannot know what an arbitrary file contains, so a request using this
+    /// field is responsible for its own `headers:` if the server needs one.
+    /// The file's content must be valid UTF-8 — see the module docs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_file: Option<String>,
+    /// A body given as name/value pairs, URL-encoded and sent as
+    /// `application/x-www-form-urlencoded` — the same encoding an HTML form
+    /// submission uses.
+    ///
+    /// ```text
+    /// form:
+    ///   username: ada
+    ///   remember_me: "true"
+    /// ```
+    ///
+    /// A plain YAML mapping cannot repeat a key, so unlike
+    /// [`headers`](Self::headers) this has no list form for a repeated field
+    /// name — nothing in Sendra has needed one yet. See
+    /// [`Request::resolve_body`] for the `Content-Type` rule, which matches
+    /// [`json`](Self::json)'s.
+    ///
+    /// Deserialized the same way [`headers`](Self::headers) is — a repeated
+    /// field name is written as a list rather than rejected as a duplicate
+    /// key — since a form field repeating (an HTML multi-select, say) is the
+    /// same shape of problem a repeated header already had a good answer for.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_headers",
+        serialize_with = "serialize_headers"
+    )]
+    pub form: Vec<(String, String)>,
+    /// A body given as named parts, each either inline text or a file, sent
+    /// as `multipart/form-data`.
+    ///
+    /// ```text
+    /// multipart:
+    ///   - name: description
+    ///     value: a photo of my cat
+    ///   - name: photo
+    ///     path: ./cat.jpg
+    /// ```
+    ///
+    /// Each part is exactly one of a text part (`value`) or a file part
+    /// (`path`, resolved the same way [`body_file`](Self::body_file) is) —
+    /// [`Request::validate`] rejects a part with both or neither. See the
+    /// module docs for why a file part's content must be valid UTF-8 in this
+    /// version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub multipart: Vec<MultipartPart>,
     /// Declarative checks on the response, evaluated by
     /// [`Assertions::evaluate`] once it arrives.
     ///
@@ -440,7 +545,9 @@ pub struct Request {
 impl Request {
     /// Parse a request from a YAML string.
     pub fn from_yaml_str(yaml: &str) -> Result<Self, SendraError> {
-        serde_yaml::from_str(yaml).map_err(SendraError::ParseStr)
+        let request: Request = serde_yaml::from_str(yaml).map_err(SendraError::ParseStr)?;
+        request.validate()?;
+        Ok(request)
     }
 
     /// Read and parse a request from a YAML file on disk.
@@ -450,10 +557,133 @@ impl Request {
             path: path.to_path_buf(),
             source,
         })?;
-        serde_yaml::from_str(&raw).map_err(|source| SendraError::Parse {
+        let request: Request = serde_yaml::from_str(&raw).map_err(|source| SendraError::Parse {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        request.validate()?;
+        Ok(request)
+    }
+
+    /// Rules the `Deserialize` impl cannot express: at most one of
+    /// `body`/`json`/`body_file`/`form`/`multipart` may be set, and each
+    /// `multipart` part needs exactly one of `value`/`path`.
+    ///
+    /// Checked here, at parse time, rather than left for
+    /// [`resolve_body`](Self::resolve_body) to discover: a request with two
+    /// body sources is a broken file the same way an unnamed request in a
+    /// collection is, and both are worth catching before anything is sent
+    /// rather than resolved by silently picking one and ignoring the rest.
+    fn validate(&self) -> Result<(), SendraError> {
+        let invalid = |reason: String| Err(SendraError::InvalidRequest { reason });
+
+        let mut set = Vec::new();
+        if self.body.is_some() {
+            set.push("body");
+        }
+        if self.json.is_some() {
+            set.push("json");
+        }
+        if self.body_file.is_some() {
+            set.push("body_file");
+        }
+        if !self.form.is_empty() {
+            set.push("form");
+        }
+        if !self.multipart.is_empty() {
+            set.push("multipart");
+        }
+        if set.len() > 1 {
+            return invalid(format!(
+                "at most one of `body`, `json`, `body_file`, `form`, `multipart` may be set, but found: {}",
+                set.join(", ")
+            ));
+        }
+
+        for part in &self.multipart {
+            match (&part.value, &part.path) {
+                (Some(_), Some(_)) => {
+                    return invalid(format!(
+                        "multipart part `{}` has both `value` and `path`; exactly one is required",
+                        part.name
+                    ));
+                }
+                (None, None) => {
+                    return invalid(format!(
+                        "multipart part `{}` has neither `value` nor `path`; exactly one is required",
+                        part.name
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resolve whichever of `body`/`json`/`body_file`/`form`/`multipart` was
+    /// set into the final `body` string that goes on the wire, setting
+    /// `Content-Type` when the field implies one and the request has not
+    /// already set that header itself.
+    ///
+    /// Called once, after environment substitution and before the config is
+    /// applied or a `pre_request` script runs — so both see a plain `body`
+    /// string regardless of which field produced it, the same way they
+    /// already see a request whose `{{var}}`s have been resolved. `json`,
+    /// `body_file`, `form` and `multipart` are cleared on the way out; `body`
+    /// is the only body field left on the result.
+    ///
+    /// `base_dir` is where `body_file` and a multipart part's `path` resolve
+    /// relative to: **the directory containing the request's own YAML file**,
+    /// not the process's current working directory. A request file is
+    /// something a user can run from anywhere — `sendra run
+    /// requests/create-user.yaml` from a repository root — and `body_file:
+    /// ./payload.json` written inside `create-user.yaml` obviously means the
+    /// file beside it, not one resolved against whatever directory the
+    /// command happened to be typed from.
+    ///
+    /// `json`, `form` and `body_file`'s *path* were already substituted by
+    /// [`Environment::apply`](crate::Environment::apply) before this runs.
+    /// `body_file`'s *file content* is deliberately not substituted — it is
+    /// external content Sendra reads, not a value written in the request
+    /// file, and substitution has never reached outside the document; see the
+    /// [`environment`] module docs.
+    ///
+    /// File content — for `body_file` and a multipart file part alike — is
+    /// read as UTF-8 text; a file that is not valid UTF-8 is
+    /// [`SendraError::BodyFileIo`]. Sendra's bodies are text throughout, the
+    /// same way a [`Response`]'s is, and true binary uploads are out of scope
+    /// for this version.
+    pub fn resolve_body(&self, base_dir: &Path) -> Result<Request, SendraError> {
+        let mut resolved = self.clone();
+
+        if let Some(value) = &self.json {
+            let body = serde_json::to_string(value).expect("a serde_json::Value always serializes");
+            resolved.body = Some(body);
+            config::insert_if_absent(&mut resolved.headers, "Content-Type", "application/json");
+        } else if let Some(path) = &self.body_file {
+            resolved.body = Some(read_body_file(base_dir, path)?);
+        } else if !self.form.is_empty() {
+            let body = serde_urlencoded::to_string(&self.form)
+                .expect("a Vec<(String, String)> always encodes as x-www-form-urlencoded pairs");
+            resolved.body = Some(body);
+            config::insert_if_absent(
+                &mut resolved.headers,
+                "Content-Type",
+                "application/x-www-form-urlencoded",
+            );
+        } else if !self.multipart.is_empty() {
+            let (body, content_type) = encode_multipart(&self.multipart, base_dir)?;
+            resolved.body = Some(body);
+            config::insert_if_absent(&mut resolved.headers, "Content-Type", &content_type);
+        }
+
+        resolved.json = None;
+        resolved.body_file = None;
+        resolved.form = Vec::new();
+        resolved.multipart = Vec::new();
+
+        Ok(resolved)
     }
 
     /// Display label: the `name` field if present, else `METHOD url`.
@@ -475,6 +705,102 @@ impl Request {
             .find(|(existing, _)| existing == name)
             .map(|(_, value)| value.as_str())
     }
+}
+
+/// One part of a [`Request::multipart`] body: either inline text (`value`) or
+/// a file (`path`), never both and never neither — enforced by
+/// [`Request::validate`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MultipartPart {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// Read a `body_file` (or a multipart file part) relative to `base_dir`, as
+/// UTF-8 text.
+///
+/// A non-UTF-8 file surfaces as [`SendraError::BodyFileIo`] wrapping an
+/// `InvalidData` error, matching what `std::fs::read_to_string` itself
+/// returns for the same failure, rather than a silent lossy conversion —
+/// unlike a *response* body, which Sendra has never promised to send
+/// unmodified.
+fn read_body_file(base_dir: &Path, path: &str) -> Result<String, SendraError> {
+    let full_path = base_dir.join(path);
+    std::fs::read_to_string(&full_path).map_err(|source| SendraError::BodyFileIo {
+        path: full_path,
+        source,
+    })
+}
+
+/// Encode a `multipart` body by hand, as `multipart/form-data` text, and
+/// return it along with the `Content-Type` (boundary included) it implies.
+///
+/// Not built with `reqwest::multipart::Form`: that type holds arbitrary
+/// bytes and cannot be cloned, `PartialEq`d or serialized, none of which
+/// [`Request`] can give up — it is `Clone`, `PartialEq`, `Serialize` and
+/// `Deserialize` throughout, including in the config/substitution/scripting
+/// pipeline a multipart request passes through like any other. Writing the
+/// format directly keeps the whole body a `String`, consistent with
+/// [`resolve_body`](Request::resolve_body)'s UTF-8-text rule for
+/// `body_file`.
+///
+/// The boundary is derived from the current time, which is unique enough
+/// per-request for a boundary's actual job: a delimiter unlikely to occur
+/// inside any part's own content, not a cryptographic guarantee.
+fn encode_multipart(
+    parts: &[MultipartPart],
+    base_dir: &Path,
+) -> Result<(String, String), SendraError> {
+    let boundary = format!(
+        "----sendra-{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+
+    let mut body = String::new();
+    for part in parts {
+        body.push_str("--");
+        body.push_str(&boundary);
+        body.push_str("\r\n");
+        match (&part.value, &part.path) {
+            (Some(value), None) => {
+                body.push_str(&format!(
+                    "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                    part.name
+                ));
+                body.push_str(value);
+            }
+            (None, Some(path)) => {
+                let filename = Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(path);
+                body.push_str(&format!(
+                    "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n\r\n",
+                    part.name, filename
+                ));
+                body.push_str(&read_body_file(base_dir, path)?);
+            }
+            // Ruled out by `Request::validate` before `resolve_body` is ever
+            // reached; kept exhaustive rather than `unreachable!()` so a
+            // future caller of `encode_multipart` that skips validation gets
+            // an empty part instead of a panic.
+            (Some(_), Some(_)) | (None, None) => {}
+        }
+        body.push_str("\r\n");
+    }
+    body.push_str("--");
+    body.push_str(&boundary);
+    body.push_str("--\r\n");
+
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+    Ok((body, content_type))
 }
 
 /// Deserialize a `headers:` mapping into ordered `(name, value)` pairs.
@@ -707,6 +1033,14 @@ impl Collection {
                     index + 1
                 ));
             }
+            // Wrapped into `InvalidCollection`, with which request it was,
+            // the same way the duplicate-name error above is — a standalone
+            // request file raises `InvalidRequest` directly, but inside a
+            // collection this is still a fact about *the file*, so it gets
+            // the file-level error with request-level context added.
+            if let Err(SendraError::InvalidRequest { reason }) = request.validate() {
+                return invalid(format!("request {} ({name}): {reason}", index + 1));
+            }
         }
 
         Ok(())
@@ -777,7 +1111,9 @@ impl Document {
             collection.validate()?;
             Ok(Document::Collection(collection))
         } else {
-            Ok(Document::Single(serde_yaml::from_str(yaml).map_err(&wrap)?))
+            let request: Request = serde_yaml::from_str(yaml).map_err(&wrap)?;
+            request.validate()?;
+            Ok(Document::Single(request))
         }
     }
 
@@ -1180,6 +1516,10 @@ body: null
                 url: "https://api.example.com/users/1".to_string(),
                 headers: expected_headers,
                 body: None,
+                json: None,
+                body_file: None,
+                form: Vec::new(),
+                multipart: Vec::new(),
                 assertions: None,
                 pre_request: None,
                 post_request: None,
@@ -1641,6 +1981,8 @@ enviroment: staging
             "test-collection.yaml",
             "scripted-request.yaml",
             "capture-chain.yaml",
+            "repeated-headers.yaml",
+            "structured-bodies.yaml",
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("..")
@@ -1669,6 +2011,10 @@ enviroment: staging
             url: "http://127.0.0.1:1/".to_string(),
             headers: vec![("bad header".to_string(), "x".to_string())],
             body: None,
+            json: None,
+            body_file: None,
+            form: Vec::new(),
+            multipart: Vec::new(),
             assertions: None,
             pre_request: None,
             post_request: None,
@@ -1696,6 +2042,10 @@ enviroment: staging
             url: "http://127.0.0.1:1/".to_string(),
             headers: Vec::new(),
             body: None,
+            json: None,
+            body_file: None,
+            form: Vec::new(),
+            multipart: Vec::new(),
             assertions: None,
             pre_request: None,
             post_request: None,
@@ -1819,6 +2169,10 @@ enviroment: staging
             url: url.to_string(),
             headers: Vec::new(),
             body: None,
+            json: None,
+            body_file: None,
+            form: Vec::new(),
+            multipart: Vec::new(),
             assertions: None,
             pre_request: None,
             post_request: None,
@@ -2549,5 +2903,229 @@ enviroment: staging
             plain.redirects.is_empty(),
             "the previous request's chain must not leak into this one"
         );
+    }
+
+    // --- structured bodies: json, body_file, form, multipart ---------------
+
+    /// A minimal request whose only body field is set from `field: value`
+    /// (already valid YAML for every shape these tests need — a scalar, a
+    /// block, a sequence).
+    fn request_with(field_and_value: &str) -> Request {
+        Request::from_yaml_str(&format!(
+            "method: POST\nurl: https://example.com\n{field_and_value}\n"
+        ))
+        .expect("the test request should parse")
+    }
+
+    #[test]
+    fn a_json_body_is_serialized_and_gets_the_default_content_type() {
+        let request = request_with("json:\n  name: ada\n  roles: [admin, user]\n");
+        let resolved = request
+            .resolve_body(Path::new("."))
+            .expect("no file to read");
+
+        let sent: serde_json::Value =
+            serde_json::from_str(resolved.body.as_deref().expect("a body was produced"))
+                .expect("the body is valid json");
+        assert_eq!(
+            sent,
+            serde_json::json!({"name": "ada", "roles": ["admin", "user"]})
+        );
+        assert_eq!(resolved.header("Content-Type"), Some("application/json"));
+        // The structured field is gone from the resolved request: the only
+        // body field left is the plain string a script or `send_prepared`
+        // reads.
+        assert!(resolved.json.is_none());
+    }
+
+    #[test]
+    fn a_json_bodys_explicit_content_type_is_not_clobbered() {
+        let request = request_with(
+            "headers:\n  Content-Type: application/vnd.example+json\njson:\n  ok: true\n",
+        );
+        let resolved = request
+            .resolve_body(Path::new("."))
+            .expect("no file to read");
+
+        assert_eq!(
+            resolved.header("Content-Type"),
+            Some("application/vnd.example+json"),
+            "an explicit content-type header must win over the automatic one"
+        );
+    }
+
+    #[test]
+    fn body_file_reads_relative_to_the_request_files_directory_not_the_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("payload.json"), r#"{"id":1}"#).unwrap();
+
+        let request = request_with("body_file: ./payload.json\n");
+        let resolved = request
+            .resolve_body(dir.path())
+            .expect("the file is beside the (hypothetical) request file");
+
+        assert_eq!(resolved.body.as_deref(), Some(r#"{"id":1}"#));
+        // `body_file` sets no content-type: Sendra cannot know what an
+        // arbitrary file holds, so the request's own `headers:` is
+        // responsible.
+        assert!(resolved.header("Content-Type").is_none());
+
+        // And resolving against a directory that does *not* hold the file —
+        // standing in for the process's cwd — fails, which is the point of
+        // the whole test: the path is relative to something specific, not
+        // wherever `sendra` happened to be run from.
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            request.resolve_body(elsewhere.path()),
+            Err(SendraError::BodyFileIo { .. })
+        ));
+    }
+
+    #[test]
+    fn a_non_utf8_body_file_is_a_typed_error_not_a_silent_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("payload.bin"), [0xff, 0xfe, 0x00, 0xff]).unwrap();
+
+        let request = request_with("body_file: ./payload.bin\n");
+        assert!(matches!(
+            request.resolve_body(dir.path()),
+            Err(SendraError::BodyFileIo { .. })
+        ));
+    }
+
+    #[test]
+    fn a_form_body_is_url_encoded_and_gets_the_default_content_type() {
+        let request = request_with("form:\n  username: ada lovelace\n  remember_me: \"true\"\n");
+        let resolved = request
+            .resolve_body(Path::new("."))
+            .expect("no file to read");
+
+        assert_eq!(
+            resolved.body.as_deref(),
+            Some("username=ada+lovelace&remember_me=true")
+        );
+        assert_eq!(
+            resolved.header("Content-Type"),
+            Some("application/x-www-form-urlencoded")
+        );
+        assert!(resolved.form.is_empty());
+    }
+
+    #[test]
+    fn a_multipart_body_encodes_a_text_part_and_a_file_part() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cat.txt"), "meow").unwrap();
+
+        let request = request_with(
+            "multipart:\n  \
+             - name: description\n    value: a photo of my cat\n  \
+             - name: photo\n    path: ./cat.txt\n",
+        );
+        let resolved = request
+            .resolve_body(dir.path())
+            .expect("the file part reads fine");
+
+        let content_type = resolved
+            .header("Content-Type")
+            .expect("multipart sets its own content-type")
+            .to_string();
+        assert!(
+            content_type.starts_with("multipart/form-data; boundary="),
+            "got {content_type}"
+        );
+        let boundary = content_type
+            .strip_prefix("multipart/form-data; boundary=")
+            .unwrap();
+
+        let body = resolved.body.expect("a body was produced");
+        assert!(body.contains(&format!("--{boundary}\r\n")));
+        assert!(body.contains(
+            "Content-Disposition: form-data; name=\"description\"\r\n\r\na photo of my cat"
+        ));
+        assert!(body.contains(
+            "Content-Disposition: form-data; name=\"photo\"; filename=\"cat.txt\"\r\n\r\nmeow"
+        ));
+        assert!(body.trim_end().ends_with(&format!("--{boundary}--")));
+        assert!(resolved.multipart.is_empty());
+    }
+
+    #[test]
+    fn a_multipart_part_with_both_value_and_path_is_rejected_at_parse_time() {
+        let err = Request::from_yaml_str(
+            "method: POST\nurl: https://example.com\n\
+             multipart:\n  - name: photo\n    value: x\n    path: ./cat.jpg\n",
+        )
+        .expect_err("a part cannot be both text and a file");
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("both `value` and `path`")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_multipart_part_with_neither_value_nor_path_is_rejected_at_parse_time() {
+        let err = Request::from_yaml_str(
+            "method: POST\nurl: https://example.com\nmultipart:\n  - name: photo\n",
+        )
+        .expect_err("a part needs exactly one of value/path");
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("neither `value` nor `path`")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_request_naming_two_body_fields_is_rejected_at_parse_time() {
+        let err = Request::from_yaml_str(
+            "method: POST\nurl: https://example.com\nbody: '{}'\njson:\n  a: 1\n",
+        )
+        .expect_err("body and json together must be rejected");
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("body") && reason.contains("json")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn two_body_fields_inside_a_collection_are_rejected_with_the_requests_context() {
+        let yaml = "\
+requests:
+  - name: Broken
+    method: POST
+    url: https://example.com
+    form:
+      a: '1'
+    body_file: ./x.json
+";
+        let err = Document::from_yaml_str(yaml).expect_err("must be rejected");
+        match err {
+            SendraError::InvalidCollection { reason } => {
+                assert!(reason.contains("Broken"), "got {reason}");
+                assert!(reason.contains("form"), "got {reason}");
+                assert!(reason.contains("body_file"), "got {reason}");
+            }
+            other => panic!("expected InvalidCollection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plain_body_still_parses_and_resolves_unchanged() {
+        // The non-goal, pinned: a file written before this feature existed
+        // still works exactly as it did.
+        let request = request_with("body: '{\"name\": \"ada\"}'\n");
+        let resolved = request
+            .resolve_body(Path::new("."))
+            .expect("nothing to read");
+        assert_eq!(resolved.body.as_deref(), Some(r#"{"name": "ada"}"#));
+        assert!(resolved.header("Content-Type").is_none());
+    }
+
+    #[test]
+    fn a_request_with_no_body_field_at_all_resolves_to_no_body() {
+        let request = request_with("");
+        let resolved = request
+            .resolve_body(Path::new("."))
+            .expect("nothing to resolve");
+        assert!(resolved.body.is_none());
     }
 }

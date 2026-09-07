@@ -181,6 +181,7 @@ pub(crate) async fn run(
     let reporter = &Reporter::new(Format::for_json_flag(json), Detail::Full, show_captures);
     let outcomes = run_requests(
         &requests,
+        base_dir(path),
         &environment,
         reporter,
         |request, environment| async move {
@@ -242,6 +243,7 @@ pub(crate) async fn test(
     );
     let outcomes = run_requests(
         &requests,
+        base_dir(path),
         &environment,
         reporter,
         |request, environment| async move {
@@ -253,6 +255,22 @@ pub(crate) async fn test(
     let summary = Summary::of(&outcomes);
     reporter.finish_test(&summary);
     summary.exit()
+}
+
+/// The directory `body_file` and multipart file paths in requests loaded from
+/// `path` resolve relative to: `path`'s own directory, not the process's
+/// current working directory.
+///
+/// A request file is something a user runs from anywhere — `sendra run
+/// requests/create-user.yaml` from a repository root — and a `body_file:
+/// ./payload.json` written inside `create-user.yaml` means the file beside
+/// it, not one resolved against wherever the command was typed. `path` with
+/// no parent (a bare filename, or `/`) resolves against `.`, which is the
+/// same thing a bare filename already means to `path` itself.
+fn base_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 /// Why the run could not get the environment it was going to send against.
@@ -408,6 +426,7 @@ fn environment_for(
 /// [`worst`]: crate::exit::worst
 pub(crate) async fn run_requests<S, F>(
     requests: &[&Request],
+    base_dir: &Path,
     environment: &Environment,
     reporter: &Reporter,
     mut send_one: S,
@@ -432,7 +451,15 @@ where
         // Built here, per request, from the store as it stands now — which is
         // the whole of the ordering guarantee. See the note above.
         let environment = environment.with_captured(&captured);
-        let substituted = environment.apply(request);
+        // Substitution, then — while `{{var}}`s are already resolved but
+        // before the config or a `pre_request` script ever sees the request —
+        // resolving whichever of `body`/`json`/`body_file`/`form`/`multipart`
+        // was set down to the final `body` string. Both failures are the same
+        // category: the request could not be built, so there is nothing to
+        // send. See `Request::resolve_body`.
+        let substituted = environment
+            .apply(request)
+            .and_then(|request| request.resolve_body(base_dir));
 
         // Announced before the outcome either way, because in a collection run
         // the label is the only thing that says *which* request this is — a
@@ -641,10 +668,16 @@ requests:
         // Stands in for the network: records what it was handed and reports a
         // clean response, so the substitution is the only failure in the run.
         let mut sent = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |request, _| {
-            sent.push(request.url.clone());
-            async { responded(200) }
-        })
+        let outcomes = run_requests(
+            &requests,
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |request, _| {
+                sent.push(request.url.clone());
+                async { responded(200) }
+            },
+        )
         .await;
         let exit = exit_for_run(&outcomes, false);
 
@@ -675,9 +708,13 @@ requests:
         // ...but it suppresses a *status*, and a request that was never built
         // has no status to forgive. Same treatment as a connection failure,
         // which the flag does not suppress either.
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |_, _| async {
-            responded(404)
-        })
+        let outcomes = run_requests(
+            &requests,
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |_, _| async { responded(404) },
+        )
         .await;
 
         assert_eq!(exit_for_run(&outcomes, true), Exit::Failure);
@@ -691,6 +728,51 @@ requests:
             .expect("the test request should parse")
             .requests()[0]
             .clone()
+    }
+
+    #[tokio::test]
+    async fn a_pre_request_script_sees_the_resolved_body_regardless_of_which_field_set_it() {
+        // The design decision the issue asks for, end to end minus the
+        // socket: by the time a `pre_request` script runs, `resolve_body`
+        // (called inside `run_requests`, before this closure) has already
+        // turned `json:` into the plain `body` string a script has always
+        // seen. The script here checks that string and mutates it, exactly
+        // as it would for a request that had written `body:` by hand.
+        let document = Document::from_yaml_str(
+            "method: POST\nurl: https://example.com\n\
+             json:\n  id: 1\n\
+             pre_request: |\n  \
+             if request.body != \"{\\\"id\\\":1}\" { throw \"unexpected body: \" + request.body; }\n  \
+             request.body = request.body + \"!\";\n",
+        )
+        .unwrap();
+        let requests: Vec<&Request> = document.requests().iter().collect();
+
+        let mut seen_body = None;
+        let outcomes = run_requests(
+            &requests,
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |request, _| {
+                // `json` is already `None` here — resolved away before this
+                // closure runs, the same way `send` in the real pipeline
+                // only ever sees a request past that point.
+                assert!(
+                    request.json.is_none(),
+                    "`json` must already be resolved by the time a script can run"
+                );
+                let scripts = Scripts::compile(&request).expect("the script compiles");
+                let (prepared, _) = run_pre_request(scripts.pre_request().unwrap(), &request);
+                let prepared = prepared.expect("the script runs and does not throw");
+                seen_body = Some(prepared.body.clone());
+                async { responded(200) }
+            },
+        )
+        .await;
+
+        assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
+        assert_eq!(seen_body, Some(Some("{\"id\":1}!".to_string())));
     }
 
     #[tokio::test]
@@ -904,9 +986,13 @@ requests:
 
         // Every sibling answers 500, so the run holds both kinds of failure at
         // once. "Never got a response" is the more serious of the two.
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |_, _| async {
-            responded(500)
-        })
+        let outcomes = run_requests(
+            &requests,
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |_, _| async { responded(500) },
+        )
         .await;
 
         assert_eq!(exit_for_run(&outcomes, false), Exit::Failure);
@@ -921,10 +1007,16 @@ requests:
         let request = document.get("Third").expect("`Third` is in the collection");
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&[request], &environment(), &reporter(), |request, _| {
-            sent.push(request.url.clone());
-            async { responded(200) }
-        })
+        let outcomes = run_requests(
+            &[request],
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |request, _| {
+                sent.push(request.url.clone());
+                async { responded(200) }
+            },
+        )
         .await;
 
         assert_eq!(sent, vec!["https://example.com/third"]);
@@ -939,10 +1031,16 @@ requests:
             .expect("`Broken` is in the collection");
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&[request], &environment(), &reporter(), |request, _| {
-            sent.push(request.url.clone());
-            async { responded(200) }
-        })
+        let outcomes = run_requests(
+            &[request],
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |request, _| {
+                sent.push(request.url.clone());
+                async { responded(200) }
+            },
+        )
         .await;
 
         assert!(sent.is_empty(), "nothing should have been sent");
@@ -966,10 +1064,16 @@ requests:
         let requests: Vec<&Request> = document.requests().iter().collect();
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |request, _| {
-            sent.push(request.url.clone());
-            async { responded(200) }
-        })
+        let outcomes = run_requests(
+            &requests,
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |request, _| {
+                sent.push(request.url.clone());
+                async { responded(200) }
+            },
+        )
         .await;
 
         assert_eq!(
@@ -1159,10 +1263,16 @@ requests:
         let mut sent = Vec::new();
         for name in ["staging", "prod"] {
             let environment = environment_for(project.path(), Some(name)).expect("both exist");
-            let outcomes = run_requests(&requests, &environment, &reporter(), |request, _| {
-                sent.push(request.url.clone());
-                async { responded(200) }
-            })
+            let outcomes = run_requests(
+                &requests,
+                Path::new("."),
+                &environment,
+                &reporter(),
+                |request, _| {
+                    sent.push(request.url.clone());
+                    async { responded(200) }
+                },
+            )
             .await;
             assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
         }
@@ -1187,14 +1297,20 @@ requests:
         assert!(requests[0].assertions.is_none());
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |request, _| {
-            assert!(
-                request.assertions.is_none(),
-                "substitution must not invent a block"
-            );
-            sent.push(request.url.clone());
-            async { responded(200) }
-        })
+        let outcomes = run_requests(
+            &requests,
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |request, _| {
+                assert!(
+                    request.assertions.is_none(),
+                    "substitution must not invent a block"
+                );
+                sent.push(request.url.clone());
+                async { responded(200) }
+            },
+        )
         .await;
 
         assert_eq!(sent, vec!["https://example.com/plain"]);
@@ -1219,10 +1335,16 @@ assertions:
         let requests: Vec<&Request> = document.requests().iter().collect();
 
         let mut seen = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |request, _| {
-            seen.push(request.assertions.clone());
-            async { responded(200) }
-        })
+        let outcomes = run_requests(
+            &requests,
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |request, _| {
+                seen.push(request.assertions.clone());
+                async { responded(200) }
+            },
+        )
         .await;
 
         assert_eq!(exit_for_run(&outcomes, false), Exit::Ok);
@@ -1245,10 +1367,16 @@ assertions:
         let requests: Vec<&Request> = document.requests().iter().collect();
 
         let mut sent = Vec::new();
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |request, _| {
-            sent.push(request.url.clone());
-            async { all_passed(200) }
-        })
+        let outcomes = run_requests(
+            &requests,
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |request, _| {
+                sent.push(request.url.clone());
+                async { all_passed(200) }
+            },
+        )
         .await;
 
         assert_eq!(
@@ -1292,6 +1420,7 @@ requests:
 
         let outcomes = run_requests(
             &requests,
+            Path::new("."),
             &environment(),
             &reporter(),
             |request, _| async move {
@@ -1335,9 +1464,13 @@ assertions:
         let requests: Vec<&Request> = document.requests().iter().collect();
         assert_eq!(requests.len(), 1);
 
-        let outcomes = run_requests(&requests, &environment(), &reporter(), |_, _| async {
-            all_passed(200)
-        })
+        let outcomes = run_requests(
+            &requests,
+            Path::new("."),
+            &environment(),
+            &reporter(),
+            |_, _| async { all_passed(200) },
+        )
         .await;
 
         assert_eq!(
@@ -1410,6 +1543,7 @@ requests:
         let mut sent: Vec<(String, Option<String>)> = Vec::new();
         let outcomes = run_requests(
             &requests,
+            Path::new("."),
             &environment(),
             &reporter(),
             |request, environment| {
@@ -1478,6 +1612,7 @@ requests:
         let mut sent = Vec::new();
         let outcomes = run_requests(
             &requests,
+            Path::new("."),
             &environment(),
             &reporter(),
             |request, environment| {
@@ -1512,9 +1647,13 @@ requests:
         let requests: Vec<&Request> = document.requests().iter().collect();
 
         for _ in 0..2 {
-            let outcomes = run_requests(&requests, &environment(), &reporter(), |_, _| async {
-                responded(200)
-            })
+            let outcomes = run_requests(
+                &requests,
+                Path::new("."),
+                &environment(),
+                &reporter(),
+                |_, _| async { responded(200) },
+            )
             .await;
             assert!(matches!(outcomes[0], Outcome::NoResponse));
         }
@@ -1549,6 +1688,7 @@ requests:
         let mut sent = Vec::new();
         let outcomes = run_requests(
             &requests,
+            Path::new("."),
             &environment(),
             &reporter(),
             |request, environment| {
@@ -1593,6 +1733,7 @@ requests:
         let mut sent = Vec::new();
         let outcomes = run_requests(
             &requests,
+            Path::new("."),
             &environment(),
             &reporter(),
             |request, environment| {
@@ -1664,6 +1805,7 @@ requests:
         let mut sent = Vec::new();
         let outcomes = run_requests(
             &requests,
+            Path::new("."),
             &environment(),
             &reporter(),
             |request, environment| {
