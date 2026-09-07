@@ -33,3 +33,6 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = { workspace = true }
 # The `--json` integration tests read the binary's stdout back as JSON.
 serde_json = { workspace = true }
+# The `--junit` integration tests parse the report back with a real XML
+# parser, not just by eye. See the note on the workspace dependency.
+roxmltree = { workspace = true }
