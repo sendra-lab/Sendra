@@ -1,0 +1,30 @@
+# `auth:` resolves `bearer` or `basic` credentials into an `Authorization`
+# header, so you no longer hand-write `Bearer <token>` or base64-encode
+# `user:pass` yourself — see `Request::auth` and `Request::resolve_auth`.
+# Exactly one of `bearer`/`basic` may be set, and it may not be combined with
+# an explicit `Authorization` header under `headers:`.
+#
+#   cargo run -p sendra-cli -- run examples/auth.yaml            # both
+#   cargo run -p sendra-cli -- run examples/auth.yaml "..."      # just one
+#
+# httpbin.org's /bearer and /basic-auth/<user>/<pass> endpoints exist
+# specifically to validate these two schemes: each returns 200 with the
+# credentials it saw when they're correct, and 401 otherwise — proving the
+# encoding is actually correct, not just plausible-looking.
+name: Auth against httpbin
+requests:
+  - name: Bearer token
+    method: GET
+    url: https://httpbin.org/bearer
+    auth:
+      bearer: my-token-123
+
+  - name: Basic auth
+    method: GET
+    # httpbin checks the credentials in the URL against the ones actually
+    # sent, so `user`/`pass` below must match `ada`/`s3cr3t` here for a 200.
+    url: https://httpbin.org/basic-auth/ada/s3cr3t
+    auth:
+      basic:
+        user: ada
+        pass: s3cr3t

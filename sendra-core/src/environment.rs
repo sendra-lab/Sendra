@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 
 use crate::assertions::Assertions;
 use crate::config::PROJECT_DIR_NAME;
-use crate::{Collection, Document, MultipartPart, Request, SendraError};
+use crate::{Auth, BasicAuth, Collection, Document, MultipartPart, Request, SendraError};
 
 /// Directory holding environment files, under a project's `.sendra/`.
 const ENVIRONMENTS_DIR_NAME: &str = "environments";
@@ -338,6 +338,32 @@ impl Environment {
                     })
                 })
                 .collect::<Result<_, SendraError>>()?,
+            // `{{var}}` reaches a bearer token or basic user/pass the same
+            // way it reaches every other value field — see the note on
+            // `Request::auth`.
+            auth: request
+                .auth
+                .as_ref()
+                .map(|auth| -> Result<Auth, SendraError> {
+                    Ok(Auth {
+                        bearer: auth
+                            .bearer
+                            .as_deref()
+                            .map(|token| self.expand_templates(token))
+                            .transpose()?,
+                        basic: auth
+                            .basic
+                            .as_ref()
+                            .map(|basic| -> Result<BasicAuth, SendraError> {
+                                Ok(BasicAuth {
+                                    user: self.expand_templates(&basic.user)?,
+                                    pass: self.expand_templates(&basic.pass)?,
+                                })
+                            })
+                            .transpose()?,
+                    })
+                })
+                .transpose()?,
             assertions: request
                 .assertions
                 .as_ref()

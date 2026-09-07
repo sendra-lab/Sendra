@@ -564,6 +564,14 @@ fn request_from_dynamic(original: &Request, value: Dynamic) -> Result<Request, S
         body_file: original.body_file.clone(),
         form: original.form.clone(),
         multipart: original.multipart.clone(),
+        // Not exposed to the script and carried through untouched — by the
+        // time a `pre_request` script runs, `Request::resolve_auth` has
+        // already resolved `auth` into the `Authorization` header above and
+        // cleared this field, so it is already `None` here regardless of
+        // whether the request file used `auth` at all. A script that wants
+        // to change authentication changes `request.headers["Authorization"]`,
+        // exactly as it always has.
+        auth: original.auth.clone(),
         // The other mechanism that reads this response, carried through
         // untouched. Scripts and assertions do not see each other.
         assertions: original.assertions.clone(),

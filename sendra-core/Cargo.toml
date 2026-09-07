@@ -21,6 +21,9 @@ jsonpath-rust = { workspace = true }
 serde_urlencoded = { workspace = true }
 reqwest = { workspace = true }
 thiserror = { workspace = true }
+# `auth.basic` base64-encodes `user:pass` into the `Authorization` header —
+# see the note on `Request::resolve_auth`.
+base64 = { workspace = true }
 # Locating the global config directory per platform. `dirs`, not `directories`:
 # see the note on `config::global_config_path`.
 dirs = { workspace = true }

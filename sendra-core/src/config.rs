@@ -461,6 +461,7 @@ mod tests {
             body_file: None,
             form: Vec::new(),
             multipart: Vec::new(),
+            auth: None,
             assertions: None,
             pre_request: None,
             post_request: None,
@@ -876,6 +877,7 @@ mod tests {
             body_file: None,
             form: Vec::new(),
             multipart: Vec::new(),
+            auth: None,
             // Config merges headers and nothing else; assertions are checked
             // against the response, which a default header cannot change, and
             // scripts run later still — the config has finished by then.

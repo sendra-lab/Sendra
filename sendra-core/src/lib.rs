@@ -504,6 +504,39 @@ pub struct Request {
     /// version.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub multipart: Vec<MultipartPart>,
+    /// How to authenticate this request: bearer token or basic credentials,
+    /// resolved to a plain `Authorization` header before anything else sees
+    /// it.
+    ///
+    /// ```text
+    /// auth:
+    ///   bearer: {{token}}
+    ///
+    /// # or
+    ///
+    /// auth:
+    ///   basic:
+    ///     user: {{username}}
+    ///     pass: {{password}}
+    /// ```
+    ///
+    /// Exactly one of `bearer`/`basic` may be set — [`Request::validate`]
+    /// rejects any other combination, the same shape as the five body
+    /// fields above. A request may not set `auth` *and* an explicit
+    /// `Authorization` header under `headers:`: both trying to control the
+    /// same header is far more likely a mistake than a deliberate layering
+    /// (unlike, say, a config default header and a request header, where
+    /// "the request wins" is a sensible answer), so `validate` rejects the
+    /// combination rather than silently picking one.
+    ///
+    /// [`Request::resolve_auth`] turns this into the `Authorization` header
+    /// and clears the field, following the same "scripts see the final
+    /// resolved form" precedent as [`Request::resolve_body`]: a
+    /// `pre_request` script reads or overrides
+    /// `request.headers["Authorization"]` like any other header, with no
+    /// separate `request.auth` API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<Auth>,
     /// Declarative checks on the response, evaluated by
     /// [`Assertions::evaluate`] once it arrives.
     ///
@@ -653,6 +686,38 @@ impl Request {
             }
         }
 
+        if let Some(auth) = &self.auth {
+            let mut set = Vec::new();
+            if auth.bearer.is_some() {
+                set.push("bearer");
+            }
+            if auth.basic.is_some() {
+                set.push("basic");
+            }
+            if set.len() != 1 {
+                return invalid(format!(
+                    "exactly one of `auth.bearer` or `auth.basic` must be set, but found: {}",
+                    if set.is_empty() {
+                        "neither".to_string()
+                    } else {
+                        set.join(", ")
+                    }
+                ));
+            }
+
+            if self
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("Authorization"))
+            {
+                return invalid(
+                    "`auth` and an explicit `Authorization` header cannot both be set on the \
+                     same request; remove one"
+                        .to_string(),
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -781,6 +846,44 @@ impl Request {
         Ok(resolved)
     }
 
+    /// Resolve `auth` into the `Authorization` header that goes on the wire,
+    /// clearing `auth` on the way out.
+    ///
+    /// Called after [`resolve_body`](Self::resolve_body) and before the
+    /// config is applied or a `pre_request` script runs — the same
+    /// "structured input becomes the final wire form before anything else
+    /// touches it" shape as `resolve_query` and `resolve_body`. A
+    /// `pre_request` script therefore sees a plain `Authorization` header
+    /// like any other, with no separate `request.auth` API.
+    ///
+    /// [`Request::validate`] has already rejected a request that sets both
+    /// `auth` and an explicit `Authorization` header, so this always adds
+    /// the header rather than needing [`config::insert_if_absent`]'s
+    /// suppression rule.
+    pub fn resolve_auth(&self) -> Result<Request, SendraError> {
+        let mut resolved = self.clone();
+
+        if let Some(auth) = &self.auth {
+            let value = match (&auth.bearer, &auth.basic) {
+                (Some(token), None) => format!("Bearer {token}"),
+                (None, Some(basic)) => {
+                    let credentials = format!("{}:{}", basic.user, basic.pass);
+                    let encoded = base64::Engine::encode(
+                        &base64::engine::general_purpose::STANDARD,
+                        credentials,
+                    );
+                    format!("Basic {encoded}")
+                }
+                // `validate` already rejected any other combination.
+                _ => unreachable!("Request::validate enforces exactly one of bearer/basic"),
+            };
+            resolved.headers.push(("Authorization".to_string(), value));
+        }
+        resolved.auth = None;
+
+        Ok(resolved)
+    }
+
     /// Display label: the `name` field if present, else `METHOD url`.
     pub fn label(&self) -> String {
         match &self.name {
@@ -813,6 +916,34 @@ pub struct MultipartPart {
     pub value: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+}
+
+/// [`Request::auth`]: exactly one of `bearer` or `basic`, enforced by
+/// [`Request::validate`].
+///
+/// This is also the shape a default `auth:` at the environment/config level
+/// is expected to reuse unchanged, and the shape a future `api_key` variant
+/// is expected to join as a third mutually-exclusive case — so kept as its
+/// own type rather than inlined onto `Request`, the same way `MultipartPart`
+/// is its own type rather than an inline tuple.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Auth {
+    /// Sets `Authorization: Bearer <bearer>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer: Option<String>,
+    /// Sets `Authorization: Basic <base64(user:pass)>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basic: Option<BasicAuth>,
+}
+
+/// [`Auth::basic`]'s credentials, base64-encoded as `user:pass` by
+/// [`Request::resolve_auth`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BasicAuth {
+    pub user: String,
+    pub pass: String,
 }
 
 /// Read a `body_file` (or a multipart file part) relative to `base_dir`, as
@@ -1616,6 +1747,7 @@ body: null
                 body_file: None,
                 form: Vec::new(),
                 multipart: Vec::new(),
+                auth: None,
                 assertions: None,
                 pre_request: None,
                 post_request: None,
@@ -2080,6 +2212,7 @@ enviroment: staging
             "repeated-headers.yaml",
             "structured-bodies.yaml",
             "query-params.yaml",
+            "auth.yaml",
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("..")
@@ -2113,6 +2246,7 @@ enviroment: staging
             body_file: None,
             form: Vec::new(),
             multipart: Vec::new(),
+            auth: None,
             assertions: None,
             pre_request: None,
             post_request: None,
@@ -2145,6 +2279,7 @@ enviroment: staging
             body_file: None,
             form: Vec::new(),
             multipart: Vec::new(),
+            auth: None,
             assertions: None,
             pre_request: None,
             post_request: None,
@@ -2273,6 +2408,7 @@ enviroment: staging
             body_file: None,
             form: Vec::new(),
             multipart: Vec::new(),
+            auth: None,
             assertions: None,
             pre_request: None,
             post_request: None,
@@ -3343,5 +3479,90 @@ requests:
                 ("tag".to_string(), "iced".to_string()),
             ]
         );
+    }
+
+    // --- auth: bearer and basic ---------------------------------------------
+
+    #[test]
+    fn auth_bearer_resolves_to_a_bearer_authorization_header() {
+        let request = request_with("auth:\n  bearer: my-token\n");
+        let resolved = request.resolve_auth().expect("resolves");
+        assert_eq!(resolved.header("Authorization"), Some("Bearer my-token"));
+        assert!(resolved.auth.is_none());
+    }
+
+    #[test]
+    fn auth_basic_resolves_to_a_base64_encoded_authorization_header() {
+        let request = request_with("auth:\n  basic:\n    user: ada\n    pass: s3cr3t\n");
+        let resolved = request.resolve_auth().expect("resolves");
+        // base64("ada:s3cr3t")
+        assert_eq!(
+            resolved.header("Authorization"),
+            Some("Basic YWRhOnMzY3IzdA==")
+        );
+        assert!(resolved.auth.is_none());
+    }
+
+    #[test]
+    fn a_request_with_no_auth_field_resolves_to_no_authorization_header() {
+        let request = request_with("");
+        let resolved = request.resolve_auth().expect("nothing to resolve");
+        assert!(resolved.header("Authorization").is_none());
+    }
+
+    #[test]
+    fn auth_naming_both_bearer_and_basic_is_rejected_at_parse_time() {
+        let err = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nauth:\n  bearer: x\n  basic:\n    user: a\n    pass: b\n",
+        )
+        .expect_err("bearer and basic together must be rejected");
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("bearer") && reason.contains("basic")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn auth_naming_neither_bearer_nor_basic_is_rejected_at_parse_time() {
+        let err = Request::from_yaml_str("method: GET\nurl: https://example.com\nauth: {}\n")
+            .expect_err("an empty auth block must be rejected");
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("bearer") && reason.contains("basic")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn auth_alongside_an_explicit_authorization_header_is_rejected_at_parse_time() {
+        let err = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nheaders:\n  Authorization: Bearer hand-written\nauth:\n  bearer: x\n",
+        )
+        .expect_err("auth and an explicit Authorization header together must be rejected");
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("Authorization")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_authorization_collision_check_is_case_insensitive() {
+        let err = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nheaders:\n  authorization: Bearer hand-written\nauth:\n  bearer: x\n",
+        )
+        .expect_err("a differently-cased Authorization header must still collide");
+        assert!(matches!(&err, SendraError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn environment_substitution_reaches_bearer_and_basic_values() {
+        let request =
+            request_with("auth:\n  basic:\n    user: '{{username}}'\n    pass: '{{password}}'\n");
+        let environment =
+            crate::Environment::from_yaml_str("username: ada\npassword: s3cr3t\n").unwrap();
+        let substituted = environment.apply(&request).expect("both are set");
+        let auth = substituted.auth.expect("auth survives substitution");
+        let basic = auth.basic.expect("basic survives substitution");
+        assert_eq!(basic.user, "ada");
+        assert_eq!(basic.pass, "s3cr3t");
     }
 }
