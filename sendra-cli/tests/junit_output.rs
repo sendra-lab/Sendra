@@ -261,6 +261,71 @@ fn junit_does_not_change_the_exit_code() {
 }
 
 #[test]
+fn junit_for_a_single_named_request_has_one_testcase() {
+    // `test <file> <name>` is additive over `test <file>`: the same
+    // machinery, fed one request instead of all four, should just naturally
+    // produce a report with one `<testsuite>`/`<testcase>` pair rather than
+    // needing special-casing.
+    let server = FixedServer::start();
+    let dir = project(&server);
+    let report_path = dir.path().join("report.xml");
+
+    let output = sendra(
+        dir.path(),
+        &["test", "req.yaml", "Passes", "--junit", "report.xml"],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "`Passes` alone should pass: stderr was {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let xml = std::fs::read_to_string(&report_path).expect("the report was written");
+    let document = roxmltree::Document::parse(&xml)
+        .unwrap_or_else(|err| panic!("the report must be well-formed XML ({err}): {xml}"));
+
+    let suite = document
+        .descendants()
+        .find(|node| node.has_tag_name("testsuite"))
+        .expect("one <testsuite>");
+    assert_eq!(suite.attribute("tests"), Some("1"));
+    assert_eq!(suite.attribute("failures"), Some("0"));
+    assert_eq!(suite.attribute("errors"), Some("0"));
+    assert_eq!(suite.attribute("skipped"), Some("0"));
+
+    let cases: Vec<_> = document
+        .descendants()
+        .filter(|node| node.has_tag_name("testcase"))
+        .collect();
+    assert_eq!(cases.len(), 1, "one <testcase> for the one request tested");
+    assert_eq!(cases[0].attribute("name"), Some("Passes"));
+}
+
+#[test]
+fn test_with_a_nonexistent_request_name_fails_like_run_does() {
+    let server = FixedServer::start();
+    let dir = project(&server);
+
+    let run_output = sendra(dir.path(), &["run", "req.yaml", "Nonexistent"]);
+    let test_output = sendra(dir.path(), &["test", "req.yaml", "Nonexistent"]);
+
+    assert_eq!(
+        test_output.status.code(),
+        run_output.status.code(),
+        "the same missing name should fail the same way under both subcommands"
+    );
+    assert_ne!(test_output.status.code(), Some(0));
+
+    let stderr = String::from_utf8_lossy(&test_output.stderr);
+    assert!(
+        stderr.contains("Nonexistent"),
+        "the error should name the request that was not found: {stderr}"
+    );
+}
+
+#[test]
 fn run_refuses_junit() {
     // The explicit non-goal: `run` produces no verdict for a JUnit report to
     // describe, so the flag is `test`'s alone and clap refuses it as unknown.

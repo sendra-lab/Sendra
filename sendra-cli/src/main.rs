@@ -55,6 +55,7 @@ async fn main() -> ExitCode {
 
         Command::Test {
             path,
+            request,
             env,
             header,
             var,
@@ -69,6 +70,7 @@ async fn main() -> ExitCode {
             }
             test(
                 &path,
+                request.as_deref(),
                 env.as_deref(),
                 &header,
                 &var,
