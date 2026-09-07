@@ -31,6 +31,9 @@ async fn main() -> ExitCode {
             path,
             request,
             env,
+            header,
+            var,
+            timeout,
             allow_error_status,
             json,
             show_captures,
@@ -38,6 +41,9 @@ async fn main() -> ExitCode {
             &path,
             request.as_deref(),
             env.as_deref(),
+            &header,
+            &var,
+            timeout,
             allow_error_status,
             json,
             show_captures,
@@ -48,6 +54,9 @@ async fn main() -> ExitCode {
         Command::Test {
             path,
             env,
+            header,
+            var,
+            timeout,
             json,
             show_captures,
             allow_error_status,
@@ -55,9 +64,17 @@ async fn main() -> ExitCode {
             if allow_error_status {
                 reject_allow_error_status();
             }
-            test(&path, env.as_deref(), json, show_captures)
-                .await
-                .into()
+            test(
+                &path,
+                env.as_deref(),
+                &header,
+                &var,
+                timeout,
+                json,
+                show_captures,
+            )
+            .await
+            .into()
         }
     }
 }

@@ -640,7 +640,10 @@ Names are compared case-insensitively, because that is how HTTP header names
 work: a config `Authorization` and a request `authorization` are one header, and
 the request's value is the one sent.
 
-There are no CLI flags to override config yet — the file is the only input.
+`--timeout` and `-H`/`--header` override this file for one invocation without
+editing it — see [CLI overrides](#cli-overrides), and
+[Precedence, start to finish](#precedence-start-to-finish) for where they sit
+relative to everything else.
 
 ## Environments and variables
 
@@ -726,6 +729,9 @@ sendra test req.yaml --env ci       # same rule, same walk-up, same errors
 The name is a filename, not a keyword — `staging`, `prod`, `local`, `ci` and
 `default` are all just files in `.sendra/environments/`, found by the same
 upward walk, nearest one wins.
+
+`--var name=value` sets one variable for this invocation, with or without an
+environment file at all — see [CLI overrides](#cli-overrides).
 
 Two rules about environments that are not there, and they are deliberately
 different from each other:
@@ -1049,6 +1055,133 @@ cursor is a real flow that has to be expressible.
   independently against the same response: a failed assertion does not stop the
   capture beside it, and a failed capture does not fail an assertion. Both are
   reported, and a request that broke both is one failed request.
+
+## CLI overrides
+
+Three flags change one invocation without touching a file, on `sendra run` and
+`sendra test` alike:
+
+```sh
+sendra run req.yaml -H "X-Trace-Id: abc123" --var base_url=http://localhost:8080 --timeout 5
+```
+
+| Flag                    | Repeatable | Overrides                                                        |
+| ------------------------ | ---------- | ----------------------------------------------------------------- |
+| `-H`/`--header "Name: value"` | yes  | config headers, the request's own `headers:`, a resolved `auth:` |
+| `--var name=value`       | yes        | the active environment file's value for `name`                    |
+| `--timeout <seconds>`    | no         | the resolved config timeout                                       |
+
+All three are invocation-only: there is no config-file equivalent, and nothing
+here changes how a config or environment file itself resolves — see
+[Precedence, start to finish](#precedence-start-to-finish) for how they fit
+with everything else.
+
+**`-H`/`--header` wins every conflict a header can be in.** It is compared
+case-insensitively, like every other header rule in Sendra, and it *replaces*
+rather than merges: a repeated header the request file wrote, a config
+default, and the `Authorization` header a resolved `auth:` block produced are
+all dropped in favour of the `-H` value if the name matches.
+
+```sh
+# req.yaml sets auth: bearer: original — this invocation sends Bearer overridden instead
+sendra run req.yaml -H "Authorization: Bearer overridden"
+```
+
+Passing `-H` more than once for the *same* name keeps only the last value:
+
+```sh
+sendra run req.yaml -H "X-Trace-Id: first" -H "X-Trace-Id: second"   # sends only "second"
+```
+
+That is a deliberate departure from the request file's own `headers:`, which
+does allow a name to repeat and sends every occurrence. A name typed twice on
+one command line reads as "I meant to change it, and mistyped the first try" —
+the way retyping a shell variable reassigns it rather than appending to it —
+not as a deliberate multi-value header. If a genuinely repeated header is ever
+needed from the command line, that is a different, additive flag someone can
+propose; `-H` staying a plain override keeps its own rule simple.
+
+A malformed value — no `:` in `-H`, no `=` in `--var` — is refused immediately
+with exit code `2`, the same way any other bad argument is, rather than
+surfacing later as a confusing substitution or request-building failure.
+
+**`--var` behaves exactly like part of the environment file for this run.** It
+sets a variable whether or not `--env` was passed at all, and overrides the
+same name in the file that *was* loaded when both are present:
+
+```sh
+sendra run req.yaml --var base_url=http://localhost:8080          # no environment file needed
+sendra run req.yaml --env staging --var base_url=http://localhost # wins over staging.yaml's base_url
+```
+
+Because it is folded into the same set of names an environment file populates
+rather than kept as some higher, separate layer, it inherits that layer's
+rules rather than needing new ones of its own — in particular, [name
+collisions](#name-collisions): a `capture` block naming a variable a `--var`
+already set is refused exactly as if the environment file had defined it.
+
+```sh
+sendra test req.yaml --var token=cli-value   # req.yaml also has `capture: { token: $.token }`
+```
+
+```text
+capture
+  ✗ token from `$.token` — the active environment already defines this
+    variable; rename the capture or the `--var`/environment entry
+```
+
+That is not a special case written for `--var` — it falls out of `--var`
+being indistinguishable, by the time a capture's collision check runs, from a
+value the environment file itself defined. The alternative — letting a
+capture silently override a `--var`, or a `--var` silently pre-empt a capture
+— has the same problem an environment-file collision has: the same `{{name}}`
+would mean two different things at two different points in the same run,
+discoverable only by reading the file and counting positions.
+
+**`--timeout <seconds>` overrides the resolved config timeout**, whole-request
+— connect, send and body read — for this invocation only:
+
+```sh
+sendra run req.yaml --timeout 5   # gives up after 5s, whatever config.yaml says
+```
+
+## Precedence, start to finish
+
+Every layer that can decide a value for a request has been introduced above,
+one pair at a time as it was added. Stated as a single chain, weakest to
+strongest:
+
+```
+hardcoded default
+  → global config
+    → project config
+      → environment file (--env, or the default one)
+        → captured variables (as they accumulate through the run)
+          → CLI overrides (-H, --var, --timeout)
+```
+
+A few things are true of every step in that chain and worth stating once
+rather than once per pair:
+
+- **Later beats earlier, and that is the whole rule.** Project config beats
+  global config key by key ([Configuration](#configuration)); an environment
+  file's variables beat nothing below them because nothing below them is a
+  variable, but a request's own `headers:`/`body` beat a config default the
+  same way ([Configuration](#configuration)); a capture beats an earlier
+  capture of the same name, and is refused rather than allowed to beat an
+  environment file's variable ([Name collisions](#name-collisions)); a
+  CLI override beats everything, because there is nothing after it.
+- **Headers and variables are two different chains**, not one, because a
+  header and a `{{var}}` are resolved at different times against different
+  inputs — substitution happens once, before a request is ever sent to config
+  or a script, and `Config::apply`'s header merge happens after. The table
+  above lists what each override beats *within its own chain*: `-H` never
+  competes with `--var`, and `--timeout` competes with neither.
+- **A `pre_request` script still runs last of all**, after every override in
+  both chains, and can still change or remove anything an override set — the
+  same way it can undo a config header. No override in this chain is given
+  special protection from a script the request file itself wrote; the request
+  file's own script always gets the last, most specific word.
 
 ## Scripting
 

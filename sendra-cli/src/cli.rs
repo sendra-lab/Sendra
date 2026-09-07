@@ -5,6 +5,43 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+/// Parse one `-H`/`--header` value: `Name: value`.
+///
+/// A clap `value_parser` rather than downstream validation, so a malformed
+/// value (`-H "no-colon-here"`) is refused where every other bad argument
+/// is — with clap's usual message and exit code 2 — instead of surfacing
+/// later as a confusing substitution or request-building failure.
+///
+/// Both sides are trimmed: the natural way to type this is `"Name: value"`,
+/// with the space after the colon that HTTP header folding has always
+/// treated as insignificant, and trimming it here means that space never
+/// becomes part of the value by accident.
+fn parse_header_override(raw: &str) -> Result<(String, String), String> {
+    let (name, value) = raw
+        .split_once(':')
+        .ok_or_else(|| format!("expected `Name: value`, got `{raw}` (no `:` found)"))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("header name is empty in `{raw}`"));
+    }
+    Ok((name.to_string(), value.trim().to_string()))
+}
+
+/// Parse one `--var` value: `name=value`.
+///
+/// Same reasoning as [`parse_header_override`]: a clap-level parser turns a
+/// missing `=` into a clear, immediate CLI error rather than a variable that
+/// silently never gets set.
+fn parse_var_override(raw: &str) -> Result<(String, String), String> {
+    let (name, value) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("expected `name=value`, got `{raw}` (no `=` found)"))?;
+    if name.is_empty() {
+        return Err(format!("variable name is empty in `{raw}`"));
+    }
+    Ok((name.to_string(), value.to_string()))
+}
+
 #[derive(Parser)]
 #[command(
     name = "sendra",
@@ -42,6 +79,51 @@ pub(crate) enum Command {
         // this doc comment is what `--help` prints, so it stays user-facing.
         #[arg(long, value_name = "NAME")]
         env: Option<String>,
+
+        /// Add or override a header for this invocation only, `Name: value`.
+        ///
+        /// Repeatable. Wins over everything else a header can come from —
+        /// config's default headers, the request file's own `headers:`, and
+        /// the `Authorization` header an `auth:` block resolves to — because
+        /// it is the most specific, most deliberate override available: typed
+        /// for this one run, not left in a file for every run after it.
+        ///
+        /// Passing `-H` more than once for the *same* name (case-insensitive)
+        /// replaces the earlier value rather than adding a repeat. That
+        /// differs from the request file's own `headers:`, which does allow a
+        /// name to repeat — but a name typed twice on one command line reads
+        /// as "I meant to change it", the way retyping a shell variable
+        /// reassigns it rather than appending to it, not as a deliberate
+        /// multi-value header.
+        ///
+        /// See the README's "Precedence, start to finish" section for where
+        /// this sits among every other layer.
+        #[arg(short = 'H', long = "header", value_name = "NAME:VALUE", value_parser = parse_header_override)]
+        header: Vec<(String, String)>,
+
+        /// Set a substitution variable for this invocation only, `name=value`.
+        ///
+        /// Repeatable, and usable with or without `--env`. Overrides a value
+        /// the active environment file defines for the same name, for the
+        /// same "most specific wins" reason `-H` overrides config and request
+        /// headers. It is treated as if it were part of the environment file
+        /// itself rather than as a separate, higher layer: in particular, a
+        /// `capture` block naming the same variable a `--var` already set is
+        /// refused exactly as it would be for a name the file defines — see
+        /// the README for why letting a capture silently win, or silently
+        /// lose, would both be worse than an error.
+        #[arg(long = "var", value_name = "NAME=VALUE", value_parser = parse_var_override)]
+        var: Vec<(String, String)>,
+
+        /// Override the resolved timeout, in seconds, for this invocation
+        /// only.
+        ///
+        /// Applies to the whole request — connect, send and body read — the
+        /// same span `timeout_seconds` in a config file covers. Wins over
+        /// both the global and the project config, for the same reason every
+        /// other override here does.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
 
         /// Exit 0 even when a response status is 4xx or 5xx.
         ///
@@ -101,6 +183,22 @@ pub(crate) enum Command {
         /// naming an environment that has no file is an error.
         #[arg(long, value_name = "NAME")]
         env: Option<String>,
+
+        /// Add or override a header for this invocation only, `Name: value`.
+        /// Behaves exactly as it does on `run` — see `run --help` for the
+        /// full reasoning and the repeated-`-H` rule.
+        #[arg(short = 'H', long = "header", value_name = "NAME:VALUE", value_parser = parse_header_override)]
+        header: Vec<(String, String)>,
+
+        /// Set a substitution variable for this invocation only, `name=value`.
+        /// Behaves exactly as it does on `run` — see `run --help`.
+        #[arg(long = "var", value_name = "NAME=VALUE", value_parser = parse_var_override)]
+        var: Vec<(String, String)>,
+
+        /// Override the resolved timeout, in seconds, for this invocation
+        /// only. Behaves exactly as it does on `run` — see `run --help`.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
 
         /// Print one JSON object describing the whole run, instead of the
         /// human-readable output.
@@ -201,12 +299,18 @@ mod tests {
             Command::Test {
                 path,
                 env,
+                header,
+                var,
+                timeout,
                 json,
                 show_captures,
                 allow_error_status,
             } => {
                 assert_eq!(path, PathBuf::from("collection.yaml"));
                 assert_eq!(env.as_deref(), Some("staging"));
+                assert!(header.is_empty(), "no -H was passed");
+                assert!(var.is_empty(), "no --var was passed");
+                assert_eq!(timeout, None, "no --timeout was passed");
                 assert!(!json, "the human output is what you get without --json");
                 assert!(!show_captures, "captures are redacted by default");
                 assert!(!allow_error_status);
@@ -268,5 +372,172 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // --- `-H`/`--header` ----------------------------------------------------
+
+    #[test]
+    fn header_is_repeatable_and_offered_by_both_subcommands() {
+        let cli = Cli::try_parse_from([
+            "sendra",
+            "run",
+            "req.yaml",
+            "-H",
+            "X-Trace-Id: abc",
+            "--header",
+            "Accept: application/json",
+        ])
+        .expect("`-H`/`--header` are the same flag, and repeat");
+
+        match cli.command {
+            Command::Run { header, .. } => assert_eq!(
+                header,
+                vec![
+                    ("X-Trace-Id".to_string(), "abc".to_string()),
+                    ("Accept".to_string(), "application/json".to_string()),
+                ],
+                "both occurrences must reach `main`, in order"
+            ),
+            _ => panic!("`sendra run` should have parsed as `Command::Run`"),
+        }
+
+        let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "-H", "X-Trace-Id: abc"])
+            .expect("`-H` is offered by `test` too");
+        assert!(matches!(
+            cli.command,
+            Command::Test { header, .. } if header == vec![("X-Trace-Id".to_string(), "abc".to_string())]
+        ));
+    }
+
+    #[test]
+    fn header_trims_the_space_after_the_colon_but_not_the_name() {
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "-H", "X-Trace-Id:   abc  "])
+            .expect("a trailing/leading space around the value is not an error");
+        match cli.command {
+            Command::Run { header, .. } => {
+                assert_eq!(header, vec![("X-Trace-Id".to_string(), "abc".to_string())]);
+            }
+            _ => panic!("`sendra run` should have parsed as `Command::Run`"),
+        }
+    }
+
+    /// `Cli` derives no `Debug`, so `Result::expect_err`/`unwrap_err` (which
+    /// both require it on the `Ok` side) cannot be used against
+    /// `Cli::try_parse_from` directly; this unwraps by hand instead.
+    fn expect_cli_error(args: &[&str]) -> clap::Error {
+        match Cli::try_parse_from(args) {
+            Ok(_) => panic!("expected a CLI error parsing {args:?}"),
+            Err(err) => err,
+        }
+    }
+
+    #[test]
+    fn a_malformed_header_is_a_clear_cli_error() {
+        let err = expect_cli_error(&["sendra", "run", "req.yaml", "-H", "no-colon-here"]);
+        assert_eq!(
+            err.exit_code(),
+            2,
+            "clap's usage-error exit code, same as any other bad argument"
+        );
+        assert!(
+            err.to_string().contains("no `:` found"),
+            "the message should say what is wrong: {err}"
+        );
+
+        let err = expect_cli_error(&["sendra", "run", "req.yaml", "-H", ": no name"]);
+        assert!(err.to_string().contains("header name is empty"));
+    }
+
+    // --- `--var` -------------------------------------------------------------
+
+    #[test]
+    fn var_is_repeatable_and_offered_by_both_subcommands() {
+        let cli = Cli::try_parse_from([
+            "sendra",
+            "run",
+            "req.yaml",
+            "--var",
+            "base_url=https://example.com",
+            "--var",
+            "token=abc123",
+        ])
+        .expect("`--var` repeats");
+
+        match cli.command {
+            Command::Run { var, .. } => assert_eq!(
+                var,
+                vec![
+                    ("base_url".to_string(), "https://example.com".to_string()),
+                    ("token".to_string(), "abc123".to_string()),
+                ]
+            ),
+            _ => panic!("`sendra run` should have parsed as `Command::Run`"),
+        }
+
+        let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--var", "token=abc123"])
+            .expect("`--var` is offered by `test` too");
+        assert!(matches!(
+            cli.command,
+            Command::Test { var, .. } if var == vec![("token".to_string(), "abc123".to_string())]
+        ));
+    }
+
+    #[test]
+    fn a_var_value_may_contain_an_equals_sign() {
+        // Only the first `=` is the separator — a value that is itself a
+        // `key=value` pair (a query string, say) must survive intact.
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--var", "q=a=b"])
+            .expect("only the first `=` splits name from value");
+        match cli.command {
+            Command::Run { var, .. } => {
+                assert_eq!(var, vec![("q".to_string(), "a=b".to_string())]);
+            }
+            _ => panic!("`sendra run` should have parsed as `Command::Run`"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_var_is_a_clear_cli_error() {
+        let err = expect_cli_error(&["sendra", "run", "req.yaml", "--var", "no-equals-here"]);
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("no `=` found"));
+
+        let err = expect_cli_error(&["sendra", "run", "req.yaml", "--var", "=novalue"]);
+        assert!(err.to_string().contains("variable name is empty"));
+    }
+
+    // --- `--timeout` -----------------------------------------------------
+
+    #[test]
+    fn timeout_is_an_optional_number_of_seconds_offered_by_both_subcommands() {
+        let cli =
+            Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`--timeout` is optional");
+        assert!(matches!(cli.command, Command::Run { timeout: None, .. }));
+
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--timeout", "5"])
+            .expect("`--timeout` takes a number of seconds");
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                timeout: Some(5),
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--timeout", "5"])
+            .expect("`--timeout` is offered by `test` too");
+        assert!(matches!(
+            cli.command,
+            Command::Test {
+                timeout: Some(5),
+                ..
+            }
+        ));
+
+        assert!(
+            Cli::try_parse_from(["sendra", "run", "req.yaml", "--timeout", "not-a-number"])
+                .is_err(),
+            "a non-numeric timeout is a clap-level error"
+        );
     }
 }
