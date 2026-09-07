@@ -277,6 +277,16 @@ impl Environment {
             method: request.method,
             url: self.expand_templates(&request.url)?,
             headers,
+            // `{{var}}` reaches query values (and list entries within them)
+            // the same way it reaches header values above — consistent with
+            // every other value field.
+            query: request
+                .query
+                .iter()
+                .map(|(name, value)| {
+                    Ok((self.expand_templates(name)?, self.expand_templates(value)?))
+                })
+                .collect::<Result<_, SendraError>>()?,
             body: request
                 .body
                 .as_deref()

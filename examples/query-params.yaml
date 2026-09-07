@@ -1,0 +1,27 @@
+# `query:` as a map of parameter name to value, merged onto `url`'s own query
+# string with real percent-encoding — see `Request::query` and
+# `Request::resolve_query`. The alternative is hand-building the query string
+# inside `url` itself, where a space, `&`, `=` or non-ASCII character has to
+# be escaped by hand.
+#
+#   cargo run -p sendra-cli -- run examples/query-params.yaml
+#
+# httpbin.org/get echoes back the query parameters it actually received under
+# `args`, so the response shows the encoding and the merge landed correctly,
+# not just that the request didn't error.
+name: Query parameters against httpbin
+method: GET
+# `url` already carries one query parameter of its own, to demonstrate the
+# merge: `existing` survives untouched, and `q` below is added alongside it.
+url: https://httpbin.org/get?existing=already-here
+query:
+  # A space, an ampersand and a non-ASCII character, all encoded properly
+  # rather than concatenated as-is.
+  q: coffee & tea, café
+  # A repeated key: written as a list, the same syntax `headers:` uses for a
+  # header sent more than once, since it is the same shape of problem.
+  tag:
+    - hot
+    - iced
+  # An unquoted number, coerced to its string form rather than rejected.
+  limit: 10

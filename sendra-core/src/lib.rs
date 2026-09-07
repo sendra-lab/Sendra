@@ -382,6 +382,41 @@ pub struct Request {
         serialize_with = "serialize_headers"
     )]
     pub headers: Vec<(String, String)>,
+    /// Query parameters, merged onto whatever `url` already has and
+    /// percent-encoded properly — the alternative to hand-building a query
+    /// string inside `url` itself, where a value containing a space, `&`,
+    /// `=` or non-ASCII character has to be encoded by hand or the request
+    /// silently means something different than intended.
+    ///
+    /// ```text
+    /// url: https://api.example.com/search
+    /// query:
+    ///   q: coffee & tea      # -> q=coffee+%26+tea
+    ///   tag:                 # list: one `tag=` per entry, in order
+    ///     - hot
+    ///     - iced
+    /// ```
+    ///
+    /// [`Request::resolve_query`] merges this onto `url`'s own query string
+    /// (if it has one) with **`query` winning**: a key present in both is
+    /// sent only with the value(s) from here, not the URL's. `query` is the
+    /// more structured, explicit source, so a key repeated between the two
+    /// is far more likely to be a stale copy left in `url` than a
+    /// deliberately duplicated value.
+    ///
+    /// Deserialized the same way [`headers`](Self::headers) is — a value may
+    /// be a scalar or, for a repeated key (`?tag=hot&tag=iced`), a list of
+    /// scalars — since a repeated query parameter is the same shape of
+    /// problem a repeated header already had a good answer for. An unquoted
+    /// number or boolean is coerced to its string form rather than rejected,
+    /// matching header values.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_headers",
+        serialize_with = "serialize_headers"
+    )]
+    pub query: Vec<(String, String)>,
     /// Raw body, sent verbatim.
     ///
     /// One of five ways to specify a body — `body`, [`json`](Self::json),
@@ -619,6 +654,66 @@ impl Request {
         }
 
         Ok(())
+    }
+
+    /// Merge `query` onto `url`'s own query string, percent-encoded
+    /// properly, returning a request whose `url` is the final string that
+    /// goes on the wire and whose `query` is empty.
+    ///
+    /// Called right after environment substitution and before
+    /// [`resolve_body`](Self::resolve_body), the config, or a `pre_request`
+    /// script ever see the request — the same "structured input becomes the
+    /// final wire form before anything else touches it" shape as
+    /// `resolve_body`. A `pre_request` script therefore sees `query`
+    /// parameters already merged into `request.url`, not a separate map, for
+    /// consistency with `resolve_body`'s "scripts see the final resolved
+    /// form" precedent.
+    ///
+    /// A request with an empty `query` is returned with `url` untouched —
+    /// not even reparsed — so a `url`-only request behaves exactly as it
+    /// always has, including one whose `url` would not itself parse as a
+    /// valid [`reqwest::Url`] (which today is only ever caught by `reqwest`
+    /// itself, at send time).
+    ///
+    /// Uses [`reqwest::Url`]'s own query-pair APIs — already a dependency —
+    /// rather than string concatenation, so a value containing a space, `&`,
+    /// `=` or non-ASCII character is encoded correctly rather than however it
+    /// happened to be typed.
+    pub fn resolve_query(&self) -> Result<Request, SendraError> {
+        let mut resolved = self.clone();
+        if self.query.is_empty() {
+            return Ok(resolved);
+        }
+
+        let mut url =
+            reqwest::Url::parse(&self.url).map_err(|source| SendraError::InvalidRequest {
+                reason: format!("url `{}` is not valid: {source}", self.url),
+            })?;
+
+        // `query` wins: drop any existing pair under a name `query` also
+        // sets, then write the URL's surviving pairs back first so a key
+        // `query` says nothing about keeps its place ahead of the new ones.
+        let overridden: std::collections::HashSet<&str> =
+            self.query.iter().map(|(name, _)| name.as_str()).collect();
+        let kept: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(name, _)| !overridden.contains(name.as_ref()))
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .collect();
+
+        let mut pairs = url.query_pairs_mut();
+        pairs.clear();
+        for (name, value) in &kept {
+            pairs.append_pair(name, value);
+        }
+        for (name, value) in &self.query {
+            pairs.append_pair(name, value);
+        }
+        drop(pairs);
+
+        resolved.url = url.to_string();
+        resolved.query = Vec::new();
+        Ok(resolved)
     }
 
     /// Resolve whichever of `body`/`json`/`body_file`/`form`/`multipart` was
@@ -1515,6 +1610,7 @@ body: null
                 method: Method::Get,
                 url: "https://api.example.com/users/1".to_string(),
                 headers: expected_headers,
+                query: Vec::new(),
                 body: None,
                 json: None,
                 body_file: None,
@@ -1983,6 +2079,7 @@ enviroment: staging
             "capture-chain.yaml",
             "repeated-headers.yaml",
             "structured-bodies.yaml",
+            "query-params.yaml",
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("..")
@@ -2010,6 +2107,7 @@ enviroment: staging
             // would surface as a Network error instead, which the assert catches.
             url: "http://127.0.0.1:1/".to_string(),
             headers: vec![("bad header".to_string(), "x".to_string())],
+            query: Vec::new(),
             body: None,
             json: None,
             body_file: None,
@@ -2041,6 +2139,7 @@ enviroment: staging
             method: Method::Get,
             url: "http://127.0.0.1:1/".to_string(),
             headers: Vec::new(),
+            query: Vec::new(),
             body: None,
             json: None,
             body_file: None,
@@ -2168,6 +2267,7 @@ enviroment: staging
             method: Method::Get,
             url: url.to_string(),
             headers: Vec::new(),
+            query: Vec::new(),
             body: None,
             json: None,
             body_file: None,
@@ -3127,5 +3227,121 @@ requests:
             .resolve_body(Path::new("."))
             .expect("nothing to resolve");
         assert!(resolved.body.is_none());
+    }
+
+    // --- query: as a map with real percent-encoding -------------------------
+
+    fn get_with(field_and_value: &str) -> Request {
+        Request::from_yaml_str(&format!(
+            "method: GET\nurl: https://example.com/search\n{field_and_value}\n"
+        ))
+        .expect("the test request should parse")
+    }
+
+    #[test]
+    fn a_request_with_no_query_field_leaves_the_url_untouched() {
+        // The non-goal, pinned: a url-only request is not even reparsed.
+        let request = get_with("");
+        let resolved = request.resolve_query().expect("nothing to resolve");
+        assert_eq!(resolved.url, "https://example.com/search");
+        assert!(resolved.query.is_empty());
+    }
+
+    #[test]
+    fn a_query_map_merges_onto_a_url_with_no_existing_query_string() {
+        let request = get_with("query:\n  a: '1'\n  b: '2'\n");
+        let resolved = request.resolve_query().expect("resolves");
+        assert_eq!(resolved.url, "https://example.com/search?a=1&b=2");
+        assert!(resolved.query.is_empty(), "cleared after resolution");
+    }
+
+    #[test]
+    fn a_query_map_is_appended_onto_a_url_that_already_has_a_query_string() {
+        let request = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com/search?existing=1\nquery:\n  new: '2'\n",
+        )
+        .unwrap();
+        let resolved = request.resolve_query().expect("resolves");
+        assert_eq!(resolved.url, "https://example.com/search?existing=1&new=2");
+    }
+
+    #[test]
+    fn a_key_in_both_the_url_and_the_query_map_is_decided_by_the_query_map() {
+        // `query:` wins: the URL's own `a=from-url` is dropped, not sent
+        // alongside `a=from-query`.
+        let request = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com/search?a=from-url&b=kept\nquery:\n  a: from-query\n",
+        )
+        .unwrap();
+        let resolved = request.resolve_query().expect("resolves");
+        let url = reqwest::Url::parse(&resolved.url).unwrap();
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("b".to_string(), "kept".to_string()),
+                ("a".to_string(), "from-query".to_string()),
+            ],
+            "got {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn special_characters_are_percent_encoded_not_concatenated() {
+        let request = get_with("query:\n  q: 'coffee & tea, café'\n");
+        let resolved = request.resolve_query().expect("resolves");
+
+        // Read back through `Url` rather than asserting on the exact encoded
+        // string: what matters is that the server sees the value that was
+        // written, not which of several valid encodings was chosen.
+        let url = reqwest::Url::parse(&resolved.url).unwrap();
+        let (_, value) = url
+            .query_pairs()
+            .find(|(name, _)| name == "q")
+            .expect("q was sent");
+        assert_eq!(value, "coffee & tea, café");
+        // And the raw query string actually is encoded, not the literal text
+        // with a space and a non-ASCII character sitting in it.
+        assert!(!resolved.url.contains(' '));
+        assert!(resolved.url.is_ascii());
+    }
+
+    #[test]
+    fn a_repeated_query_key_is_written_as_a_list() {
+        let request = get_with("query:\n  tag:\n    - hot\n    - iced\n");
+        let resolved = request.resolve_query().expect("resolves");
+        let url = reqwest::Url::parse(&resolved.url).unwrap();
+        let tags: Vec<String> = url
+            .query_pairs()
+            .filter(|(name, _)| name == "tag")
+            .map(|(_, value)| value.into_owned())
+            .collect();
+        assert_eq!(tags, vec!["hot".to_string(), "iced".to_string()]);
+    }
+
+    #[test]
+    fn an_unquoted_number_query_value_is_coerced_to_its_string_form() {
+        let request = get_with("query:\n  limit: 10\n");
+        let resolved = request.resolve_query().expect("resolves");
+        assert_eq!(resolved.url, "https://example.com/search?limit=10");
+    }
+
+    #[test]
+    fn environment_substitution_reaches_query_values_and_list_entries() {
+        let request =
+            get_with("query:\n  tenant: '{{tenant}}'\n  tag:\n    - '{{tenant}}'\n    - iced\n");
+        let environment = crate::Environment::from_yaml_str("tenant: acme\n").unwrap();
+        let substituted = environment.apply(&request).expect("tenant is set");
+        assert_eq!(
+            substituted.query,
+            vec![
+                ("tenant".to_string(), "acme".to_string()),
+                ("tag".to_string(), "acme".to_string()),
+                ("tag".to_string(), "iced".to_string()),
+            ]
+        );
     }
 }

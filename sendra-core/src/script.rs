@@ -546,6 +546,12 @@ fn request_from_dynamic(original: &Request, value: Dynamic) -> Result<Request, S
         method: original.method,
         url,
         headers,
+        // Not exposed to the script and carried through untouched — by the
+        // time a `pre_request` script runs, `Request::resolve_query` has
+        // already merged whatever `query` held into `url` above, so this is
+        // already empty regardless of whether the request file used `query`
+        // at all.
+        query: original.query.clone(),
         body: string_field(&map, "body")?,
         // Not exposed to the script (see the allow-list above) and carried
         // through untouched — by the time a `pre_request` script runs,
