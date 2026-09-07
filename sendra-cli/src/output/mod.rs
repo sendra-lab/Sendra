@@ -31,7 +31,7 @@ use self::json::{
 
 pub(crate) use self::errors::{
     print_environment_error, print_error, print_error_line, reject_allow_error_status,
-    reject_output_status_with_dry_run, reject_output_with_json,
+    reject_output_status_with_dry_run, reject_output_with_json, reject_quiet_with_output,
 };
 
 /// Which rendering a run produces.
@@ -134,6 +134,16 @@ pub(crate) struct Reporter {
     /// — the run's wall-clock elapsed time, read only if `junit_path` is
     /// `Some`.
     started: Instant,
+    /// `-q`/`--quiet`: suppress the `→ <label>` lines
+    /// [`request_started`](Self::request_started) would otherwise print to
+    /// stderr. Independent of `output` — `-q` also implies `-o none`, but
+    /// that is resolved by the caller into `output` before a `Reporter` is
+    /// built (see `main`), since it changes what `output` *is* rather than
+    /// being a second thing this type has to consult when deciding what to
+    /// print. This field exists only for the half of `-q` that has no other
+    /// home: the labels print regardless of `format` or `output`, so nothing
+    /// else already gates them.
+    quiet: bool,
 }
 
 impl Reporter {
@@ -147,6 +157,7 @@ impl Reporter {
             junit_cases: RefCell::new(Vec::new()),
             current_label: RefCell::new(String::new()),
             started: Instant::now(),
+            quiet: false,
         }
     }
 
@@ -154,6 +165,13 @@ impl Reporter {
     /// the run is over — `sendra test --junit <path>`. See [`junit_path`].
     pub(crate) fn with_junit(mut self, path: PathBuf) -> Self {
         self.junit_path = Some(path);
+        self
+    }
+
+    /// Opt this reporter into `-q`/`--quiet`'s label suppression. See
+    /// [`quiet`](Self::quiet).
+    pub(crate) fn with_quiet(mut self, quiet: bool) -> Self {
+        self.quiet = quiet;
         self
     }
 
@@ -176,13 +194,17 @@ impl Reporter {
     /// The `→` label goes to stderr in both modes, unchanged: in a collection
     /// run it is the only thing that says *which* request the next lines are
     /// about, and a "no variable named X" message names the variable, not the
-    /// request.
+    /// request. Suppressed by `-q`/`--quiet` — this is narration, not a
+    /// pass/fail answer, which is the line `-q` draws; see
+    /// [`quiet`](Self::quiet).
     pub(crate) fn request_started(&self, label: &str) {
-        eprintln!(
-            "{} {}",
-            "→".if_supports_color(Stream::Stderr, |t| t.dimmed()),
-            label.if_supports_color(Stream::Stderr, |t| t.bold())
-        );
+        if !self.quiet {
+            eprintln!(
+                "{} {}",
+                "→".if_supports_color(Stream::Stderr, |t| t.dimmed()),
+                label.if_supports_color(Stream::Stderr, |t| t.bold())
+            );
+        }
 
         if self.recording() {
             self.requests.borrow_mut().push(RequestRecord::new(label));

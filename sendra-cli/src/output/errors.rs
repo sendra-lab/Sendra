@@ -72,6 +72,32 @@ pub(crate) fn reject_output_with_json() -> ! {
         .exit()
 }
 
+/// Refuse `-q`/`--quiet` combined with an explicit `-o <mode>` other than
+/// `none`, and say why.
+///
+/// `-q` implies `-o none` for the response half of what it quiets — see
+/// `Command::Run::quiet` — so a conflicting explicit mode is a real
+/// disagreement between two flags about whether a response should be shown,
+/// not a case with an obvious winner. [`reject_output_with_json`] draws the
+/// same line for the same reason.
+pub(crate) fn reject_quiet_with_output() -> ! {
+    use clap::CommandFactory;
+
+    Cli::command()
+        .error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "`-q`/`--quiet` does not apply together with `-o <mode>` other than `-o none`.\n\n  \
+             `-q` already implies `-o none` for the response — quiet mode is about \
+             suppressing everything that is not a pass/fail answer, and a response \
+             is exactly that kind of noise. An explicit `-o full`/`status`/`body`/`headers` \
+             says the opposite: show a response. Sendra will not guess which one \
+             you meant.\n\n  \
+             Drop `-o` to let `-q` decide, drop `-q` to use `-o` on its own, or pass \
+             `-o none` explicitly — it agrees with `-q` and is accepted.",
+        )
+        .exit()
+}
+
 /// Refuse `sendra run --dry-run -o status`, and say why.
 ///
 /// A dry run never sends the request, so there is no status line for
