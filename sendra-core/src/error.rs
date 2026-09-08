@@ -125,6 +125,26 @@ pub enum SendraError {
         source: std::io::Error,
     },
 
+    /// A `client_cert`/`client_key` path (from either config file, or
+    /// `--client-cert`/`--client-key`) named a file that could not be read.
+    /// Distinct from [`Client`](Self::Client), which wraps only a
+    /// `reqwest::Error`: reading the file happens before reqwest is ever
+    /// involved, and the message needs to say which path was the problem.
+    #[error("could not read client certificate file `{path}`")]
+    ClientCertIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Only one of `client_cert`/`client_key` — from config, `--client-cert`/
+    /// `--client-key`, or a mix of both — resolved to a path. A client
+    /// certificate and its private key are only meaningful as a pair; sending
+    /// half of one silently would be worse than refusing to build the client
+    /// at all.
+    #[error("client_cert/client_key must both be set, but only the {which} was")]
+    ClientCertIncomplete { which: &'static str },
+
     /// A config file was found but could not be read. Separate from [`Io`](Self::Io)
     /// so a front-end can say "your config is broken" rather than "your request
     /// file is broken" — the user did not name this path on the command line

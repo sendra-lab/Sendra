@@ -227,6 +227,80 @@ pub struct ConfigFile {
     /// same as everyone else" default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+
+    /// Present a client certificate for mutual TLS — the config-file form of
+    /// `--client-cert`/`--client-key`.
+    ///
+    /// ```text
+    /// client_cert:
+    ///   cert: ./client.pem
+    ///   key: ./client-key.pem
+    /// ```
+    ///
+    /// PEM only, not PKCS#12: Sendra's `reqwest` is built against `rustls-tls`
+    /// alone (no `native-tls`), and `reqwest::Identity`'s PKCS#12 and
+    /// split-PEM constructors both require `native-tls` — pulling that in
+    /// would mean shipping a second TLS backend just to accept one more input
+    /// format. `Identity::from_pem` (the one constructor `rustls-tls` does
+    /// expose) wants a single buffer containing both the certificate and its
+    /// private key, so [`build_client`](crate::build_client) reads both files
+    /// and concatenates them in memory before handing that buffer to reqwest.
+    ///
+    /// `cert`/`key` are resolved relative to *this config file's own
+    /// directory*, not the current working directory — the same rule
+    /// `body_file:` uses for the request file that names it, and for the same
+    /// reason: a project config checked into version control should mean the
+    /// same file on every machine it runs on, not whichever directory the
+    /// command happened to be typed from. See
+    /// [`resolve_client_cert_paths`]. `--client-cert`/`--client-key`, by
+    /// contrast, resolve relative to the working directory, matching how
+    /// every other CLI-supplied path (`--junit`, say) is read.
+    ///
+    /// Both halves are required together — a cert with no key, or a key with
+    /// no cert, is refused as [`SendraError::ClientCertIncomplete`] when
+    /// [`build_client`](crate::build_client) tries to use it, the same place
+    /// every other client-construction failure is reported. That check runs
+    /// after CLI overrides are folded in, so a config `cert:` paired with a
+    /// `--client-key` override (or vice versa) is a valid combination, not an
+    /// error — only ending up with just one side, from any mix of sources, is
+    /// refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<ClientCertFile>,
+}
+
+/// The `client_cert:` config key's on-disk shape: a cert path and a key
+/// path, both plain strings so [`resolve_client_cert_paths`] can rewrite a
+/// relative one in place before it is ever turned into a [`PathBuf`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientCertFile {
+    pub cert: String,
+    pub key: String,
+}
+
+/// Resolve `client_cert.cert`/`client_cert.key` in `file`, if set and
+/// relative, against the directory containing `config_path` — the config
+/// file that named them, not the current working directory.
+///
+/// Called immediately after each config file is read, while the path it came
+/// from is still in scope: by the time [`ConfigFile::merge_over`] runs, a
+/// project config's `client_cert:` and a global config's `client_cert:` may
+/// already have been resolved against two different base directories, and
+/// merging must not have to guess which one a given value came from.
+fn resolve_client_cert_paths(file: &mut ConfigFile, config_path: &Path) {
+    let Some(client_cert) = &mut file.client_cert else {
+        return;
+    };
+    let base = config_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for field in [&mut client_cert.cert, &mut client_cert.key] {
+        let candidate = Path::new(field.as_str());
+        if candidate.is_relative() {
+            *field = base.join(candidate).to_string_lossy().into_owned();
+        }
+    }
 }
 
 impl ConfigFile {
@@ -284,6 +358,7 @@ impl ConfigFile {
             follow_redirects: self.follow_redirects.or(base.follow_redirects),
             insecure: self.insecure.or(base.insecure),
             proxy: self.proxy.or(base.proxy),
+            client_cert: self.client_cert.or(base.client_cert),
         }
     }
 }
@@ -305,6 +380,13 @@ pub struct Config {
     /// Route every request through this HTTP proxy, or `None` to follow the
     /// standard proxy environment variables. See [`ConfigFile::proxy`].
     pub proxy: Option<String>,
+    /// Client certificate file for mutual TLS, or `None` to present none. See
+    /// [`ConfigFile::client_cert`]. Always set together with `client_key`, or
+    /// not at all — [`build_client`](crate::build_client) refuses a `Config`
+    /// where exactly one of the two is `Some`.
+    pub client_cert: Option<PathBuf>,
+    /// Private key matching `client_cert`. See [`ConfigFile::client_cert`].
+    pub client_key: Option<PathBuf>,
     /// The config files this was built from, in the order they were merged
     /// (global first). Empty when no config file was found anywhere.
     pub sources: Vec<PathBuf>,
@@ -323,6 +405,8 @@ impl Default for Config {
             redirects: FollowRedirects::default(),
             insecure: false,
             proxy: None,
+            client_cert: None,
+            client_key: None,
             sources: Vec::new(),
         }
     }
@@ -370,9 +454,19 @@ impl Config {
             if !path.is_file() {
                 continue;
             }
-            merged = ConfigFile::from_path(&path)?.merge_over(merged);
+            let mut file = ConfigFile::from_path(&path)?;
+            resolve_client_cert_paths(&mut file, &path);
+            merged = file.merge_over(merged);
             sources.push(path);
         }
+
+        let (client_cert, client_key) = match merged.client_cert {
+            Some(client_cert) => (
+                Some(PathBuf::from(client_cert.cert)),
+                Some(PathBuf::from(client_cert.key)),
+            ),
+            None => (None, None),
+        };
 
         Ok(Self {
             headers: merged.headers,
@@ -382,6 +476,8 @@ impl Config {
             redirects: merged.follow_redirects.unwrap_or_default(),
             insecure: merged.insecure.unwrap_or(false),
             proxy: merged.proxy,
+            client_cert,
+            client_key,
             sources,
         })
     }
@@ -906,6 +1002,129 @@ mod tests {
         let config = Config::resolve_from(&root, Some(&global)).unwrap();
 
         assert_eq!(config.proxy.as_deref(), Some("http://project-proxy:8080"));
+    }
+
+    // --- `client_cert` -------------------------------------------------------
+
+    #[test]
+    fn no_client_cert_key_resolves_to_neither_cert_nor_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(temp.path(), "timeout_seconds: 5\n");
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        assert_eq!(config.client_cert, None);
+        assert_eq!(config.client_key, None);
+    }
+
+    #[test]
+    fn a_relative_client_cert_resolves_against_the_project_configs_own_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(
+            temp.path(),
+            "client_cert:\n  cert: ./client.pem\n  key: ./client-key.pem\n",
+        );
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        // Relative to `.sendra/`, the directory the config file itself is
+        // in — not the project root, and not the process's cwd.
+        assert_eq!(
+            config.client_cert,
+            Some(root.join(PROJECT_DIR_NAME).join("client.pem"))
+        );
+        assert_eq!(
+            config.client_key,
+            Some(root.join(PROJECT_DIR_NAME).join("client-key.pem"))
+        );
+    }
+
+    #[test]
+    fn a_relative_client_cert_resolves_against_the_global_configs_own_directory_not_the_project() {
+        // The global and project configs live under different roots in this
+        // test; a relative `client_cert:` in the global file must resolve
+        // against *its* directory even when a project config exists too.
+        let temp = tempfile::tempdir().unwrap();
+        let global = global(
+            temp.path(),
+            "client_cert:\n  cert: ./g.pem\n  key: ./g-key.pem\n",
+        );
+        let root = project(temp.path(), "timeout_seconds: 5\n");
+
+        let config = Config::resolve_from(&root, Some(&global)).unwrap();
+
+        assert_eq!(
+            config.client_cert,
+            Some(global.parent().unwrap().join("g.pem"))
+        );
+        assert_eq!(
+            config.client_key,
+            Some(global.parent().unwrap().join("g-key.pem"))
+        );
+    }
+
+    #[test]
+    fn an_absolute_client_cert_path_is_left_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let absolute = temp.path().join("elsewhere").join("client.pem");
+        // A plain YAML scalar does not interpret `\`, so an absolute Windows
+        // path is written as-is rather than escaped.
+        let root = project(
+            temp.path(),
+            &format!(
+                "client_cert:\n  cert: {}\n  key: ./client-key.pem\n",
+                absolute.display()
+            ),
+        );
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        assert_eq!(config.client_cert, Some(absolute));
+    }
+
+    #[test]
+    fn a_project_client_cert_overrides_a_global_one_wholesale() {
+        let temp = tempfile::tempdir().unwrap();
+        let global = global(
+            temp.path(),
+            "client_cert:\n  cert: ./g.pem\n  key: ./g-key.pem\n",
+        );
+        let root = project(
+            temp.path(),
+            "client_cert:\n  cert: ./p.pem\n  key: ./p-key.pem\n",
+        );
+
+        let config = Config::resolve_from(&root, Some(&global)).unwrap();
+
+        assert_eq!(
+            config.client_cert,
+            Some(root.join(PROJECT_DIR_NAME).join("p.pem"))
+        );
+        assert_eq!(
+            config.client_key,
+            Some(root.join(PROJECT_DIR_NAME).join("p-key.pem"))
+        );
+    }
+
+    #[test]
+    fn client_cert_with_only_a_cert_key_is_a_parse_error() {
+        // `cert`/`key` are both required inside `client_cert:` — a config
+        // that names only one is a malformed pair, not a partial setting to
+        // merge with the other source later. See `Config::client_cert`'s doc
+        // comment for the case that *is* allowed: a config cert paired with a
+        // CLI-supplied key, or vice versa.
+        let err = ConfigFile::from_yaml_str("client_cert:\n  cert: ./c.pem\n")
+            .expect_err("`key` is required alongside `cert`");
+        assert!(matches!(err, SendraError::ParseStr(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn an_unknown_key_inside_client_cert_is_rejected() {
+        let err = ConfigFile::from_yaml_str(
+            "client_cert:\n  cert: ./c.pem\n  key: ./k.pem\n  password: hunter2\n",
+        )
+        .expect_err("`password` is not a known field of `client_cert`");
+        assert!(matches!(err, SendraError::ParseStr(_)), "got {err:?}");
     }
 
     #[test]

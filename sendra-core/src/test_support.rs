@@ -379,6 +379,128 @@ pub(crate) fn start_self_signed_tls_server() -> SocketAddr {
     addr
 }
 
+/// A server that terminates a TLS handshake demanding a client certificate
+/// signed by a locally generated CA, then answers one request with a fixed
+/// `200` — mutual TLS's test fixture. A connection presenting no client
+/// certificate, or one not signed by that CA, fails during the handshake and
+/// never reaches the request/response exchange below; a client presenting
+/// the returned certificate/key pair (fed to
+/// `reqwest::ClientBuilder::identity`, via
+/// [`crate::build_client`]'s `client_cert`/`client_key`) authenticates and
+/// gets the `200`.
+///
+/// The server's own certificate is self-signed for `127.0.0.1`, exactly like
+/// [`start_self_signed_tls_server`] — a client under test still needs
+/// `--insecure`/`insecure: true` to accept *that*, which is deliberate: it
+/// keeps this fixture testing exactly one thing (does the server demand and
+/// verify a client certificate) rather than two, and lets an
+/// `insecure` + client-certificate combination be exercised against the one
+/// server both features already have a fixture for.
+///
+/// Returns the server's address and the client certificate/key it will
+/// accept, as PEM strings — written to files by the caller (this function
+/// does not know whether the test wants them under a config directory or a
+/// bare temp directory) rather than as paths itself.
+pub(crate) fn start_mutual_tls_server() -> (SocketAddr, String, String) {
+    // See the identical line in `start_self_signed_tls_server`.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // The server's own identity — self-signed, unrelated to the CA below,
+    // because this fixture is about the *client* certificate the server
+    // demands, not about the server's own.
+    let server_certified = rcgen::generate_simple_self_signed(["127.0.0.1".to_string()])
+        .expect("a self-signed certificate for 127.0.0.1 generates");
+    let server_cert_der = server_certified.cert.der().clone();
+    let server_key_der =
+        rustls::pki_types::PrivateKeyDer::Pkcs8(server_certified.key_pair.serialize_der().into());
+
+    // A CA that exists only to sign the one client certificate this server
+    // will accept — not presented to the client itself, so it never needs a
+    // subject alt name of its own.
+    let mut ca_params =
+        rcgen::CertificateParams::new(Vec::new()).expect("no subject alt names cannot fail");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::KeyCertSign);
+    ca_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::DigitalSignature);
+    ca_params.key_usages.push(rcgen::KeyUsagePurpose::CrlSign);
+    let ca_key = rcgen::KeyPair::generate().expect("key generation does not fail");
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .expect("a self-signed CA certificate generates");
+
+    // The one client certificate this server will accept, signed by the CA
+    // above rather than self-signed — the whole point of the fixture.
+    let mut client_params =
+        rcgen::CertificateParams::new(Vec::new()).expect("no subject alt names cannot fail");
+    client_params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::DigitalSignature);
+    client_params
+        .extended_key_usages
+        .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+    let client_key = rcgen::KeyPair::generate().expect("key generation does not fail");
+    let client_cert = client_params
+        .signed_by(&client_key, &ca_cert, &ca_key)
+        .expect("the client certificate is signed by the CA");
+    let client_cert_pem = client_cert.pem();
+    let client_key_pem = client_key.serialize_pem();
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(ca_cert.der().clone())
+        .expect("the CA certificate is well-formed DER");
+    let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .expect("a verifier with one trusted root builds");
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(vec![server_cert_der], server_key_der)
+        .expect("the freshly generated server cert and key are valid together");
+    let server_config = Arc::new(server_config);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is free");
+    let addr = listener.local_addr().expect("the listener has an address");
+
+    std::thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        // A connection with no client certificate, or one the verifier above
+        // does not trust, fails right here — `ServerConnection::new` succeeds
+        // (it just builds local state), but driving the handshake through
+        // the first read below is where rustls actually rejects it, so the
+        // read returns `Err`/`0` and this thread quietly stops, exactly as it
+        // does for a plain connection drop.
+        let Ok(mut conn) = rustls::ServerConnection::new(server_config) else {
+            return;
+        };
+        let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+
+        let mut reader = BufReader::new(&mut tls);
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+            return;
+        }
+        loop {
+            let mut header = String::new();
+            match reader.read_line(&mut header) {
+                Ok(0) | Err(_) => return,
+                Ok(_) if header == "\r\n" => break,
+                Ok(_) => {}
+            }
+        }
+
+        let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    });
+
+    (addr, client_cert_pem, client_key_pem)
+}
+
 /// A server that records the request line of the one connection it accepts,
 /// then answers `200` — a stand-in for an HTTP proxy.
 ///

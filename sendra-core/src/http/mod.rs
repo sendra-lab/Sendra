@@ -160,9 +160,9 @@ mod tests {
     use crate::http::client::build_client;
     use crate::http::response::RedirectHop;
     use crate::test_support::{
-        get, ok_bytes, ok_response, redirect_response, start_proxy_recording_server,
-        start_route_server, start_self_signed_tls_server, start_stalling_server, CountingServer,
-        Stall,
+        get, ok_bytes, ok_response, redirect_response, start_mutual_tls_server,
+        start_proxy_recording_server, start_route_server, start_self_signed_tls_server,
+        start_stalling_server, CountingServer, Stall,
     };
     use crate::{config, Method, SendraError};
     use std::collections::BTreeMap;
@@ -642,6 +642,190 @@ mod tests {
             panic!("a malformed proxy URL must not build a client");
         };
         assert!(matches!(err, SendraError::Client(_)), "got {err:?}");
+    }
+
+    // --- `client_cert` ---------------------------------------------------------
+
+    /// Write `contents` to `dir/name`, returning the path — the shared setup
+    /// every `client_cert` test below needs, for both the certificate and the
+    /// key.
+    fn write_pem(dir: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_request_without_a_client_certificate_is_rejected_by_the_mtls_server() {
+        let (addr, _client_cert_pem, _client_key_pem) = start_mutual_tls_server();
+        // `insecure: true` because the server's own certificate is
+        // self-signed — see `start_mutual_tls_server`'s doc comment — and
+        // this test is about the *client* certificate, not the server's.
+        let config = Config {
+            insecure: true,
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a client with no identity still builds");
+
+        let err = send(&get(&format!("https://{addr}/")), &client, &config)
+            .await
+            .expect_err("the server demands a client certificate this client never presented");
+
+        assert!(
+            matches!(err, SendraError::Network { .. }),
+            "a rejected handshake is a fact about the connection, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_correctly_configured_client_certificate_authenticates() {
+        let (addr, client_cert_pem, client_key_pem) = start_mutual_tls_server();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = write_pem(dir.path(), "client.pem", &client_cert_pem);
+        let key_path = write_pem(dir.path(), "client-key.pem", &client_key_pem);
+
+        let config = Config {
+            insecure: true,
+            client_cert: Some(cert_path),
+            client_key: Some(key_path),
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a matching cert/key pair builds a client");
+
+        let response = send(&get(&format!("https://{addr}/")), &client, &config)
+            .await
+            .expect("the server accepts a client certificate it issued the CA for");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "ok");
+    }
+
+    #[tokio::test]
+    async fn insecure_and_a_client_certificate_together_both_apply() {
+        // The two settings are orthogonal — `insecure` is about verifying the
+        // *server's* certificate, `client_cert` is about presenting the
+        // *client's* — and this is both of them exercised in the one request
+        // that actually needs both: the mTLS server's self-signed identity
+        // requires `insecure`, and its client-verification requires
+        // `client_cert`. Neither alone gets a `200` here.
+        let (addr, client_cert_pem, client_key_pem) = start_mutual_tls_server();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = write_pem(dir.path(), "client.pem", &client_cert_pem);
+        let key_path = write_pem(dir.path(), "client-key.pem", &client_key_pem);
+
+        let config = Config {
+            insecure: true,
+            client_cert: Some(cert_path),
+            client_key: Some(key_path),
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a client builds");
+
+        let response = send(&get(&format!("https://{addr}/")), &client, &config)
+            .await
+            .expect("insecure + a valid client certificate together must succeed");
+
+        assert_eq!(response.status, 200);
+    }
+
+    #[tokio::test]
+    async fn a_missing_client_cert_file_is_a_typed_error_naming_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_cert = dir.path().join("nope.pem");
+        let key_path = write_pem(dir.path(), "client-key.pem", "irrelevant");
+
+        let config = Config {
+            client_cert: Some(missing_cert.clone()),
+            client_key: Some(key_path),
+            ..Config::default()
+        };
+
+        let Err(err) = build_client(&config) else {
+            panic!("a missing cert file must not build a client");
+        };
+        match err {
+            SendraError::ClientCertIo { path, .. } => assert_eq!(path, missing_cert),
+            other => panic!("expected ClientCertIo, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_client_key_file_is_a_typed_error_naming_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = write_pem(dir.path(), "client.pem", "irrelevant");
+        let missing_key = dir.path().join("nope-key.pem");
+
+        let config = Config {
+            client_cert: Some(cert_path),
+            client_key: Some(missing_key.clone()),
+            ..Config::default()
+        };
+
+        let Err(err) = build_client(&config) else {
+            panic!("a missing key file must not build a client");
+        };
+        match err {
+            SendraError::ClientCertIo { path, .. } => assert_eq!(path, missing_key),
+            other => panic!("expected ClientCertIo, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_pem_content_is_a_client_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = write_pem(dir.path(), "client.pem", "not a pem file at all");
+        let key_path = write_pem(dir.path(), "client-key.pem", "also not a pem file");
+
+        let config = Config {
+            client_cert: Some(cert_path),
+            client_key: Some(key_path),
+            ..Config::default()
+        };
+
+        let Err(err) = build_client(&config) else {
+            panic!("garbage PEM content must not build a client");
+        };
+        assert!(matches!(err, SendraError::Client(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn only_a_client_cert_with_no_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = write_pem(dir.path(), "client.pem", "irrelevant");
+
+        let config = Config {
+            client_cert: Some(cert_path),
+            client_key: None,
+            ..Config::default()
+        };
+
+        let Err(err) = build_client(&config) else {
+            panic!("a cert with no key must be refused");
+        };
+        assert!(
+            matches!(err, SendraError::ClientCertIncomplete { which: "cert" }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_client_key_with_no_cert_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = write_pem(dir.path(), "client-key.pem", "irrelevant");
+
+        let config = Config {
+            client_cert: None,
+            client_key: Some(key_path),
+            ..Config::default()
+        };
+
+        let Err(err) = build_client(&config) else {
+            panic!("a key with no cert must be refused");
+        };
+        assert!(
+            matches!(err, SendraError::ClientCertIncomplete { which: "key" }),
+            "got {err:?}"
+        );
     }
 
     // --- non-UTF-8 response bodies -----------------------------------------

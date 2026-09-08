@@ -75,19 +75,23 @@ pub struct HttpClient {
 /// because a client is not configuration: it holds sockets, it is cheap to
 /// clone and expensive to rebuild, and it belongs to a *run*, whereas the
 /// config it is built from is a resolved set of values that outlives any
-/// particular one. The config decides four things here — the timeout, the
-/// redirect policy, whether TLS certificates are verified, and which proxy
-/// (if any) requests go through — and nothing else about the client is
+/// particular one. The config decides five things here — the timeout, the
+/// redirect policy, whether TLS certificates are verified, which proxy (if
+/// any) requests go through, and which client certificate (if any) to
+/// present for mutual TLS — and nothing else about the client is
 /// configurable in v1; reqwest's own pool defaults are what a command-line
 /// tool wants.
 ///
 /// Fails when reqwest cannot construct a client at all (a TLS backend that
-/// will not initialise, say) or when [`Config::proxy`] does not parse as a
-/// URL reqwest accepts — both are fatal to the whole run and so are
-/// [`SendraError::Client`] rather than a per-request network error: a
-/// malformed `proxy:`/`--proxy` value means no request in this run could
-/// ever have gone anywhere, same as a client reqwest itself refuses to
-/// build.
+/// will not initialise, say), when [`Config::proxy`] does not parse as a URL
+/// reqwest accepts, or when the client certificate cannot be built — either
+/// because `client_cert`/`client_key` names a file that cannot be read
+/// ([`SendraError::ClientCertIo`]), only one of the pair is set
+/// ([`SendraError::ClientCertIncomplete`]), or the files read do not form a
+/// valid identity ([`SendraError::Client`]) — all fatal to the whole run: a
+/// malformed `proxy:`/`--proxy` value, or an unusable client certificate,
+/// means no request in this run could ever have gone anywhere, same as a
+/// client reqwest itself refuses to build.
 pub fn build_client(config: &Config) -> Result<HttpClient, SendraError> {
     let redirects: RedirectLog = Arc::new(Mutex::new(Vec::new()));
 
@@ -148,6 +152,10 @@ pub fn build_client(config: &Config) -> Result<HttpClient, SendraError> {
     // applies, matching what curl and every other common HTTP tool already
     // do without being asked.
 
+    if let Some(identity) = client_identity(config)? {
+        builder = builder.identity(identity);
+    }
+
     let inner = builder.build().map_err(SendraError::Client)?;
 
     Ok(HttpClient {
@@ -155,6 +163,50 @@ pub fn build_client(config: &Config) -> Result<HttpClient, SendraError> {
         redirects,
         timeout: config.timeout,
     })
+}
+
+/// Build the client certificate identity for mutual TLS, or `None` when
+/// `config` sets neither `client_cert` nor `client_key`.
+///
+/// Reads both files and concatenates them into one buffer — certificate PEM,
+/// then key PEM — because reqwest's `rustls-tls` backend exposes exactly one
+/// identity constructor, [`reqwest::Identity::from_pem`], and it wants both
+/// halves in a single buffer rather than as two arguments. (The two-argument
+/// and PKCS#12 constructors exist on `reqwest::Identity` but are gated behind
+/// the `native-tls` feature, which this workspace does not enable — see
+/// [`Config::client_cert`]'s doc comment.) A file that cannot be read is
+/// [`SendraError::ClientCertIo`], naming the path, before reqwest ever sees
+/// it; a buffer reqwest cannot parse as a valid identity is
+/// [`SendraError::Client`], the same variant every other client-construction
+/// failure here uses.
+///
+/// Exactly one of `client_cert`/`client_key` being set is refused as
+/// [`SendraError::ClientCertIncomplete`] — see that variant's doc comment for
+/// why this is checked here rather than earlier: CLI overrides for one half
+/// and a config value for the other are a valid combination, and both are
+/// folded into `config` before this ever runs.
+fn client_identity(config: &Config) -> Result<Option<reqwest::Identity>, SendraError> {
+    match (&config.client_cert, &config.client_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let mut pem = std::fs::read(cert_path).map_err(|source| SendraError::ClientCertIo {
+                path: cert_path.clone(),
+                source,
+            })?;
+            let key = std::fs::read(key_path).map_err(|source| SendraError::ClientCertIo {
+                path: key_path.clone(),
+                source,
+            })?;
+            pem.push(b'\n');
+            pem.extend_from_slice(&key);
+
+            reqwest::Identity::from_pem(&pem)
+                .map(Some)
+                .map_err(SendraError::Client)
+        }
+        (Some(_), None) => Err(SendraError::ClientCertIncomplete { which: "cert" }),
+        (None, Some(_)) => Err(SendraError::ClientCertIncomplete { which: "key" }),
+        (None, None) => Ok(None),
+    }
 }
 
 /// Raised by the custom redirect policy in [`build_client`] when a chain runs
