@@ -352,6 +352,51 @@ pub struct Request {
     /// stays those characters; see [`Environment::apply`](crate::Environment::apply).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<Captures>,
+
+    /// Retry this request on a true failure — no response at all: a DNS,
+    /// connection, TLS or timeout error — up to `count` additional attempts,
+    /// waiting `delay_ms` (default `0`, no wait) between each.
+    ///
+    /// ```text
+    /// retry:
+    ///   count: 2
+    ///   delay_ms: 200
+    /// ```
+    ///
+    /// Only a failure to get *any* response triggers a retry. A 4xx/5xx is
+    /// still a response — [`send_prepared`](crate::send_prepared) returns it
+    /// as `Ok`, not `Err` — so it is never retried by this field; retrying on
+    /// a specific status is a separate, more advanced feature this does not
+    /// attempt. Simple, fixed backoff: no exponential delay or jitter.
+    ///
+    /// **Only the final attempt's outcome is reported.** A request that fails
+    /// twice and then succeeds is reported as a plain, ordinary success — the
+    /// two failed attempts before it are never counted toward `sendra test`'s
+    /// summary or either subcommand's exit code, though each retry is logged
+    /// to stderr for visibility. A request that exhausts every attempt is
+    /// reported as the one failure it always would have been, with no
+    /// separate record of the attempts that came before it.
+    ///
+    /// `None` — no `retry:` key at all — means a request is sent once and
+    /// whatever happens is final, exactly as it was before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryConfig>,
+}
+
+/// How many extra times to try a request, and how long to wait between
+/// attempts, when it fails to get any response — see [`Request::retry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RetryConfig {
+    /// Additional attempts beyond the first — `count: 2` means up to three
+    /// attempts total. `0` is accepted and means what writing no `retry:`
+    /// block at all already means.
+    pub count: u32,
+    /// Milliseconds to wait before each retry. `None`/omitted is `0`: retry
+    /// immediately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
 }
 
 impl Request {
@@ -522,6 +567,7 @@ body: null
                 pre_request: None,
                 post_request: None,
                 capture: None,
+                retry: None,
             }
         );
     }
@@ -811,5 +857,67 @@ capture:
             SendraError::Io { path, .. } => assert_eq!(path, Path::new("does/not/exist.yaml")),
             other => panic!("expected Io, got {other:?}"),
         }
+    }
+
+    // --- `retry` -----------------------------------------------------------
+
+    #[test]
+    fn no_retry_key_at_all_is_none() {
+        // The no-op guarantee: a file written before this field existed
+        // parses to exactly the same `Request` it always did.
+        let request = Request::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
+        assert_eq!(request.retry, None);
+    }
+
+    #[test]
+    fn retry_parses_count_and_an_optional_delay() {
+        let request = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nretry:\n  count: 2\n  delay_ms: 250\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.retry,
+            Some(RetryConfig {
+                count: 2,
+                delay_ms: Some(250),
+            })
+        );
+    }
+
+    #[test]
+    fn retry_delay_ms_is_optional_and_defaults_to_none() {
+        let request =
+            Request::from_yaml_str("method: GET\nurl: https://example.com\nretry:\n  count: 3\n")
+                .unwrap();
+
+        assert_eq!(
+            request.retry,
+            Some(RetryConfig {
+                count: 3,
+                delay_ms: None,
+            })
+        );
+    }
+
+    #[test]
+    fn retry_without_count_is_a_parse_error() {
+        // `count` has no default: writing `retry:` at all is a statement of
+        // intent to retry, and a block that does not say how many times is a
+        // broken file rather than "retry zero times".
+        let err = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nretry:\n  delay_ms: 100\n",
+        )
+        .expect_err("a `retry` block with no `count` must not parse");
+        assert!(matches!(err, SendraError::ParseStr(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn retry_rejects_an_unknown_field() {
+        let err = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nretry:\n  count: 1\n  backoff: exponential\n",
+        )
+        .expect_err("an unknown `retry` field must not silently parse");
+        assert!(matches!(err, SendraError::ParseStr(_)), "got {err:?}");
     }
 }

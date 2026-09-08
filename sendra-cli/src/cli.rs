@@ -42,6 +42,21 @@ fn parse_var_override(raw: &str) -> Result<(String, String), String> {
     Ok((name.to_string(), value.to_string()))
 }
 
+/// Parse `--repeat`'s value: a positive count of passes.
+///
+/// `0` is refused here, at the clap level, rather than accepted as "run
+/// nothing" — a collection run always sends at least the one pass it would
+/// have sent without the flag, so `--repeat 0` can only be a typo for `1`
+/// (the default, and the same as omitting the flag) or for a larger number,
+/// and guessing which is not a trade Sendra makes on your behalf.
+fn parse_repeat(raw: &str) -> Result<u32, String> {
+    match raw.parse::<u32>() {
+        Ok(0) => Err("`--repeat` must be at least 1".to_string()),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("expected a positive integer, got `{raw}`")),
+    }
+}
+
 /// How much of the response — or, under `--dry-run`, the resolved request —
 /// the human-readable output shows: `-o`/`--output`.
 ///
@@ -150,6 +165,29 @@ pub(crate) enum Command {
         /// other override here does.
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
+
+        /// Repeat the entire run this many times, sequentially — one full
+        /// pass over every selected request completes before the next
+        /// begins. Omit it (or pass `1`) to run once, as always.
+        ///
+        /// Every pass sends the same requests, in the same order, under the
+        /// same environment — but each starts with **no captured
+        /// variables**: a capture from pass 1 is never visible to pass 2, the
+        /// same way nothing survives between two separate invocations. Each
+        /// `--repeat` pass is a clean run, not one continuous chain of `N`
+        /// times the requests.
+        ///
+        /// Passes are never sent concurrently — the requests inside one
+        /// pass are not either, and this flag does not change that. The
+        /// exit code is worst-wins across every request in every pass: one
+        /// failure anywhere fails the whole invocation, exactly as it would
+        /// within a single pass. Under `--json`/`--junit`, a request's label
+        /// is suffixed with `(iteration N of M)` on every pass but the only
+        /// one, so `sendra test collection.yaml --repeat 3` reports three
+        /// distinct records per request rather than the same one three
+        /// times.
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_repeat)]
+        repeat: u32,
 
         /// Exit 0 even when a response status is 4xx or 5xx.
         ///
@@ -334,6 +372,15 @@ pub(crate) enum Command {
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
 
+        /// Repeat the entire run this many times, sequentially. Behaves
+        /// exactly as it does on `run` — see `run --help` for the full
+        /// reasoning, including the per-pass capture reset and the
+        /// `(iteration N of M)` label suffix `--json`/`--junit` add — with
+        /// one addition: the summary `test` prints counts every request in
+        /// every pass, not just the last one.
+        #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_repeat)]
+        repeat: u32,
+
         /// Print one JSON object describing the whole run, instead of the
         /// human-readable output.
         ///
@@ -490,6 +537,7 @@ mod tests {
                 header,
                 var,
                 timeout,
+                repeat,
                 json,
                 show_captures,
                 junit,
@@ -504,6 +552,7 @@ mod tests {
                 assert!(header.is_empty(), "no -H was passed");
                 assert!(var.is_empty(), "no --var was passed");
                 assert_eq!(timeout, None, "no --timeout was passed");
+                assert_eq!(repeat, 1, "no --repeat was passed");
                 assert!(!json, "the human output is what you get without --json");
                 assert!(!show_captures, "captures are redacted by default");
                 assert_eq!(junit, None, "no --junit was passed");
@@ -863,5 +912,43 @@ mod tests {
                 .is_err(),
             "a non-numeric timeout is a clap-level error"
         );
+    }
+
+    // --- `--repeat` --------------------------------------------------------
+
+    #[test]
+    fn repeat_defaults_to_one_and_is_offered_by_both_subcommands() {
+        let cli =
+            Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`--repeat` is optional");
+        assert!(matches!(cli.command, Command::Run { repeat: 1, .. }));
+
+        let cli = Cli::try_parse_from(["sendra", "test", "req.yaml"])
+            .expect("`--repeat` is optional on `test`");
+        assert!(matches!(cli.command, Command::Test { repeat: 1, .. }));
+
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--repeat", "3"])
+            .expect("`--repeat` takes a count");
+        assert!(matches!(cli.command, Command::Run { repeat: 3, .. }));
+
+        let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--repeat", "5"])
+            .expect("`--repeat` is offered by `test` too");
+        assert!(matches!(cli.command, Command::Test { repeat: 5, .. }));
+    }
+
+    #[test]
+    fn repeat_zero_is_a_clear_cli_error() {
+        let err = expect_cli_error(&["sendra", "run", "req.yaml", "--repeat", "0"]);
+        assert_eq!(err.exit_code(), 2);
+        assert!(
+            err.to_string().contains("at least 1"),
+            "the message should say why: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_repeat_is_a_clear_cli_error() {
+        let err = expect_cli_error(&["sendra", "run", "req.yaml", "--repeat", "many"]);
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("positive integer"));
     }
 }

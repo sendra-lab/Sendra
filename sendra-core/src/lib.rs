@@ -28,5 +28,5 @@ pub use http::response::{RedirectHop, Response};
 pub use http::{send, send_prepared};
 pub use request::auth::{Auth, BasicAuth};
 pub use request::multipart::MultipartPart;
-pub use request::{Method, Request};
+pub use request::{Method, Request, RetryConfig};
 pub use script::{Hook, Script, ScriptOutcome, ScriptOutput, Scripts};

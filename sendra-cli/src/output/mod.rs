@@ -147,6 +147,21 @@ pub(crate) struct Reporter {
     /// home: the labels print regardless of `format` or `output`, so nothing
     /// else already gates them.
     quiet: bool,
+    /// `--repeat`'s current pass, as `"iteration N of M"` — or `None`, the
+    /// overwhelming majority of runs, when `--repeat` was not passed (or was
+    /// passed as `1`). Set by [`set_iteration`](Self::set_iteration) once per
+    /// pass, before that pass's [`run_requests`](crate::run::run_requests)
+    /// call; read by [`request_started`](Self::request_started) to decorate
+    /// the label every downstream record is keyed on.
+    ///
+    /// This is the whole of how `--repeat` keeps `--json`/`--junit` output
+    /// from colliding across passes: `"Login"` sent three times becomes
+    /// `"Login (iteration 1 of 3)"`, `"Login (iteration 2 of 3)"`,
+    /// `"Login (iteration 3 of 3)"`, three distinct [`RequestRecord`]s /
+    /// [`junit::Case`]s rather than one overwritten twice — with no change to
+    /// either's shape, since the label is decorated once, before either ever
+    /// sees it.
+    iteration: RefCell<Option<String>>,
 }
 
 impl Reporter {
@@ -161,6 +176,7 @@ impl Reporter {
             current_label: RefCell::new(String::new()),
             started: Instant::now(),
             quiet: false,
+            iteration: RefCell::new(None),
         }
     }
 
@@ -182,6 +198,30 @@ impl Reporter {
         self.format == Format::Json
     }
 
+    /// Tell this reporter which `--repeat` pass is about to run: `current`,
+    /// one-based, out of `total`.
+    ///
+    /// `total <= 1` — `--repeat` was not passed, or was passed as `1` — clears
+    /// the marker instead of setting it: a run that is not repeating must
+    /// look exactly as it did before this flag existed, label suffix
+    /// included, since decorating every label with "(iteration 1 of 1)" would
+    /// be new noise for a case that changed nothing. See [`iteration`].
+    pub(crate) fn set_iteration(&self, current: usize, total: usize) {
+        *self.iteration.borrow_mut() =
+            (total > 1).then(|| format!("iteration {current} of {total}"));
+    }
+
+    /// `label`, with the current `--repeat` pass appended when one is set —
+    /// see [`iteration`]. The single point every label passes through on its
+    /// way into a [`RequestRecord`]/[`junit::Case`]/stderr line, so the three
+    /// stay in agreement about which pass a given request belongs to.
+    fn decorate(&self, label: &str) -> String {
+        match &*self.iteration.borrow() {
+            Some(iteration) => format!("{label} ({iteration})"),
+            None => label.to_string(),
+        }
+    }
+
     /// The blank line between one request's output and the next.
     ///
     /// Nothing under `--json`: the separator is whitespace on stdout, and
@@ -201,6 +241,11 @@ impl Reporter {
     /// pass/fail answer, which is the line `-q` draws; see
     /// [`quiet`](Self::quiet).
     pub(crate) fn request_started(&self, label: &str) {
+        // Decorated once, here, before anything downstream — the stderr
+        // line, the `--json` record and the `--junit` case — ever sees it.
+        // See `decorate` and `iteration`.
+        let label = self.decorate(label);
+
         if !self.quiet {
             eprintln!(
                 "{} {}",
@@ -210,11 +255,28 @@ impl Reporter {
         }
 
         if self.recording() {
-            self.requests.borrow_mut().push(RequestRecord::new(label));
+            self.requests.borrow_mut().push(RequestRecord::new(&label));
         }
 
         // Kept whether or not `--junit` is in play — see `current_label`.
-        *self.current_label.borrow_mut() = label.to_string();
+        *self.current_label.borrow_mut() = label;
+    }
+
+    /// A send failed but a `retry` block on the request means another attempt
+    /// is coming — `attempt` is the one that just failed, `of` the total
+    /// attempts the request is allowed.
+    ///
+    /// To stderr, unconditionally — like [`request_failed`](Self::request_failed),
+    /// this is a fact about a failure, not narration, so `-q`/`--quiet` does
+    /// not suppress it. Nothing is recorded for `--json`/`--junit`: per
+    /// `Request::retry`, only the final attempt's outcome is ever reported —
+    /// this is purely for a person watching the run to see *why* it is about
+    /// to try again.
+    pub(crate) fn retrying(&self, attempt: usize, of: usize, err: &SendraError) {
+        eprintln!(
+            "  {} attempt {attempt} of {of} failed, retrying: {err}",
+            "↻".if_supports_color(Stream::Stderr, |t| t.dimmed()),
+        );
     }
 
     /// Whatever a script printed with `print` or `debug`, one line at a time.
@@ -248,19 +310,32 @@ impl Reporter {
     /// none; `capture` is its capture report, empty when it declared no
     /// `capture` block. All three are printed under the response in the order
     /// they ran in: script, assertions, capture.
+    ///
+    /// `attempts` is how many times [`sendra_core::send_prepared`] was called
+    /// before this response came back — `1` when the request declared no
+    /// `retry` block, or succeeded on its first try; up to `retry.count + 1`
+    /// when every retry was needed. It is not printed to the terminal — the
+    /// retries that preceded this response were already announced as they
+    /// happened, via [`retrying`](Self::retrying) — but it is recorded into
+    /// both `--json` (`RequestRecord::attempts`) and `--junit`
+    /// (`Case`'s `attempts` attribute), always present and defaulting to `1`,
+    /// so a request that needed a retry to succeed leaves a trace in the
+    /// output that persists past the run, not only on stderr while it was
+    /// happening.
     pub(crate) fn responded(
         &self,
         response: &Response,
         script: Option<&ScriptOutcome>,
         assertions: &AssertionReport,
         capture: &CaptureReport,
+        attempts: usize,
     ) {
         if self.junit_path.is_some() {
             let label = self.current_label.borrow().clone();
             self.junit_cases
                 .borrow_mut()
                 .push(junit::Case::from_response(
-                    label, response, script, assertions, capture,
+                    label, response, script, assertions, capture, attempts,
                 ));
         }
 
@@ -274,6 +349,7 @@ impl Reporter {
                 // since a block with entries always produces a result per entry.
                 record.capture =
                     (!capture.is_empty()).then(|| CaptureRecord::new(capture, self.show_captures));
+                record.attempts = attempts;
             });
             return;
         }
@@ -366,19 +442,30 @@ impl Reporter {
     /// The error is printed to stderr in both modes — that is where it already
     /// went, and a `--json` run whose output is being redirected should still
     /// say on the terminal that something failed.
-    pub(crate) fn request_failed(&self, err: &SendraError) {
+    ///
+    /// `attempts` is the same reading [`responded`](Self::responded) takes —
+    /// how many times [`sendra_core::send_prepared`] was actually called.
+    /// Every failure that never reaches the network at all (a substitution
+    /// failure, a script that will not compile, a `pre_request` throw) passes
+    /// `1` here: `retry` only widens a *send*, and none of those ever got that
+    /// far. A `retry`-exhausted failure passes the true count, so a request
+    /// that failed on every attempt shows exactly how many it made.
+    pub(crate) fn request_failed(&self, err: &SendraError, attempts: usize) {
         print_error(err);
 
         if self.junit_path.is_some() {
             let label = self.current_label.borrow().clone();
             self.junit_cases
                 .borrow_mut()
-                .push(junit::Case::from_error(label, err));
+                .push(junit::Case::from_error(label, err, attempts));
         }
 
         if self.recording() {
             let message = error_message(err);
-            self.with_current(|record| record.error = Some(message));
+            self.with_current(|record| {
+                record.error = Some(message);
+                record.attempts = attempts;
+            });
         }
     }
 
@@ -504,7 +591,7 @@ mod tests {
         let assertions =
             assertions_from("method: GET\nurl: https://example.com\nassertions:\n  status: 404\n")
                 .evaluate(&response);
-        reporter.responded(&response, None, &assertions, &CaptureReport::default());
+        reporter.responded(&response, None, &assertions, &CaptureReport::default(), 1);
 
         let document = document(&reporter, None);
 
@@ -544,10 +631,13 @@ mod tests {
         let reporter = Reporter::new(Format::Json, OutputMode::Full, false);
 
         reporter.request_started("GET https://example.com");
-        reporter.request_failed(&SendraError::Io {
-            path: "req.yaml".into(),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
-        });
+        reporter.request_failed(
+            &SendraError::Io {
+                path: "req.yaml".into(),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            },
+            1,
+        );
 
         let request = &document(&reporter, None)["requests"][0];
 
@@ -577,7 +667,7 @@ mod tests {
             "method: GET\nurl: https://example.com\nassertions:\n  status: 200\n  json:\n    $.id: 1\n",
         )
         .evaluate(&response);
-        reporter.responded(&response, None, &assertions, &CaptureReport::default());
+        reporter.responded(&response, None, &assertions, &CaptureReport::default(), 1);
 
         let assertions = &document(&reporter, None)["requests"][0]["assertions"];
 
@@ -604,6 +694,7 @@ mod tests {
                 None,
                 &AssertionReport::default(),
                 &CaptureReport::default(),
+                1,
             );
         }
 
@@ -629,6 +720,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
 
         let summary = Summary {
@@ -675,6 +767,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
 
         let request = &document(&reporter, None)["requests"][0];
@@ -692,6 +785,7 @@ mod tests {
             Some(&ScriptOutcome::Passed),
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
 
         let script = &document(&reporter, None)["requests"][0]["post_request"];
@@ -711,6 +805,7 @@ mod tests {
             }),
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
 
         let request = &document(&reporter, None)["requests"][0];
@@ -737,6 +832,7 @@ mod tests {
             Some(&ScriptOutcome::Passed),
             &assertions,
             &CaptureReport::default(),
+            1,
         );
 
         let request = &document(&reporter, None)["requests"][0];
@@ -772,6 +868,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
 
         assert!(reporter.requests.borrow().is_empty());
@@ -794,6 +891,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
         reporter.finish_test(&Summary {
             total: 1,
@@ -822,7 +920,7 @@ mod tests {
         let assertions =
             assertions_from("method: GET\nurl: https://example.com\nassertions:\n  status: 404\n")
                 .evaluate(&response);
-        reporter.responded(&response, None, &assertions, &CaptureReport::default());
+        reporter.responded(&response, None, &assertions, &CaptureReport::default(), 1);
 
         let summary = Summary {
             total: 1,
@@ -853,6 +951,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
         reporter.finish_test(&Summary {
             total: 1,
@@ -892,6 +991,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
 
         let request = &document(&reporter, None)["requests"][0];
@@ -917,6 +1017,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &capture,
+            1,
         );
 
         let capture = &document(&reporter, None)["requests"][0]["capture"];
@@ -946,6 +1047,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &capture,
+            1,
         );
 
         let capture = &document(&reporter, None)["requests"][0]["capture"];
@@ -971,6 +1073,7 @@ mod tests {
                 None,
                 &AssertionReport::default(),
                 &capture,
+                1,
             );
 
             let capture = &document(&reporter, None)["requests"][0]["capture"];
