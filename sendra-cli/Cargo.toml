@@ -23,8 +23,12 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 # A single request per invocation means no work to spread across threads, so
 # the current-thread runtime ("rt") is enough; "rt-multi-thread" would only add
-# a worker pool nothing here uses. "macros" is for #[tokio::main].
-tokio = { workspace = true, features = ["rt", "macros"] }
+# a worker pool nothing here uses. "macros" is for #[tokio::main]. "time" is
+# for the fixed delay between retry attempts (`Request::retry.delay_ms`) —
+# sequential `tokio::time::sleep` calls, never a spawned timer, since retries
+# and `--repeat` both have to stay strictly one-send-at-a-time; see the note
+# on `RedirectLog` in sendra-core.
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
 
 [dev-dependencies]
 # Which environment `--env` resolves to is tested against real directory trees,

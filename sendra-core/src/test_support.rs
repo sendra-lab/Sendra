@@ -71,6 +71,7 @@ pub(crate) fn get(url: &str) -> Request {
         pre_request: None,
         post_request: None,
         capture: None,
+        retry: None,
     }
 }
 

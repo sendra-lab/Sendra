@@ -276,6 +276,10 @@ pub(super) fn request_from_dynamic(
         // feature in its own right — as is letting a script stash a value for
         // later requests — and neither is this one.
         capture: original.capture.clone(),
+        // Not exposed to the script, and not the script's to change: how
+        // many times a *send* is retried is a fact about the pipeline
+        // running the script, not about the request the script is shaping.
+        retry: original.retry,
     })
 }
 

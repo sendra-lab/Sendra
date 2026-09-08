@@ -187,6 +187,7 @@ mod tests {
             pre_request: None,
             post_request: None,
             capture: None,
+            retry: None,
         };
         let config = Config::default();
         let client = build_client(&config).expect("a client builds");
@@ -220,6 +221,7 @@ mod tests {
             pre_request: None,
             post_request: None,
             capture: None,
+            retry: None,
         };
         let config = Config {
             headers: BTreeMap::from([("bad header".to_string(), "x".to_string())]),

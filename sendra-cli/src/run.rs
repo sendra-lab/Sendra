@@ -217,6 +217,14 @@ fn prepare(
 /// module doc comment for the full chain and [`prepare`]/[`send`] for where
 /// each one is actually applied.
 ///
+/// `repeat` is `--repeat`: the whole selected run — every request in
+/// `requests` — sent again, sequentially, this many times, `1` (the default)
+/// being today's single pass. Each pass is its own [`run_requests`] call, so
+/// each starts with an empty capture store — see that function's doc comment
+/// — and every pass's outcomes are folded into the same `exit_for_run` call
+/// at the end, worst-wins across every request in every pass, exactly as
+/// `worst` already folds every request within one pass.
+///
 /// `dry_run` is `--dry-run`: every resolution step still runs — substitution
 /// in [`run_requests`], then config/`-H`/`pre_request` in
 /// [`prepare_request`] — and the pipeline stops there instead of calling
@@ -253,6 +261,7 @@ pub(crate) async fn run(
     headers: &[(String, String)],
     vars: &[(String, String)],
     timeout: Option<u64>,
+    repeat: u32,
     allow_error_status: bool,
     json: bool,
     show_captures: bool,
@@ -305,20 +314,37 @@ pub(crate) async fn run(
         show_captures,
     )
     .with_quiet(quiet);
-    let outcomes = run_requests(
-        &requests,
-        base_dir(path),
-        &environment,
-        reporter,
-        |request, environment| async move {
-            if dry_run {
-                dry_run_one(&request, config, headers, reporter)
-            } else {
-                send(&request, client, config, &environment, headers, reporter).await
-            }
-        },
-    )
-    .await;
+
+    // `--repeat`: one full sequential pass over `requests` per iteration,
+    // each through its own `run_requests` call so its capture store starts
+    // empty — see the module doc comment on `run_requests` and `repeat`'s own
+    // doc comment in `cli.rs`. `repeat == 1` (the default) is exactly the
+    // loop this always was, one pass, with `reporter.set_iteration` clearing
+    // the label suffix rather than adding "(iteration 1 of 1)" noise nothing
+    // asked for.
+    let mut outcomes = Vec::new();
+    for iteration in 1..=repeat {
+        if iteration > 1 {
+            reporter.separate();
+        }
+        reporter.set_iteration(iteration as usize, repeat as usize);
+        outcomes.extend(
+            run_requests(
+                &requests,
+                base_dir(path),
+                &environment,
+                reporter,
+                |request, environment| async move {
+                    if dry_run {
+                        dry_run_one(&request, config, headers, reporter)
+                    } else {
+                        send(&request, client, config, &environment, headers, reporter).await
+                    }
+                },
+            )
+            .await,
+        );
+    }
     reporter.finish_run();
 
     exit_for_run(&outcomes, allow_error_status)
@@ -358,6 +384,11 @@ pub(crate) async fn run(
 /// `quiet` behaves exactly as it does on `run` — see there.
 ///
 /// `verbose` behaves exactly as it does on `run` — see there.
+///
+/// `repeat` behaves exactly as it does on `run` — see there — with one
+/// addition: [`Summary::of`] is called once, over every pass's outcomes
+/// concatenated together, so the printed counts and the `--json` `summary`
+/// object both cover every request in every pass rather than only the last.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn test(
     path: &Path,
@@ -366,6 +397,7 @@ pub(crate) async fn test(
     headers: &[(String, String)],
     vars: &[(String, String)],
     timeout: Option<u64>,
+    repeat: u32,
     json: bool,
     show_captures: bool,
     junit: Option<PathBuf>,
@@ -421,16 +453,27 @@ pub(crate) async fn test(
         reporter = reporter.with_junit(path);
     }
     let reporter = &reporter;
-    let outcomes = run_requests(
-        &requests,
-        base_dir(path),
-        &environment,
-        reporter,
-        |request, environment| async move {
-            send(&request, client, config, &environment, headers, reporter).await
-        },
-    )
-    .await;
+
+    // `--repeat`: see the identical loop, and its doc comment, in `run`.
+    let mut outcomes = Vec::new();
+    for iteration in 1..=repeat {
+        if iteration > 1 {
+            reporter.separate();
+        }
+        reporter.set_iteration(iteration as usize, repeat as usize);
+        outcomes.extend(
+            run_requests(
+                &requests,
+                base_dir(path),
+                &environment,
+                reporter,
+                |request, environment| async move {
+                    send(&request, client, config, &environment, headers, reporter).await
+                },
+            )
+            .await,
+        );
+    }
 
     let summary = Summary::of(&outcomes);
     reporter.finish_test(&summary);
@@ -795,7 +838,12 @@ fn dry_run_one(
 /// with `--dry-run`'s [`dry_run_one`]. What is left here is the half that only
 /// runs once something is actually going over the wire:
 ///
-/// 5. **Send.**
+/// 5. **Send — and, on a true failure (no response at all), retry.** A
+///    request's `retry` block (see [`Request::retry`](sendra_core::Request::retry))
+///    allows up to `count` further attempts, each after `delay_ms` of fixed
+///    delay, all sequentially through the one shared client. Only the last
+///    attempt's result reaches the steps below; every earlier failure is
+///    announced via [`Reporter::retrying`] and then discarded.
 /// 6. **Run `post_request`** against the response.
 /// 7. **Evaluate assertions** against the same response. Whether a script ran,
 ///    and what it decided, changes nothing about them — the two mechanisms are
@@ -834,8 +882,39 @@ async fn send(
         return Outcome::NoResponse;
     };
 
-    // The run's one client, not a new one: see [`prepare`].
-    match sendra_core::send_prepared(&prepared, client).await {
+    // The run's one client, not a new one: see [`prepare`]. `retry` widens
+    // this from one send to up to `count + 1`, all through that same client,
+    // one after another — never concurrently, which is what lets the
+    // client's redirect log stay a single shared `Arc<Mutex<...>>` with no
+    // change here at all. See `Request::retry` for the reporting rule this
+    // implements: every attempt but the last is discarded once one succeeds,
+    // and only announced via `reporter.retrying` for visibility.
+    let attempts = prepared
+        .retry
+        .as_ref()
+        .map_or(1, |retry| retry.count as usize + 1);
+    let delay_ms = prepared
+        .retry
+        .as_ref()
+        .and_then(|retry| retry.delay_ms)
+        .unwrap_or(0);
+
+    let mut attempt = 1;
+    let result = loop {
+        match sendra_core::send_prepared(&prepared, client).await {
+            Ok(response) => break Ok(response),
+            Err(err) if attempt < attempts => {
+                reporter.retrying(attempt, attempts, &err);
+                if delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                attempt += 1;
+            }
+            Err(err) => break Err(err),
+        }
+    };
+
+    match result {
         Ok(response) => {
             // No `post_request` block is `None`, which prints nothing — a
             // different thing from a script that ran and was happy. Same rule

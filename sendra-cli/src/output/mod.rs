@@ -147,6 +147,21 @@ pub(crate) struct Reporter {
     /// home: the labels print regardless of `format` or `output`, so nothing
     /// else already gates them.
     quiet: bool,
+    /// `--repeat`'s current pass, as `"iteration N of M"` — or `None`, the
+    /// overwhelming majority of runs, when `--repeat` was not passed (or was
+    /// passed as `1`). Set by [`set_iteration`](Self::set_iteration) once per
+    /// pass, before that pass's [`run_requests`](crate::run::run_requests)
+    /// call; read by [`request_started`](Self::request_started) to decorate
+    /// the label every downstream record is keyed on.
+    ///
+    /// This is the whole of how `--repeat` keeps `--json`/`--junit` output
+    /// from colliding across passes: `"Login"` sent three times becomes
+    /// `"Login (iteration 1 of 3)"`, `"Login (iteration 2 of 3)"`,
+    /// `"Login (iteration 3 of 3)"`, three distinct [`RequestRecord`]s /
+    /// [`junit::Case`]s rather than one overwritten twice — with no change to
+    /// either's shape, since the label is decorated once, before either ever
+    /// sees it.
+    iteration: RefCell<Option<String>>,
 }
 
 impl Reporter {
@@ -161,6 +176,7 @@ impl Reporter {
             current_label: RefCell::new(String::new()),
             started: Instant::now(),
             quiet: false,
+            iteration: RefCell::new(None),
         }
     }
 
@@ -182,6 +198,30 @@ impl Reporter {
         self.format == Format::Json
     }
 
+    /// Tell this reporter which `--repeat` pass is about to run: `current`,
+    /// one-based, out of `total`.
+    ///
+    /// `total <= 1` — `--repeat` was not passed, or was passed as `1` — clears
+    /// the marker instead of setting it: a run that is not repeating must
+    /// look exactly as it did before this flag existed, label suffix
+    /// included, since decorating every label with "(iteration 1 of 1)" would
+    /// be new noise for a case that changed nothing. See [`iteration`].
+    pub(crate) fn set_iteration(&self, current: usize, total: usize) {
+        *self.iteration.borrow_mut() =
+            (total > 1).then(|| format!("iteration {current} of {total}"));
+    }
+
+    /// `label`, with the current `--repeat` pass appended when one is set —
+    /// see [`iteration`]. The single point every label passes through on its
+    /// way into a [`RequestRecord`]/[`junit::Case`]/stderr line, so the three
+    /// stay in agreement about which pass a given request belongs to.
+    fn decorate(&self, label: &str) -> String {
+        match &*self.iteration.borrow() {
+            Some(iteration) => format!("{label} ({iteration})"),
+            None => label.to_string(),
+        }
+    }
+
     /// The blank line between one request's output and the next.
     ///
     /// Nothing under `--json`: the separator is whitespace on stdout, and
@@ -201,6 +241,11 @@ impl Reporter {
     /// pass/fail answer, which is the line `-q` draws; see
     /// [`quiet`](Self::quiet).
     pub(crate) fn request_started(&self, label: &str) {
+        // Decorated once, here, before anything downstream — the stderr
+        // line, the `--json` record and the `--junit` case — ever sees it.
+        // See `decorate` and `iteration`.
+        let label = self.decorate(label);
+
         if !self.quiet {
             eprintln!(
                 "{} {}",
@@ -210,11 +255,28 @@ impl Reporter {
         }
 
         if self.recording() {
-            self.requests.borrow_mut().push(RequestRecord::new(label));
+            self.requests.borrow_mut().push(RequestRecord::new(&label));
         }
 
         // Kept whether or not `--junit` is in play — see `current_label`.
-        *self.current_label.borrow_mut() = label.to_string();
+        *self.current_label.borrow_mut() = label;
+    }
+
+    /// A send failed but a `retry` block on the request means another attempt
+    /// is coming — `attempt` is the one that just failed, `of` the total
+    /// attempts the request is allowed.
+    ///
+    /// To stderr, unconditionally — like [`request_failed`](Self::request_failed),
+    /// this is a fact about a failure, not narration, so `-q`/`--quiet` does
+    /// not suppress it. Nothing is recorded for `--json`/`--junit`: per
+    /// `Request::retry`, only the final attempt's outcome is ever reported —
+    /// this is purely for a person watching the run to see *why* it is about
+    /// to try again.
+    pub(crate) fn retrying(&self, attempt: usize, of: usize, err: &SendraError) {
+        eprintln!(
+            "  {} attempt {attempt} of {of} failed, retrying: {err}",
+            "↻".if_supports_color(Stream::Stderr, |t| t.dimmed()),
+        );
     }
 
     /// Whatever a script printed with `print` or `debug`, one line at a time.

@@ -172,6 +172,10 @@ impl Environment {
             // could not be written as `{{name}}` in the request that uses it,
             // for the same reason a request's `name` is left alone.
             capture: request.capture.clone(),
+            // Not substituted, for the same reason `capture` is not: `count`
+            // and `delay_ms` are plain numbers, not `{{var}}`-bearing string
+            // fields, so there is nothing here for this pass to expand.
+            retry: request.retry,
         })
     }
 

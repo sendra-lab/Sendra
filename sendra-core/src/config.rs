@@ -466,6 +466,7 @@ mod tests {
             pre_request: None,
             post_request: None,
             capture: None,
+            retry: None,
         }
     }
 
@@ -903,6 +904,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             ),
+            retry: None,
         };
 
         let applied = config.apply(&request);
