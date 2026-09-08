@@ -217,8 +217,11 @@ fn only_the_final_attempt_is_reported_in_json_and_the_summary() {
     let document: serde_json::Value = serde_json::from_slice(&output.stdout)
         .expect("--json output must be one parseable document");
 
-    // One record, not three: the two failed attempts leave no trace in the
-    // document at all, only visibility on stderr.
+    // One record, not three: the two failed attempts are not separate
+    // entries, and nothing about them counts as a second failure — the
+    // record is a plain success. `attempts` is the one trace they leave
+    // behind: see `a_recovered_retry_reports_its_attempt_count_in_json_and_junit`
+    // below for that in detail.
     let requests = document["requests"]
         .as_array()
         .expect("requests is an array");
@@ -237,4 +240,139 @@ fn only_the_final_attempt_is_reported_in_json_and_the_summary() {
                 .unwrap_or(0),
         1
     );
+}
+
+// --- Retries are visible as an `attempts` count, past the run itself -----
+//
+// `attempts` is always present, on every request record in both formats,
+// and defaults to `1` — see `Reporter::responded`/`Reporter::request_failed`
+// in `sendra-cli/src/output/mod.rs`. Retries recovering a request no longer
+// leave a trace on stderr alone: the count they took survives into
+// `--json`/`--junit`, which is what a CI log actually keeps.
+
+#[test]
+fn a_recovered_retry_reports_its_attempt_count_in_json_and_junit() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    // One failure, then success: two attempts total.
+    let addr = fail_then_succeed(1, "ok");
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        format!(
+            "name: Flaky\nmethod: GET\nurl: http://{addr}/\nretry:\n  count: 2\n  delay_ms: 5\n"
+        ),
+    )
+    .unwrap();
+    let report_path = dir.path().join("report.xml");
+
+    let output = sendra(
+        dir.path(),
+        &["test", "req.yaml", "--json", "--junit", "report.xml"],
+    );
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("--json output must be one parseable document");
+    assert_eq!(
+        document["requests"][0]["attempts"], 2,
+        "one failed attempt plus the one that succeeded: {document}"
+    );
+
+    let xml = std::fs::read_to_string(&report_path).expect("the report was written");
+    assert!(
+        xml.contains("attempts=\"2\""),
+        "the JUnit testcase should carry the same count: {xml}"
+    );
+}
+
+#[test]
+fn retries_exhausted_reports_the_full_attempt_count_on_the_error_record() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let addr = always_refuses();
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        format!(
+            "name: NeverUp\nmethod: GET\nurl: http://{addr}/\nretry:\n  count: 2\n  delay_ms: 1\n"
+        ),
+    )
+    .unwrap();
+    let report_path = dir.path().join("report.xml");
+
+    let output = sendra(
+        dir.path(),
+        &["test", "req.yaml", "--json", "--junit", "report.xml"],
+    );
+    assert_eq!(output.status.code(), Some(1));
+
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("--json output must be one parseable document");
+    assert_eq!(
+        document["requests"][0]["attempts"], 3,
+        "the original attempt plus both retries: {document}"
+    );
+    assert!(document["requests"][0]["error"].is_string());
+
+    let xml = std::fs::read_to_string(&report_path).expect("the report was written");
+    assert!(xml.contains("attempts=\"3\""), "{xml}");
+    assert!(xml.contains("<error"), "{xml}");
+}
+
+#[test]
+fn a_request_with_no_retry_block_reports_attempts_one_by_default() {
+    // The documented default: a file that never mentions `retry:` still gets
+    // an `attempts` key, always `1`, so a consumer never has to branch on
+    // whether this build of Sendra supports the field.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let addr = fail_then_succeed(0, "ok");
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        format!("name: Plain\nmethod: GET\nurl: http://{addr}/\n"),
+    )
+    .unwrap();
+    let report_path = dir.path().join("report.xml");
+
+    let output = sendra(
+        dir.path(),
+        &["test", "req.yaml", "--json", "--junit", "report.xml"],
+    );
+    assert!(output.status.success());
+
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("--json output must be one parseable document");
+    assert_eq!(document["requests"][0]["attempts"], 1, "{document}");
+
+    let xml = std::fs::read_to_string(&report_path).expect("the report was written");
+    assert!(xml.contains("attempts=\"1\""), "{xml}");
+}
+
+#[test]
+fn a_request_that_never_reaches_the_network_reports_attempts_one() {
+    // A substitution failure never calls `send_prepared` at all, so `retry`
+    // (even if declared) never has anything to widen — the pre-send failure
+    // categories all report the same default as a request with no `retry`
+    // block.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        "name: Broken\nmethod: GET\nurl: '{{nope}}/broken'\nretry:\n  count: 3\n",
+    )
+    .unwrap();
+    let report_path = dir.path().join("report.xml");
+
+    let output = sendra(
+        dir.path(),
+        &["test", "req.yaml", "--json", "--junit", "report.xml"],
+    );
+    assert_eq!(output.status.code(), Some(1));
+
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("--json output must be one parseable document");
+    assert_eq!(document["requests"][0]["attempts"], 1, "{document}");
+
+    let xml = std::fs::read_to_string(&report_path).expect("the report was written");
+    assert!(xml.contains("attempts=\"1\""), "{xml}");
 }

@@ -85,6 +85,16 @@ pub(super) struct RequestRecord {
     /// keys, so a consumer can read `.resolved` on every request without
     /// knowing whether this run used the flag.
     pub(super) resolved: Option<ResolvedRequestRecord>,
+    /// How many times [`sendra_core::send_prepared`] was called for this
+    /// request — `1` when it declared no `retry` block, or succeeded (or gave
+    /// up) on its first try; up to `retry.count + 1` when every retry ran.
+    /// Always present, always at least `1`, the same way `resolved` is always
+    /// present: a file written before `retry` existed reports `attempts: 1`
+    /// on every request, so nothing has to check whether this build supports
+    /// the field before reading it. See [`Reporter::responded`](super::Reporter::responded)
+    /// and [`Reporter::request_failed`](super::Reporter::request_failed) for
+    /// where the number comes from.
+    pub(super) attempts: usize,
 }
 
 impl RequestRecord {
@@ -97,6 +107,7 @@ impl RequestRecord {
             assertions: AssertionsRecord::default(),
             capture: None,
             resolved: None,
+            attempts: 1,
         }
     }
 }

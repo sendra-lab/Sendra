@@ -57,6 +57,12 @@ pub(super) struct Case {
     name: String,
     time_seconds: f64,
     status: Status,
+    /// How many times `sendra_core::send_prepared` was called — see
+    /// `RequestRecord::attempts` in `output/json.rs` for the full reasoning;
+    /// this is the same number, carried into `--junit` as the `attempts`
+    /// attribute on `<testcase>` rather than into a JSON field. Always at
+    /// least `1`.
+    attempts: usize,
 }
 
 enum Status {
@@ -80,6 +86,7 @@ impl Case {
         script: Option<&ScriptOutcome>,
         assertions: &AssertionReport,
         capture: &CaptureReport,
+        attempts: usize,
     ) -> Self {
         let mut failures = Vec::new();
 
@@ -120,18 +127,20 @@ impl Case {
             name,
             time_seconds: response.elapsed.as_secs_f64(),
             status,
+            attempts,
         }
     }
 
     /// Build a case from a request that never got a response — the same
     /// input [`Reporter::request_failed`](super::Reporter::request_failed)
     /// already has in hand.
-    pub(super) fn from_error(name: String, err: &SendraError) -> Self {
+    pub(super) fn from_error(name: String, err: &SendraError, attempts: usize) -> Self {
         Self {
             name,
             // No response, so no elapsed time to report.
             time_seconds: 0.0,
             status: Status::Error(error_message(err)),
+            attempts,
         }
     }
 }
@@ -192,10 +201,18 @@ pub(super) fn render(cases: &[Case], summary: &Summary, total_time: Duration) ->
 
     for case in cases {
         let name = escape(&case.name);
+        // `attempts` is a Sendra-specific extension attribute — not part of
+        // the JUnit spec, but unknown attributes are ignored by every major
+        // reader (GitHub Actions, GitLab, Jenkins), and this is the same
+        // number `--json`'s `attempts` field reports, in the one place a
+        // `<testcase>` has to carry it. Always present, even for the
+        // overwhelming majority of cases where it is `1` — a consumer
+        // grepping for `attempts="` should not have to also handle it being
+        // absent.
         let _ = write!(
             out,
-            "    <testcase classname=\"{name}\" name=\"{name}\" time=\"{:.3}\">",
-            case.time_seconds,
+            "    <testcase classname=\"{name}\" name=\"{name}\" time=\"{:.3}\" attempts=\"{}\">",
+            case.time_seconds, case.attempts,
         );
 
         match &case.status {
@@ -262,6 +279,7 @@ mod tests {
             None,
             &assertions,
             &CaptureReport::default(),
+            1,
         );
         assert!(matches!(case.status, Status::Passed));
     }
@@ -278,6 +296,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
         let xml = render(&[case], &summary(1, 0, 0, 1, 0), Duration::ZERO);
         assert!(xml.contains("<skipped/>"), "{xml}");
@@ -306,6 +325,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &capture,
+            1,
         );
         match &case.status {
             Status::Failure(message) => {
@@ -322,7 +342,7 @@ mod tests {
             path: "req.yaml".into(),
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
         };
-        let case = Case::from_error("Get user".to_string(), &err);
+        let case = Case::from_error("Get user".to_string(), &err, 1);
         let xml = render(&[case], &summary(1, 0, 0, 0, 1), Duration::ZERO);
 
         assert!(xml.contains("<error"), "{xml}");
@@ -350,6 +370,7 @@ mod tests {
             None,
             &assertions,
             &CaptureReport::default(),
+            1,
         );
         let xml = render(&[case], &summary(1, 0, 1, 0, 0), Duration::ZERO);
 
@@ -391,6 +412,7 @@ mod tests {
             None,
             &assertions,
             &CaptureReport::default(),
+            1,
         );
         let xml = render(&[case], &summary(1, 0, 1, 0, 0), Duration::ZERO);
 

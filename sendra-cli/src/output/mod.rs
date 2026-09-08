@@ -310,19 +310,32 @@ impl Reporter {
     /// none; `capture` is its capture report, empty when it declared no
     /// `capture` block. All three are printed under the response in the order
     /// they ran in: script, assertions, capture.
+    ///
+    /// `attempts` is how many times [`sendra_core::send_prepared`] was called
+    /// before this response came back — `1` when the request declared no
+    /// `retry` block, or succeeded on its first try; up to `retry.count + 1`
+    /// when every retry was needed. It is not printed to the terminal — the
+    /// retries that preceded this response were already announced as they
+    /// happened, via [`retrying`](Self::retrying) — but it is recorded into
+    /// both `--json` (`RequestRecord::attempts`) and `--junit`
+    /// (`Case`'s `attempts` attribute), always present and defaulting to `1`,
+    /// so a request that needed a retry to succeed leaves a trace in the
+    /// output that persists past the run, not only on stderr while it was
+    /// happening.
     pub(crate) fn responded(
         &self,
         response: &Response,
         script: Option<&ScriptOutcome>,
         assertions: &AssertionReport,
         capture: &CaptureReport,
+        attempts: usize,
     ) {
         if self.junit_path.is_some() {
             let label = self.current_label.borrow().clone();
             self.junit_cases
                 .borrow_mut()
                 .push(junit::Case::from_response(
-                    label, response, script, assertions, capture,
+                    label, response, script, assertions, capture, attempts,
                 ));
         }
 
@@ -336,6 +349,7 @@ impl Reporter {
                 // since a block with entries always produces a result per entry.
                 record.capture =
                     (!capture.is_empty()).then(|| CaptureRecord::new(capture, self.show_captures));
+                record.attempts = attempts;
             });
             return;
         }
@@ -428,19 +442,30 @@ impl Reporter {
     /// The error is printed to stderr in both modes — that is where it already
     /// went, and a `--json` run whose output is being redirected should still
     /// say on the terminal that something failed.
-    pub(crate) fn request_failed(&self, err: &SendraError) {
+    ///
+    /// `attempts` is the same reading [`responded`](Self::responded) takes —
+    /// how many times [`sendra_core::send_prepared`] was actually called.
+    /// Every failure that never reaches the network at all (a substitution
+    /// failure, a script that will not compile, a `pre_request` throw) passes
+    /// `1` here: `retry` only widens a *send*, and none of those ever got that
+    /// far. A `retry`-exhausted failure passes the true count, so a request
+    /// that failed on every attempt shows exactly how many it made.
+    pub(crate) fn request_failed(&self, err: &SendraError, attempts: usize) {
         print_error(err);
 
         if self.junit_path.is_some() {
             let label = self.current_label.borrow().clone();
             self.junit_cases
                 .borrow_mut()
-                .push(junit::Case::from_error(label, err));
+                .push(junit::Case::from_error(label, err, attempts));
         }
 
         if self.recording() {
             let message = error_message(err);
-            self.with_current(|record| record.error = Some(message));
+            self.with_current(|record| {
+                record.error = Some(message);
+                record.attempts = attempts;
+            });
         }
     }
 
@@ -566,7 +591,7 @@ mod tests {
         let assertions =
             assertions_from("method: GET\nurl: https://example.com\nassertions:\n  status: 404\n")
                 .evaluate(&response);
-        reporter.responded(&response, None, &assertions, &CaptureReport::default());
+        reporter.responded(&response, None, &assertions, &CaptureReport::default(), 1);
 
         let document = document(&reporter, None);
 
@@ -606,10 +631,13 @@ mod tests {
         let reporter = Reporter::new(Format::Json, OutputMode::Full, false);
 
         reporter.request_started("GET https://example.com");
-        reporter.request_failed(&SendraError::Io {
-            path: "req.yaml".into(),
-            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
-        });
+        reporter.request_failed(
+            &SendraError::Io {
+                path: "req.yaml".into(),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+            },
+            1,
+        );
 
         let request = &document(&reporter, None)["requests"][0];
 
@@ -639,7 +667,7 @@ mod tests {
             "method: GET\nurl: https://example.com\nassertions:\n  status: 200\n  json:\n    $.id: 1\n",
         )
         .evaluate(&response);
-        reporter.responded(&response, None, &assertions, &CaptureReport::default());
+        reporter.responded(&response, None, &assertions, &CaptureReport::default(), 1);
 
         let assertions = &document(&reporter, None)["requests"][0]["assertions"];
 
@@ -666,6 +694,7 @@ mod tests {
                 None,
                 &AssertionReport::default(),
                 &CaptureReport::default(),
+                1,
             );
         }
 
@@ -691,6 +720,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
 
         let summary = Summary {
@@ -737,6 +767,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
 
         let request = &document(&reporter, None)["requests"][0];
@@ -754,6 +785,7 @@ mod tests {
             Some(&ScriptOutcome::Passed),
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
 
         let script = &document(&reporter, None)["requests"][0]["post_request"];
@@ -773,6 +805,7 @@ mod tests {
             }),
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
 
         let request = &document(&reporter, None)["requests"][0];
@@ -799,6 +832,7 @@ mod tests {
             Some(&ScriptOutcome::Passed),
             &assertions,
             &CaptureReport::default(),
+            1,
         );
 
         let request = &document(&reporter, None)["requests"][0];
@@ -834,6 +868,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
 
         assert!(reporter.requests.borrow().is_empty());
@@ -856,6 +891,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
         reporter.finish_test(&Summary {
             total: 1,
@@ -884,7 +920,7 @@ mod tests {
         let assertions =
             assertions_from("method: GET\nurl: https://example.com\nassertions:\n  status: 404\n")
                 .evaluate(&response);
-        reporter.responded(&response, None, &assertions, &CaptureReport::default());
+        reporter.responded(&response, None, &assertions, &CaptureReport::default(), 1);
 
         let summary = Summary {
             total: 1,
@@ -915,6 +951,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
         reporter.finish_test(&Summary {
             total: 1,
@@ -954,6 +991,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &CaptureReport::default(),
+            1,
         );
 
         let request = &document(&reporter, None)["requests"][0];
@@ -979,6 +1017,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &capture,
+            1,
         );
 
         let capture = &document(&reporter, None)["requests"][0]["capture"];
@@ -1008,6 +1047,7 @@ mod tests {
             None,
             &AssertionReport::default(),
             &capture,
+            1,
         );
 
         let capture = &document(&reporter, None)["requests"][0]["capture"];
@@ -1033,6 +1073,7 @@ mod tests {
                 None,
                 &AssertionReport::default(),
                 &capture,
+                1,
             );
 
             let capture = &document(&reporter, None)["requests"][0]["capture"];

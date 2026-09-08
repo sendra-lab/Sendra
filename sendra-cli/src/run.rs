@@ -700,7 +700,10 @@ where
         let outcome = match substituted {
             Ok(request) => send_one(request, environment).await,
             Err(err) => {
-                reporter.request_failed(&err);
+                // Never reached the network at all, so there is nothing for
+                // `retry` to have widened — one attempt, the same as every
+                // other pre-send failure below.
+                reporter.request_failed(&err, 1);
                 Outcome::NoResponse
             }
         };
@@ -766,7 +769,7 @@ fn prepare_request(
     let scripts = match Scripts::compile(request) {
         Ok(scripts) => scripts,
         Err(err) => {
-            reporter.request_failed(&err);
+            reporter.request_failed(&err, 1);
             return None;
         }
     };
@@ -787,7 +790,7 @@ fn prepare_request(
             match result {
                 Ok(prepared) => prepared,
                 Err(err) => {
-                    reporter.request_failed(&err);
+                    reporter.request_failed(&err, 1);
                     return None;
                 }
             }
@@ -942,7 +945,12 @@ async fn send(
                 .map(|capture| capture.evaluate(&response, environment))
                 .unwrap_or_default();
 
-            reporter.responded(&response, script.as_ref(), &assertions, &capture);
+            // `attempt` is the loop variable above, left at whichever attempt
+            // this response came back on — 1 when `retry` was never
+            // configured or never needed, up to `attempts` when every retry
+            // was used. See `Reporter::responded`'s doc comment for how this
+            // number reaches `--json`/`--junit`.
+            reporter.responded(&response, script.as_ref(), &assertions, &capture, attempt);
 
             Outcome::Responded {
                 status: response.status,
@@ -952,7 +960,9 @@ async fn send(
             }
         }
         Err(err) => {
-            reporter.request_failed(&err);
+            // Same `attempt` reading as above: here it is the total number of
+            // attempts made before giving up, i.e. `attempts` itself.
+            reporter.request_failed(&err, attempt);
             Outcome::NoResponse
         }
     }
