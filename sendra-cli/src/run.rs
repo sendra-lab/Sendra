@@ -80,6 +80,20 @@ struct Prepared {
 /// `config.insecure` on, never back off, matching `--insecure` being a bare
 /// flag with no `--secure` counterpart; `proxy_override`, when present, wins
 /// outright, matching `--timeout`.
+///
+/// `client_cert_override`/`client_key_override` are `--client-cert`/
+/// `--client-key`: the same highest-precedence layer, applied the same way
+/// and for the same reason — before `build_client` ever sees `config` —
+/// but, unlike `insecure_override`/`proxy_override`, resolved *independently*
+/// of each other rather than as a pair. Each one, when present, replaces only
+/// its own half of `config`'s client certificate, so `--client-cert` on the
+/// command line can pair with a `client_cert.key` a config file set (or vice
+/// versa) — [`sendra_core::build_client`] is what actually requires both
+/// halves to be present together, once every source has had its say, not
+/// this function. Resolved relative to the current working directory — see
+/// [`Config::client_cert`](sendra_core::Config::client_cert)'s doc comment
+/// for why that differs from the config-file form's own resolution rule.
+#[allow(clippy::too_many_arguments)]
 fn prepare(
     path: &Path,
     environment_name: Option<&str>,
@@ -87,6 +101,8 @@ fn prepare(
     timeout_override: Option<u64>,
     insecure_override: bool,
     proxy_override: Option<&str>,
+    client_cert_override: Option<&Path>,
+    client_key_override: Option<&Path>,
 ) -> Result<Prepared, Exit> {
     // Computed first, and reused below for both config and the environment,
     // rather than each resolving the working directory on its own: one
@@ -143,6 +159,12 @@ fn prepare(
     }
     if let Some(url) = proxy_override {
         config.proxy = Some(url.to_string());
+    }
+    if let Some(path) = client_cert_override {
+        config.client_cert = Some(path.to_path_buf());
+    }
+    if let Some(path) = client_key_override {
+        config.client_key = Some(path.to_path_buf());
     }
 
     // One client for the whole invocation: every request below sends through
@@ -288,6 +310,12 @@ fn prepare(
 /// before the sending loop starts: unlike `verbose`'s provenance just above,
 /// this is not gated behind a flag of its own and is not suppressed by
 /// `quiet` — see that function's own doc comment for why.
+///
+/// `client_cert`/`client_key` are `--client-cert`/`--client-key`, folded into
+/// `config` inside [`prepare`] the same way `insecure`/`proxy` are — see
+/// there. Presenting a client certificate is not a security downgrade the
+/// way `--insecure` is, so unlike `insecure` it prints no warning of its own,
+/// gated or not.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     path: &Path,
@@ -299,6 +327,8 @@ pub(crate) async fn run(
     repeat: u32,
     insecure: bool,
     proxy: Option<&str>,
+    client_cert: Option<&Path>,
+    client_key: Option<&Path>,
     allow_error_status: bool,
     json: bool,
     show_captures: bool,
@@ -314,7 +344,16 @@ pub(crate) async fn run(
         document,
         project_config,
         global_config,
-    } = match prepare(path, environment_name, vars, timeout, insecure, proxy) {
+    } = match prepare(
+        path,
+        environment_name,
+        vars,
+        timeout,
+        insecure,
+        proxy,
+        client_cert,
+        client_key,
+    ) {
         Ok(prepared) => prepared,
         Err(exit) => return exit,
     };
@@ -433,6 +472,8 @@ pub(crate) async fn run(
 /// `insecure` and `proxy` behave exactly as they do on `run` — see there —
 /// including the unconditional, `-q`-immune warning whenever the resolved
 /// `config.insecure` comes back true.
+///
+/// `client_cert`/`client_key` behave exactly as they do on `run` — see there.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn test(
     path: &Path,
@@ -444,6 +485,8 @@ pub(crate) async fn test(
     repeat: u32,
     insecure: bool,
     proxy: Option<&str>,
+    client_cert: Option<&Path>,
+    client_key: Option<&Path>,
     json: bool,
     show_captures: bool,
     junit: Option<PathBuf>,
@@ -458,7 +501,16 @@ pub(crate) async fn test(
         document,
         project_config,
         global_config,
-    } = match prepare(path, environment_name, vars, timeout, insecure, proxy) {
+    } = match prepare(
+        path,
+        environment_name,
+        vars,
+        timeout,
+        insecure,
+        proxy,
+        client_cert,
+        client_key,
+    ) {
         Ok(prepared) => prepared,
         Err(exit) => return exit,
     };

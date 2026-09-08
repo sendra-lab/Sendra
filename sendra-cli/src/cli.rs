@@ -227,6 +227,28 @@ pub(crate) enum Command {
         #[arg(long, value_name = "URL")]
         proxy: Option<String>,
 
+        /// Present this client certificate for mutual TLS, for this
+        /// invocation only. Requires `--client-key` as well — a cert with no
+        /// key (or a key with no cert) is refused when the client is built.
+        ///
+        /// Wins over `client_cert.cert` in either config file — resolved
+        /// independently of `--client-key`, so a `--client-cert` here can
+        /// pair with a `client_cert.key` a config file set, and vice versa;
+        /// only ending up with just one side, from any mix of sources, is an
+        /// error. Resolved relative to the current working directory,
+        /// matching every other CLI-supplied path (`--junit`, say) — unlike
+        /// `client_cert.cert` in a config file, which resolves relative to
+        /// that file's own directory. See the docs for the full reasoning.
+        #[arg(long, value_name = "PATH")]
+        client_cert: Option<PathBuf>,
+
+        /// Private key matching `--client-cert`, for this invocation only.
+        /// Behaves exactly as `--client-cert` does — see there — including
+        /// resolving relative to the current working directory and
+        /// overriding `client_cert.key` independently of `--client-cert`.
+        #[arg(long, value_name = "PATH")]
+        client_key: Option<PathBuf>,
+
         /// Exit 0 even when a response status is 4xx or 5xx.
         ///
         /// Responses are printed either way; this only changes the exit code,
@@ -431,6 +453,19 @@ pub(crate) enum Command {
         #[arg(long, value_name = "URL")]
         proxy: Option<String>,
 
+        /// Present this client certificate for mutual TLS, for this
+        /// invocation only. Behaves exactly as it does on `run` — see
+        /// `run --help` for the full reasoning, including the
+        /// `--client-key` pairing rule and the config-relative-vs-cwd-relative
+        /// path resolution.
+        #[arg(long, value_name = "PATH")]
+        client_cert: Option<PathBuf>,
+
+        /// Private key matching `--client-cert`, for this invocation only.
+        /// Behaves exactly as it does on `run` — see `run --help`.
+        #[arg(long, value_name = "PATH")]
+        client_key: Option<PathBuf>,
+
         /// Print one JSON object describing the whole run, instead of the
         /// human-readable output.
         ///
@@ -590,6 +625,8 @@ mod tests {
                 repeat,
                 insecure,
                 proxy,
+                client_cert,
+                client_key,
                 json,
                 show_captures,
                 junit,
@@ -607,6 +644,8 @@ mod tests {
                 assert_eq!(repeat, 1, "no --repeat was passed");
                 assert!(!insecure, "no --insecure was passed");
                 assert_eq!(proxy, None, "no --proxy was passed");
+                assert_eq!(client_cert, None, "no --client-cert was passed");
+                assert_eq!(client_key, None, "no --client-key was passed");
                 assert!(!json, "the human output is what you get without --json");
                 assert!(!show_captures, "captures are redacted by default");
                 assert_eq!(junit, None, "no --junit was passed");
@@ -1061,6 +1100,88 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Test { proxy: Some(ref url), .. } if url == "http://proxy.example.com:8080"
+        ));
+    }
+
+    // --- `--client-cert`/`--client-key` --------------------------------------
+
+    #[test]
+    fn client_cert_and_client_key_default_to_none_and_are_offered_by_both_subcommands() {
+        let cli =
+            Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("both flags are optional");
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                client_cert: None,
+                client_key: None,
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from([
+            "sendra",
+            "run",
+            "req.yaml",
+            "--client-cert",
+            "client.pem",
+            "--client-key",
+            "client-key.pem",
+        ])
+        .expect("`--client-cert`/`--client-key` take a path each");
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                client_cert: Some(ref cert),
+                client_key: Some(ref key),
+                ..
+            } if cert == &PathBuf::from("client.pem") && key == &PathBuf::from("client-key.pem")
+        ));
+
+        let cli = Cli::try_parse_from([
+            "sendra",
+            "test",
+            "req.yaml",
+            "--client-cert",
+            "client.pem",
+            "--client-key",
+            "client-key.pem",
+        ])
+        .expect("`--client-cert`/`--client-key` are offered by `test` too");
+        assert!(matches!(
+            cli.command,
+            Command::Test {
+                client_cert: Some(ref cert),
+                client_key: Some(ref key),
+                ..
+            } if cert == &PathBuf::from("client.pem") && key == &PathBuf::from("client-key.pem")
+        ));
+    }
+
+    #[test]
+    fn client_cert_and_client_key_may_be_passed_independently() {
+        // Each flag overrides only its own half of the config's client
+        // certificate — see `Config::client_cert`'s doc comment — so parsing
+        // must not require the other to be present.
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--client-cert", "c.pem"])
+            .expect("`--client-cert` alone must parse");
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                client_cert: Some(ref cert),
+                client_key: None,
+                ..
+            } if cert == &PathBuf::from("c.pem")
+        ));
+
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--client-key", "k.pem"])
+            .expect("`--client-key` alone must parse");
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                client_cert: None,
+                client_key: Some(ref key),
+                ..
+            } if key == &PathBuf::from("k.pem")
         ));
     }
 

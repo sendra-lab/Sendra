@@ -605,6 +605,9 @@ timeout_seconds: 20 # whole-request timeout: connect, send and body read
 follow_redirects: true # true (default, 10 hops), false, or a custom hop count
 insecure: false # true disables TLS certificate verification — see below
 proxy: http://proxy.example.com:8080 # route every request through this proxy
+client_cert: # present a client certificate for mutual TLS — see below
+  cert: ./client.pem
+  key: ./client-key.pem
 ```
 
 The schema stays small on purpose — the fields above are the whole of it
@@ -630,6 +633,32 @@ nothing Sendra parses itself. Setting it, from either the config file or
 respects by default (matching curl and most other HTTP tooling) are not
 consulted once an explicit proxy is configured. No `proxy:` key and no
 `--proxy` is the plain "follow the environment" default.
+
+**`client_cert: {cert, key}` presents a client certificate for mutual
+TLS** — the case where the *server* wants proof of who the *client* is, not
+just the other way around. Both `cert` and `key` are required together: a
+config naming only one is a parse error, and a CLI override supplying only
+`--client-cert` or only `--client-key` against a config that supplies neither
+is refused when the client is built. PEM only, not PKCS#12/`.pfx`: Sendra's
+HTTP client is built against `rustls` alone, and accepting a PKCS#12 file
+would mean shipping a second TLS backend just for that one format — `openssl
+pkcs12 -export ... ` (or an existing `.pfx`) can always be split back into a
+`cert.pem`/`key.pem` pair with `openssl pkcs12 -in bundle.pfx -clcerts
+-nokeys -out client.pem` / `-nocerts -nodes -out client-key.pem`.
+
+`cert`/`key` resolve **relative to this config file's own directory**, not
+the current working directory — the same rule a request's `body_file:` uses
+for the file that names it. A project config checked into version control
+should mean the same certificate on every machine it runs on, regardless of
+which directory the command happened to be typed from. `--client-cert`/
+`--client-key`, covered in [CLI overrides](#cli-overrides), resolve relative
+to the working directory instead, matching every other CLI-supplied path.
+
+Orthogonal to `--insecure`: a client certificate is about proving who *this
+client* is to the server, while `--insecure` is about whether *the server's*
+certificate gets checked. Nothing stops the two from applying to the same
+run — a self-signed internal endpoint that also demands a client
+certificate needs both.
 
 **Finding the project config.** Sendra walks up from the directory you ran it
 in, looking for `.sendra/config.yaml`, the same way git looks for `.git`. So a
@@ -671,8 +700,9 @@ Names are compared case-insensitively, because that is how HTTP header names
 work: a config `Authorization` and a request `authorization` are one header, and
 the request's value is the one sent.
 
-`--timeout`, `-H`/`--header`, `--insecure` and `--proxy` all override this
-file for one invocation without editing it — see
+`--timeout`, `-H`/`--header`, `--insecure`, `--proxy` and
+`--client-cert`/`--client-key` all override this file for one invocation
+without editing it — see
 [CLI overrides](#cli-overrides), and
 [Precedence, start to finish](#precedence-start-to-finish) for where they sit
 relative to everything else.
@@ -1199,12 +1229,19 @@ sendra run req.yaml -H "X-Trace-Id: abc123" --var base_url=http://localhost:8080
 | `--timeout <seconds>`    | no         | the resolved config `timeout_seconds`                             |
 | `--insecure`             | no         | the resolved config `insecure` — can only turn it *on*             |
 | `--proxy <url>`          | no         | the resolved config `proxy`                                       |
+| `--client-cert <path>`   | no         | the resolved config `client_cert.cert`                             |
+| `--client-key <path>`    | no         | the resolved config `client_cert.key`                              |
 
 `-H` and `--var` are invocation-only — there is no config-file equivalent for
-either. `--timeout`, `--insecure` and `--proxy` each *do* have one
-(`timeout_seconds`, `insecure`, `proxy` — see [Configuration](#configuration)),
-and CLI wins over both config files for all three, the same "most specific
-wins" rule every override here follows. Nothing here changes how a config or
+either. `--timeout`, `--insecure`, `--proxy`, `--client-cert` and
+`--client-key` each *do* have one (`timeout_seconds`, `insecure`, `proxy`,
+`client_cert.cert`, `client_cert.key` — see
+[Configuration](#configuration)), and CLI wins over both config files for
+all five, the same "most specific wins" rule every override here follows.
+`--client-cert` and `--client-key` are resolved independently of each other,
+so a `--client-cert` on the command line can pair with a `client_cert.key` a
+config file set, and vice versa — only Sendra ending up with just one half
+of the pair, from any mix of sources, is refused. Nothing here changes how a config or
 environment file itself resolves — see
 [Precedence, start to finish](#precedence-start-to-finish) for how every one
 of these flags fits with everything else.
@@ -1302,6 +1339,26 @@ proxy environment variables:
 sendra run req.yaml --proxy http://proxy.example.com:8080
 ```
 
+**`--client-cert <path>`/`--client-key <path>` override the resolved config
+`client_cert.cert`/`client_cert.key`**, each independently of the other — see
+[Configuration](#configuration) for the full `client_cert:` reasoning,
+including why PEM is the only format accepted and why the two orthogonal
+`insecure`/`client_cert` settings can both apply to the same run. Resolved
+**relative to the current working directory**, unlike the config-file form,
+which resolves relative to the config file's own directory:
+
+```sh
+sendra run req.yaml --client-cert ./client.pem --client-key ./client-key.pem
+```
+
+A path here is not treated as sensitive the way an `-H`/`--var` value is:
+an error naming a missing or malformed cert/key file shows the path in
+full, the same way `--proxy`'s URL is never redacted. The path is not the
+secret — the key file's *contents* are — so there is nothing to gain by
+hiding it. Like `--proxy`, neither flag is currently echoed by
+`-v`/`--verbose`'s provenance report; only `-H`/`--var` overrides are, by
+name, for the reason given there.
+
 ## Precedence, start to finish
 
 Every layer that can decide a value for a request has been introduced above,
@@ -1314,7 +1371,8 @@ hardcoded default
     → project config
       → environment file (--env, or the default one)
         → captured variables (as they accumulate through the run)
-          → CLI overrides (-H, --var, --timeout, --insecure, --proxy)
+          → CLI overrides (-H, --var, --timeout, --insecure, --proxy,
+                           --client-cert, --client-key)
 ```
 
 A few things are true of every step in that chain and worth stating once
@@ -1333,11 +1391,12 @@ rather than once per pair:
   inputs — substitution happens once, before a request is ever sent to config
   or a script, and `Config::apply`'s header merge happens after. The table
   above lists what each override beats *within its own chain*: `-H` never
-  competes with `--var`, and `--timeout`/`--insecure`/`--proxy` compete with
-  neither — all three are client-level settings, resolved once when the one
-  client the whole run sends through is built, not per request; there is no
-  reason for any of them to vary within a single run, the same way there is
-  no reason `--timeout` would.
+  competes with `--var`, and `--timeout`/`--insecure`/`--proxy`/
+  `--client-cert`/`--client-key` compete with neither — all five are
+  client-level settings, resolved once when the one client the whole run
+  sends through is built, not per request; there is no reason for any of
+  them to vary within a single run, the same way there is no reason
+  `--timeout` would.
 - **A `pre_request` script still runs last of all**, after every override in
   both chains, and can still change or remove anything an override set — the
   same way it can undo a config header. No override in this chain is given
