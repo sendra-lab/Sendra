@@ -1384,6 +1384,8 @@ dependencies = [
  "sendra-core",
  "serde",
  "serde_json",
+ "serde_yaml",
+ "shlex",
  "tempfile",
  "tokio",
 ]

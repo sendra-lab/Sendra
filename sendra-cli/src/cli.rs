@@ -543,6 +543,45 @@ pub(crate) enum Command {
     // TODO: point at the docs site here once it exists, instead of leaving
     // the reasoning implicit.
     Init,
+
+    /// Convert another tool's command into a Sendra request file.
+    Import {
+        #[command(subcommand)]
+        target: ImportTarget,
+    },
+}
+
+/// What `sendra import` can convert. Its own enum, nested under `Command`,
+/// so a second source format can join `Curl` later without every existing
+/// `Command` match arm having to learn about it.
+#[derive(Subcommand)]
+pub(crate) enum ImportTarget {
+    /// Convert a curl command line into a Sendra request file.
+    ///
+    /// Covers the common flags — `-X`, `-H`, `-d`/`--data`/`--data-raw`/
+    /// `--data-binary`, `-u`, `-F`, `-b`, `-A` and the URL itself — and
+    /// prints a plain-text summary, to stderr, of anything it could not
+    /// convert: a flag with no per-request equivalent (`-k`/`--insecure`,
+    /// `-x`/`--proxy`, pointing at the `sendra run` flag that matches it) or
+    /// a flag this command does not know at all. curl's enormous flag
+    /// surface is not fully covered — this is a useful, honest, best-effort
+    /// converter, not a complete one.
+    Curl {
+        /// The curl command to convert, as a single shell-quoted string —
+        /// e.g. `sendra import curl 'curl -X POST https://api.example.com
+        /// -H "Accept: application/json"'`.
+        ///
+        /// Omit it to read the command from stdin instead, for a pipe-based
+        /// workflow: `pbpaste | sendra import curl`.
+        command: Option<String>,
+
+        /// Write the generated YAML to this path instead of stdout.
+        ///
+        /// Omit it to write to stdout, which composes with shell
+        /// redirection: `sendra import curl '...' > request.yaml`.
+        #[arg(short = 'o', long = "output", value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
 }
 
 #[cfg(test)]

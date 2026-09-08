@@ -21,6 +21,9 @@ serde = { workspace = true }
 # the object the server sent, in the order it sent it, and the default
 # `Map<String, Value>` is a `BTreeMap` that would silently sort the keys.
 serde_json = { workspace = true, features = ["preserve_order"] }
+# `sendra import curl` serializes the `Request` it builds straight to YAML
+# — the same crate `sendra-core` already parses request files with.
+serde_yaml = { workspace = true }
 # A single request per invocation means no work to spread across threads, so
 # the current-thread runtime ("rt") is enough; "rt-multi-thread" would only add
 # a worker pool nothing here uses. "macros" is for #[tokio::main]. "time" is
@@ -29,6 +32,14 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 # and `--repeat` both have to stay strictly one-send-at-a-time; see the note
 # on `RedirectLog` in sendra-core.
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
+# Shell-word tokenization for `sendra import curl`: splits a curl command
+# line into argv the way a POSIX shell would (quotes, backslash escapes),
+# rather than hand-rolling that grammar. Maintained by the rust-lang org
+# (also used by `cc`, `bindgen`, `autocfg`) and already resolved into this
+# workspace's `Cargo.lock` as a transitive build-dependency of `cc` — this
+# just names it as a real, direct dependency of `sendra-cli` rather than
+# pulling in a second crate for the same job.
+shlex = "2"
 
 [dev-dependencies]
 # Which environment `--env` resolves to is tested against real directory trees,

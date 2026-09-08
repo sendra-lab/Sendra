@@ -5,6 +5,7 @@
 
 mod cli;
 mod exit;
+mod import;
 mod init;
 mod output;
 mod run;
@@ -15,7 +16,8 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use crate::cli::{Cli, Command, OutputMode};
+use crate::cli::{Cli, Command, ImportTarget, OutputMode};
+use crate::import::import_curl;
 use crate::init::init;
 use crate::output::{
     reject_allow_error_status, reject_output_status_with_dry_run, reject_output_with_json,
@@ -162,5 +164,9 @@ async fn main() -> ExitCode {
         }
 
         Command::Init => init().into(),
+
+        Command::Import { target } => match target {
+            ImportTarget::Curl { command, output } => import_curl(command, output).into(),
+        },
     }
 }
