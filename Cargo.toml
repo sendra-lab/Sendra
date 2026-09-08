@@ -63,3 +63,16 @@ rustls = { version = "0.23", default-features = false, features = [
   "ring",
   "std",
 ] }
+# `hmac_sha256()`, registered into the script engine — the one HMAC algorithm
+# it exposes. RustCrypto crates: the same org and API family `sha2` below
+# comes from, widely depended on across the ecosystem (rustls, and most Rust
+# crypto users, sit on one RustCrypto crate or another) and actively
+# maintained.
+hmac = "0.13"
+# `hmac_sha256()`'s hash function. See the note on `hmac` above.
+sha2 = "0.11"
+# `uuid()`, registered into the script engine. The de facto standard Rust UUID
+# crate — actively maintained, and its `v4` feature pulls in only `getrandom`
+# (a thin, widely-used syscall wrapper for the OS's own CSPRNG), not a general
+# `rand` dependency this workspace has no other use for.
+uuid = { version = "1", features = ["v4"] }
