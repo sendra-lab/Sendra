@@ -459,6 +459,99 @@ fn a_plain_form_post_gets_curls_own_default_content_type() {
     );
 }
 
+/// Runs one curl command that sets both a flag with an implicit default for
+/// some header (`-A`, `-b`, `-u`) and an explicit `-H` for that same header,
+/// both for real (against `curl_server`) and through the file `sendra
+/// import curl` generates from the identical command (against
+/// `sendra_server`), then asserts `header_name` came out as `expected` on
+/// *both* wires.
+///
+/// This is the real proof for the precedence rule `curl.rs` implements —
+/// "an explicit header always wins over the flag that would otherwise set a
+/// default" — against curl's actual wire behavior, not merely against the
+/// generated YAML or against this converter's own reasoning about what curl
+/// does. Asserting the specific winning value (not just that the two sides
+/// agree with each other) is what rules out both sides having coincidentally
+/// picked the *flag's* value instead.
+fn assert_precedence_matches_curl(flags: &[&str], header_name: &str, expected: &str) {
+    let curl_server = CapturingServer::start();
+    let sendra_server = CapturingServer::start();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+
+    let mut curl_args: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+    curl_args.push(format!("{}/", curl_server.base_url()));
+    assert_success(&run_real_curl(&curl_args));
+
+    let mut curl_command = vec!["curl".to_string()];
+    curl_command.extend(flags.iter().map(|s| s.to_string()));
+    curl_command.push(format!("{}/", sendra_server.base_url()));
+    let curl_command = curl_command
+        .iter()
+        .map(|arg| shlex_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert_success(&sendra(
+        dir.path(),
+        &["import", "curl", &curl_command, "-o", "req.yaml"],
+    ));
+    assert_success(&sendra(dir.path(), &["run", "req.yaml"]));
+
+    let from_curl = curl_server.captured();
+    let from_sendra = sendra_server.captured();
+
+    assert_eq!(
+        from_curl.header(header_name),
+        Some(expected),
+        "sanity check on real curl's own wire behavior — if this fails, the \
+         test's assumption about curl's precedence is wrong, not Sendra's \
+         conversion"
+    );
+    assert_eq!(
+        from_sendra.header(header_name),
+        Some(expected),
+        "the generated file must reproduce curl's real precedence: explicit \
+         `-H {header_name}: ...` beats the flag that would otherwise default it"
+    );
+}
+
+#[test]
+fn dash_a_loses_to_an_explicit_user_agent_header_on_the_real_wire() {
+    assert_precedence_matches_curl(
+        &[
+            "-A",
+            "curl-default-agent/1.0",
+            "-H",
+            "User-Agent: explicit-agent/2.0",
+        ],
+        "User-Agent",
+        "explicit-agent/2.0",
+    );
+}
+
+#[test]
+fn dash_b_loses_to_an_explicit_cookie_header_on_the_real_wire() {
+    assert_precedence_matches_curl(
+        &["-b", "session=fromflag", "-H", "Cookie: session=fromheader"],
+        "Cookie",
+        "session=fromheader",
+    );
+}
+
+#[test]
+fn dash_u_loses_to_an_explicit_authorization_header_on_the_real_wire() {
+    assert_precedence_matches_curl(
+        &[
+            "-u",
+            "ada:s3cr3t",
+            "-H",
+            "Authorization: Bearer explicit-token",
+        ],
+        "Authorization",
+        "Bearer explicit-token",
+    );
+}
+
 /// Minimal single-quote shell-quoting for building a curl command string to
 /// hand to `sendra import curl` — good enough for the argument values this
 /// test file actually produces (a JSON body, a header value, credentials),
