@@ -35,6 +35,13 @@ dirs = { workspace = true }
 # construction: see the module docs on `script` for what is reachable from a
 # script and what is not.
 rhai = { workspace = true }
+# `hmac_sha256()`, registered into the script engine — see the note on both
+# in the workspace `Cargo.toml`.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+# `uuid()`, registered into the script engine — see the note in the workspace
+# `Cargo.toml`.
+uuid = { workspace = true }
 
 [dev-dependencies]
 # Only the test harness needs a runtime here; the binary picks its own.
