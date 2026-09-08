@@ -691,7 +691,7 @@ mod tests {
         ));
 
         // `run` produces no verdict, so it has nothing for a JUnit report to
-        // say — the flag is `test`'s alone, per the issue's explicit non-goal.
+        // say — the flag is deliberately `test`'s alone.
         let err = expect_cli_error(&["sendra", "run", "req.yaml", "--junit", "report.xml"]);
         assert_eq!(err.exit_code(), 2, "`run --junit` is a usage error");
     }

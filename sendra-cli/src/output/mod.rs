@@ -1033,9 +1033,9 @@ mod tests {
 
     #[test]
     fn show_captures_opts_back_into_the_raw_values() {
-        // `--show-captures` — `false` was the shape every test above this one
-        // exercised before this issue; this is the flag that gets the
-        // pre-existing behaviour back.
+        // `--show-captures` — `false` (redacted) is the default every test
+        // above this one exercises; this is the flag that opts back into the
+        // raw values.
         let reporter = Reporter::new(Format::Json, OutputMode::Full, true);
         let body = r#"{"token":"abc123","user":{"id":42}}"#;
         let capture = capture_report(

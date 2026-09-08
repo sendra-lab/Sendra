@@ -38,8 +38,8 @@
 //!   text the author never wrote, so a parse error could point at a line that
 //!   exists in no file, with a column that means nothing.
 //! - It would let `{{var}}` appear anywhere at all — in `method`, in half of a
-//!   key name — which is a far larger contract than this issue means to add,
-//!   and not one that could be walked back later.
+//!   key name — which is a far larger contract than substitution is meant to
+//!   make, and not one that could be walked back later.
 //!
 //! The cost is that only the fields listed above are templated. `method` is a
 //! closed enum with no useful placeholder, and `name` is deliberately excluded
@@ -242,9 +242,9 @@ impl Environment {
     ///
     /// The result is *not* re-scanned for `{{...}}`. Substitution is a single
     /// pass by design: recursion would let one environment variable reference
-    /// another (the layering this issue explicitly does not do), and would let a
-    /// value fetched from the OS environment be read as a template rather than
-    /// as data.
+    /// another (a layering deliberately left out), and would let a value
+    /// fetched from the OS environment be read as a template rather than as
+    /// data.
     fn lookup(&self, name: &str) -> Result<String, SendraError> {
         // Captured first, and it costs nothing to be exact about why: the two
         // maps are disjoint by construction, since a capture whose name the
@@ -754,8 +754,8 @@ mod tests {
 
     #[test]
     fn the_default_environment_lives_where_the_readme_says_it_does() {
-        // The temporary wiring is a documented path, so pin it: issue 5 swaps
-        // the name, not the layout.
+        // The layout is a documented path, so pin it: naming a different
+        // environment changes which file is read, never where it lives.
         let path = environment_path(Path::new("/project"), DEFAULT_ENVIRONMENT_NAME);
         assert!(
             path.ends_with(Path::new(".sendra/environments/default.yaml")),

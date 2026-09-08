@@ -117,10 +117,10 @@ impl CapturingServer {
 }
 
 /// A server that reads a request and then goes quiet for `delay` — the same
-/// "issue 6" pattern `sendra-core`'s own timeout tests use
-/// (`start_stalling_server` in `sendra-core/src/lib.rs`), reproduced here
-/// because this test is about `--timeout` reaching the client through the
-/// CLI's config override, not about the timeout mechanism itself.
+/// pattern `sendra-core`'s own timeout tests use (`start_stalling_server` in
+/// `sendra-core/src/lib.rs`), reproduced here because this test is about
+/// `--timeout` reaching the client through the CLI's config override, not
+/// about the timeout mechanism itself.
 fn start_stalling_server(delay: Duration) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is free");
     let addr = listener.local_addr().expect("the listener has an address");

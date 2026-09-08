@@ -287,8 +287,8 @@ mod tests {
     #[test]
     fn a_request_that_checked_nothing_is_skipped() {
         // No script and no assertions — the third category, and JUnit's
-        // `<skipped>` is the reading this issue settled on rather than a
-        // bare pass.
+        // `<skipped>` is the reading settled on here rather than a bare
+        // pass.
         let response = response_with("text/plain", "ok");
         let case = Case::from_response(
             "Login".to_string(),
