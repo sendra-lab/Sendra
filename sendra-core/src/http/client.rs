@@ -75,13 +75,19 @@ pub struct HttpClient {
 /// because a client is not configuration: it holds sockets, it is cheap to
 /// clone and expensive to rebuild, and it belongs to a *run*, whereas the
 /// config it is built from is a resolved set of values that outlives any
-/// particular one. The config decides two things here — the timeout and the
-/// redirect policy — and nothing else about the client is configurable in v1;
-/// reqwest's own pool defaults are what a command-line tool wants.
+/// particular one. The config decides four things here — the timeout, the
+/// redirect policy, whether TLS certificates are verified, and which proxy
+/// (if any) requests go through — and nothing else about the client is
+/// configurable in v1; reqwest's own pool defaults are what a command-line
+/// tool wants.
 ///
-/// Fails only when reqwest cannot construct a client at all (a TLS backend that
-/// will not initialise, say), which is fatal to the whole run and so is
-/// [`SendraError::Client`] rather than a per-request network error.
+/// Fails when reqwest cannot construct a client at all (a TLS backend that
+/// will not initialise, say) or when [`Config::proxy`] does not parse as a
+/// URL reqwest accepts — both are fatal to the whole run and so are
+/// [`SendraError::Client`] rather than a per-request network error: a
+/// malformed `proxy:`/`--proxy` value means no request in this run could
+/// ever have gone anywhere, same as a client reqwest itself refuses to
+/// build.
 pub fn build_client(config: &Config) -> Result<HttpClient, SendraError> {
     let redirects: RedirectLog = Arc::new(Mutex::new(Vec::new()));
 
@@ -118,11 +124,31 @@ pub fn build_client(config: &Config) -> Result<HttpClient, SendraError> {
 
     // reqwest has no timeout of its own by default, so an unresponsive server
     // would hang the process indefinitely; the config always supplies one.
-    let inner = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(config.timeout)
         .redirect(policy)
-        .build()
-        .map_err(SendraError::Client)?;
+        // Unconditional rather than only-when-true: `false` is exactly
+        // reqwest's own default (verify), so this changes nothing for the
+        // overwhelming majority of runs and there is no third state to
+        // handle.
+        .danger_accept_invalid_certs(config.insecure);
+
+    if let Some(url) = &config.proxy {
+        // `no_proxy()` first: it turns off reqwest's automatic detection of
+        // the system `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment
+        // variables without touching a proxy added explicitly afterwards —
+        // see the reasoning on `Config::proxy`. An explicit proxy is meant to
+        // be authoritative for the run, not one more candidate layered on
+        // top of whatever the environment happens to say.
+        let proxy = reqwest::Proxy::all(url).map_err(SendraError::Client)?;
+        builder = builder.no_proxy().proxy(proxy);
+    }
+    // No `proxy:`/`--proxy`: say nothing, and reqwest's own default —
+    // reading `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` from the environment —
+    // applies, matching what curl and every other common HTTP tool already
+    // do without being asked.
+
+    let inner = builder.build().map_err(SendraError::Client)?;
 
     Ok(HttpClient {
         inner,

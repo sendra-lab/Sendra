@@ -307,3 +307,121 @@ pub(crate) fn ok_bytes(content_type: &str, body: &[u8]) -> Vec<u8> {
     response.extend_from_slice(body);
     response
 }
+
+/// A server that terminates a TLS handshake with a self-signed certificate
+/// for `127.0.0.1`, then answers one request with a fixed `200` —
+/// `--insecure`'s test fixture: a client verifying certificates against a
+/// real CA has nothing to trust here, exactly the case `--insecure` exists
+/// for.
+///
+/// Sync `rustls`, not `tokio-rustls`: this file's servers all run on a plain
+/// blocking thread, and `rustls::Stream` wraps a blocking `Read + Write` the
+/// same way every plain-HTTP server above wraps a raw `TcpStream`, so the
+/// handshake and the request/response exchange after it go through ordinary
+/// `Read`/`Write` calls rather than a second async runtime just for this one
+/// server.
+pub(crate) fn start_self_signed_tls_server() -> SocketAddr {
+    // rustls requires exactly one process-wide default `CryptoProvider`.
+    // reqwest's own client — built in this same test binary, via the
+    // `rustls-tls` feature — installs one too; whichever gets there first
+    // wins, and an `Err` here only means it already has. Both resolve to the
+    // `ring` backend either way — see the note on this dev-dependency in the
+    // workspace `Cargo.toml`.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let certified = rcgen::generate_simple_self_signed(["127.0.0.1".to_string()])
+        .expect("a self-signed certificate for 127.0.0.1 generates");
+    let cert_der = certified.cert.der().clone();
+    let key_der =
+        rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .expect("the freshly generated cert and key are valid together");
+    let server_config = Arc::new(server_config);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is free");
+    let addr = listener.local_addr().expect("the listener has an address");
+
+    std::thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        let Ok(mut conn) = rustls::ServerConnection::new(server_config) else {
+            return;
+        };
+        let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+
+        // The same "request line, then headers to the blank line" read this
+        // file's plain-HTTP servers use, inlined rather than shared through
+        // `drain_request_headers`: that helper is typed to a bare
+        // `BufReader<TcpStream>`, and generalising it over `Read` for the
+        // sake of one more caller would be a bigger change than this test
+        // fixture needs.
+        let mut reader = BufReader::new(&mut tls);
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+            return;
+        }
+        loop {
+            let mut header = String::new();
+            match reader.read_line(&mut header) {
+                Ok(0) | Err(_) => return,
+                Ok(_) if header == "\r\n" => break,
+                Ok(_) => {}
+            }
+        }
+
+        let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    });
+
+    addr
+}
+
+/// A server that records the request line of the one connection it accepts,
+/// then answers `200` — a stand-in for an HTTP proxy.
+///
+/// It does not actually forward anything anywhere: a client configured to
+/// proxy through this address sends its request *to* this server with the
+/// target's full URL on the request line (`GET http://target/path HTTP/1.1`,
+/// "absolute-form", per RFC 7230 §5.3.2) rather than the plain path a direct
+/// request would use (`GET /path HTTP/1.1`, "origin-form"). Recording that
+/// line and asserting on its shape is what proves a request actually went
+/// *through* this address as a proxy, rather than merely reaching some
+/// server that happened to answer 200 — the distinction
+/// [`build_client`](crate::build_client)'s `--proxy` tests are for.
+pub(crate) fn start_proxy_recording_server() -> (SocketAddr, Arc<std::sync::Mutex<Option<String>>>)
+{
+    let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is free");
+    let addr = listener.local_addr().expect("the listener has an address");
+    let seen = Arc::new(std::sync::Mutex::new(None));
+
+    let stored = seen.clone();
+    std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut writer = stream.try_clone().expect("the socket clones");
+        let mut reader = BufReader::new(stream);
+
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+            return;
+        }
+        loop {
+            let mut header = String::new();
+            match reader.read_line(&mut header) {
+                Ok(0) | Err(_) => return,
+                Ok(_) if header == "\r\n" => break,
+                Ok(_) => {}
+            }
+        }
+
+        *stored.lock().unwrap() = Some(request_line.trim_end().to_string());
+        let _ = writer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let _ = writer.flush();
+    });
+
+    (addr, seen)
+}

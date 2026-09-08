@@ -602,11 +602,34 @@ headers: # merged into every request; a header in the request file wins
   User-Agent: sendra
   Accept: application/json
 timeout_seconds: 20 # whole-request timeout: connect, send and body read
+follow_redirects: true # true (default, 10 hops), false, or a custom hop count
+insecure: false # true disables TLS certificate verification — see below
+proxy: http://proxy.example.com:8080 # route every request through this proxy
 ```
 
-Those two keys are the whole schema for now. Unknown keys are rejected, like
-everywhere else in Sendra, so `timeout` instead of `timeout_seconds` is an error
-you see rather than a setting that quietly never applies.
+The schema stays small on purpose — the fields above are the whole of it
+today. Unknown keys are rejected, like everywhere else in Sendra, so `timeout`
+instead of `timeout_seconds` is an error you see rather than a setting that
+quietly never applies.
+
+**`insecure: true` disables TLS certificate verification for every request
+this run sends.** It exists for a self-signed or otherwise untrusted
+endpoint — an internal staging host, say — where there is no CA chain to
+verify against, not for routine use against the public internet: it removes
+the one thing standing between a request and a man-in-the-middle. Whenever
+this resolves to `true`, from either the config file or `--insecure`, Sendra
+prints a one-line warning to stderr before sending anything, and `-q` does
+not suppress it — see [CLI overrides](#cli-overrides) for `--insecure`
+itself and the reasoning behind that.
+
+**`proxy: <url>` routes every request through an HTTP proxy**, `http://user:pass@host:port`
+included — credentials in the URL are read by the underlying HTTP client,
+nothing Sendra parses itself. Setting it, from either the config file or
+`--proxy`, takes over proxying for the run entirely: the standard
+`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables Sendra otherwise
+respects by default (matching curl and most other HTTP tooling) are not
+consulted once an explicit proxy is configured. No `proxy:` key and no
+`--proxy` is the plain "follow the environment" default.
 
 **Finding the project config.** Sendra walks up from the directory you ran it
 in, looking for `.sendra/config.yaml`, the same way git looks for `.git`. So a
@@ -648,8 +671,9 @@ Names are compared case-insensitively, because that is how HTTP header names
 work: a config `Authorization` and a request `authorization` are one header, and
 the request's value is the one sent.
 
-`--timeout` and `-H`/`--header` override this file for one invocation without
-editing it — see [CLI overrides](#cli-overrides), and
+`--timeout`, `-H`/`--header`, `--insecure` and `--proxy` all override this
+file for one invocation without editing it — see
+[CLI overrides](#cli-overrides), and
 [Precedence, start to finish](#precedence-start-to-finish) for where they sit
 relative to everything else.
 
@@ -1161,7 +1185,7 @@ cursor is a real flow that has to be expressible.
 
 ## CLI overrides
 
-Three flags change one invocation without touching a file, on `sendra run` and
+Flags that change one invocation without touching a file, on `sendra run` and
 `sendra test` alike:
 
 ```sh
@@ -1172,12 +1196,18 @@ sendra run req.yaml -H "X-Trace-Id: abc123" --var base_url=http://localhost:8080
 | ------------------------ | ---------- | ----------------------------------------------------------------- |
 | `-H`/`--header "Name: value"` | yes  | config headers, the request's own `headers:`, a resolved `auth:` |
 | `--var name=value`       | yes        | the active environment file's value for `name`                    |
-| `--timeout <seconds>`    | no         | the resolved config timeout                                       |
+| `--timeout <seconds>`    | no         | the resolved config `timeout_seconds`                             |
+| `--insecure`             | no         | the resolved config `insecure` — can only turn it *on*             |
+| `--proxy <url>`          | no         | the resolved config `proxy`                                       |
 
-All three are invocation-only: there is no config-file equivalent, and nothing
-here changes how a config or environment file itself resolves — see
-[Precedence, start to finish](#precedence-start-to-finish) for how they fit
-with everything else.
+`-H` and `--var` are invocation-only — there is no config-file equivalent for
+either. `--timeout`, `--insecure` and `--proxy` each *do* have one
+(`timeout_seconds`, `insecure`, `proxy` — see [Configuration](#configuration)),
+and CLI wins over both config files for all three, the same "most specific
+wins" rule every override here follows. Nothing here changes how a config or
+environment file itself resolves — see
+[Precedence, start to finish](#precedence-start-to-finish) for how every one
+of these flags fits with everything else.
 
 **`-H`/`--header` wins every conflict a header can be in.** It is compared
 case-insensitively, like every other header rule in Sendra, and it *replaces*
@@ -1248,6 +1278,30 @@ discoverable only by reading the file and counting positions.
 sendra run req.yaml --timeout 5   # gives up after 5s, whatever config.yaml says
 ```
 
+**`--insecure` overrides the resolved config `insecure`, but only upward.**
+There is no `--secure` to force certificate verification back on over a
+config that set `insecure: true` — the same shape as `--dry-run` or any
+other bare flag here, none of which have a negating counterpart either:
+
+```sh
+sendra run req.yaml --insecure   # against a self-signed staging host, say
+```
+
+Whenever this resolves to `true` — from `--insecure` or from `insecure: true`
+in either config file — Sendra prints a one-line warning to stderr before
+sending anything, and keeps printing it even under `-q`/`--json`: see
+[Configuration](#configuration) for the full reasoning on why this one
+notice is not narration `-q` trims away.
+
+**`--proxy <url>` overrides the resolved config `proxy`** outright, taking
+over proxying for the run entirely — see
+[Configuration](#configuration) for how that interacts with the standard
+proxy environment variables:
+
+```sh
+sendra run req.yaml --proxy http://proxy.example.com:8080
+```
+
 ## Precedence, start to finish
 
 Every layer that can decide a value for a request has been introduced above,
@@ -1260,7 +1314,7 @@ hardcoded default
     → project config
       → environment file (--env, or the default one)
         → captured variables (as they accumulate through the run)
-          → CLI overrides (-H, --var, --timeout)
+          → CLI overrides (-H, --var, --timeout, --insecure, --proxy)
 ```
 
 A few things are true of every step in that chain and worth stating once
@@ -1279,7 +1333,11 @@ rather than once per pair:
   inputs — substitution happens once, before a request is ever sent to config
   or a script, and `Config::apply`'s header merge happens after. The table
   above lists what each override beats *within its own chain*: `-H` never
-  competes with `--var`, and `--timeout` competes with neither.
+  competes with `--var`, and `--timeout`/`--insecure`/`--proxy` compete with
+  neither — all three are client-level settings, resolved once when the one
+  client the whole run sends through is built, not per request; there is no
+  reason for any of them to vary within a single run, the same way there is
+  no reason `--timeout` would.
 - **A `pre_request` script still runs last of all**, after every override in
   both chains, and can still change or remove anything an override set — the
   same way it can undo a config header. No override in this chain is given
