@@ -6,6 +6,7 @@ mod human;
 mod json;
 mod junit;
 mod provenance;
+mod warnings;
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -36,6 +37,7 @@ pub(crate) use self::errors::{
     reject_verbose_with_quiet,
 };
 pub(crate) use self::provenance::print_provenance;
+pub(crate) use self::warnings::print_insecure_warning;
 
 /// Which rendering a run produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

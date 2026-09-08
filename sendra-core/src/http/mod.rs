@@ -160,8 +160,9 @@ mod tests {
     use crate::http::client::build_client;
     use crate::http::response::RedirectHop;
     use crate::test_support::{
-        get, ok_bytes, ok_response, redirect_response, start_route_server, start_stalling_server,
-        CountingServer, Stall,
+        get, ok_bytes, ok_response, redirect_response, start_proxy_recording_server,
+        start_route_server, start_self_signed_tls_server, start_stalling_server, CountingServer,
+        Stall,
     };
     use crate::{config, Method, SendraError};
     use std::collections::BTreeMap;
@@ -555,6 +556,92 @@ mod tests {
             matches!(err, SendraError::Network { .. }),
             "a refused connection is a fact about the network, not about the timeout, got {err:?}"
         );
+    }
+
+    // --- `insecure` ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_self_signed_endpoint_fails_verification_by_default() {
+        let addr = start_self_signed_tls_server();
+        let config = Config::default();
+        let client = build_client(&config).expect("a client builds");
+
+        let err = send(&get(&format!("https://{addr}/")), &client, &config)
+            .await
+            .expect_err("a self-signed certificate must not verify by default");
+
+        assert!(
+            matches!(err, SendraError::Network { .. }),
+            "a certificate failure is a fact about the connection, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn insecure_true_accepts_the_same_self_signed_endpoint() {
+        let addr = start_self_signed_tls_server();
+        let config = Config {
+            insecure: true,
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a client builds");
+
+        let response = send(&get(&format!("https://{addr}/")), &client, &config)
+            .await
+            .expect("--insecure must let the same handshake through");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "ok");
+    }
+
+    // --- `proxy` ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_configured_proxy_actually_receives_the_request() {
+        let (proxy_addr, seen) = start_proxy_recording_server();
+        let config = Config {
+            proxy: Some(format!("http://{proxy_addr}")),
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a client builds");
+
+        // A target host nothing in this test binds or listens on: if the
+        // request reached it directly rather than through the proxy, this
+        // would fail to connect instead of succeeding.
+        let response = send(
+            &get("http://example-target.invalid/widgets"),
+            &client,
+            &config,
+        )
+        .await
+        .expect("the proxy stand-in answers 200 to whatever reaches it");
+
+        assert_eq!(response.status, 200);
+
+        let request_line = seen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the proxy should have seen exactly one request");
+        // Absolute-form, target URL and all — the proof this went *through*
+        // the proxy rather than being sent directly to a server that just
+        // happened to be listening at `proxy_addr`.
+        assert_eq!(
+            request_line, "GET http://example-target.invalid/widgets HTTP/1.1",
+            "the proxy did not see an absolute-form request line: {request_line:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_proxy_url_is_a_client_error() {
+        let config = Config {
+            proxy: Some("not a url".to_string()),
+            ..Config::default()
+        };
+
+        let Err(err) = build_client(&config) else {
+            panic!("a malformed proxy URL must not build a client");
+        };
+        assert!(matches!(err, SendraError::Client(_)), "got {err:?}");
     }
 
     // --- non-UTF-8 response bodies -----------------------------------------

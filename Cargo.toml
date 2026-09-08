@@ -46,3 +46,20 @@ flate2 = "1"
 # an XML writer for production use, since the report itself needs nothing
 # more than string formatting and five characters of escaping.
 roxmltree = "0.21"
+# Test-only: generates a throwaway self-signed certificate so `--insecure`'s
+# tests can run a real TLS handshake against an endpoint with no trusted CA
+# behind it, rather than only unit-testing the `ClientBuilder` call. Pinned to
+# the `rustls-pki-types` version already in the tree via reqwest's
+# `rustls-tls` feature, so this adds a small pure-Rust crate rather than a
+# second, incompatible copy of the certificate types.
+rcgen = "0.13"
+# Test-only, alongside `rcgen`: terminates the TLS handshake the self-signed
+# cert above is used in. `default-features = false` + explicit `ring` matches
+# the backend reqwest's own `rustls-tls` feature already resolves to in this
+# workspace (see `Cargo.lock`) — picking the same backend rather than pulling
+# in `aws-lc-rs`, a second TLS crypto implementation with its own build-time
+# C/cmake requirement, just for a test.
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+] }

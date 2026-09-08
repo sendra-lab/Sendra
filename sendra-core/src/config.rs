@@ -16,9 +16,10 @@
 //! No config file anywhere is a perfectly ordinary state — everything falls
 //! back to the hardcoded defaults in [`Config::default`].
 //!
-//! The schema is deliberately tiny (default headers, default timeout). This
-//! module exists to prove the *resolution* mechanism; fields get added to
-//! [`ConfigFile`] as features that need them land, not in advance.
+//! The schema stays small on purpose, and grows only as a feature actually
+//! needs a new key — [`ConfigFile`] documents the current full set. This
+//! module exists first to prove the *resolution* mechanism: every key
+//! resolves through the same global-then-project, per-key `merge_over`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -185,6 +186,47 @@ pub struct ConfigFile {
     /// [`FollowRedirects`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_redirects: Option<FollowRedirects>,
+
+    /// Skip TLS certificate verification for every request this run sends —
+    /// the config-file form of `--insecure`.
+    ///
+    /// A real security-relevant setting, not a convenience default: it exists
+    /// for a self-signed or otherwise untrusted endpoint (an internal
+    /// staging host, say) where there is no CA chain to verify against, and
+    /// it disables the one thing standing between a request and a
+    /// man-in-the-middle. See [`build_client`](crate::build_client) for where
+    /// it is applied, and the CLI's `--insecure` doc comment for the warning
+    /// printed whenever this resolves to `true`, from either source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insecure: Option<bool>,
+
+    /// Route every request through this HTTP proxy — the config-file form of
+    /// `--proxy`.
+    ///
+    /// ```text
+    /// proxy: http://proxy.example.com:8080
+    /// proxy: http://user:pass@proxy.example.com:8080   # credentials in the URL
+    /// ```
+    ///
+    /// A plain URL string rather than a structured `{host, port, user, pass}`
+    /// object: reqwest, which actually builds the proxying connector, already
+    /// reads user/pass credentials straight out of the URL's userinfo, so a
+    /// second, Sendra-specific way to spell the same thing would be a second
+    /// thing to keep in sync with reqwest's own parsing rather than a real
+    /// capability. Not validated here — an unparsable URL surfaces as a
+    /// [`SendraError::Client`] when [`build_client`](crate::build_client)
+    /// tries to build the client, the same place every other
+    /// client-construction failure is reported.
+    ///
+    /// Setting this — from either the config file or `--proxy` — takes over
+    /// proxying for the run entirely: the standard `HTTP_PROXY`/
+    /// `HTTPS_PROXY`/`NO_PROXY` environment variables Sendra otherwise
+    /// respects by default (matching curl, and every other common HTTP tool)
+    /// are not consulted once an explicit proxy is configured. `None` — no
+    /// `proxy:` key and no `--proxy` — is the plain "follow the environment,
+    /// same as everyone else" default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 impl ConfigFile {
@@ -240,6 +282,8 @@ impl ConfigFile {
             headers,
             timeout_seconds: self.timeout_seconds.or(base.timeout_seconds),
             follow_redirects: self.follow_redirects.or(base.follow_redirects),
+            insecure: self.insecure.or(base.insecure),
+            proxy: self.proxy.or(base.proxy),
         }
     }
 }
@@ -256,6 +300,11 @@ pub struct Config {
     pub timeout: Duration,
     /// Whether to follow redirects, and how many hops to allow.
     pub redirects: FollowRedirects,
+    /// Skip TLS certificate verification. See [`ConfigFile::insecure`].
+    pub insecure: bool,
+    /// Route every request through this HTTP proxy, or `None` to follow the
+    /// standard proxy environment variables. See [`ConfigFile::proxy`].
+    pub proxy: Option<String>,
     /// The config files this was built from, in the order they were merged
     /// (global first). Empty when no config file was found anywhere.
     pub sources: Vec<PathBuf>,
@@ -263,13 +312,17 @@ pub struct Config {
 
 impl Default for Config {
     /// What Sendra does with no config file anywhere: no extra headers,
-    /// [`DEFAULT_TIMEOUT`], and redirects followed up to
-    /// [`DEFAULT_MAX_REDIRECTS`] — reqwest's own default.
+    /// [`DEFAULT_TIMEOUT`], redirects followed up to
+    /// [`DEFAULT_MAX_REDIRECTS`] — reqwest's own default — TLS verification
+    /// on, and no explicit proxy (so the standard proxy environment
+    /// variables apply, same as any other HTTP tool).
     fn default() -> Self {
         Self {
             headers: BTreeMap::new(),
             timeout: DEFAULT_TIMEOUT,
             redirects: FollowRedirects::default(),
+            insecure: false,
+            proxy: None,
             sources: Vec::new(),
         }
     }
@@ -327,6 +380,8 @@ impl Config {
                 .timeout_seconds
                 .map_or(DEFAULT_TIMEOUT, Duration::from_secs),
             redirects: merged.follow_redirects.unwrap_or_default(),
+            insecure: merged.insecure.unwrap_or(false),
+            proxy: merged.proxy,
             sources,
         })
     }
@@ -753,6 +808,113 @@ mod tests {
             message.contains("could not parse"),
             "got {message}: {err:?}"
         );
+    }
+
+    // --- `insecure` ---------------------------------------------------------
+
+    #[test]
+    fn no_insecure_key_resolves_to_false() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(temp.path(), "timeout_seconds: 5\n");
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        assert!(!config.insecure);
+    }
+
+    #[test]
+    fn insecure_true_resolves_to_true() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(temp.path(), "insecure: true\n");
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        assert!(config.insecure);
+    }
+
+    #[test]
+    fn a_project_insecure_overrides_a_global_one_wholesale() {
+        let temp = tempfile::tempdir().unwrap();
+        let global = global(temp.path(), "insecure: true\n");
+        let root = project(temp.path(), "insecure: false\n");
+
+        let config = Config::resolve_from(&root, Some(&global)).unwrap();
+
+        assert!(!config.insecure, "the project's explicit false must win");
+    }
+
+    #[test]
+    fn a_global_insecure_applies_when_the_project_says_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let global = global(temp.path(), "insecure: true\n");
+        let root = project(temp.path(), "timeout_seconds: 5\n");
+
+        let config = Config::resolve_from(&root, Some(&global)).unwrap();
+
+        assert!(config.insecure);
+    }
+
+    // --- `proxy` -------------------------------------------------------------
+
+    #[test]
+    fn no_proxy_key_resolves_to_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(temp.path(), "timeout_seconds: 5\n");
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        assert_eq!(config.proxy, None);
+    }
+
+    #[test]
+    fn proxy_resolves_to_the_configured_url() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(temp.path(), "proxy: http://proxy.example.com:8080\n");
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        assert_eq!(
+            config.proxy.as_deref(),
+            Some("http://proxy.example.com:8080")
+        );
+    }
+
+    #[test]
+    fn a_proxy_url_with_embedded_credentials_round_trips_unchanged() {
+        // Sendra does not parse or special-case the credentials — they are
+        // reqwest's to read out of the URL when the client is built.
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(
+            temp.path(),
+            "proxy: http://user:pass@proxy.example.com:8080\n",
+        );
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        assert_eq!(
+            config.proxy.as_deref(),
+            Some("http://user:pass@proxy.example.com:8080")
+        );
+    }
+
+    #[test]
+    fn a_project_proxy_overrides_a_global_one_wholesale() {
+        let temp = tempfile::tempdir().unwrap();
+        let global = global(temp.path(), "proxy: http://global-proxy:8080\n");
+        let root = project(temp.path(), "proxy: http://project-proxy:8080\n");
+
+        let config = Config::resolve_from(&root, Some(&global)).unwrap();
+
+        assert_eq!(config.proxy.as_deref(), Some("http://project-proxy:8080"));
+    }
+
+    #[test]
+    fn an_unknown_config_key_near_proxy_or_insecure_is_still_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(temp.path(), "insecur: true\n");
+
+        let err = Config::resolve_from(&root, None).expect_err("a typo must not be ignored");
+        assert!(matches!(err, SendraError::ConfigParse { .. }), "{err:?}");
     }
 
     #[test]

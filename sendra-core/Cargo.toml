@@ -44,3 +44,8 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 tempfile = { workspace = true }
 # Encodes the gzip fixture body in the compression test.
 flate2 = { workspace = true }
+# `--insecure`'s test TLS server: a throwaway self-signed certificate...
+rcgen = { workspace = true }
+# ...and the handshake it terminates. See the note on both in the workspace
+# `Cargo.toml`.
+rustls = { workspace = true }

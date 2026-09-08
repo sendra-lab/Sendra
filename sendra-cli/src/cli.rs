@@ -189,6 +189,44 @@ pub(crate) enum Command {
         #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_repeat)]
         repeat: u32,
 
+        /// Disable TLS certificate verification for this invocation only.
+        ///
+        /// Wins over `insecure: true`/`false` in either config file, the
+        /// same "CLI beats config" rule every other override here follows —
+        /// but only in the direction that turns it *on*: there is no
+        /// `--secure` to force verification back on over a config that set
+        /// `insecure: true`, the same way there is no way to un-set a bare
+        /// flag like `--dry-run`.
+        ///
+        /// A real security-relevant setting, not a convenience default:
+        /// meant for a self-signed or otherwise untrusted endpoint — an
+        /// internal staging host, say — where there is no CA chain to check
+        /// against, not for routine use against the public internet.
+        /// Whenever this resolves to true, from either source, a one-line
+        /// warning prints to stderr before any request is sent, and *is
+        /// not* suppressed by `-q`/`--quiet`: `-q` trims narration, and
+        /// whether certificate verification is off for this run is a fact
+        /// about what is about to happen on the wire, not narration about
+        /// how the pipeline resolved. It still has nothing to do with
+        /// `--json`, whose stdout contract is unaffected — the warning is
+        /// stderr, like every other diagnostic here.
+        #[arg(long)]
+        insecure: bool,
+
+        /// Route every request through this HTTP proxy for this invocation
+        /// only, `http://host:port` (or `http://user:pass@host:port` for a
+        /// proxy that requires credentials — read straight out of the URL
+        /// by the underlying HTTP client, nothing Sendra-specific).
+        ///
+        /// Wins over `proxy:` in either config file. Setting it — from
+        /// either source — takes over proxying entirely for this run: the
+        /// standard `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment
+        /// variables Sendra otherwise respects by default, matching curl
+        /// and most other HTTP tooling, are not consulted once an explicit
+        /// proxy is configured.
+        #[arg(long, value_name = "URL")]
+        proxy: Option<String>,
+
         /// Exit 0 even when a response status is 4xx or 5xx.
         ///
         /// Responses are printed either way; this only changes the exit code,
@@ -381,6 +419,18 @@ pub(crate) enum Command {
         #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_repeat)]
         repeat: u32,
 
+        /// Disable TLS certificate verification for this invocation only.
+        /// Behaves exactly as it does on `run` — see `run --help` for the
+        /// full reasoning, including the `-q`/`--json` interaction of the
+        /// warning it prints whenever this resolves to true.
+        #[arg(long)]
+        insecure: bool,
+
+        /// Route every request through this HTTP proxy for this invocation
+        /// only. Behaves exactly as it does on `run` — see `run --help`.
+        #[arg(long, value_name = "URL")]
+        proxy: Option<String>,
+
         /// Print one JSON object describing the whole run, instead of the
         /// human-readable output.
         ///
@@ -538,6 +588,8 @@ mod tests {
                 var,
                 timeout,
                 repeat,
+                insecure,
+                proxy,
                 json,
                 show_captures,
                 junit,
@@ -553,6 +605,8 @@ mod tests {
                 assert!(var.is_empty(), "no --var was passed");
                 assert_eq!(timeout, None, "no --timeout was passed");
                 assert_eq!(repeat, 1, "no --repeat was passed");
+                assert!(!insecure, "no --insecure was passed");
+                assert_eq!(proxy, None, "no --proxy was passed");
                 assert!(!json, "the human output is what you get without --json");
                 assert!(!show_captures, "captures are redacted by default");
                 assert_eq!(junit, None, "no --junit was passed");
@@ -950,5 +1004,82 @@ mod tests {
         let err = expect_cli_error(&["sendra", "run", "req.yaml", "--repeat", "many"]);
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("positive integer"));
+    }
+
+    // --- `--insecure` --------------------------------------------------------
+
+    #[test]
+    fn insecure_defaults_to_false_and_is_offered_by_both_subcommands() {
+        let cli =
+            Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`--insecure` is optional");
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                insecure: false,
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--insecure"])
+            .expect("`--insecure` is offered by `run`");
+        assert!(matches!(cli.command, Command::Run { insecure: true, .. }));
+
+        let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--insecure"])
+            .expect("`--insecure` is offered by `test`");
+        assert!(matches!(cli.command, Command::Test { insecure: true, .. }));
+    }
+
+    // --- `--proxy` -------------------------------------------------------------
+
+    #[test]
+    fn proxy_defaults_to_none_and_is_offered_by_both_subcommands() {
+        let cli =
+            Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`--proxy` is optional");
+        assert!(matches!(cli.command, Command::Run { proxy: None, .. }));
+
+        let cli = Cli::try_parse_from([
+            "sendra",
+            "run",
+            "req.yaml",
+            "--proxy",
+            "http://proxy.example.com:8080",
+        ])
+        .expect("`--proxy` takes a URL");
+        assert!(matches!(
+            cli.command,
+            Command::Run { proxy: Some(ref url), .. } if url == "http://proxy.example.com:8080"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "sendra",
+            "test",
+            "req.yaml",
+            "--proxy",
+            "http://proxy.example.com:8080",
+        ])
+        .expect("`--proxy` is offered by `test` too");
+        assert!(matches!(
+            cli.command,
+            Command::Test { proxy: Some(ref url), .. } if url == "http://proxy.example.com:8080"
+        ));
+    }
+
+    #[test]
+    fn a_proxy_url_with_credentials_parses_as_one_opaque_string() {
+        // Not validated or split apart at the clap level — see `Config::proxy`
+        // for why: reqwest reads the credentials straight out of the URL.
+        let cli = Cli::try_parse_from([
+            "sendra",
+            "run",
+            "req.yaml",
+            "--proxy",
+            "http://user:pass@proxy.example.com:8080",
+        ])
+        .expect("credentials embedded in the URL are not rejected here");
+        assert!(matches!(
+            cli.command,
+            Command::Run { proxy: Some(ref url), .. }
+                if url == "http://user:pass@proxy.example.com:8080"
+        ));
     }
 }

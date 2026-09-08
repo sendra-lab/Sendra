@@ -12,7 +12,10 @@ use sendra_core::{Config, Document, Environment, HttpClient, Request, SendraErro
 
 use crate::cli::OutputMode;
 use crate::exit::{exit_for_run, Exit, Outcome, Summary};
-use crate::output::{print_environment_error, print_error, print_provenance, Format, Reporter};
+use crate::output::{
+    print_environment_error, print_error, print_insecure_warning, print_provenance, Format,
+    Reporter,
+};
 
 /// Everything both subcommands do before the first byte goes out: the config,
 /// the HTTP client the whole run sends through, the environment, and the file.
@@ -67,11 +70,23 @@ struct Prepared {
 /// sees. `-H`/`--header` is not one of the arguments — see [`send`], where it
 /// is applied instead, and the module doc comment for the full precedence
 /// chain this and `send` together implement.
+///
+/// `insecure_override` and `proxy_override` are `--insecure` and `--proxy`:
+/// two more CLI overrides that belong here for the same reason `timeout`
+/// does, and for no other — both are read only by
+/// [`sendra_core::build_client`], never per-request, so both are folded into
+/// `config` before the one client this run's every request shares is built,
+/// exactly like `timeout_override`. `insecure_override` can only turn
+/// `config.insecure` on, never back off, matching `--insecure` being a bare
+/// flag with no `--secure` counterpart; `proxy_override`, when present, wins
+/// outright, matching `--timeout`.
 fn prepare(
     path: &Path,
     environment_name: Option<&str>,
     var_overrides: &[(String, String)],
     timeout_override: Option<u64>,
+    insecure_override: bool,
+    proxy_override: Option<&str>,
 ) -> Result<Prepared, Exit> {
     // Computed first, and reused below for both config and the environment,
     // rather than each resolving the working directory on its own: one
@@ -117,6 +132,17 @@ fn prepare(
     // CLI overrides exist at all.
     if let Some(seconds) = timeout_override {
         config.timeout = Duration::from_secs(seconds);
+    }
+
+    // `--insecure`/`--proxy`, the same highest-precedence layer as
+    // `--timeout` above, applied the same way and for the same reason —
+    // before `build_client` ever sees `config`. See the doc comment on this
+    // function's parameters.
+    if insecure_override {
+        config.insecure = true;
+    }
+    if let Some(url) = proxy_override {
+        config.proxy = Some(url.to_string());
     }
 
     // One client for the whole invocation: every request below sends through
@@ -253,6 +279,15 @@ fn prepare(
 /// via `output::print_provenance`, before the sending loop starts —
 /// stderr-only and unaffected by `json`, per its own doc comment in
 /// `cli.rs`.
+///
+/// `insecure` and `proxy` are `--insecure` and `--proxy`, folded into
+/// `config` inside [`prepare`] before the client is built — see there for
+/// how each wins over its config-file counterpart. Whenever the *resolved*
+/// `config.insecure` — from either source, not only the flag — comes back
+/// `true`, [`output::print_insecure_warning`] prints once, unconditionally,
+/// before the sending loop starts: unlike `verbose`'s provenance just above,
+/// this is not gated behind a flag of its own and is not suppressed by
+/// `quiet` — see that function's own doc comment for why.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     path: &Path,
@@ -262,6 +297,8 @@ pub(crate) async fn run(
     vars: &[(String, String)],
     timeout: Option<u64>,
     repeat: u32,
+    insecure: bool,
+    proxy: Option<&str>,
     allow_error_status: bool,
     json: bool,
     show_captures: bool,
@@ -277,7 +314,7 @@ pub(crate) async fn run(
         document,
         project_config,
         global_config,
-    } = match prepare(path, environment_name, vars, timeout) {
+    } = match prepare(path, environment_name, vars, timeout, insecure, proxy) {
         Ok(prepared) => prepared,
         Err(exit) => return exit,
     };
@@ -291,6 +328,9 @@ pub(crate) async fn run(
             vars,
             headers,
         );
+    }
+    if config.insecure {
+        print_insecure_warning();
     }
 
     let requests: Vec<&Request> = match name {
@@ -389,6 +429,10 @@ pub(crate) async fn run(
 /// addition: [`Summary::of`] is called once, over every pass's outcomes
 /// concatenated together, so the printed counts and the `--json` `summary`
 /// object both cover every request in every pass rather than only the last.
+///
+/// `insecure` and `proxy` behave exactly as they do on `run` — see there —
+/// including the unconditional, `-q`-immune warning whenever the resolved
+/// `config.insecure` comes back true.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn test(
     path: &Path,
@@ -398,6 +442,8 @@ pub(crate) async fn test(
     vars: &[(String, String)],
     timeout: Option<u64>,
     repeat: u32,
+    insecure: bool,
+    proxy: Option<&str>,
     json: bool,
     show_captures: bool,
     junit: Option<PathBuf>,
@@ -412,7 +458,7 @@ pub(crate) async fn test(
         document,
         project_config,
         global_config,
-    } = match prepare(path, environment_name, vars, timeout) {
+    } = match prepare(path, environment_name, vars, timeout, insecure, proxy) {
         Ok(prepared) => prepared,
         Err(exit) => return exit,
     };
@@ -426,6 +472,9 @@ pub(crate) async fn test(
             vars,
             headers,
         );
+    }
+    if config.insecure {
+        print_insecure_warning();
     }
 
     let requests: Vec<&Request> = match name {

@@ -40,3 +40,12 @@ serde_json = { workspace = true }
 # The `--junit` integration tests parse the report back with a real XML
 # parser, not just by eye. See the note on the workspace dependency.
 roxmltree = { workspace = true }
+# `--insecure`'s end-to-end test spins up its own self-signed TLS server —
+# see the note on both in the workspace `Cargo.toml`. Duplicated from
+# `sendra-core`'s own dev-dependency of the same crates rather than shared:
+# `sendra-core`'s server helper is `pub(crate)` test-only code in a different
+# crate, unreachable from here, so the fixture is rebuilt at this level
+# too — small, and it is what actually proves `--insecure` end to end
+# through the real binary rather than through `sendra-core`'s API directly.
+rcgen = { workspace = true }
+rustls = { workspace = true }
