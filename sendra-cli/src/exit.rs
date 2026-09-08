@@ -559,9 +559,9 @@ mod tests {
 
     // --- assertions do not touch the exit code ---------------------------
     //
-    // The non-goal of the issue that added assertions, tested rather than
-    // assumed. `sendra run` reports what came back; `sendra test` will be the
-    // command that passes or fails on expectations.
+    // A deliberate non-goal, tested rather than assumed: `sendra run` reports
+    // what came back; `sendra test` is the command that passes or fails on
+    // expectations.
 
     /// A report in which everything that could fail, did.
     fn a_failing_report(status: u16) -> AssertionReport {

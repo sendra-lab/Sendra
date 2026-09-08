@@ -639,10 +639,11 @@ fn environment_for(
 /// **Substitution happens here, per request, not as a pass over the batch
 /// first.** A `{{var}}` with nothing behind it, or a `${VAR}` that is not
 /// exported, is exactly the same category of problem as a refused connection:
-/// *this* request could not be completed. Issue 2 settled what a run does with
-/// that — the sibling requests are still sent, every result is still printed,
-/// and the aggregate decides the exit code — and there is no reason a variable
-/// should be the one failure that also cancels the requests around it. Checking
+/// *this* request could not be completed. A run treats that the same way it
+/// treats any other per-request failure — the sibling requests are still
+/// sent, every result is still printed, and the aggregate decides the exit
+/// code — since there is no reason a variable should be the one failure that
+/// also cancels the requests around it. Checking
 /// the whole collection up front would additionally mean the file's *last*
 /// request could stop the first one from ever being sent, which is the kind of
 /// order-dependence [`worst`] exists to keep out of the exit code.
@@ -1260,8 +1261,8 @@ requests:
 
         #[tokio::test]
         async fn a_pre_request_script_sees_the_resolved_body_regardless_of_which_field_set_it() {
-            // The design decision the issue asks for, end to end minus the
-            // socket: by the time a `pre_request` script runs, `resolve_body`
+            // The design decision, tested end to end minus the socket: by the
+            // time a `pre_request` script runs, `resolve_body`
             // (called inside `run_requests`, before this closure) has already
             // turned `json:` into the plain `body` string a script has always
             // seen. The script here checks that string and mutates it, exactly
@@ -1305,11 +1306,11 @@ requests:
 
         #[tokio::test]
         async fn a_pre_request_script_runs_after_the_config_and_wins() {
-            // The ordering the issue fixes, tested where it is decided: the config
-            // default is in place before the script runs, so the script can see it,
-            // change it, and — the case that only works because the CLI applies the
-            // config itself rather than letting `sendra_core::send` do it — remove
-            // it and have it stay removed.
+            // The ordering, tested where it is decided: the config default is
+            // in place before the script runs, so the script can see it,
+            // change it, and — the case that only works because the CLI
+            // applies the config itself rather than letting
+            // `sendra_core::send` do it — remove it and have it stay removed.
             let config = Config {
                 headers: BTreeMap::from([
                     ("X-From-Config".to_string(), "config".to_string()),
@@ -1611,7 +1612,7 @@ requests:
 
         #[test]
         fn naming_an_environment_that_does_not_exist_is_an_error() {
-            // The decision this issue turns on: an explicit name is an assertion
+            // The decision this test pins: an explicit name is an assertion
             // that the environment exists, so a typo fails loudly instead of
             // silently running against no variables at all. See `environment_for`.
             let project = tempfile::tempdir().unwrap();

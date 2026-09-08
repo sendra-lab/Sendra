@@ -85,7 +85,7 @@ fn dry_run_never_opens_a_socket_and_returns_instantly() {
 #[test]
 fn dry_run_shows_the_fully_resolved_request() {
     // Substitution, a config header, `query`, `auth`, and a `pre_request`
-    // script that mutates a header — one of each of batch 2's pieces, so the
+    // script that mutates a header — one of each resolution step, so the
     // printed output has to reflect every one of them in its final state.
     let dir = tempfile::tempdir().expect("a temporary directory");
 

@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn a_json_path_against_a_body_that_is_not_json_is_a_failed_assertion() {
-        // The case the issue calls out: not a panic, and not a load-time error
+        // The edge case worth pinning: not a panic, and not a load-time error
         // either — whether the body parses is only knowable once it arrives.
         let html = response(200, &[("content-type", "text/html")], "<html>nope</html>");
         let report = assertions("json:\n  $.user.id: 42\n").evaluate(&html);

@@ -385,9 +385,9 @@ method: POST
 url: https://example.com
 ";
         // Three requests, one per structured body field, each with a
-        // `{{tenant}}` inside a *value* — the case the issue asks for
-        // explicitly: a JSON/form/multipart body wanting a substituted field
-        // is exactly as ordinary as a substituted plain `body`.
+        // `{{tenant}}` inside a *value*: a JSON/form/multipart body wanting a
+        // substituted field is exactly as ordinary as a substituted plain
+        // `body`.
         let json_request = Request::from_yaml_str(&format!(
             "{yaml}json:\n  tenant: '{{{{tenant}}}}'\n  nested:\n    id: '{{{{tenant}}}}'\n"
         ))

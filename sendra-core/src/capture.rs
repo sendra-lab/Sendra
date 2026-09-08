@@ -3,11 +3,11 @@
 //!
 //! A request file may carry a `capture` block: variable names mapped to a
 //! source to read from the response once it arrives. The default source,
-//! and the only one issue 10 (batch 1) shipped, is a JSON path evaluated
-//! against the response body — a bare string still means exactly that, for
-//! every file already written against it. Two more sources are read from a
-//! response's envelope rather than its body: a named header, and the status
-//! code itself.
+//! and originally the only one, is a JSON path evaluated against the
+//! response body — a bare string still means exactly that, for every file
+//! already written against it. Two more sources are read from a response's
+//! envelope rather than its body: a named header, and the status code
+//! itself.
 //!
 //! ```yaml
 //! name: Log in
@@ -105,10 +105,10 @@ use crate::{Environment, Response};
 
 /// Where one `capture` entry reads its value from.
 ///
-/// A bare string is the default and only form issue 10 (batch 1) shipped: a
-/// JSON path into the response body. The two additive forms are objects, so
-/// a bare string can never be confused with them: `header: Set-Cookie` reads
-/// a response header, and `status: true` reads the numeric status code.
+/// A bare string is the original and default form: a JSON path into the
+/// response body. The two additive forms are objects, so a bare string can
+/// never be confused with them: `header: Set-Cookie` reads a response
+/// header, and `status: true` reads the numeric status code.
 ///
 /// `status: false` is rejected at parse time (a request file that says it
 /// does not want the status captured this way is not saying anything a
@@ -161,8 +161,8 @@ impl CaptureSource {
     /// The label a report shows for this entry — the path text unchanged
     /// for the default JSON-path form (so [`CaptureResult::path`] and
     /// everything reading it, `--json` output included, is untouched for
-    /// every file written against issue 10 batch 1), and a short description
-    /// of the source for the two new forms.
+    /// every file already written against the original bare-string form),
+    /// and a short description of the source for the two additive forms.
     fn label(&self) -> String {
         match self {
             CaptureSource::JsonPath(path) => path.clone(),
@@ -501,7 +501,8 @@ fn capture_one(
     }
 }
 
-/// The JSON-path source: unchanged from issue 10 batch 1.
+/// The JSON-path source: the original, default form, unchanged since it was
+/// the only one.
 fn capture_json_path(
     variable: &str,
     path: &str,
@@ -852,14 +853,14 @@ mod tests {
         assert!(report.values().is_empty());
     }
 
-    // --- issue 15 (batch 2): header and status capture ---------------------
+    // --- header and status capture ------------------------------------------
 
     #[test]
     fn a_bare_string_still_means_a_json_path_unchanged() {
-        // The regression the whole issue turns on: `entries()` used to map
-        // straight to a path `String`; it now maps to a `CaptureSource`, and
-        // a bare-string entry must still deserialise to `JsonPath` holding
-        // that exact text, byte for byte.
+        // The regression this whole section guards against: `entries()` used
+        // to map straight to a path `String`; it now maps to a
+        // `CaptureSource`, and a bare-string entry must still deserialise to
+        // `JsonPath` holding that exact text, byte for byte.
         let parsed = captures("auth_token: $.token\n");
         assert_eq!(
             parsed.entries()["auth_token"],
