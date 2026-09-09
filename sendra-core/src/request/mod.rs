@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::assertions::Assertions;
 use crate::capture::Captures;
 use crate::error::SendraError;
-use crate::request::auth::Auth;
+use crate::request::auth::{ApiKeyLocation, Auth};
 use crate::request::headers::{deserialize_headers, serialize_headers};
 use crate::request::multipart::MultipartPart;
 
@@ -262,9 +262,9 @@ pub struct Request {
     /// version.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub multipart: Vec<MultipartPart>,
-    /// How to authenticate this request: bearer token or basic credentials,
-    /// resolved to a plain `Authorization` header before anything else sees
-    /// it.
+    /// How to authenticate this request: bearer token, basic credentials or
+    /// a static API key, resolved to a plain header (and, for `api_key` in
+    /// `query` form, a query parameter) before anything else sees it.
     ///
     /// ```text
     /// auth:
@@ -276,23 +276,32 @@ pub struct Request {
     ///   basic:
     ///     user: {{username}}
     ///     pass: {{password}}
+    ///
+    /// # or
+    ///
+    /// auth:
+    ///   api_key:
+    ///     in: header          # or: query
+    ///     name: X-API-Key     # or a query param name
+    ///     value: {{api_key}}
     /// ```
     ///
-    /// Exactly one of `bearer`/`basic` may be set — [`Request::validate`]
+    /// Exactly one of `bearer`/`basic`/`api_key` may be set — [`Request::validate`]
     /// rejects any other combination, the same shape as the five body
-    /// fields above. A request may not set `auth` *and* an explicit
-    /// `Authorization` header under `headers:`: both trying to control the
-    /// same header is far more likely a mistake than a deliberate layering
+    /// fields above. A request may not set `auth` *and* an explicit header
+    /// (or, for `api_key` in `query` form, query parameter) of the same
+    /// name it would itself set: both trying to control the same header (or
+    /// parameter) is far more likely a mistake than a deliberate layering
     /// (unlike, say, a config default header and a request header, where
     /// "the request wins" is a sensible answer), so `validate` rejects the
     /// combination rather than silently picking one.
     ///
-    /// [`Request::resolve_auth`] turns this into the `Authorization` header
-    /// and clears the field, following the same "scripts see the final
-    /// resolved form" precedent as [`Request::resolve_body`]: a
+    /// [`Request::resolve_auth`] turns this into the final header (or query
+    /// parameter) and clears the field, following the same "scripts see the
+    /// final resolved form" precedent as [`Request::resolve_body`]: a
     /// `pre_request` script reads or overrides
-    /// `request.headers["Authorization"]` like any other header, with no
-    /// separate `request.auth` API.
+    /// `request.headers["Authorization"]` (or any other header `api_key`
+    /// set) like any other header, with no separate `request.auth` API.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<Auth>,
     /// Declarative checks on the response, evaluated by
@@ -498,9 +507,13 @@ impl Request {
             if auth.basic.is_some() {
                 set.push("basic");
             }
+            if auth.api_key.is_some() {
+                set.push("api_key");
+            }
             if set.len() != 1 {
                 return invalid(format!(
-                    "exactly one of `auth.bearer` or `auth.basic` must be set, but found: {}",
+                    "exactly one of `auth.bearer`, `auth.basic` or `auth.api_key` must be set, \
+                     but found: {}",
                     if set.is_empty() {
                         "neither".to_string()
                     } else {
@@ -509,16 +522,49 @@ impl Request {
                 ));
             }
 
-            if self
-                .headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("Authorization"))
+            if (auth.bearer.is_some() || auth.basic.is_some())
+                && self
+                    .headers
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case("Authorization"))
             {
                 return invalid(
                     "`auth` and an explicit `Authorization` header cannot both be set on the \
                      same request; remove one"
                         .to_string(),
                 );
+            }
+
+            if let Some(api_key) = &auth.api_key {
+                // Same rule as bearer/basic vs. an explicit `Authorization`
+                // header: an `api_key` header colliding with an explicit
+                // `headers:` entry of the same name is just as much "two
+                // things claiming ownership of one header", so it is rejected
+                // the same way rather than silently picking one.
+                match api_key.r#in {
+                    ApiKeyLocation::Header => {
+                        if self
+                            .headers
+                            .iter()
+                            .any(|(name, _)| name.eq_ignore_ascii_case(&api_key.name))
+                        {
+                            return invalid(format!(
+                                "`auth.api_key` and an explicit `headers.{}` cannot both be set \
+                                 on the same request; remove one",
+                                api_key.name
+                            ));
+                        }
+                    }
+                    ApiKeyLocation::Query => {
+                        if self.query.iter().any(|(name, _)| name == &api_key.name) {
+                            return invalid(format!(
+                                "`auth.api_key` and an explicit `query.{}` cannot both be set on \
+                                 the same request; remove one",
+                                api_key.name
+                            ));
+                        }
+                    }
+                }
             }
         }
 

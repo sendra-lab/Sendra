@@ -410,6 +410,7 @@ pub(crate) fn convert(command: &str) -> Result<Conversion, CurlImportError> {
         Some((user, pass)) if !has_header(&headers, "Authorization") => Some(Auth {
             bearer: None,
             basic: Some(BasicAuth { user, pass }),
+            api_key: None,
         }),
         Some(_) => {
             // Both `-u` and an explicit `Authorization` header were given.

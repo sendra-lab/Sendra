@@ -1,16 +1,20 @@
-# `auth:` resolves `bearer` or `basic` credentials into an `Authorization`
-# header, so you no longer hand-write `Bearer <token>` or base64-encode
-# `user:pass` yourself — see `Request::auth` and `Request::resolve_auth`.
-# Exactly one of `bearer`/`basic` may be set, and it may not be combined with
-# an explicit `Authorization` header under `headers:`.
+# `auth:` resolves `bearer`/`basic`/`api_key` credentials into a header (or,
+# for `api_key` in `query` form, a query parameter), so you no longer
+# hand-write `Bearer <token>`, base64-encode `user:pass`, or add a header/
+# query:/ entry yourself — see `Request::auth` and `Request::resolve_auth`.
+# Exactly one of `bearer`/`basic`/`api_key` may be set, and none of them may
+# be combined with an explicit header (or, for `api_key` in `query` form,
+# query parameter) of the same name they would themselves set.
 #
-#   cargo run -p sendra-cli -- run examples/auth.yaml            # both
+#   cargo run -p sendra-cli -- run examples/auth.yaml            # all
 #   cargo run -p sendra-cli -- run examples/auth.yaml "..."      # just one
 #
 # httpbin.org's /bearer and /basic-auth/<user>/<pass> endpoints exist
-# specifically to validate these two schemes: each returns 200 with the
-# credentials it saw when they're correct, and 401 otherwise — proving the
-# encoding is actually correct, not just plausible-looking.
+# specifically to validate those two schemes: each returns 200 with the
+# credentials it saw when they're correct, and 401 otherwise. /headers and
+# /get echo back exactly what they received, which is what proves an
+# `api_key` in `header`/`query` form actually landed on the wire, not just
+# that the request didn't error.
 name: Auth against httpbin
 requests:
   - name: Bearer token
@@ -28,3 +32,21 @@ requests:
       basic:
         user: ada
         pass: s3cr3t
+
+  - name: API key as a header
+    method: GET
+    url: https://httpbin.org/headers
+    auth:
+      api_key:
+        in: header
+        name: X-API-Key
+        value: my-api-key-123
+
+  - name: API key as a query parameter
+    method: GET
+    url: https://httpbin.org/get
+    auth:
+      api_key:
+        in: query
+        name: api_key
+        value: my-api-key-123

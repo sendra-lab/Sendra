@@ -8,7 +8,9 @@
 use std::collections::BTreeMap;
 
 use crate::assertions::{Assertions, NotAssertions};
-use crate::{Auth, BasicAuth, Collection, Document, MultipartPart, Request, SendraError};
+use crate::{
+    ApiKeyAuth, Auth, BasicAuth, Collection, Document, MultipartPart, Request, SendraError,
+};
 
 use super::Environment;
 
@@ -118,9 +120,9 @@ impl Environment {
                     })
                 })
                 .collect::<Result<_, SendraError>>()?,
-            // `{{var}}` reaches a bearer token or basic user/pass the same
-            // way it reaches every other value field — see the note on
-            // `Request::auth`.
+            // `{{var}}` reaches a bearer token, basic user/pass, or an
+            // api_key's name/value the same way it reaches every other value
+            // field — see the note on `Request::auth`.
             auth: request
                 .auth
                 .as_ref()
@@ -138,6 +140,17 @@ impl Environment {
                                 Ok(BasicAuth {
                                     user: self.expand_templates(&basic.user)?,
                                     pass: self.expand_templates(&basic.pass)?,
+                                })
+                            })
+                            .transpose()?,
+                        api_key: auth
+                            .api_key
+                            .as_ref()
+                            .map(|api_key| -> Result<ApiKeyAuth, SendraError> {
+                                Ok(ApiKeyAuth {
+                                    r#in: api_key.r#in,
+                                    name: self.expand_templates(&api_key.name)?,
+                                    value: self.expand_templates(&api_key.value)?,
                                 })
                             })
                             .transpose()?,

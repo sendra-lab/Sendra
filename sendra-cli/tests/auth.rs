@@ -1,6 +1,6 @@
-//! End-to-end coverage for `auth:` — the block that resolves `bearer` or
-//! `basic` credentials into an `Authorization` header before anything else
-//! sees the request.
+//! End-to-end coverage for `auth:` — the block that resolves `bearer`,
+//! `basic` or `api_key` credentials into a header (or, for `api_key` in
+//! `query` form, a query parameter) before anything else sees the request.
 //!
 //! A hand-rolled server records the raw headers it received, the same
 //! pattern [`structured_body`](structured_body.rs) uses: what is under test
@@ -14,9 +14,11 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
-/// One HTTP request as the server saw it: status line aside, just the
-/// headers (lower-cased names).
+/// One HTTP request as the server saw it: the request line (`METHOD path
+/// HTTP/1.1`, so a query string is visible) plus the headers (lower-cased
+/// names).
 struct Captured {
+    request_line: String,
     headers: Vec<(String, String)>,
 }
 
@@ -78,7 +80,10 @@ impl CapturingServer {
                 reader.read_exact(&mut body).expect("the body reads");
             }
 
-            *stored.lock().unwrap() = Some(Captured { headers });
+            *stored.lock().unwrap() = Some(Captured {
+                request_line: request_line.trim_end().to_string(),
+                headers,
+            });
 
             writer
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
@@ -225,6 +230,118 @@ fn auth_and_an_explicit_authorization_header_together_is_rejected() {
 
     let output = sendra(dir.path(), &["run", "req.yaml"]);
     assert_failure(&output);
+}
+
+#[test]
+fn auth_api_key_header_sets_the_named_header() {
+    let server = CapturingServer::start();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        format!(
+            "method: GET\nurl: {}/\nauth:\n  api_key:\n    in: header\n    name: X-API-Key\n    value: s3cr3t\n",
+            server.base_url()
+        ),
+    )
+    .unwrap();
+
+    assert_success(&sendra(dir.path(), &["run", "req.yaml"]));
+
+    let captured = server.captured();
+    assert_eq!(captured.header("x-api-key"), Some("s3cr3t"));
+}
+
+#[test]
+fn auth_api_key_query_merges_through_the_same_query_resolution_as_query() {
+    let server = CapturingServer::start();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        format!(
+            "method: GET\nurl: {}/search?existing=1\nauth:\n  api_key:\n    in: query\n    name: api_key\n    value: s3cr3t\n",
+            server.base_url()
+        ),
+    )
+    .unwrap();
+
+    assert_success(&sendra(dir.path(), &["run", "req.yaml"]));
+
+    let captured = server.captured();
+    assert_eq!(
+        captured.request_line,
+        "GET /search?existing=1&api_key=s3cr3t HTTP/1.1"
+    );
+}
+
+#[test]
+fn setting_bearer_and_api_key_together_is_rejected() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        "method: GET\nurl: https://example.com\nauth:\n  bearer: x\n  api_key:\n    in: header\n    name: X-API-Key\n    value: y\n",
+    )
+    .unwrap();
+
+    let output = sendra(dir.path(), &["run", "req.yaml"]);
+    assert_failure(&output);
+}
+
+#[test]
+fn an_api_key_header_colliding_with_an_explicit_header_of_the_same_name_is_rejected() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        "method: GET\nurl: https://example.com\nheaders:\n  X-API-Key: hand-written\nauth:\n  api_key:\n    in: header\n    name: X-API-Key\n    value: y\n",
+    )
+    .unwrap();
+
+    let output = sendra(dir.path(), &["run", "req.yaml"]);
+    assert_failure(&output);
+}
+
+#[test]
+fn auth_api_key_values_are_substituted_from_the_environment() {
+    let server = CapturingServer::start();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir_all(dir.path().join(".sendra/environments")).unwrap();
+    std::fs::write(
+        dir.path().join(".sendra/environments/default.yaml"),
+        "token: from-the-environment\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        format!(
+            "method: GET\nurl: {}/\nauth:\n  api_key:\n    in: header\n    name: X-API-Key\n    value: '{{{{token}}}}'\n",
+            server.base_url()
+        ),
+    )
+    .unwrap();
+
+    assert_success(&sendra(dir.path(), &["run", "req.yaml"]));
+
+    let captured = server.captured();
+    assert_eq!(captured.header("x-api-key"), Some("from-the-environment"));
+}
+
+#[test]
+fn a_pre_request_script_can_read_the_resolved_api_key_header_with_no_special_api() {
+    let server = CapturingServer::start();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        format!(
+            "method: GET\nurl: {}/\nauth:\n  api_key:\n    in: header\n    name: X-API-Key\n    value: original\npre_request: |\n  request.headers[\"X-Saw\"] = request.headers[\"X-API-Key\"];\n  request.headers[\"X-API-Key\"] = \"overridden\";\n",
+            server.base_url()
+        ),
+    )
+    .unwrap();
+
+    assert_success(&sendra(dir.path(), &["run", "req.yaml"]));
+
+    let captured = server.captured();
+    assert_eq!(captured.header("x-saw"), Some("original"));
+    assert_eq!(captured.header("x-api-key"), Some("overridden"));
 }
 
 #[test]

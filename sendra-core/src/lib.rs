@@ -26,7 +26,7 @@ pub use error::SendraError;
 pub use http::client::{build_client, HttpClient};
 pub use http::response::{RedirectHop, Response};
 pub use http::{send, send_prepared};
-pub use request::auth::{Auth, BasicAuth};
+pub use request::auth::{ApiKeyAuth, ApiKeyLocation, Auth, BasicAuth};
 pub use request::multipart::MultipartPart;
 pub use request::{Method, Request, RetryConfig};
 pub use script::{Hook, Script, ScriptOutcome, ScriptOutput, Scripts};
