@@ -1697,8 +1697,34 @@ hover-documentation while writing a request file:
 | `schema/config.schema.json`      | `.sendra/config.yaml`                      |
 | `schema/environment.schema.json` | `.sendra/environments/*.yaml`              |
 
+**Getting the files.** None of this requires a clone of this repository —
+that would only work for someone building Sendra from source, and the actual
+audience for editor tooling is anyone who has `sendra` installed. Three ways
+to get them, in order of how little they assume you have:
+
+1. **No download at all** — point your editor at the hosted, raw copy:
+   `https://raw.githubusercontent.com/sendra-lab/Sendra/<ref>/schema/request.schema.json`
+   (and similarly for the other three). `<ref>` is currently a commit SHA,
+   pinned rather than `main`, so the schema your editor validates against
+   cannot change out from under you between one session and the next —
+   **TODO: switch `<ref>` to a release tag once the package/release phase
+   ships one**; there is no tag yet to point at. Find the current SHA at
+   <https://github.com/sendra-lab/Sendra/commits/main>, or with
+   `git rev-parse HEAD` in a checkout.
+2. **`sendra schema`** — if you have the binary installed but not the repo,
+   this writes the same four files into `./schema/` (or `--output <dir>`),
+   baked into the binary at build time, so it works offline:
+   ```sh
+   sendra schema
+   ```
+   Safe to re-run after a `sendra` upgrade to pick up a newer schema — unlike
+   `sendra init`, it overwrites rather than refusing, since nothing under
+   `schema/` is meant to hold anything of yours.
+3. **A checkout** — the committed `schema/*.schema.json` files directly, as
+   below.
+
 **VS Code**, with the [YAML extension](https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml)
-installed, add to `.vscode/settings.json`:
+installed, add to `.vscode/settings.json`. Local paths (options 2 or 3 above):
 
 ```jsonc
 {
@@ -1707,6 +1733,19 @@ installed, add to `.vscode/settings.json`:
     "./schema/request.schema.json": ["examples/*.yaml"],
     "./schema/config.schema.json": [".sendra/config.yaml"],
     "./schema/environment.schema.json": [".sendra/environments/*.yaml"]
+  }
+}
+```
+
+Or the hosted URL (option 1 — no local file needed at all):
+
+```jsonc
+{
+  "yaml.schemas": {
+    "https://raw.githubusercontent.com/sendra-lab/Sendra/<ref>/schema/collection.schema.json": ["**/*collection*.yaml"],
+    "https://raw.githubusercontent.com/sendra-lab/Sendra/<ref>/schema/request.schema.json": ["examples/*.yaml"],
+    "https://raw.githubusercontent.com/sendra-lab/Sendra/<ref>/schema/config.schema.json": [".sendra/config.yaml"],
+    "https://raw.githubusercontent.com/sendra-lab/Sendra/<ref>/schema/environment.schema.json": [".sendra/environments/*.yaml"]
   }
 }
 ```
@@ -1763,6 +1802,14 @@ rather than derived: environment files parse straight into a
 so there is no dedicated Rust type for `schemars` to point at. It is still
 checked by the same anti-drift step, against a literal in `xtask` rather than
 against a type.
+
+`sendra schema` (see [`sendra-cli/src/schema.rs`](sendra-cli/src/schema.rs))
+embeds the same four committed files with `include_str!`, so there is no
+separate "embedded copy" that could go stale on its own: it is the exact same
+bytes, read at compile time instead of at generation time. A test in that
+module reads each file from disk independently at test time and compares it
+against what got embedded, as a regression guard against a future change
+accidentally hardcoding a literal instead.
 
 ## Development
 
