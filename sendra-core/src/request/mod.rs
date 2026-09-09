@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::assertions::Assertions;
 use crate::capture::Captures;
 use crate::error::SendraError;
-use crate::request::auth::{ApiKeyLocation, Auth};
+use crate::request::auth::Auth;
 use crate::request::headers::{deserialize_headers, serialize_headers};
 use crate::request::multipart::MultipartPart;
 
@@ -500,71 +500,11 @@ impl Request {
         }
 
         if let Some(auth) = &self.auth {
-            let mut set = Vec::new();
-            if auth.bearer.is_some() {
-                set.push("bearer");
+            if let Err(reason) = auth.validate_exclusivity() {
+                return invalid(reason);
             }
-            if auth.basic.is_some() {
-                set.push("basic");
-            }
-            if auth.api_key.is_some() {
-                set.push("api_key");
-            }
-            if set.len() != 1 {
-                return invalid(format!(
-                    "exactly one of `auth.bearer`, `auth.basic` or `auth.api_key` must be set, \
-                     but found: {}",
-                    if set.is_empty() {
-                        "neither".to_string()
-                    } else {
-                        set.join(", ")
-                    }
-                ));
-            }
-
-            if (auth.bearer.is_some() || auth.basic.is_some())
-                && self
-                    .headers
-                    .iter()
-                    .any(|(name, _)| name.eq_ignore_ascii_case("Authorization"))
-            {
-                return invalid(
-                    "`auth` and an explicit `Authorization` header cannot both be set on the \
-                     same request; remove one"
-                        .to_string(),
-                );
-            }
-
-            if let Some(api_key) = &auth.api_key {
-                // Same rule as bearer/basic vs. an explicit `Authorization`
-                // header: an `api_key` header colliding with an explicit
-                // `headers:` entry of the same name is just as much "two
-                // things claiming ownership of one header", so it is rejected
-                // the same way rather than silently picking one.
-                match api_key.r#in {
-                    ApiKeyLocation::Header => {
-                        if self
-                            .headers
-                            .iter()
-                            .any(|(name, _)| name.eq_ignore_ascii_case(&api_key.name))
-                        {
-                            return invalid(format!(
-                                "`auth.api_key` and an explicit `headers.{}` cannot both be set \
-                                 on the same request; remove one",
-                                api_key.name
-                            ));
-                        }
-                    }
-                    ApiKeyLocation::Query => {
-                        if self.query.iter().any(|(name, _)| name == &api_key.name) {
-                            return invalid(format!(
-                                "`auth.api_key` and an explicit `query.{}` cannot both be set on \
-                                 the same request; remove one",
-                                api_key.name
-                            ));
-                        }
-                    }
-                }
+            if let Some(reason) = auth.collision_reason(&self.headers, &self.query) {
+                return invalid(reason);
             }
         }
 

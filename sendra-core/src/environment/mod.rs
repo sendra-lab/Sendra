@@ -15,6 +15,21 @@
 //! environment when it is used, so a file that names a secret can still be
 //! committed — the secret itself never is.
 //!
+//! One top-level key is reserved rather than a variable: `auth`. An
+//! environment may carry a default [`Auth`](crate::Auth) block — exactly the
+//! same shape [`Request::auth`](crate::Request::auth) is — applied to every
+//! request run against it that sets no `auth:` of its own:
+//!
+//! ```text
+//! base_url: https://staging.api.example.com
+//! auth:
+//!   bearer: ${API_TOKEN}
+//! ```
+//!
+//! See [`Environment::auth`] for the full precedence rule (a request's own
+//! `auth:` fully replaces the environment's, never merges with it) and
+//! [`Environment::apply`] for where it is filled in.
+//!
 //! Two references, two syntaxes, on purpose. `{{name}}` only ever means "a
 //! variable from the environment file" and is only looked for in request files;
 //! `${VAR}` only ever means "a variable from the OS environment" and is only
@@ -49,21 +64,30 @@
 //! the response — header names, JSON paths — are not, for a related reason:
 //! see [`Environment::apply_assertions`].
 //!
-//! # Why there is no `EnvironmentFile`/`Environment` pair
+//! # `EnvironmentFile` vs. `Environment`
 //!
 //! [`Config`](crate::Config) splits into a `ConfigFile` (every field optional,
-//! because that optionality is the merge information) and a resolved `Config`.
-//! Environments do not layer — an explicit non-goal for v1, flat files only —
-//! so there is nothing for a second type to merge and no `Option` to resolve
-//! away. One type is the whole story.
+//! because that optionality is the merge information) and a resolved `Config`
+//! because several config *sources* — project file, global file, CLI flags —
+//! merge into one. [`EnvironmentFile`] splits from [`Environment`] for a much
+//! narrower reason: it is purely the on-disk shape `serde` deserializes,
+//! while `Environment` additionally carries `source`, the per-run `captured`
+//! store, and (in tests) a stand-in OS environment — none of which come from
+//! the file itself. There is still no merging or layering here: one
+//! environment file, read once, is the whole story, the same non-goal for v1
+//! as always. `EnvironmentFile` exists for `schemars` to derive a real schema
+//! from (see `xtask`), not because a second environment file could combine
+//! with a first.
 
 mod substitute;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 use crate::config::PROJECT_DIR_NAME;
-use crate::SendraError;
+use crate::{Auth, SendraError};
 
 /// Directory holding environment files, under a project's `.sendra/`.
 const ENVIRONMENTS_DIR_NAME: &str = "environments";
@@ -93,6 +117,23 @@ pub struct Environment {
     /// references: those are resolved when a variable is used, not when the
     /// file is read. See [`Environment::lookup`].
     pub variables: BTreeMap<String, String>,
+
+    /// A default `auth:` block, reusing [`Request::auth`](crate::Request::auth)'s
+    /// exact shape, applied by [`Environment::apply`] to every request run
+    /// against this environment that sets no `auth:` of its own.
+    ///
+    /// **Fully replaced, never merged**, by a request's own `auth:` — the
+    /// same "two things claiming ownership of one setting" stance
+    /// `Request::auth` already takes against an explicit `Authorization`
+    /// header, applied one layer up: a request that wants different
+    /// credentials than its environment's default writes its own `auth:`
+    /// block, in full, rather than overriding one field of this one.
+    ///
+    /// `bearer`/`basic`/`api_key` still hold unsubstituted `{{var}}`/`${VAR}`
+    /// text here, exactly like [`variables`](Self::variables) — resolved,
+    /// against this same environment, only when [`apply`](Self::apply)
+    /// actually uses it.
+    pub auth: Option<Auth>,
 
     /// The file this came from, or `None` for an environment that was not read
     /// from disk (the empty default, or one built in a test). Carried so a
@@ -132,12 +173,8 @@ pub struct Environment {
 impl Environment {
     /// Parse an environment from a YAML string.
     pub fn from_yaml_str(yaml: &str) -> Result<Self, SendraError> {
-        Ok(Self {
-            variables: parse(yaml, SendraError::ParseStr)?,
-            source: None,
-            captured: BTreeMap::new(),
-            os_env_override: None,
-        })
+        let file = parse(yaml, SendraError::ParseStr)?;
+        Self::from_file(file, None)
     }
 
     /// Read and parse an environment file from disk.
@@ -147,12 +184,37 @@ impl Environment {
             path: path.to_path_buf(),
             source,
         })?;
+        let file = parse(&raw, |source| SendraError::EnvParse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Self::from_file(file, Some(path.to_path_buf()))
+    }
+
+    /// Common tail of [`from_yaml_str`](Self::from_yaml_str) and
+    /// [`from_path`](Self::from_path): validate the parsed `auth:` block, if
+    /// any, then assemble the runtime [`Environment`] around it.
+    ///
+    /// `auth`'s own mutual-exclusivity rule (`Auth::validate_exclusivity`) is
+    /// checked here, once, at parse time — the same point
+    /// [`Request::validate`](crate::Request::validate) checks it for a
+    /// request's own `auth:` block, since this is the exact same rule on the
+    /// exact same type. What it cannot check yet is a collision with a
+    /// request's headers/query, since there is no request in scope until
+    /// [`apply`](Self::apply) runs — see there.
+    fn from_file(file: EnvironmentFile, source: Option<PathBuf>) -> Result<Self, SendraError> {
+        if let Some(auth) = &file.auth {
+            if let Err(reason) = auth.validate_exclusivity() {
+                return Err(SendraError::InvalidEnvironment {
+                    path: source,
+                    reason,
+                });
+            }
+        }
         Ok(Self {
-            variables: parse(&raw, |source| SendraError::EnvParse {
-                path: path.to_path_buf(),
-                source,
-            })?,
-            source: Some(path.to_path_buf()),
+            variables: file.variables,
+            auth: file.auth,
+            source,
             captured: BTreeMap::new(),
             os_env_override: None,
         })
@@ -199,11 +261,12 @@ impl Environment {
     /// sizes a hand-written collection reaches, and it buys the property that
     /// the value handed to [`apply`](Self::apply) cannot change underneath it.
     ///
-    /// Nothing else changes: `source`, and the OS-environment override tests
-    /// use, are carried through untouched.
+    /// Nothing else changes: `source`, `auth`, and the OS-environment
+    /// override tests use, are carried through untouched.
     pub fn with_captured(&self, captured: &BTreeMap<String, String>) -> Self {
         Self {
             variables: self.variables.clone(),
+            auth: self.auth.clone(),
             source: self.source.clone(),
             captured: captured.clone(),
             os_env_override: self.os_env_override.clone(),
@@ -292,30 +355,101 @@ impl Environment {
     }
 }
 
-/// Parse the flat map an environment file holds.
+/// The on-disk shape of one environment file: every top-level key is a
+/// variable, **except `auth`**, which is reserved for an optional default
+/// [`Auth`] block — see the module docs and [`Environment::auth`].
 ///
-/// Every value is a string, and an unquoted YAML scalar becomes exactly the text
-/// it was written as: `port: 8080` is the string `8080`, `flag: true` is `true`,
-/// `version: 1.0` is `1.0`. That is the only rule that makes sense for a
-/// substitution engine — what is in the file is what goes into the request, with
-/// no round trip through a number or a bool to round `1.0` down to `1` or to
-/// re-spell `true` as `True`. Quoting changes nothing, so `'8080'` is there for
-/// anyone who would rather be explicit.
+/// `auth` is the only top-level key this type gives a name to — every other
+/// key becomes a variable, the same way it always has — so a file with no
+/// `auth:` key behaves exactly like the flat `BTreeMap<String, String>` this
+/// used to deserialize straight into. The one behavior change this trades
+/// for that continuity: a project that happened to have a variable literally
+/// named `auth` now needs a different name, or its own `auth:` block
+/// instead.
 ///
-/// A value that is a *sequence or a mapping* is a parse error, and that is the
-/// rule keeping environments flat: `staging:` with variables nested underneath
-/// fails to load rather than half-working, which is what "no inheritance in v1"
-/// has to mean in practice.
+/// Every variable value is a string, and an unquoted YAML scalar becomes
+/// exactly the text it was written as: `port: 8080` is the string `8080`,
+/// `flag: true` is `true`, `version: 1.0` is `1.0`. That is the only rule
+/// that makes sense for a substitution engine — what is in the file is what
+/// goes into the request, with no round trip through a number or a bool to
+/// round `1.0` down to `1` or to re-spell `true` as `True`. Quoting changes
+/// nothing, so `'8080'` is there for anyone who would rather be explicit.
+///
+/// A variable value that is a *sequence or a mapping* is a parse error, and
+/// that is the rule keeping environments flat: `staging:` with variables
+/// nested underneath fails to load rather than half-working, which is what
+/// "no inheritance in v1" has to mean in practice. `auth:` is exempt from
+/// this — it is a mapping on purpose — but only `auth` is; any other nested
+/// key is still rejected exactly as before.
+///
+/// `Deserialize` is hand-written rather than `#[derive(Deserialize)]` with
+/// `#[serde(flatten)]` on `variables`: `flatten` deserializes the whole
+/// document through `serde`'s generic `Content` capture first, and that
+/// buffering loses `serde_yaml`'s laxness at the leaves — a captured integer
+/// or float no longer coerces to a string the way a value read straight off
+/// the source text does, and `serde_yaml::Value`'s own `Number` has the same
+/// problem (it does not even retain `1.0` vs `1` as written). Either would
+/// silently break every existing environment file with a bare number/bool
+/// value the moment `auth:` support was added — exactly the backward
+/// compatibility this format change is not allowed to cost. Walking the map
+/// by hand and calling `next_value::<String>()` per key, below, asks
+/// `serde_yaml` for a string directly off that key's own source node, which
+/// is the same call (and the same laxness) `BTreeMap<String, String>`'s own
+/// `Deserialize` impl has always made.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct EnvironmentFile {
+    #[cfg_attr(feature = "schema", schemars(default))]
+    pub auth: Option<Auth>,
+    #[cfg_attr(feature = "schema", schemars(flatten))]
+    pub variables: BTreeMap<String, String>,
+}
+
+impl<'de> Deserialize<'de> for EnvironmentFile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = EnvironmentFile;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a mapping of variable name to value, with an optional `auth` block")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut file = EnvironmentFile::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "auth" {
+                        file.auth = Some(map.next_value::<Auth>()?);
+                    } else {
+                        file.variables.insert(key, map.next_value::<String>()?);
+                    }
+                }
+                Ok(file)
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+/// Parse an environment file's raw shape — see [`EnvironmentFile`].
 fn parse(
     yaml: &str,
     wrap: impl Fn(serde_yaml::Error) -> SendraError,
-) -> Result<BTreeMap<String, String>, SendraError> {
+) -> Result<EnvironmentFile, SendraError> {
     // An empty file, or one that is only comments, is YAML null. Creating the
     // file before filling it in is too reasonable to be an error, so read it as
     // an environment with no variables — the same call `ConfigFile` makes.
     let probe: serde_yaml::Value = serde_yaml::from_str(yaml).map_err(&wrap)?;
     if probe.is_null() {
-        return Ok(BTreeMap::new());
+        return Ok(EnvironmentFile::default());
     }
     serde_yaml::from_str(yaml).map_err(&wrap)
 }
@@ -445,6 +579,7 @@ pub(crate) mod test_helpers {
     pub(crate) fn environment(variables: &[(&str, &str)], os_env: &[(&str, &str)]) -> Environment {
         Environment {
             variables: pairs(variables),
+            auth: None,
             source: None,
             captured: BTreeMap::new(),
             os_env_override: Some(pairs(os_env)),
@@ -586,6 +721,7 @@ mod tests {
         let request = Request::from_yaml_str("method: GET\nurl: '{{token}}'\n").unwrap();
         let environment = Environment {
             variables: pairs(&[("token", "${SENDRA_TEST_DEFINITELY_NOT_SET_9F3A}")]),
+            auth: None,
             source: None,
             captured: BTreeMap::new(),
             os_env_override: None,
@@ -668,6 +804,41 @@ mod tests {
 
         let err = Environment::from_yaml_str("hosts:\n  - https://x\n")
             .expect_err("a variable is one value, not a list");
+        assert!(matches!(err, SendraError::ParseStr(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn an_auth_block_parses_alongside_ordinary_variables() {
+        let environment = Environment::from_yaml_str(
+            "base_url: https://staging.example.com\nauth:\n  bearer: '{{token}}'\n",
+        )
+        .unwrap();
+
+        // `auth` is reserved, not folded into `variables` as an ordinary
+        // entry — the same way every other top-level key still is.
+        assert_eq!(environment.names(), vec!["base_url"]);
+        assert!(!environment.variables.contains_key("auth"));
+        let auth = environment.auth.expect("the auth block was parsed");
+        assert_eq!(auth.bearer.as_deref(), Some("{{token}}"));
+    }
+
+    #[test]
+    fn an_environment_file_with_no_auth_key_leaves_auth_none() {
+        let environment = Environment::from_yaml_str("base_url: https://example.com\n").unwrap();
+        assert!(environment.auth.is_none());
+    }
+
+    #[test]
+    fn an_auth_value_that_is_not_a_mapping_is_a_typed_error() {
+        let err = Environment::from_yaml_str("auth: not-a-mapping\n")
+            .expect_err("auth must be a bearer/basic/api_key mapping");
+        assert!(matches!(err, SendraError::ParseStr(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn an_auth_block_naming_an_unknown_field_is_a_typed_error() {
+        let err = Environment::from_yaml_str("auth:\n  bogus: x\n")
+            .expect_err("Auth::deny_unknown_fields rejects it");
         assert!(matches!(err, SendraError::ParseStr(_)), "got {err:?}");
     }
 

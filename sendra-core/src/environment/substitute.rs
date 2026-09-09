@@ -51,6 +51,44 @@ impl Environment {
             headers.push((name, value));
         }
 
+        // `{{var}}` reaches query values (and list entries within them) the
+        // same way it reaches header values above — consistent with every
+        // other value field. Computed as a local, not inline in the struct
+        // literal below, because the `auth` field below needs it too — an
+        // environment-level default `auth.api_key` in `query` form has to be
+        // checked for a collision against these same substituted names.
+        let query: Vec<(String, String)> = request
+            .query
+            .iter()
+            .map(|(name, value)| Ok((self.expand_templates(name)?, self.expand_templates(value)?)))
+            .collect::<Result<_, SendraError>>()?;
+
+        // `auth` precedence: a request's own `auth:` fully replaces this
+        // environment's default — never merged — so the environment's
+        // `auth` is only even substituted when the request set none of its
+        // own. Either way `{{var}}` reaches every field (`bearer`, `basic`'s
+        // `user`/`pass`, `api_key`'s `name`/`value`) the same way it reaches
+        // every other value field.
+        let auth = match &request.auth {
+            Some(auth) => Some(self.substitute_auth(auth)?),
+            None => match &self.auth {
+                Some(auth) => {
+                    let auth = self.substitute_auth(auth)?;
+                    // `Request::validate` already checked a request's own
+                    // `auth:` against its own headers/query at parse time;
+                    // an environment's default cannot be checked until now,
+                    // once it is known which request (and its
+                    // already-substituted headers/query) it is being
+                    // applied to.
+                    if let Some(reason) = auth.collision_reason(&headers, &query) {
+                        return Err(SendraError::InvalidRequest { reason });
+                    }
+                    Some(auth)
+                }
+                None => None,
+            },
+        };
+
         Ok(Request {
             // `name` is left alone: it is what `sendra run <file> <name>`
             // selects on, and a label that changed with the environment could
@@ -59,16 +97,7 @@ impl Environment {
             method: request.method,
             url: self.expand_templates(&request.url)?,
             headers,
-            // `{{var}}` reaches query values (and list entries within them)
-            // the same way it reaches header values above — consistent with
-            // every other value field.
-            query: request
-                .query
-                .iter()
-                .map(|(name, value)| {
-                    Ok((self.expand_templates(name)?, self.expand_templates(value)?))
-                })
-                .collect::<Result<_, SendraError>>()?,
+            query,
             body: request
                 .body
                 .as_deref()
@@ -120,43 +149,7 @@ impl Environment {
                     })
                 })
                 .collect::<Result<_, SendraError>>()?,
-            // `{{var}}` reaches a bearer token, basic user/pass, or an
-            // api_key's name/value the same way it reaches every other value
-            // field — see the note on `Request::auth`.
-            auth: request
-                .auth
-                .as_ref()
-                .map(|auth| -> Result<Auth, SendraError> {
-                    Ok(Auth {
-                        bearer: auth
-                            .bearer
-                            .as_deref()
-                            .map(|token| self.expand_templates(token))
-                            .transpose()?,
-                        basic: auth
-                            .basic
-                            .as_ref()
-                            .map(|basic| -> Result<BasicAuth, SendraError> {
-                                Ok(BasicAuth {
-                                    user: self.expand_templates(&basic.user)?,
-                                    pass: self.expand_templates(&basic.pass)?,
-                                })
-                            })
-                            .transpose()?,
-                        api_key: auth
-                            .api_key
-                            .as_ref()
-                            .map(|api_key| -> Result<ApiKeyAuth, SendraError> {
-                                Ok(ApiKeyAuth {
-                                    r#in: api_key.r#in,
-                                    name: self.expand_templates(&api_key.name)?,
-                                    value: self.expand_templates(&api_key.value)?,
-                                })
-                            })
-                            .transpose()?,
-                    })
-                })
-                .transpose()?,
+            auth,
             assertions: request
                 .assertions
                 .as_ref()
@@ -341,6 +334,43 @@ impl Environment {
     fn expand_templates(&self, text: &str) -> Result<String, SendraError> {
         super::expand(text, TEMPLATE_OPEN, TEMPLATE_CLOSE, |name| {
             self.lookup(name)
+        })
+    }
+
+    /// `{{var}}` reaches a bearer token, basic user/pass, or an api_key's
+    /// name/value the same way it reaches every other value field — see the
+    /// note on `Request::auth`. Shared between substituting a request's own
+    /// `auth:` and this environment's default `auth:` ([`apply`](Self::apply)),
+    /// since both are the exact same [`Auth`] shape substituted against the
+    /// exact same environment.
+    fn substitute_auth(&self, auth: &Auth) -> Result<Auth, SendraError> {
+        Ok(Auth {
+            bearer: auth
+                .bearer
+                .as_deref()
+                .map(|token| self.expand_templates(token))
+                .transpose()?,
+            basic: auth
+                .basic
+                .as_ref()
+                .map(|basic| -> Result<BasicAuth, SendraError> {
+                    Ok(BasicAuth {
+                        user: self.expand_templates(&basic.user)?,
+                        pass: self.expand_templates(&basic.pass)?,
+                    })
+                })
+                .transpose()?,
+            api_key: auth
+                .api_key
+                .as_ref()
+                .map(|api_key| -> Result<ApiKeyAuth, SendraError> {
+                    Ok(ApiKeyAuth {
+                        r#in: api_key.r#in,
+                        name: self.expand_templates(&api_key.name)?,
+                        value: self.expand_templates(&api_key.value)?,
+                    })
+                })
+                .transpose()?,
         })
     }
 }
@@ -833,6 +863,95 @@ capture:
         assert_eq!(
             applied.capture.as_ref().unwrap().entries()["token"],
             crate::CaptureSource::JsonPath("$.{{field}}".to_string())
+        );
+    }
+
+    // --- environment-level default `auth:` -----------------------------------
+
+    #[test]
+    fn environment_level_auth_applies_when_the_request_sets_none_of_its_own() {
+        let environment = Environment::from_yaml_str(
+            "base_url: https://example.com\nauth:\n  bearer: env-token\n",
+        )
+        .unwrap();
+        let request = Request::from_yaml_str("method: GET\nurl: '{{base_url}}'\n").unwrap();
+
+        let applied = environment.apply(&request).expect("resolves");
+        let auth = applied.auth.expect("the environment default was filled in");
+        assert_eq!(auth.bearer.as_deref(), Some("env-token"));
+    }
+
+    #[test]
+    fn a_requests_own_auth_fully_replaces_the_environments_default_not_merges() {
+        let environment = Environment::from_yaml_str("auth:\n  bearer: env-token\n").unwrap();
+        let request = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nauth:\n  basic:\n    user: a\n    pass: b\n",
+        )
+        .unwrap();
+
+        let applied = environment.apply(&request).expect("resolves");
+        let auth = applied.auth.expect("the request's own auth survives");
+        // The request's own `basic` wins outright — not merged with the
+        // environment's `bearer` into some combination of both.
+        assert!(auth.bearer.is_none());
+        assert_eq!(auth.basic.map(|basic| basic.user), Some("a".to_string()));
+    }
+
+    #[test]
+    fn environment_level_auth_substitutes_against_its_own_environments_variables() {
+        let environment =
+            Environment::from_yaml_str("token: s3cret\nauth:\n  bearer: '{{token}}'\n").unwrap();
+        let request = Request::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
+
+        let applied = environment.apply(&request).expect("`token` resolves");
+        assert_eq!(
+            applied.auth.and_then(|auth| auth.bearer),
+            Some("s3cret".to_string())
+        );
+    }
+
+    #[test]
+    fn environment_level_auth_header_colliding_with_an_explicit_header_is_rejected() {
+        let environment = Environment::from_yaml_str("auth:\n  bearer: env-token\n").unwrap();
+        let request = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nheaders:\n  Authorization: hand-written\n",
+        )
+        .unwrap();
+
+        let err = environment
+            .apply(&request)
+            .expect_err("the environment default would collide with the explicit header");
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("Authorization")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn environment_level_api_key_in_query_form_resolves_end_to_end() {
+        let environment = Environment::from_yaml_str(
+            "auth:\n  api_key:\n    in: query\n    name: api_key\n    value: s3cret\n",
+        )
+        .unwrap();
+        let request =
+            Request::from_yaml_str("method: GET\nurl: https://example.com/search\n").unwrap();
+
+        let resolved = environment
+            .apply(&request)
+            .and_then(|request| request.resolve_auth())
+            .and_then(|request| request.resolve_query())
+            .expect("resolves end to end");
+        assert_eq!(resolved.url, "https://example.com/search?api_key=s3cret");
+    }
+
+    #[test]
+    fn a_malformed_environment_level_auth_block_is_a_typed_error_at_parse_time() {
+        let err =
+            Environment::from_yaml_str("auth:\n  bearer: x\n  basic:\n    user: a\n    pass: b\n")
+                .expect_err("bearer and basic together must be rejected");
+        assert!(
+            matches!(&err, SendraError::InvalidEnvironment { reason, .. } if reason.contains("bearer") && reason.contains("basic")),
+            "got {err:?}"
         );
     }
 }

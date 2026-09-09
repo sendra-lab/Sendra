@@ -131,7 +131,7 @@
       "additionalProperties": false
     },
     "Auth": {
-      "description": "[`crate::Request::auth`]: exactly one of `bearer`, `basic` or `api_key`,\nenforced by [`crate::Request::validate`].\n\nThis is also the shape a default `auth:` at the environment/config level\nis expected to reuse unchanged — `api_key` joins `bearer`/`basic` as a\nthird mutually-exclusive case in that same shape, so kept as its own type\nrather than inlined onto `Request`, the same way `MultipartPart` is its\nown type rather than an inline tuple.",
+      "description": "[`crate::Request::auth`]: exactly one of `bearer`, `basic` or `api_key`,\nenforced by [`Auth::validate_exclusivity`].\n\nThis is also the shape a default `auth:` at the environment level reuses\nunchanged (see [`crate::environment::Environment::auth`]) — `api_key`\njoins `bearer`/`basic` as a third mutually-exclusive case in that same\nshape, so kept as its own type rather than inlined onto `Request`, the\nsame way `MultipartPart` is its own type rather than an inline tuple.",
       "type": "object",
       "properties": {
         "api_key": {

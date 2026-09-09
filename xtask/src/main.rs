@@ -7,19 +7,13 @@
 //! exit, with a diff-shaped message) if a committed file would change — the
 //! anti-drift check CI runs so a schema can never silently go stale against
 //! the types it claims to describe.
-//!
-//! There is one exception: `environment.schema.json`. Environment files parse
-//! straight into a `BTreeMap<String, String>` — see
-//! `sendra_core::environment` — so there is no dedicated Rust type for
-//! `schemars` to derive from. That schema is a hand-written literal, checked
-//! in exactly the same way as the other three so it cannot drift from *this
-//! file* even though it cannot drift from a Rust type that does not exist.
 
 use std::path::{Path, PathBuf};
 
 use schemars::{schema_for, Schema};
 use sendra_core::collection::Collection;
 use sendra_core::config::ConfigFile;
+use sendra_core::environment::EnvironmentFile;
 use sendra_core::request::Request;
 
 fn schema_dir() -> PathBuf {
@@ -51,35 +45,19 @@ fn targets() -> Vec<Target> {
         },
         Target {
             file_name: "environment.schema.json",
-            schema: environment_schema(),
+            schema: titled(schema_for!(EnvironmentFile), "Sendra environment"),
         },
     ]
 }
 
 /// `schema_for!` already titles a root schema with the type's Rust name
-/// (`Request`, `Collection`, `ConfigFile`); this overrides it with the name a
-/// file's own author would recognise, since "ConfigFile" is an internal
-/// implementation detail no `.sendra/config.yaml` author has ever seen.
+/// (`Request`, `Collection`, `ConfigFile`, `EnvironmentFile`); this overrides
+/// it with the name a file's own author would recognise, since
+/// "EnvironmentFile" is an internal implementation detail no
+/// `.sendra/environments/*.yaml` author has ever seen.
 fn titled(mut schema: Schema, title: &str) -> Schema {
     schema.insert("title".to_string(), title.into());
     schema
-}
-
-/// Hand-written, not `schemars`-generated: there is no `EnvironmentFile`
-/// Rust type to derive from (see the module docs above). The shape is a
-/// closed, one-line fact — every value is coerced to a string, matching
-/// [`sendra_core::environment`]'s own parsing — so a hand-maintained schema
-/// carries negligible drift risk despite not being derived.
-fn environment_schema() -> Schema {
-    schemars::json_schema!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "Sendra environment",
-        "description": "An environment file: a flat mapping of variable name to value, \
-            substituted for `{{name}}` in a request. Every value is read as a string — \
-            `port: 8080` defines the string \"8080\", not a number.",
-        "type": "object",
-        "additionalProperties": { "type": "string" }
-    })
 }
 
 fn render(schema: &Schema) -> String {

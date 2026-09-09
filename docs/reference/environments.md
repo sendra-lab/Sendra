@@ -149,3 +149,48 @@ Two further rules, both deliberate:
 Values are strings, and an unquoted scalar substitutes as exactly the text you
 wrote: `port: 8080` is `8080`, `version: 1.0` is `1.0`. Nothing takes a round
 trip through a number on the way in, so `1.0` can never arrive as `1`.
+
+## A default `auth:` for the whole environment
+
+`auth` is one reserved top-level key — every other key is still an ordinary
+variable. It carries a default [authentication](requests.md#authentication)
+block, in the exact same `bearer`/`basic`/`api_key` shape a request's own
+`auth:` uses, applied to every request run against this environment that sets
+no `auth:` of its own:
+
+```yaml
+# .sendra/environments/staging.yaml
+base_url: https://staging.api.example.com
+auth:
+  bearer: ${API_TOKEN}
+```
+
+```yaml
+# req.yaml — no auth: of its own, so staging.yaml's applies
+method: GET
+url: '{{base_url}}/me'
+```
+
+**A request's own `auth:` fully replaces the environment's — never merged.**
+A request that wants different credentials writes its own `auth:` block, in
+full, the same "one thing owns this setting" stance a request's `auth:`
+already takes against an explicit `Authorization` header. Setting `auth:` on
+a request is therefore how to opt out of an environment's default entirely,
+not how to add to it.
+
+`{{var}}` inside the environment's own `auth:` resolves against that same
+environment's variables, exactly like `base_url` above does — so
+`${API_TOKEN}` in the example is read from the OS environment the same way
+any other `${VAR}` reference is.
+
+A request with no `auth:` block but an explicit header or query parameter of
+the name the environment's default would itself set (`Authorization` for
+`bearer`/`basic`, or an `api_key`'s own `name`) is rejected the same way an
+explicit `auth:` conflicting with a hand-written header already is: two
+things claiming ownership of one setting.
+
+There is no equivalent at the config-file level (`.sendra/config.yaml`):
+config is deliberately environment-agnostic tool-wide settings (issue 3's
+original design), while an auth scheme is inherently tied to which
+environment it authenticates against — the same reasoning that puts
+`base_url` in an environment file rather than in config.
