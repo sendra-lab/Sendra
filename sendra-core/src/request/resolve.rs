@@ -849,7 +849,10 @@ requests:
             .await
             .expect("the mock token endpoint answers");
         assert_eq!(
-            resolved.auth.as_ref().and_then(|auth| auth.bearer.as_deref()),
+            resolved
+                .auth
+                .as_ref()
+                .and_then(|auth| auth.bearer.as_deref()),
             Some("acquired-token"),
             "resolve_oauth must collapse auth.oauth into auth.bearer"
         );
@@ -917,7 +920,9 @@ requests:
             "method: GET\nurl: https://example.com\nheaders:\n  Authorization: Bearer hand-written\nauth:\n  oauth:\n    grant_type: client_credentials\n    token_url: https://example.com/token\n    client_id: id\n    client_secret: secret\n",
         )
         .expect_err("auth.oauth and an explicit Authorization header together must be rejected");
-        assert!(matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("Authorization")));
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("Authorization"))
+        );
     }
 
     #[test]

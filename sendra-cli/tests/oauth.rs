@@ -372,7 +372,9 @@ fn environment_level_oauth_is_shared_across_requests_exactly_like_request_level(
 
 #[test]
 fn a_request_level_oauth_config_overrides_the_environments_default_entirely() {
-    let server = OAuthServer::start(ok_token_response(r#"{"access_token": "should-not-be-used"}"#));
+    let server = OAuthServer::start(ok_token_response(
+        r#"{"access_token": "should-not-be-used"}"#,
+    ));
     let dir = tempfile::tempdir().expect("a temporary directory");
     std::fs::create_dir_all(dir.path().join(".sendra/environments")).unwrap();
     std::fs::write(
