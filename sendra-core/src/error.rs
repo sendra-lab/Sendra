@@ -293,4 +293,22 @@ pub enum SendraError {
     /// the fix is a line of the script rather than whatever it was checking.
     #[error("the `pre_request` script left the request in a state it cannot be sent in: {reason}")]
     ScriptRequest { reason: String },
+
+    /// An `auth.oauth` token acquisition failed: bad credentials, an
+    /// unreachable or non-2xx token endpoint, or a response with no
+    /// `access_token`.
+    ///
+    /// Raised lazily, only when a request whose `auth.oauth` needs a token is
+    /// about to run — [`Request::resolve_oauth`](crate::Request::resolve_oauth),
+    /// called just before [`Request::resolve_auth`](crate::Request::resolve_auth)
+    /// — rather than up front for the whole run, since it happens per-request
+    /// the same way a substitution failure does. A request whose acquisition
+    /// fails is a per-request failure with no response, the same category
+    /// `VariableNotFound` already is; the siblings around it, using other
+    /// auth or none at all, are unaffected. See [`crate::oauth`] for the
+    /// in-run cache this reads and writes, and for why a failure for a given
+    /// `oauth:` config is remembered rather than retried for every later
+    /// request that shares it.
+    #[error("could not acquire an OAuth token from `{token_url}`: {reason}")]
+    OAuthAcquisition { token_url: String, reason: String },
 }

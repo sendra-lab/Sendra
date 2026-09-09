@@ -283,7 +283,7 @@
       "additionalProperties": false
     },
     "Auth": {
-      "description": "[`crate::Request::auth`]: exactly one of `bearer`, `basic` or `api_key`,\nenforced by [`Auth::validate_exclusivity`].\n\nThis is also the shape a default `auth:` at the environment level reuses\nunchanged (see [`crate::environment::Environment::auth`]) — `api_key`\njoins `bearer`/`basic` as a third mutually-exclusive case in that same\nshape, so kept as its own type rather than inlined onto `Request`, the\nsame way `MultipartPart` is its own type rather than an inline tuple.",
+      "description": "[`crate::Request::auth`]: exactly one of `bearer`, `basic`, `api_key` or\n`oauth`, enforced by [`Auth::validate_exclusivity`].\n\nThis is also the shape a default `auth:` at the environment level reuses\nunchanged (see [`crate::environment::Environment::auth`]) — `api_key`\nand `oauth` join `bearer`/`basic` as mutually-exclusive cases in that same\nshape, so kept as its own type rather than inlined onto `Request`, the\nsame way `MultipartPart` is its own type rather than an inline tuple.",
       "type": "object",
       "properties": {
         "api_key": {
@@ -313,6 +313,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "oauth": {
+          "description": "Acquires a bearer token from an OAuth token endpoint before the\nrequest is sent — see [`OAuthAuth`].",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OAuthAuth"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       },
@@ -474,6 +485,59 @@
         }
       },
       "additionalProperties": false
+    },
+    "OAuthAuth": {
+      "description": "[`Auth::oauth`]: acquire a bearer token from an OAuth token endpoint\nbefore the request is sent, under either of two grants.\n\n```text\nauth:\n  oauth:\n    grant_type: client_credentials   # or: password\n    token_url: https://auth.example.com/token\n    client_id: {{client_id}}\n    client_secret: {{client_secret}}\n    scope: read write                 # optional\n    # required only for grant_type: password\n    username: {{username}}\n    password: {{password}}\n```\n\nOnly these two grants — neither `authorization_code` (it needs a browser\nredirect and a local callback listener, a different problem for a\nheadless CLI) nor `refresh_token` (no cheaper once expiry-checking\nexists, deferred) — see [`crate::oauth`]'s module docs for both.\n\n[`crate::Request::resolve_oauth`] acquires the token — through\n[`crate::oauth::OAuthTokenCache`], reusing one already acquired for the\nsame `token_url`/`client_id`/`grant_type`/`scope` within this run rather\nthan re-authenticating per request — and hands it to the exact same\n`Authorization: Bearer` code path [`Auth::bearer`] already resolves to;\nsee [`crate::Request::resolve_auth`].",
+      "type": "object",
+      "properties": {
+        "client_id": {
+          "type": "string"
+        },
+        "client_secret": {
+          "type": "string"
+        },
+        "grant_type": {
+          "$ref": "#/$defs/OAuthGrantType"
+        },
+        "password": {
+          "description": "Required when [`grant_type`](Self::grant_type) is\n[`OAuthGrantType::Password`] — see [`validate_grant_fields`](Self::validate_grant_fields).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token_url": {
+          "type": "string"
+        },
+        "username": {
+          "description": "Required when [`grant_type`](Self::grant_type) is\n[`OAuthGrantType::Password`] — see [`validate_grant_fields`](Self::validate_grant_fields).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "grant_type",
+        "token_url",
+        "client_id",
+        "client_secret"
+      ]
+    },
+    "OAuthGrantType": {
+      "description": "[`OAuthAuth::grant_type`]: which of the two supported OAuth grants to\nuse. See [`crate::oauth`]'s module docs for why only these two.",
+      "type": "string",
+      "enum": [
+        "client_credentials",
+        "password"
+      ]
     },
     "RetryConfig": {
       "description": "How many extra times to try a request, and how long to wait between\nattempts, when it fails to get any response — see [`Request::retry`].",

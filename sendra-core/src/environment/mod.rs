@@ -210,6 +210,14 @@ impl Environment {
                     reason,
                 });
             }
+            if let Some(oauth) = &auth.oauth {
+                if let Err(reason) = oauth.validate_grant_fields() {
+                    return Err(SendraError::InvalidEnvironment {
+                        path: source,
+                        reason,
+                    });
+                }
+            }
         }
         Ok(Self {
             variables: file.variables,

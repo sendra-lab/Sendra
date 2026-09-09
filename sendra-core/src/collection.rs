@@ -390,6 +390,7 @@ enviroment: staging
             "structured-bodies.yaml",
             "query-params.yaml",
             "auth.yaml",
+            "oauth.yaml",
         ] {
             let path = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("..")

@@ -61,7 +61,8 @@ Two other consequences of headers being an ordered list rather than a map:
 `auth:` resolves credentials into the header (or, for `api_key` in `query`
 form, query parameter) that goes on the wire, so you don't hand-write
 `Bearer <token>`, base64-encode `user:pass`, or add a `headers:`/`query:`
-entry yourself. Exactly one of `bearer`, `basic` or `api_key` may be set:
+entry yourself. Exactly one of `bearer`, `basic`, `api_key` or `oauth` may be
+set:
 
 ```yaml
 auth:
@@ -81,6 +82,19 @@ auth:
     in: header # or: query
     name: X-API-Key # or a query param name
     value: '{{api_key}}'
+
+# or
+
+auth:
+  oauth:
+    grant_type: client_credentials # or: password
+    token_url: https://auth.example.com/oauth/token
+    client_id: '{{client_id}}'
+    client_secret: '{{client_secret}}'
+    scope: read write # optional
+    # required only for grant_type: password
+    username: '{{username}}'
+    password: '{{password}}'
 ```
 
 - `bearer` sets `Authorization: Bearer <bearer>`.
@@ -90,6 +104,35 @@ auth:
   mechanism a request's own `query:` map does — the same percent-encoding,
   and the same "the more structured source wins" rule on a name collision
   with the URL's own query string.
+- `oauth` acquires a bearer token from `token_url` before the request is
+  sent, then sets `Authorization: Bearer <token>` — the same header `bearer`
+  sets directly, just with the token fetched for you rather than written in
+  the file. Only the `client_credentials` and `password` grants are
+  supported; `grant_type: password` additionally requires `username` and
+  `password`, which is rejected at parse time if either is missing.
+
+  Acquiring a token is a real HTTP call, so it is the one part of `auth:`
+  that can be slow or fail on its own — a bad `client_secret`, an
+  unreachable `token_url`, or a token response with no `access_token` all
+  fail with a clear error naming `token_url` and why, rather than a
+  confusing downstream `401`. In a collection, that failure is scoped to the
+  one request that needed it, the same way an unresolved `{{var}}` is —
+  sibling requests using other auth (or none) are unaffected.
+
+  Requests that share the same `token_url`/`client_id`/`grant_type`/`scope`
+  acquire **one** token between them for the run, rather than one each — the
+  same authentication used four times in a collection is one HTTP call to
+  `token_url`, not four. A token is reused until it is close to its
+  server-reported `expires_in` (or indefinitely, if the server does not
+  report one) and reacquired automatically once it is. None of this is
+  written to disk: the cache lives only for the one `sendra` invocation,
+  the same "no persistence between separate runs" rule captured variables
+  and the cookie jar already follow.
+
+  Not supported: the `authorization_code` grant (it needs a browser
+  redirect and a local callback listener — a different shape of problem for
+  a headless CLI) and `refresh_token` (no cached token is refreshed; an
+  expired one is simply reacquired the same way the first one was).
 
 A request may not set `auth` *and* an explicit header (or, for `api_key` in
 `query` form, query parameter) of the same name it would itself set: `auth`
@@ -100,11 +143,15 @@ silently picking one.
 By the time a `pre_request` script or `sendra`'s own request builder sees the
 request, `auth` has already been resolved down to a plain header or query
 parameter — there is no separate `request.auth` API. See
-[`examples/auth.yaml`](../../examples/auth.yaml) for all three forms run
-against httpbin.org:
+[`examples/auth.yaml`](../../examples/auth.yaml) for the `bearer`/`basic`/
+`api_key` forms run against httpbin.org, and
+[`examples/oauth.yaml`](../../examples/oauth.yaml) for both `oauth` grants
+(against your own OAuth provider — there is no public demo server for
+either grant the way httpbin.org serves `/bearer`):
 
 ```sh
 cargo run -p sendra-cli -- run examples/auth.yaml
+cargo run -p sendra-cli -- run examples/oauth.yaml --env <name>
 ```
 
 ## Collection file shape

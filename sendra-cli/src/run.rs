@@ -8,7 +8,9 @@ use std::time::Duration;
 use sendra_core::config::{find_project_config, global_config_path};
 use sendra_core::environment::{find_environment, DEFAULT_ENVIRONMENT_NAME};
 use sendra_core::script::{run_post_request, run_pre_request, Scripts};
-use sendra_core::{Config, Document, Environment, HttpClient, Request, SendraError};
+use sendra_core::{
+    Config, Document, Environment, HttpClient, OAuthTokenCache, Request, SendraError,
+};
 
 use crate::cli::OutputMode;
 use crate::exit::{exit_for_run, Exit, Outcome, Summary};
@@ -25,6 +27,14 @@ struct Prepared {
     /// hitting one host reuses its connection instead of handshaking again per
     /// request. See [`sendra_core::build_client`].
     client: HttpClient,
+    /// Acquired (or failed) OAuth tokens for this invocation, shared by
+    /// every request that resolves an `auth.oauth` config — built once here,
+    /// alongside `client`, and **deliberately outlives every `--repeat`
+    /// pass** rather than being rebuilt per iteration, so a token is
+    /// acquired once for the run rather than once per pass. See
+    /// [`sendra_core::oauth`] for the cache-and-retry behaviour this exists
+    /// for.
+    oauth_cache: OAuthTokenCache,
     environment: Environment,
     document: Document,
     /// The project config file this run actually used, or `None` — for
@@ -225,6 +235,7 @@ fn prepare(
     Ok(Prepared {
         config,
         client,
+        oauth_cache: OAuthTokenCache::new(),
         environment,
         document,
         project_config,
@@ -363,6 +374,7 @@ pub(crate) async fn run(
     let Prepared {
         config,
         client,
+        oauth_cache,
         environment,
         document,
         project_config,
@@ -411,6 +423,7 @@ pub(crate) async fn run(
 
     let config = &config;
     let mut client = client;
+    let oauth_cache = &oauth_cache;
     let reporter = &Reporter::new(
         Format::for_json_flag(json),
         output.unwrap_or(OutputMode::Full),
@@ -454,6 +467,8 @@ pub(crate) async fn run(
                 base_dir(path),
                 &environment,
                 reporter,
+                client,
+                oauth_cache,
                 |request, environment| async move {
                     if dry_run {
                         dry_run_one(&request, config, headers, reporter)
@@ -542,6 +557,7 @@ pub(crate) async fn test(
     let Prepared {
         config,
         client,
+        oauth_cache,
         environment,
         document,
         project_config,
@@ -590,6 +606,7 @@ pub(crate) async fn test(
 
     let config = &config;
     let mut client = client;
+    let oauth_cache = &oauth_cache;
     let mut reporter = Reporter::new(
         Format::for_json_flag(json),
         output.unwrap_or(OutputMode::Status),
@@ -626,6 +643,8 @@ pub(crate) async fn test(
                 base_dir(path),
                 &environment,
                 reporter,
+                client,
+                oauth_cache,
                 |request, environment| async move {
                     send(&request, client, config, &environment, headers, reporter).await
                 },
@@ -812,6 +831,8 @@ pub(crate) async fn run_requests<S, F>(
     base_dir: &Path,
     environment: &Environment,
     reporter: &Reporter,
+    client: &HttpClient,
+    oauth_cache: &OAuthTokenCache,
     mut send_one: S,
 ) -> Vec<Outcome>
 where
@@ -836,20 +857,29 @@ where
         let environment = environment.with_captured(&captured);
         // Substitution, then — while `{{var}}`s are already resolved but
         // before the config or a `pre_request` script ever sees the request —
-        // resolving `auth` down to a plain header (or, for an `api_key` in
-        // `query` form, a `query` entry), merging `query` into `url`, and
-        // resolving whichever of `body`/`json`/`body_file`/`form`/`multipart`
-        // was set down to the final `body` string. `resolve_auth` runs before
-        // `resolve_query` specifically so an `api_key` in `query` form merges
-        // through the same mechanism an ordinary `query:` entry does. All
-        // failures are the same category: the request could not be built, so
-        // there is nothing to send. See `Request::resolve_auth`,
-        // `Request::resolve_query` and `Request::resolve_body`.
-        let substituted = environment
-            .apply(request)
-            .and_then(|request| request.resolve_auth())
-            .and_then(|request| request.resolve_query())
-            .and_then(|request| request.resolve_body(base_dir));
+        // acquiring an OAuth token when `auth` is `oauth` (the one `.await`
+        // in this whole chain: a token endpoint is a real HTTP call, made
+        // through the same shared `client` and cache-and-reuse logic every
+        // request in this run shares, see `Request::resolve_oauth` and
+        // `sendra_core::oauth`), resolving `auth` down to a plain header (or,
+        // for an `api_key` in `query` form, a `query` entry — an acquired
+        // OAuth token collapses into this same `bearer` case), merging
+        // `query` into `url`, and resolving whichever of
+        // `body`/`json`/`body_file`/`form`/`multipart` was set down to the
+        // final `body` string. `resolve_oauth` and `resolve_auth` both run
+        // before `resolve_query` specifically so an `api_key` in `query` form
+        // merges through the same mechanism an ordinary `query:` entry does.
+        // All failures are the same category: the request could not be
+        // built, so there is nothing to send. See `Request::resolve_oauth`,
+        // `Request::resolve_auth`, `Request::resolve_query` and
+        // `Request::resolve_body`.
+        let substituted = match environment.apply(request) {
+            Ok(request) => request.resolve_oauth(client, oauth_cache).await,
+            Err(err) => Err(err),
+        }
+        .and_then(|request| request.resolve_auth())
+        .and_then(|request| request.resolve_query())
+        .and_then(|request| request.resolve_body(base_dir));
 
         // Announced before the outcome either way, because in a collection run
         // the label is the only thing that says *which* request this is — a
@@ -1216,6 +1246,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, _| {
                     sent.push(request.url.clone());
                     async { responded(200) }
@@ -1256,6 +1288,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |_, _| async { responded(404) },
             )
             .await;
@@ -1275,6 +1309,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |_, _| async { responded(500) },
             )
             .await;
@@ -1296,6 +1332,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, _| {
                     sent.push(request.url.clone());
                     async { responded(200) }
@@ -1320,6 +1358,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, _| {
                     sent.push(request.url.clone());
                     async { responded(200) }
@@ -1353,6 +1393,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, _| {
                     sent.push(request.url.clone());
                     async { responded(200) }
@@ -1395,6 +1437,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, _| {
                     // `json` is already `None` here — resolved away before this
                     // closure runs, the same way `send` in the real pipeline
@@ -1807,6 +1851,8 @@ requests:
                     Path::new("."),
                     &environment,
                     &reporter(),
+                    &client(),
+                    &OAuthTokenCache::new(),
                     |request, _| {
                         sent.push(request.url.clone());
                         async { responded(200) }
@@ -1845,6 +1891,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, _| {
                     assert!(
                         request.assertions.is_none(),
@@ -1883,6 +1931,8 @@ assertions:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, _| {
                     seen.push(request.assertions.clone());
                     async { responded(200) }
@@ -1915,6 +1965,8 @@ assertions:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, _| {
                     sent.push(request.url.clone());
                     async { all_passed(200) }
@@ -1966,6 +2018,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, _| async move {
                     if request.url.ends_with("/unreachable") {
                         Outcome::NoResponse
@@ -2012,6 +2066,8 @@ assertions:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |_, _| async { all_passed(200) },
             )
             .await;
@@ -2040,6 +2096,8 @@ assertions:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |_, _| async { all_passed(200) },
             )
             .await;
@@ -2142,6 +2200,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, environment| {
                     // Each request answers with the body the next one reads from.
                     let body = if request.url.ends_with("/login") {
@@ -2211,6 +2271,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, environment| {
                     let outcome = captured_from(&request, &environment, r#"{"user": {"id": 42}}"#);
                     sent.push(request.url.clone());
@@ -2248,6 +2310,8 @@ requests:
                     Path::new("."),
                     &environment(),
                     &reporter(),
+                    &client(),
+                    &OAuthTokenCache::new(),
                     |_, _| async { responded(200) },
                 )
                 .await;
@@ -2287,6 +2351,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, environment| {
                     nth += 1;
                     let body = if nth == 1 {
@@ -2333,6 +2399,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, environment| {
                     let outcome =
                         captured_from(&request, &environment, r#"{"token": "https://evil.test"}"#);
@@ -2405,6 +2473,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, environment| {
                     // The login answers 200 with a body that has no `token` in it.
                     let outcome = captured_from(&request, &environment, r#"{"error": "nope"}"#);
@@ -2634,6 +2704,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &dry_run_reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, _| async move { dry_run_one(&request, config, &[], &dry_run_reporter()) },
             )
             .await;
@@ -2659,6 +2731,8 @@ requests:
                 Path::new("."),
                 &environment(),
                 &dry_run_reporter(),
+                &client(),
+                &OAuthTokenCache::new(),
                 |request, _| async move { dry_run_one(&request, config, &[], &dry_run_reporter()) },
             )
             .await;

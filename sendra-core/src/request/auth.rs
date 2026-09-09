@@ -10,12 +10,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// [`crate::Request::auth`]: exactly one of `bearer`, `basic` or `api_key`,
-/// enforced by [`Auth::validate_exclusivity`].
+/// [`crate::Request::auth`]: exactly one of `bearer`, `basic`, `api_key` or
+/// `oauth`, enforced by [`Auth::validate_exclusivity`].
 ///
 /// This is also the shape a default `auth:` at the environment level reuses
 /// unchanged (see [`crate::environment::Environment::auth`]) — `api_key`
-/// joins `bearer`/`basic` as a third mutually-exclusive case in that same
+/// and `oauth` join `bearer`/`basic` as mutually-exclusive cases in that same
 /// shape, so kept as its own type rather than inlined onto `Request`, the
 /// same way `MultipartPart` is its own type rather than an inline tuple.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,10 +32,14 @@ pub struct Auth {
     /// [`ApiKeyAuth`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<ApiKeyAuth>,
+    /// Acquires a bearer token from an OAuth token endpoint before the
+    /// request is sent — see [`OAuthAuth`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthAuth>,
 }
 
 impl Auth {
-    /// Exactly one of `bearer`/`basic`/`api_key` must be set. Called
+    /// Exactly one of `bearer`/`basic`/`api_key`/`oauth` must be set. Called
     /// wherever an `Auth` value is parsed — a request's own `auth:` block
     /// ([`crate::Request::validate`]) and an environment's default
     /// ([`crate::environment::Environment::from_yaml_str`]/`from_path`) —
@@ -51,10 +55,13 @@ impl Auth {
         if self.api_key.is_some() {
             set.push("api_key");
         }
+        if self.oauth.is_some() {
+            set.push("oauth");
+        }
         if set.len() != 1 {
             return Err(format!(
-                "exactly one of `auth.bearer`, `auth.basic` or `auth.api_key` must be set, but \
-                 found: {}",
+                "exactly one of `auth.bearer`, `auth.basic`, `auth.api_key` or `auth.oauth` must \
+                 be set, but found: {}",
                 if set.is_empty() {
                     "neither".to_string()
                 } else {
@@ -83,7 +90,7 @@ impl Auth {
         headers: &[(String, String)],
         query: &[(String, String)],
     ) -> Option<String> {
-        if (self.bearer.is_some() || self.basic.is_some())
+        if (self.bearer.is_some() || self.basic.is_some() || self.oauth.is_some())
             && headers
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case("Authorization"))
@@ -170,4 +177,93 @@ pub struct ApiKeyAuth {
 pub enum ApiKeyLocation {
     Header,
     Query,
+}
+
+/// [`Auth::oauth`]: acquire a bearer token from an OAuth token endpoint
+/// before the request is sent, under either of two grants.
+///
+/// ```text
+/// auth:
+///   oauth:
+///     grant_type: client_credentials   # or: password
+///     token_url: https://auth.example.com/token
+///     client_id: {{client_id}}
+///     client_secret: {{client_secret}}
+///     scope: read write                 # optional
+///     # required only for grant_type: password
+///     username: {{username}}
+///     password: {{password}}
+/// ```
+///
+/// Only these two grants — neither `authorization_code` (it needs a browser
+/// redirect and a local callback listener, a different problem for a
+/// headless CLI) nor `refresh_token` (no cheaper once expiry-checking
+/// exists, deferred) — see [`crate::oauth`]'s module docs for both.
+///
+/// [`crate::Request::resolve_oauth`] acquires the token — through
+/// [`crate::oauth::OAuthTokenCache`], reusing one already acquired for the
+/// same `token_url`/`client_id`/`grant_type`/`scope` within this run rather
+/// than re-authenticating per request — and hands it to the exact same
+/// `Authorization: Bearer` code path [`Auth::bearer`] already resolves to;
+/// see [`crate::Request::resolve_auth`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct OAuthAuth {
+    pub grant_type: OAuthGrantType,
+    pub token_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Required when [`grant_type`](Self::grant_type) is
+    /// [`OAuthGrantType::Password`] — see [`validate_grant_fields`](Self::validate_grant_fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// Required when [`grant_type`](Self::grant_type) is
+    /// [`OAuthGrantType::Password`] — see [`validate_grant_fields`](Self::validate_grant_fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl OAuthAuth {
+    /// `grant_type: password` requires both `username` and `password`;
+    /// `grant_type: client_credentials` needs neither. Checked wherever
+    /// [`Auth::validate_exclusivity`] already is — a request's own `auth:`
+    /// block and an environment's default — for the same typed-error rigor
+    /// every other schema rule in this project gets, rather than
+    /// discovering the gap only once a token request is attempted.
+    pub(crate) fn validate_grant_fields(&self) -> Result<(), String> {
+        if self.grant_type == OAuthGrantType::Password
+            && (self.username.is_none() || self.password.is_none())
+        {
+            return Err(
+                "`auth.oauth` with `grant_type: password` requires both `username` and \
+                 `password` to be set"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// [`OAuthAuth::grant_type`]: which of the two supported OAuth grants to
+/// use. See [`crate::oauth`]'s module docs for why only these two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthGrantType {
+    ClientCredentials,
+    Password,
+}
+
+impl OAuthGrantType {
+    /// The exact `grant_type` value OAuth's token request wire format
+    /// expects — see [RFC 6749 §4.3.2/§4.4.2].
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            OAuthGrantType::ClientCredentials => "client_credentials",
+            OAuthGrantType::Password => "password",
+        }
+    }
 }
