@@ -5,7 +5,8 @@ The full schema and behavior reference for Sendra, split by topic. Start at
 request with Sendra yet — this is the lookup material for once you have.
 
 - [Request and collection file shape](reference/requests.md) — the fields a
-  request or collection file can have, and repeated headers.
+  request or collection file can have, repeated headers, and authentication
+  (`auth: bearer`/`basic`/`api_key`).
 - [Running and testing requests](reference/running-and-testing.md) —
   `sendra run`, `sendra test`, and how a `test` run's summary counts requests.
 - [JSON output](reference/json-output.md) — the `--json` document both

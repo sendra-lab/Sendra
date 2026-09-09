@@ -56,6 +56,57 @@ Two other consequences of headers being an ordered list rather than a map:
   because a map would have silently dropped one value. Both are now simply
   sent, since nothing is lost.
 
+## Authentication
+
+`auth:` resolves credentials into the header (or, for `api_key` in `query`
+form, query parameter) that goes on the wire, so you don't hand-write
+`Bearer <token>`, base64-encode `user:pass`, or add a `headers:`/`query:`
+entry yourself. Exactly one of `bearer`, `basic` or `api_key` may be set:
+
+```yaml
+auth:
+  bearer: '{{token}}'
+
+# or
+
+auth:
+  basic:
+    user: '{{username}}'
+    pass: '{{password}}'
+
+# or
+
+auth:
+  api_key:
+    in: header # or: query
+    name: X-API-Key # or a query param name
+    value: '{{api_key}}'
+```
+
+- `bearer` sets `Authorization: Bearer <bearer>`.
+- `basic` sets `Authorization: Basic <base64(user:pass)>`.
+- `api_key` sets a named header or query parameter to a static value.
+  `in: query` merges its `name`/`value` onto `url` through the same
+  mechanism a request's own `query:` map does — the same percent-encoding,
+  and the same "the more structured source wins" rule on a name collision
+  with the URL's own query string.
+
+A request may not set `auth` *and* an explicit header (or, for `api_key` in
+`query` form, query parameter) of the same name it would itself set: `auth`
+and a hand-written `Authorization`/`X-API-Key`/etc. entry are both trying to
+control the same thing, so that's rejected at parse time rather than
+silently picking one.
+
+By the time a `pre_request` script or `sendra`'s own request builder sees the
+request, `auth` has already been resolved down to a plain header or query
+parameter — there is no separate `request.auth` API. See
+[`examples/auth.yaml`](../../examples/auth.yaml) for all three forms run
+against httpbin.org:
+
+```sh
+cargo run -p sendra-cli -- run examples/auth.yaml
+```
+
 ## Collection file shape
 
 A collection is several named requests in one file — the endpoints of a single
