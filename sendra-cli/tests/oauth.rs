@@ -57,54 +57,71 @@ impl OAuthServer {
                 let mut writer = stream.try_clone().expect("the socket clones");
                 let mut reader = BufReader::new(stream);
 
-                let mut request_line = String::new();
-                if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
-                    continue;
-                }
-                let path = request_line
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("/")
-                    .to_string();
-
-                let mut headers = Vec::new();
-                let mut content_length = 0usize;
+                // One accepted TCP connection can carry more than one HTTP
+                // request: `sendra`'s `HttpClient` is built once per run and
+                // reused for every send (HTTP/1.1 keep-alive), so the OAuth
+                // token request and the API request that follows it are
+                // very likely to go out over the *same* pooled connection
+                // once both endpoints share a host:port, as they do here.
+                // Reading only one request per accepted connection (and then
+                // letting `reader`/`writer` drop, which closes the socket)
+                // would leave that pooled connection dangling from the
+                // server's side — visible to the client as a reset the next
+                // time it tried to reuse it. Loop until the client actually
+                // hangs up, the same pattern `start_route_server` in
+                // `sendra-core` already uses for exactly this reason.
                 loop {
-                    let mut line = String::new();
-                    match reader.read_line(&mut line) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) if line == "\r\n" => break,
-                        Ok(_) => {
-                            if let Some((name, value)) = line.trim_end().split_once(':') {
-                                let value = value.trim_start().to_string();
-                                if name.eq_ignore_ascii_case("content-length") {
-                                    content_length = value.parse().unwrap_or(0);
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let path = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_string();
+
+                    let mut headers = Vec::new();
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) if line == "\r\n" => break,
+                            Ok(_) => {
+                                if let Some((name, value)) = line.trim_end().split_once(':') {
+                                    let value = value.trim_start().to_string();
+                                    if name.eq_ignore_ascii_case("content-length") {
+                                        content_length = value.parse().unwrap_or(0);
+                                    }
+                                    headers.push((name.to_string(), value));
                                 }
-                                headers.push((name.to_string(), value));
                             }
                         }
                     }
-                }
-                let mut body = vec![0u8; content_length];
-                if content_length > 0 {
-                    let _ = reader.read_exact(&mut body);
-                }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 {
+                        let _ = reader.read_exact(&mut body);
+                    }
 
-                if path.starts_with("/token") {
-                    hits.fetch_add(1, Ordering::SeqCst);
-                    if writer.write_all(&token_response).is_err() {
-                        continue;
+                    if path.starts_with("/token") {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        if writer.write_all(&token_response).is_err() {
+                            break;
+                        }
+                    } else {
+                        requests.lock().unwrap().push(Captured { headers });
+                        if writer
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                } else {
-                    requests.lock().unwrap().push(Captured { headers });
-                    if writer
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                        .is_err()
-                    {
-                        continue;
+                    if writer.flush().is_err() {
+                        break;
                     }
                 }
-                let _ = writer.flush();
             }
         });
 

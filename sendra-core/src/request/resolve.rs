@@ -264,7 +264,7 @@ impl Request {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request::auth::{OAuthAuth, OAuthGrantType};
+    use crate::request::auth::OAuthGrantType;
     use crate::SendraError;
 
     /// A minimal request whose only body field is set from `field: value`
