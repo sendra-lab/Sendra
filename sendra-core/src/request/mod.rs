@@ -503,6 +503,11 @@ impl Request {
             if let Err(reason) = auth.validate_exclusivity() {
                 return invalid(reason);
             }
+            if let Some(oauth) = &auth.oauth {
+                if let Err(reason) = oauth.validate_grant_fields() {
+                    return invalid(reason);
+                }
+            }
             if let Some(reason) = auth.collision_reason(&self.headers, &self.query) {
                 return invalid(reason);
             }

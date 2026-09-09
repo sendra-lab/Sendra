@@ -154,9 +154,9 @@ trip through a number on the way in, so `1.0` can never arrive as `1`.
 
 `auth` is one reserved top-level key — every other key is still an ordinary
 variable. It carries a default [authentication](requests.md#authentication)
-block, in the exact same `bearer`/`basic`/`api_key` shape a request's own
-`auth:` uses, applied to every request run against this environment that sets
-no `auth:` of its own:
+block, in the exact same `bearer`/`basic`/`api_key`/`oauth` shape a request's
+own `auth:` uses, applied to every request run against this environment that
+sets no `auth:` of its own:
 
 ```yaml
 # .sendra/environments/staging.yaml
@@ -188,6 +188,11 @@ the name the environment's default would itself set (`Authorization` for
 `bearer`/`basic`, or an `api_key`'s own `name`) is rejected the same way an
 explicit `auth:` conflicting with a hand-written header already is: two
 things claiming ownership of one setting.
+
+An environment-level `auth.oauth` shares the same in-run token cache as a
+request-level one — see [Authentication](requests.md#authentication) — so
+every request in the run that falls back to it acquires one token between
+them, exactly as if they had all written the same `oauth:` block themselves.
 
 There is no equivalent at the config-file level (`.sendra/config.yaml`):
 config is deliberately environment-agnostic tool-wide settings (issue 3's

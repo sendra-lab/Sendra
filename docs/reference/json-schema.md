@@ -86,8 +86,10 @@ and `follow_redirects` rejects a negative number (`"minimum": 0`). It
 because those are cross-field rules, not shape rules:
 
 - exactly one of `body` / `json` / `body_file` / `form` / `multipart` may be set
-- exactly one of `auth.bearer` / `auth.basic` may be set
+- exactly one of `auth.bearer` / `auth.basic` / `auth.api_key` / `auth.oauth`
+  may be set
 - `auth:` and an explicit `Authorization` header cannot both be set
+- `auth.oauth` with `grant_type: password` requires `username` and `password`
 - a multipart part needs exactly one of `value` / `path`
 - every request in a collection needs a `name`, and names must be unique
 - `client_cert.cert` and `client_cert.key` are required together

@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 
 use crate::assertions::{Assertions, NotAssertions};
 use crate::{
-    ApiKeyAuth, Auth, BasicAuth, Collection, Document, MultipartPart, Request, SendraError,
+    ApiKeyAuth, Auth, BasicAuth, Collection, Document, MultipartPart, OAuthAuth, Request,
+    SendraError,
 };
 
 use super::Environment;
@@ -368,6 +369,33 @@ impl Environment {
                         r#in: api_key.r#in,
                         name: self.expand_templates(&api_key.name)?,
                         value: self.expand_templates(&api_key.value)?,
+                    })
+                })
+                .transpose()?,
+            oauth: auth
+                .oauth
+                .as_ref()
+                .map(|oauth| -> Result<OAuthAuth, SendraError> {
+                    Ok(OAuthAuth {
+                        grant_type: oauth.grant_type,
+                        token_url: self.expand_templates(&oauth.token_url)?,
+                        client_id: self.expand_templates(&oauth.client_id)?,
+                        client_secret: self.expand_templates(&oauth.client_secret)?,
+                        scope: oauth
+                            .scope
+                            .as_deref()
+                            .map(|value| self.expand_templates(value))
+                            .transpose()?,
+                        username: oauth
+                            .username
+                            .as_deref()
+                            .map(|value| self.expand_templates(value))
+                            .transpose()?,
+                        password: oauth
+                            .password
+                            .as_deref()
+                            .map(|value| self.expand_templates(value))
+                            .transpose()?,
                     })
                 })
                 .transpose()?,

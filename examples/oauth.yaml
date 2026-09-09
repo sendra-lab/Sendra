@@ -1,0 +1,71 @@
+# `auth: oauth` acquires a bearer token from an OAuth token endpoint before
+# the request is sent — one HTTP call to `token_url`, then the acquired
+# token collapses into the exact same `Authorization: Bearer <token>` header
+# `auth: bearer` sets directly. See `Request::resolve_oauth` and the
+# `sendra_core::oauth` module docs for the acquisition, the cache that lets
+# every request below share one token instead of re-authenticating per
+# request, and the retry-vs-fail-fast rule for a broken config.
+#
+# Only `client_credentials` and `password` are supported — no
+# `authorization_code` (it needs a browser redirect and a local callback
+# listener, a different problem for a headless CLI) and no `refresh_token`
+# (deferred; see the module docs).
+#
+# There is no public `client_credentials`/`password` demo server the way
+# httpbin.org serves `/bearer` and `/basic-auth/<user>/<pass>`, so this file
+# points at variables rather than a real host. Run it against your own OAuth
+# provider (or a local mock — `sendra-cli`'s own test suite spins one up for
+# exactly this, see `tests/oauth.rs`) with an environment file supplying
+# them:
+#
+#   token_url: https://auth.example.com/oauth/token
+#   client_id: my-client-id
+#   client_secret: ${OAUTH_CLIENT_SECRET}
+#   username: my-username
+#   password: ${OAUTH_PASSWORD}
+#   api_base_url: https://api.example.com
+#
+#   OAUTH_CLIENT_SECRET=... OAUTH_PASSWORD=... \
+#     cargo run -p sendra-cli -- run examples/oauth.yaml --env <name>
+#
+# The two requests below use different `client_id`/`grant_type` values on
+# purpose — sharing one would only prove the same token was reused, which
+# `Client credentials, called twice` already covers on its own.
+name: OAuth-authenticated requests
+requests:
+  - name: Client credentials
+    method: GET
+    url: '{{api_base_url}}/widgets'
+    auth:
+      oauth:
+        grant_type: client_credentials
+        token_url: '{{token_url}}'
+        client_id: '{{client_id}}'
+        client_secret: '{{client_secret}}'
+        scope: widgets:read
+
+  - name: Client credentials, called twice
+    method: GET
+    url: '{{api_base_url}}/widgets/2'
+    # Same token_url/client_id/grant_type/scope as the request above: this
+    # one reuses the token already acquired for it rather than
+    # re-authenticating — the whole point of the in-run cache.
+    auth:
+      oauth:
+        grant_type: client_credentials
+        token_url: '{{token_url}}'
+        client_id: '{{client_id}}'
+        client_secret: '{{client_secret}}'
+        scope: widgets:read
+
+  - name: Password grant
+    method: GET
+    url: '{{api_base_url}}/me'
+    auth:
+      oauth:
+        grant_type: password
+        token_url: '{{token_url}}'
+        client_id: '{{client_id}}'
+        client_secret: '{{client_secret}}'
+        username: '{{username}}'
+        password: '{{password}}'

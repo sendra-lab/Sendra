@@ -9,7 +9,9 @@
 use std::path::Path;
 
 use crate::error::SendraError;
-use crate::request::auth::ApiKeyLocation;
+use crate::http::client::HttpClient;
+use crate::oauth::OAuthTokenCache;
+use crate::request::auth::{ApiKeyLocation, Auth};
 use crate::request::multipart::{encode_multipart, read_body_file};
 use crate::request::Request;
 
@@ -171,13 +173,13 @@ impl Request {
         let mut resolved = self.clone();
 
         if let Some(auth) = &self.auth {
-            match (&auth.bearer, &auth.basic, &auth.api_key) {
-                (Some(token), None, None) => {
+            match (&auth.bearer, &auth.basic, &auth.api_key, &auth.oauth) {
+                (Some(token), None, None, None) => {
                     resolved
                         .headers
                         .push(("Authorization".to_string(), format!("Bearer {token}")));
                 }
-                (None, Some(basic), None) => {
+                (None, Some(basic), None, None) => {
                     let credentials = format!("{}:{}", basic.user, basic.pass);
                     let encoded = base64::Engine::encode(
                         &base64::engine::general_purpose::STANDARD,
@@ -187,7 +189,7 @@ impl Request {
                         .headers
                         .push(("Authorization".to_string(), format!("Basic {encoded}")));
                 }
-                (None, None, Some(api_key)) => match api_key.r#in {
+                (None, None, Some(api_key), None) => match api_key.r#in {
                     ApiKeyLocation::Header => {
                         resolved
                             .headers
@@ -199,12 +201,62 @@ impl Request {
                             .push((api_key.name.clone(), api_key.value.clone()));
                     }
                 },
+                (None, None, None, Some(_)) => {
+                    // `resolve_oauth` collapses `auth.oauth` into `auth.bearer`
+                    // before this ever runs — see its doc comment. Reaching
+                    // this branch means that step was skipped, which is a
+                    // caller bug rather than a fact about the request, but it
+                    // still gets a typed error rather than the `unreachable!`
+                    // below, since `auth.oauth` is otherwise a value
+                    // `Request::validate` accepts.
+                    return Err(SendraError::InvalidRequest {
+                        reason: "auth.oauth must be resolved via Request::resolve_oauth before \
+                                 resolve_auth"
+                            .to_string(),
+                    });
+                }
                 // `validate` already rejected any other combination.
-                _ => unreachable!("Request::validate enforces exactly one of bearer/basic/api_key"),
+                _ => unreachable!(
+                    "Request::validate enforces exactly one of bearer/basic/api_key/oauth"
+                ),
             };
         }
         resolved.auth = None;
 
+        Ok(resolved)
+    }
+
+    /// Acquire an OAuth token for `auth.oauth`, collapsing it into the exact
+    /// `bearer` form [`resolve_auth`](Self::resolve_auth) already knows how
+    /// to turn into an `Authorization` header — so `oauth` is a *front end*
+    /// for the bearer case, not a second header-setting implementation. A
+    /// request whose `auth` is `None`, or whose `auth.oauth` is `None`, is
+    /// returned unchanged; there is nothing to acquire.
+    ///
+    /// Called once, before `resolve_auth`, from the request-resolution
+    /// pipeline in `sendra-cli` — the one step in that pipeline that needs
+    /// the shared [`HttpClient`] and an `.await`, since acquiring a token is
+    /// a real HTTP call to `token_url`. See [`crate::oauth`] for the cache
+    /// this reads and writes, the retry-vs-fail-fast decision for a broken
+    /// config, and the expiry margin.
+    pub async fn resolve_oauth(
+        &self,
+        client: &HttpClient,
+        cache: &OAuthTokenCache,
+    ) -> Result<Request, SendraError> {
+        let Some(oauth) = self.auth.as_ref().and_then(|auth| auth.oauth.as_ref()) else {
+            return Ok(self.clone());
+        };
+
+        let access_token = crate::oauth::acquire_token(oauth, client, cache).await?;
+
+        let mut resolved = self.clone();
+        resolved.auth = Some(Auth {
+            bearer: Some(access_token),
+            basic: None,
+            api_key: None,
+            oauth: None,
+        });
         Ok(resolved)
     }
 }
@@ -212,6 +264,7 @@ impl Request {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request::auth::OAuthGrantType;
     use crate::SendraError;
 
     /// A minimal request whose only body field is set from `field: value`
@@ -744,5 +797,154 @@ requests:
         let api_key = auth.api_key.expect("api_key survives substitution");
         assert_eq!(api_key.name, "X-API-Key");
         assert_eq!(api_key.value, "s3cr3t");
+    }
+
+    // --- auth: oauth ----------------------------------------------------------
+
+    fn client() -> HttpClient {
+        crate::http::client::build_client(&crate::Config::default()).expect("a client builds")
+    }
+
+    fn token_server(body: &'static str) -> std::net::SocketAddr {
+        crate::test_support::start_route_server(vec![(
+            "/token",
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        )])
+    }
+
+    #[tokio::test]
+    async fn a_request_with_no_oauth_auth_is_unchanged_by_resolve_oauth() {
+        let request = request_with("auth:\n  bearer: unrelated\n");
+        let client = client();
+        let cache = OAuthTokenCache::new();
+        let resolved = request
+            .resolve_oauth(&client, &cache)
+            .await
+            .expect("nothing to acquire");
+        assert_eq!(resolved, request);
+
+        let no_auth = request_with("");
+        let resolved = no_auth
+            .resolve_oauth(&client, &cache)
+            .await
+            .expect("nothing to acquire");
+        assert_eq!(resolved, no_auth);
+    }
+
+    #[tokio::test]
+    async fn auth_oauth_resolves_via_resolve_oauth_then_resolve_auth_to_a_bearer_header() {
+        let addr = token_server(r#"{"access_token": "acquired-token"}"#);
+        let request = request_with(&format!(
+            "auth:\n  oauth:\n    grant_type: client_credentials\n    token_url: http://{addr}/token\n    client_id: id\n    client_secret: secret\n"
+        ));
+        let client = client();
+        let cache = OAuthTokenCache::new();
+
+        let resolved = request
+            .resolve_oauth(&client, &cache)
+            .await
+            .expect("the mock token endpoint answers");
+        assert_eq!(
+            resolved
+                .auth
+                .as_ref()
+                .and_then(|auth| auth.bearer.as_deref()),
+            Some("acquired-token"),
+            "resolve_oauth must collapse auth.oauth into auth.bearer"
+        );
+
+        let resolved = resolved.resolve_auth().expect("resolves");
+        assert_eq!(
+            resolved.header("Authorization"),
+            Some("Bearer acquired-token")
+        );
+        assert!(resolved.auth.is_none());
+    }
+
+    #[test]
+    fn calling_resolve_auth_directly_on_unresolved_oauth_is_a_typed_error_not_a_panic() {
+        let request = request_with(
+            "auth:\n  oauth:\n    grant_type: client_credentials\n    token_url: http://example.com/token\n    client_id: id\n    client_secret: secret\n",
+        );
+        let err = request
+            .resolve_auth()
+            .expect_err("oauth must be resolved via resolve_oauth first");
+        assert!(matches!(err, SendraError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn oauth_password_grant_missing_username_is_rejected_at_parse_time() {
+        let err = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nauth:\n  oauth:\n    grant_type: password\n    token_url: https://example.com/token\n    client_id: id\n    client_secret: secret\n    password: pw\n",
+        )
+        .expect_err("password grant needs username too");
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("username") && reason.contains("password")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn oauth_client_credentials_needs_neither_username_nor_password() {
+        let request = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nauth:\n  oauth:\n    grant_type: client_credentials\n    token_url: https://example.com/token\n    client_id: id\n    client_secret: secret\n",
+        )
+        .expect("client_credentials needs no username/password");
+        let oauth = request
+            .auth
+            .expect("auth survives parse")
+            .oauth
+            .expect("oauth is set");
+        assert_eq!(oauth.grant_type, OAuthGrantType::ClientCredentials);
+    }
+
+    #[test]
+    fn auth_naming_oauth_and_bearer_together_is_rejected_at_parse_time() {
+        let err = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nauth:\n  bearer: x\n  oauth:\n    grant_type: client_credentials\n    token_url: https://example.com/token\n    client_id: id\n    client_secret: secret\n",
+        )
+        .expect_err("bearer and oauth together must be rejected");
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("bearer") && reason.contains("oauth")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn auth_oauth_alongside_an_explicit_authorization_header_is_rejected_at_parse_time() {
+        let err = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nheaders:\n  Authorization: Bearer hand-written\nauth:\n  oauth:\n    grant_type: client_credentials\n    token_url: https://example.com/token\n    client_id: id\n    client_secret: secret\n",
+        )
+        .expect_err("auth.oauth and an explicit Authorization header together must be rejected");
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("Authorization"))
+        );
+    }
+
+    #[test]
+    fn environment_substitution_reaches_oauth_fields() {
+        let request = request_with(
+            "auth:\n  oauth:\n    grant_type: password\n    token_url: '{{token_url}}'\n    client_id: '{{client_id}}'\n    client_secret: '{{client_secret}}'\n    username: '{{username}}'\n    password: '{{password}}'\n    scope: '{{scope}}'\n",
+        );
+        let environment = crate::Environment::from_yaml_str(
+            "token_url: https://auth.example.com/token\nclient_id: id-value\nclient_secret: secret-value\nusername: ada\npassword: s3cr3t\nscope: read write\n",
+        )
+        .unwrap();
+        let substituted = environment.apply(&request).expect("every variable is set");
+        let oauth = substituted
+            .auth
+            .expect("auth survives substitution")
+            .oauth
+            .expect("oauth survives substitution");
+        assert_eq!(oauth.token_url, "https://auth.example.com/token");
+        assert_eq!(oauth.client_id, "id-value");
+        assert_eq!(oauth.client_secret, "secret-value");
+        assert_eq!(oauth.username.as_deref(), Some("ada"));
+        assert_eq!(oauth.password.as_deref(), Some("s3cr3t"));
+        assert_eq!(oauth.scope.as_deref(), Some("read write"));
     }
 }

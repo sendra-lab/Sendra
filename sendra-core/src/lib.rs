@@ -12,6 +12,7 @@ pub mod config;
 pub mod environment;
 mod error;
 pub mod http;
+pub mod oauth;
 pub mod request;
 pub mod script;
 #[cfg(test)]
@@ -26,7 +27,8 @@ pub use error::SendraError;
 pub use http::client::{build_client, HttpClient};
 pub use http::response::{RedirectHop, Response};
 pub use http::{send, send_prepared};
-pub use request::auth::{ApiKeyAuth, ApiKeyLocation, Auth, BasicAuth};
+pub use oauth::OAuthTokenCache;
+pub use request::auth::{ApiKeyAuth, ApiKeyLocation, Auth, BasicAuth, OAuthAuth, OAuthGrantType};
 pub use request::multipart::MultipartPart;
 pub use request::{Method, Request, RetryConfig};
 pub use script::{Hook, Script, ScriptOutcome, ScriptOutput, Scripts};
