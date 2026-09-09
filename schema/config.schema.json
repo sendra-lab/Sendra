@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sendra config",
+  "description": "One config file, exactly as it appears on disk.\n\nEvery field is optional, and stays optional after parsing, because that\noptionality *is* the merge information: `None` means \"this file said\nnothing about it\", which is what lets a project file override one key\nwithout silently resetting the others. The all-decided resolved form is\n[`Config`].\n\n```text\nheaders:                 # merged into every request; the request wins ties\n  User-Agent: sendra\n  Accept: application/json\ntimeout_seconds: 10      # whole-request timeout, connect through body read\n```\n\nUnknown keys are rejected, matching [`Request`] and\n[`Collection`](crate::Collection): a typo in a config key would otherwise be\na setting that silently never applies, which is worse here than in a request\nfile — there is no response in which to notice it.",
+  "type": "object",
+  "properties": {
+    "client_cert": {
+      "description": "Present a client certificate for mutual TLS — the config-file form of\n`--client-cert`/`--client-key`.\n\n```text\nclient_cert:\n  cert: ./client.pem\n  key: ./client-key.pem\n```\n\nPEM only, not PKCS#12: Sendra's `reqwest` is built against `rustls-tls`\nalone (no `native-tls`), and `reqwest::Identity`'s PKCS#12 and\nsplit-PEM constructors both require `native-tls` — pulling that in\nwould mean shipping a second TLS backend just to accept one more input\nformat. `Identity::from_pem` (the one constructor `rustls-tls` does\nexpose) wants a single buffer containing both the certificate and its\nprivate key, so [`build_client`](crate::build_client) reads both files\nand concatenates them in memory before handing that buffer to reqwest.\n\n`cert`/`key` are resolved relative to *this config file's own\ndirectory*, not the current working directory — the same rule\n`body_file:` uses for the request file that names it, and for the same\nreason: a project config checked into version control should mean the\nsame file on every machine it runs on, not whichever directory the\ncommand happened to be typed from. See\n[`resolve_client_cert_paths`]. `--client-cert`/`--client-key`, by\ncontrast, resolve relative to the working directory, matching how\nevery other CLI-supplied path (`--junit`, say) is read.\n\nBoth halves are required together — a cert with no key, or a key with\nno cert, is refused as [`SendraError::ClientCertIncomplete`] when\n[`build_client`](crate::build_client) tries to use it, the same place\nevery other client-construction failure is reported. That check runs\nafter CLI overrides are folded in, so a config `cert:` paired with a\n`--client-key` override (or vice versa) is a valid combination, not an\nerror — only ending up with just one side, from any mix of sources, is\nrefused.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClientCertFile"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "follow_redirects": {
+      "description": "Whether to follow redirects, and how many hops to allow. See\n[`FollowRedirects`].",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FollowRedirects"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "headers": {
+      "description": "Headers merged into every request. A header set by the request itself\nwins.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "insecure": {
+      "description": "Skip TLS certificate verification for every request this run sends —\nthe config-file form of `--insecure`.\n\nA real security-relevant setting, not a convenience default: it exists\nfor a self-signed or otherwise untrusted endpoint (an internal\nstaging host, say) where there is no CA chain to verify against, and\nit disables the one thing standing between a request and a\nman-in-the-middle. See [`build_client`](crate::build_client) for where\nit is applied, and the CLI's `--insecure` doc comment for the warning\nprinted whenever this resolves to `true`, from either source.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "proxy": {
+      "description": "Route every request through this HTTP proxy — the config-file form of\n`--proxy`.\n\n```text\nproxy: http://proxy.example.com:8080\nproxy: http://user:pass@proxy.example.com:8080   # credentials in the URL\n```\n\nA plain URL string rather than a structured `{host, port, user, pass}`\nobject: reqwest, which actually builds the proxying connector, already\nreads user/pass credentials straight out of the URL's userinfo, so a\nsecond, Sendra-specific way to spell the same thing would be a second\nthing to keep in sync with reqwest's own parsing rather than a real\ncapability. Not validated here — an unparsable URL surfaces as a\n[`SendraError::Client`] when [`build_client`](crate::build_client)\ntries to build the client, the same place every other\nclient-construction failure is reported.\n\nSetting this — from either the config file or `--proxy` — takes over\nproxying for the run entirely: the standard `HTTP_PROXY`/\n`HTTPS_PROXY`/`NO_PROXY` environment variables Sendra otherwise\nrespects by default (matching curl, and every other common HTTP tool)\nare not consulted once an explicit proxy is configured. `None` — no\n`proxy:` key and no `--proxy` — is the plain \"follow the environment,\nsame as everyone else\" default.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "timeout_seconds": {
+      "description": "Whole-request timeout in seconds.\n\nSeconds as an integer, with the unit in the key name, rather than a\nduration string like `\"30s\"`: there is then nothing to parse, no way to\nread the unit wrong, and no syntax to stay compatible with if a richer\nduration format is wanted later.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "ClientCertFile": {
+      "description": "The `client_cert:` config key's on-disk shape: a cert path and a key\npath, both plain strings so [`resolve_client_cert_paths`] can rewrite a\nrelative one in place before it is ever turned into a [`PathBuf`].",
+      "type": "object",
+      "properties": {
+        "cert": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "cert",
+        "key"
+      ]
+    },
+    "FollowRedirects": {
+      "description": "Whether to follow redirects: `false` to report a 3xx response as-is, `true` to follow up to the default maximum, or a non-negative integer maximum number of hops.",
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "integer",
+          "minimum": 0
+        }
+      ]
+    }
+  }
+}

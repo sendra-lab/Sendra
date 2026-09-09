@@ -66,3 +66,11 @@ jobs:
       # -D warnings: a lint that only prints is a lint that gets scrolled past.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The committed schema/*.schema.json files are generated from the
+      # request/collection/config Rust types via schemars (see xtask); this
+      # regenerates them in memory and fails if a committed file would
+      # change, so a schema can never silently drift from the types it
+      # claims to describe.
+      - name: Check JSON Schema is up to date
+        run: cargo run -p xtask -- check

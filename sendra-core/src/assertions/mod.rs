@@ -107,6 +107,7 @@ use json::check_json_path;
 /// assertion silently ignored because of a typo is worse than no assertion at
 /// all, since it reads as a check that is passing.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Assertions {
     /// The exact status code the response must carry.
@@ -247,6 +248,7 @@ pub struct Assertions {
 /// the same `deny_unknown_fields` machinery as every other unknown key,
 /// rather than by a bespoke check that could drift from it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct NotAssertions {
     #[serde(default, skip_serializing_if = "Option::is_none")]

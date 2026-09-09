@@ -146,6 +146,30 @@ impl Serialize for FollowRedirects {
     }
 }
 
+/// Hand-written to match the hand-written [`Deserialize`] impl above:
+/// `true`/`false`, or a non-negative integer maximum. The `minimum: 0` below
+/// is one of the few `Request::validate`-adjacent business rules a JSON
+/// Schema combinator can actually enforce, rather than merely document — see
+/// `follow_redirects: -1`'s own parse-time rejection, which this mirrors.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for FollowRedirects {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "FollowRedirects".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "Whether to follow redirects: `false` to report a 3xx response as-is, \
+                `true` to follow up to the default maximum, or a non-negative integer maximum \
+                number of hops.",
+            "anyOf": [
+                { "type": "boolean" },
+                { "type": "integer", "minimum": 0 }
+            ]
+        })
+    }
+}
+
 /// One config file, exactly as it appears on disk.
 ///
 /// Every field is optional, and stays optional after parsing, because that
@@ -166,6 +190,7 @@ impl Serialize for FollowRedirects {
 /// a setting that silently never applies, which is worse here than in a request
 /// file — there is no response in which to notice it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     /// Headers merged into every request. A header set by the request itself
@@ -272,6 +297,7 @@ pub struct ConfigFile {
 /// path, both plain strings so [`resolve_client_cert_paths`] can rewrite a
 /// relative one in place before it is ever turned into a [`PathBuf`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct ClientCertFile {
     pub cert: String,

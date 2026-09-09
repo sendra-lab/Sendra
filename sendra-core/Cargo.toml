@@ -42,6 +42,19 @@ sha2 = { workspace = true }
 # `uuid()`, registered into the script engine — see the note in the workspace
 # `Cargo.toml`.
 uuid = { workspace = true }
+# Optional: only pulled in by the `schema` feature, which derives `JsonSchema`
+# on the on-disk request/collection/config types so `xtask` can generate the
+# editor-tooling schemas under `schema/`. Not a dependency of ordinary
+# consumers of this crate — see the `schema` feature below.
+schemars = { workspace = true, optional = true }
+
+[features]
+# Derives `schemars::JsonSchema` on the request/collection/config types, for
+# `xtask schema` to generate editor-tooling JSON Schemas from. Off by default:
+# nothing in Sendra's own parsing or validation uses a JSON Schema (see the
+# module docs on `schema_support`), so ordinary builds of this crate — the CLI
+# included — never pull in `schemars`.
+schema = ["dep:schemars"]
 
 [dev-dependencies]
 # Only the test harness needs a runtime here; the binary picks its own.

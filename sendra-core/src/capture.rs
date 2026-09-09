@@ -118,6 +118,15 @@ use crate::{Environment, Response};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum CaptureSource {
+    // `JsonSchema` cannot be derived here: the shape below is not what
+    // `#[derive(JsonSchema)]` would infer from this enum plus its
+    // `#[serde(untagged)]`, because the real acceptance rule
+    // (`status: false` is rejected) lives in the hand-written `Deserialize`
+    // impl below, not in the enum's shape. See the manual `impl JsonSchema`
+    // a few lines down, which encodes that rule as `"const": true` — one of
+    // the few business rules from `Request::validate` and friends that a
+    // JSON Schema combinator genuinely can express, rather than merely
+    // approximate.
     /// The default, bare-string form: a JSON path into the response body.
     JsonPath(String),
     /// An object form: `header: <name>`. Matched case-insensitively against
@@ -157,6 +166,45 @@ impl<'de> Deserialize<'de> for CaptureSource {
     }
 }
 
+/// Hand-written to match the hand-written [`Deserialize`] impl above rather
+/// than derived, and — unlike most of the manual impls in this crate — able
+/// to express the *whole* acceptance rule, `status: false` included: a JSON
+/// Schema validator that enforces `"const": true` on the `status` property
+/// will flag `status: false` as a schema violation, the same file Sendra's
+/// own parser rejects.
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for CaptureSource {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "CaptureSource".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "Where one `capture` entry reads its value from: a bare string is a \
+                JSON path into the response body; `{ header: <name> }` reads a response header; \
+                `{ status: true }` captures the numeric status code. `status: false` is invalid.",
+            "oneOf": [
+                {
+                    "type": "string",
+                    "description": "A JSON path into the response body."
+                },
+                {
+                    "type": "object",
+                    "properties": { "header": { "type": "string" } },
+                    "required": ["header"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": { "status": { "type": "boolean", "const": true } },
+                    "required": ["status"],
+                    "additionalProperties": false
+                }
+            ]
+        })
+    }
+}
+
 impl CaptureSource {
     /// The label a report shows for this entry — the path text unchanged
     /// for the default JSON-path form (so [`CaptureResult::path`] and
@@ -186,6 +234,7 @@ impl CaptureSource {
 /// keys either; a name nothing references is harmless, and one that cannot be
 /// referenced is a mistake visible the moment it is used.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(transparent)]
 pub struct Captures {
     entries: BTreeMap<String, CaptureSource>,
