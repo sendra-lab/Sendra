@@ -1,7 +1,7 @@
 //! `sendra schema`: materialize the JSON Schema files for editor tooling.
 //!
-//! `schema/*.schema.json` (request/collection/config/environment — see the
-//! README's "JSON Schema / editor support" section) are generated from
+//! `schema/*.schema.json` (request/collection/config/environment — see
+//! `docs/reference/json-schema.md`) are generated from
 //! `sendra-core`'s types by `xtask` and committed to the source repository.
 //! That is enough for someone who has cloned the repo, but the actual
 //! audience for editor tooling is anyone who has *installed* `sendra` —
@@ -87,8 +87,9 @@ pub(crate) fn schema(output: Option<PathBuf>) -> Exit {
 /// the author's in them, so there is nothing to protect by refusing — only a
 /// reason to make `sendra schema` after a `sendra` upgrade a normal,
 /// unremarkable way to pick up a newer schema. `schema/` mirrors the
-/// repository's own layout so the same `yaml.schemas` paths in the README
-/// work whether the four files came from a checkout or from this command.
+/// repository's own layout so the same `yaml.schemas` paths in
+/// `docs/reference/json-schema.md` work whether the four files came from a
+/// checkout or from this command.
 fn schema_in(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     let schema_dir = root.join(SCHEMA_DIR_NAME);
     std::fs::create_dir_all(&schema_dir)?;

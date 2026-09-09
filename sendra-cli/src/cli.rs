@@ -590,9 +590,9 @@ pub(crate) enum Command {
     ///
     /// The four files are baked into this binary at compile time, so this
     /// works with no network access and no clone of the Sendra repository —
-    /// see the README's "JSON Schema / editor support" section for what each
-    /// file covers and its known limits, and for the `yaml.schemas` settings
-    /// this command's output is meant to be pointed at.
+    /// see `docs/reference/json-schema.md` for what each file covers and its
+    /// known limits, and for the `yaml.schemas` settings this command's
+    /// output is meant to be pointed at.
     ///
     /// Unlike `sendra init`, running this again overwrites rather than
     /// refusing: nothing under `schema/` is meant to hold anything of yours,
