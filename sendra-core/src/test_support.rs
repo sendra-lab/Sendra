@@ -285,9 +285,36 @@ pub(crate) fn redirect_response(status: u16, reason: &str, location: &str) -> Ve
         .into_bytes()
 }
 
+/// A redirect exactly like [`redirect_response`], but carrying a
+/// `Set-Cookie` on the hop itself — the cookie jar's test fixture for
+/// whether a cookie set on an *intermediate* hop of a chain is picked up,
+/// not just one set on the final response.
+pub(crate) fn redirect_with_cookie_response(
+    status: u16,
+    reason: &str,
+    location: &str,
+    cookie: &str,
+) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 {status} {reason}\r\nLocation: {location}\r\nSet-Cookie: {cookie}\r\nContent-Length: 0\r\n\r\n"
+    )
+    .into_bytes()
+}
+
 pub(crate) fn ok_response(body: &str) -> Vec<u8> {
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+/// A raw `200`, like [`ok_response`], that also sets `cookie` via
+/// `Set-Cookie` — the cookie jar's test fixture for a plain (non-redirect)
+/// response that a login-style request would receive.
+pub(crate) fn set_cookie_response(cookie: &str, body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: {cookie}\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )
     .into_bytes()
@@ -499,6 +526,75 @@ pub(crate) fn start_mutual_tls_server() -> (SocketAddr, String, String) {
     });
 
     (addr, client_cert_pem, client_key_pem)
+}
+
+/// A server like [`start_route_server`] — the same fixed `path -> raw HTTP
+/// response` table, served over as many requests on one connection as the
+/// client sends — that additionally records the `Cookie` header of every
+/// request it receives, in the order they arrive (`None` when a request
+/// carried no `Cookie` header at all). The cookie jar's test fixture: a
+/// client jar sending cookies back is observed here as a header value
+/// actually seen on the wire, not inferred from the response it got.
+pub(crate) fn start_cookie_server(
+    routes: Vec<(&'static str, Vec<u8>)>,
+) -> (SocketAddr, Arc<std::sync::Mutex<Vec<Option<String>>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is free");
+    let addr = listener.local_addr().expect("the listener has an address");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let stored = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let mut writer = stream.try_clone().expect("the socket clones");
+            let mut reader = BufReader::new(stream);
+
+            loop {
+                let mut request_line = String::new();
+                match reader.read_line(&mut request_line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+
+                let mut cookie = None;
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) if header == "\r\n" => break,
+                        Ok(_) => {
+                            if let Some((name, value)) = header.split_once(':') {
+                                if name.trim().eq_ignore_ascii_case("cookie") {
+                                    cookie = Some(value.trim().to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                stored.lock().unwrap().push(cookie);
+
+                let response = routes
+                    .iter()
+                    .find(|(route, _)| *route == path)
+                    .map(|(_, body)| body.clone())
+                    .unwrap_or_else(|| {
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec()
+                    });
+
+                if writer.write_all(&response).is_err() {
+                    return;
+                }
+                let _ = writer.flush();
+            }
+        }
+    });
+
+    (addr, seen)
 }
 
 /// A server that records the request line of the one connection it accepts,

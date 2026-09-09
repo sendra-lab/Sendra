@@ -75,12 +75,45 @@ pub struct HttpClient {
 /// because a client is not configuration: it holds sockets, it is cheap to
 /// clone and expensive to rebuild, and it belongs to a *run*, whereas the
 /// config it is built from is a resolved set of values that outlives any
-/// particular one. The config decides five things here — the timeout, the
+/// particular one. The config decides six things here — the timeout, the
 /// redirect policy, whether TLS certificates are verified, which proxy (if
-/// any) requests go through, and which client certificate (if any) to
-/// present for mutual TLS — and nothing else about the client is
-/// configurable in v1; reqwest's own pool defaults are what a command-line
-/// tool wants.
+/// any) requests go through, which client certificate (if any) to present
+/// for mutual TLS, and whether cookies received are stored and resent
+/// automatically — and nothing else about the client is configurable in v1;
+/// reqwest's own pool defaults are what a command-line tool wants.
+///
+/// **Cookies are opt-in.** [`Config::cookie_jar`] defaults to `false`,
+/// matching curl's own default of not persisting cookies across requests
+/// unless `-c`/`-b` is passed. When enabled, this hands the client
+/// reqwest's own in-memory jar (`ClientBuilder::cookie_store(true)`) rather
+/// than a jar Sendra owns: there is no persistence to disk and nothing
+/// beyond one invocation to manage, so reqwest's default implementation is
+/// exactly what is needed. A request whose `headers:` already sets `Cookie`
+/// is left alone — reqwest only fills in the jar's `Cookie` header when the
+/// request does not already carry one, confirmed by reading reqwest's own
+/// `CookieService` rather than assumed, so an explicit `Cookie:` header
+/// always wins outright rather than merging with the jar; Sendra raises no
+/// conflict for this the way it
+/// does for `auth:` plus an explicit `Authorization` header, since the two
+/// are not the same field the way `auth:` resolves *into* `Authorization` —
+/// the jar operates beneath any one request's headers, at the client's own
+/// connection machinery. Cookies received in response to that request are
+/// still stored in the jar regardless of the request's own `Cookie` header,
+/// so a later request with no explicit header of its own picks them up.
+///
+/// **The jar sees every hop of a redirect chain, not just the final
+/// response.** reqwest layers its cookie handling *underneath* its
+/// redirect-following — each hop of a chain is a separate request/response
+/// pair the jar's `CookieService` processes on its own, confirmed by
+/// reading reqwest's source rather than assumed — so a `Set-Cookie` on an
+/// intermediate hop is stored just as reliably as one on the final
+/// response, and is even available to *later* hops in the same chain. This
+/// is a genuine advantage over `capture`'s manual `Set-Cookie` capture,
+/// which can only see the final response's headers once redirects have
+/// been followed — see the module doc comment on
+/// [`crate::capture`] for that limitation. For a login flow that redirects
+/// through an intermediate hop before setting its session cookie, the jar
+/// is the only one of the two that can pick it up.
 ///
 /// Fails when reqwest cannot construct a client at all (a TLS backend that
 /// will not initialise, say), when [`Config::proxy`] does not parse as a URL
@@ -135,7 +168,14 @@ pub fn build_client(config: &Config) -> Result<HttpClient, SendraError> {
         // reqwest's own default (verify), so this changes nothing for the
         // overwhelming majority of runs and there is no third state to
         // handle.
-        .danger_accept_invalid_certs(config.insecure);
+        .danger_accept_invalid_certs(config.insecure)
+        // Unconditional for the same reason: `false` is reqwest's own
+        // default (no cookie store), so a run that never asked for
+        // `cookie_jar`/`--cookie-jar` builds exactly the client it always
+        // has. `cookie_store(true)` hands the client reqwest's own
+        // in-memory `Jar` — see this function's doc comment for why that,
+        // rather than a jar Sendra owns, is the right implementation here.
+        .cookie_store(config.cookie_jar);
 
     if let Some(url) = &config.proxy {
         // `no_proxy()` first: it turns off reqwest's automatic detection of

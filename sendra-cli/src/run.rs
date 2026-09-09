@@ -93,6 +93,13 @@ struct Prepared {
 /// this function. Resolved relative to the current working directory — see
 /// [`Config::client_cert`](sendra_core::Config::client_cert)'s doc comment
 /// for why that differs from the config-file form's own resolution rule.
+///
+/// `cookie_jar_override` is `--cookie-jar`: the same highest-precedence
+/// layer as `insecure_override`, folded into `config` the same way and for
+/// the same reason — before `build_client` ever sees it. Like
+/// `insecure_override`, it can only turn `config.cookie_jar` on, never back
+/// off, matching `--cookie-jar` being a bare flag with no
+/// `--no-cookie-jar` counterpart.
 #[allow(clippy::too_many_arguments)]
 fn prepare(
     path: &Path,
@@ -103,6 +110,7 @@ fn prepare(
     proxy_override: Option<&str>,
     client_cert_override: Option<&Path>,
     client_key_override: Option<&Path>,
+    cookie_jar_override: bool,
 ) -> Result<Prepared, Exit> {
     // Computed first, and reused below for both config and the environment,
     // rather than each resolving the working directory on its own: one
@@ -165,6 +173,9 @@ fn prepare(
     }
     if let Some(path) = client_key_override {
         config.client_key = Some(path.to_path_buf());
+    }
+    if cookie_jar_override {
+        config.cookie_jar = true;
     }
 
     // One client for the whole invocation: every request below sends through
@@ -316,6 +327,17 @@ fn prepare(
 /// there. Presenting a client certificate is not a security downgrade the
 /// way `--insecure` is, so unlike `insecure` it prints no warning of its own,
 /// gated or not.
+///
+/// `cookie_jar` is `--cookie-jar`, folded into `config` inside [`prepare`]
+/// the same way `insecure`/`proxy` are — see there. **Interacts with
+/// `repeat`**: when the resolved `config.cookie_jar` is true, the client is
+/// rebuilt at the start of every pass after the first, so each pass starts
+/// with an empty jar — the same "each repeat is a clean run" rule
+/// `run_requests`'s capture store already follows, and the reason it needs
+/// stating here at all is that reqwest exposes no way to clear a jar in
+/// place; the client that owns it has to be rebuilt instead. When
+/// `cookie_jar` is false this changes nothing: the one client [`prepare`]
+/// built is reused for every pass, exactly as before this flag existed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run(
     path: &Path,
@@ -329,6 +351,7 @@ pub(crate) async fn run(
     proxy: Option<&str>,
     client_cert: Option<&Path>,
     client_key: Option<&Path>,
+    cookie_jar: bool,
     allow_error_status: bool,
     json: bool,
     show_captures: bool,
@@ -353,6 +376,7 @@ pub(crate) async fn run(
         proxy,
         client_cert,
         client_key,
+        cookie_jar,
     ) {
         Ok(prepared) => prepared,
         Err(exit) => return exit,
@@ -386,7 +410,7 @@ pub(crate) async fn run(
     };
 
     let config = &config;
-    let client = &client;
+    let mut client = client;
     let reporter = &Reporter::new(
         Format::for_json_flag(json),
         output.unwrap_or(OutputMode::Full),
@@ -403,6 +427,23 @@ pub(crate) async fn run(
     // asked for.
     let mut outcomes = Vec::new();
     for iteration in 1..=repeat {
+        // See this function's doc comment on `cookie_jar`: rebuilding is the
+        // only way to give this pass an empty jar, since reqwest exposes no
+        // way to clear one in place. Skipped on the first pass — the client
+        // `prepare` just built already has an empty jar — and skipped
+        // entirely when the jar is off, so nothing here changes for a run
+        // that never asked for `--cookie-jar`.
+        if iteration > 1 && config.cookie_jar {
+            client = match sendra_core::build_client(config) {
+                Ok(client) => client,
+                Err(err) => {
+                    print_error(&err);
+                    return Exit::Failure;
+                }
+            };
+        }
+        let client = &client;
+
         if iteration > 1 {
             reporter.separate();
         }
@@ -474,6 +515,9 @@ pub(crate) async fn run(
 /// `config.insecure` comes back true.
 ///
 /// `client_cert`/`client_key` behave exactly as they do on `run` — see there.
+///
+/// `cookie_jar` behaves exactly as it does on `run` — see there, including
+/// the per-pass client rebuild under `--repeat`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn test(
     path: &Path,
@@ -487,6 +531,7 @@ pub(crate) async fn test(
     proxy: Option<&str>,
     client_cert: Option<&Path>,
     client_key: Option<&Path>,
+    cookie_jar: bool,
     json: bool,
     show_captures: bool,
     junit: Option<PathBuf>,
@@ -510,6 +555,7 @@ pub(crate) async fn test(
         proxy,
         client_cert,
         client_key,
+        cookie_jar,
     ) {
         Ok(prepared) => prepared,
         Err(exit) => return exit,
@@ -543,7 +589,7 @@ pub(crate) async fn test(
     };
 
     let config = &config;
-    let client = &client;
+    let mut client = client;
     let mut reporter = Reporter::new(
         Format::for_json_flag(json),
         output.unwrap_or(OutputMode::Status),
@@ -555,9 +601,21 @@ pub(crate) async fn test(
     }
     let reporter = &reporter;
 
-    // `--repeat`: see the identical loop, and its doc comment, in `run`.
+    // `--repeat`: see the identical loop, and its doc comment, in `run` —
+    // including the per-pass client rebuild that resets the cookie jar.
     let mut outcomes = Vec::new();
     for iteration in 1..=repeat {
+        if iteration > 1 && config.cookie_jar {
+            client = match sendra_core::build_client(config) {
+                Ok(client) => client,
+                Err(err) => {
+                    print_error(&err);
+                    return Exit::Failure;
+                }
+            };
+        }
+        let client = &client;
+
         if iteration > 1 {
             reporter.separate();
         }

@@ -15,6 +15,13 @@
         }
       ]
     },
+    "cookie_jar": {
+      "description": "Persist cookies received via `Set-Cookie` and send them back\nautomatically on later requests to the same host — the config-file\nform of `--cookie-jar`.\n\n**Opt-in, off by default**, deliberately matching curl: `curl` does\nnot carry cookies between requests unless you pass `-c`/`-b`\nyourself, and Sendra follows the same convention rather than\ndefaulting to \"on\" because it would be convenient for the\nlogin-flow case this exists for. See\n[`build_client`](crate::build_client) for where it is applied.\n\nIn-memory only, for the duration of one invocation — nothing is\nwritten to disk, and nothing survives between separate `sendra run`/\n`sendra test` invocations, the same \"no persistence across\ninvocations\" rule [`crate::capture`] already follows.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "follow_redirects": {
       "description": "Whether to follow redirects, and how many hops to allow. See\n[`FollowRedirects`].",
       "anyOf": [

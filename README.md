@@ -610,6 +610,7 @@ proxy: http://proxy.example.com:8080 # route every request through this proxy
 client_cert: # present a client certificate for mutual TLS — see below
   cert: ./client.pem
   key: ./client-key.pem
+cookie_jar: false # true stores and resends cookies automatically — see below
 ```
 
 The schema stays small on purpose — the fields above are the whole of it
@@ -662,6 +663,33 @@ certificate gets checked. Nothing stops the two from applying to the same
 run — a self-signed internal endpoint that also demands a client
 certificate needs both.
 
+**`cookie_jar: true` stores cookies received via `Set-Cookie` and sends them
+back automatically on later requests to the same host.** It exists for
+login-flow-style APIs that rely on a session cookie rather than a bearer
+token. **Off by default, deliberately**: this matches curl, which does not
+carry cookies between requests unless you pass `-c`/`-b` yourself, and Sendra
+follows the same convention rather than defaulting to "on" because it would
+be convenient for the case above. See [CLI overrides](#cli-overrides) for
+`--cookie-jar` itself.
+
+In-memory only, for the duration of one invocation — nothing is written to
+disk, and nothing survives between separate `sendra run`/`sendra test`
+invocations, the same rule [captured values](#capturing-values-and-chaining-requests)
+already follow. A request whose own `headers:` sets `Cookie` is left alone:
+the underlying HTTP client only fills in the jar's `Cookie` header when the
+request does not already carry one, so an explicit header always wins
+outright rather than being merged with whatever the jar holds.
+
+**Prefer this over manually capturing `Set-Cookie` for cookie-shaped values
+specifically.** [Capturing values](#capturing-values-and-chaining-requests)
+can only see the *final* response's headers once redirects have been
+followed, so a `Set-Cookie` set on an intermediate hop of a redirect chain is
+invisible to it. `cookie_jar` has no such limit: cookie handling sits
+underneath redirect-following, so a cookie set on any hop — not just the
+final response — is captured and resent. For a login flow that redirects
+through an intermediate hop before setting its session cookie, `cookie_jar`
+is the one of the two that actually works.
+
 **Finding the project config.** Sendra walks up from the directory you ran it
 in, looking for `.sendra/config.yaml`, the same way git looks for `.git`. So a
 config at the repository root applies from anywhere inside the repository. The
@@ -702,9 +730,9 @@ Names are compared case-insensitively, because that is how HTTP header names
 work: a config `Authorization` and a request `authorization` are one header, and
 the request's value is the one sent.
 
-`--timeout`, `-H`/`--header`, `--insecure`, `--proxy` and
-`--client-cert`/`--client-key` all override this file for one invocation
-without editing it — see
+`--timeout`, `-H`/`--header`, `--insecure`, `--proxy`,
+`--client-cert`/`--client-key` and `--cookie-jar` all override this file for
+one invocation without editing it — see
 [CLI overrides](#cli-overrides), and
 [Precedence, start to finish](#precedence-start-to-finish) for where they sit
 relative to everything else.
@@ -1101,7 +1129,11 @@ capture:
 A `header:` capture reads from the *final* response only — the one `capture`
 always evaluates against — so with `follow_redirects` on, a `Set-Cookie` set
 by an intermediate hop is not reachable this way; disable `follow_redirects`
-to capture it from the 3xx response itself. A header name that repeats in the
+to capture it from the 3xx response itself, or, for a `Set-Cookie`
+specifically, prefer [`cookie_jar`](#configuration) — it sits underneath
+redirect-following rather than downstream of it, so it sees every hop
+without giving up automatic redirect-following to do it. A header name that
+repeats in the
 response (`Set-Cookie` is the common case) is a capture failure rather than a
 first-or-last guess, the same rule a JSON path selecting several values
 already follows — a capture binds a name to *one* value, and silently picking
@@ -1233,13 +1265,14 @@ sendra run req.yaml -H "X-Trace-Id: abc123" --var base_url=http://localhost:8080
 | `--proxy <url>`          | no         | the resolved config `proxy`                                       |
 | `--client-cert <path>`   | no         | the resolved config `client_cert.cert`                             |
 | `--client-key <path>`    | no         | the resolved config `client_cert.key`                              |
+| `--cookie-jar`           | no         | the resolved config `cookie_jar` — can only turn it *on*            |
 
 `-H` and `--var` are invocation-only — there is no config-file equivalent for
-either. `--timeout`, `--insecure`, `--proxy`, `--client-cert` and
-`--client-key` each *do* have one (`timeout_seconds`, `insecure`, `proxy`,
-`client_cert.cert`, `client_cert.key` — see
-[Configuration](#configuration)), and CLI wins over both config files for
-all five, the same "most specific wins" rule every override here follows.
+either. `--timeout`, `--insecure`, `--proxy`, `--client-cert`,
+`--client-key` and `--cookie-jar` each *do* have one (`timeout_seconds`,
+`insecure`, `proxy`, `client_cert.cert`, `client_cert.key`, `cookie_jar` —
+see [Configuration](#configuration)), and CLI wins over both config files for
+all six, the same "most specific wins" rule every override here follows.
 `--client-cert` and `--client-key` are resolved independently of each other,
 so a `--client-cert` on the command line can pair with a `client_cert.key` a
 config file set, and vice versa — only Sendra ending up with just one half
@@ -1361,6 +1394,22 @@ hiding it. Like `--proxy`, neither flag is currently echoed by
 `-v`/`--verbose`'s provenance report; only `-H`/`--var` overrides are, by
 name, for the reason given there.
 
+**`--cookie-jar` overrides the resolved config `cookie_jar`, but only
+upward** — the same one-directional shape as `--insecure`, with no
+`--no-cookie-jar` to force it back off over a config that set `cookie_jar:
+true`:
+
+```sh
+sendra test login-flow.yaml --cookie-jar
+```
+
+See [Configuration](#configuration) for the full reasoning, including why
+this defaults to off, how it interacts with a request's own `Cookie`
+header, and why it is worth preferring over manual `Set-Cookie` capture for
+cookie-shaped values. Under `--repeat`, each pass gets its own empty jar —
+the same "each repeat is a clean run" rule already covers
+[captured variables](#capturing-values-and-chaining-requests).
+
 ## Precedence, start to finish
 
 Every layer that can decide a value for a request has been introduced above,
@@ -1374,7 +1423,7 @@ hardcoded default
       → environment file (--env, or the default one)
         → captured variables (as they accumulate through the run)
           → CLI overrides (-H, --var, --timeout, --insecure, --proxy,
-                           --client-cert, --client-key)
+                           --client-cert, --client-key, --cookie-jar)
 ```
 
 A few things are true of every step in that chain and worth stating once
