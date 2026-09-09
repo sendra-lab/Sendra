@@ -1,9 +1,106 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Sendra environment",
-  "description": "An environment file: a flat mapping of variable name to value, substituted for `{{name}}` in a request. Every value is read as a string — `port: 8080` defines the string \"8080\", not a number.",
+  "description": "The on-disk shape of one environment file: every top-level key is a\nvariable, **except `auth`**, which is reserved for an optional default\n[`Auth`] block — see the module docs and [`Environment::auth`].\n\n`auth` is the only top-level key this type gives a name to — every other\nkey becomes a variable, the same way it always has — so a file with no\n`auth:` key behaves exactly like the flat `BTreeMap<String, String>` this\nused to deserialize straight into. The one behavior change this trades\nfor that continuity: a project that happened to have a variable literally\nnamed `auth` now needs a different name, or its own `auth:` block\ninstead.\n\nEvery variable value is a string, and an unquoted YAML scalar becomes\nexactly the text it was written as: `port: 8080` is the string `8080`,\n`flag: true` is `true`, `version: 1.0` is `1.0`. That is the only rule\nthat makes sense for a substitution engine — what is in the file is what\ngoes into the request, with no round trip through a number or a bool to\nround `1.0` down to `1` or to re-spell `true` as `True`. Quoting changes\nnothing, so `'8080'` is there for anyone who would rather be explicit.\n\nA variable value that is a *sequence or a mapping* is a parse error, and\nthat is the rule keeping environments flat: `staging:` with variables\nnested underneath fails to load rather than half-working, which is what\n\"no inheritance in v1\" has to mean in practice. `auth:` is exempt from\nthis — it is a mapping on purpose — but only `auth` is; any other nested\nkey is still rejected exactly as before.\n\n`Deserialize` is hand-written rather than `#[derive(Deserialize)]` with\n`#[serde(flatten)]` on `variables`: `flatten` deserializes the whole\ndocument through `serde`'s generic `Content` capture first, and that\nbuffering loses `serde_yaml`'s laxness at the leaves — a captured integer\nor float no longer coerces to a string the way a value read straight off\nthe source text does, and `serde_yaml::Value`'s own `Number` has the same\nproblem (it does not even retain `1.0` vs `1` as written). Either would\nsilently break every existing environment file with a bare number/bool\nvalue the moment `auth:` support was added — exactly the backward\ncompatibility this format change is not allowed to cost. Walking the map\nby hand and calling `next_value::<String>()` per key, below, asks\n`serde_yaml` for a string directly off that key's own source node, which\nis the same call (and the same laxness) `BTreeMap<String, String>`'s own\n`Deserialize` impl has always made.",
   "type": "object",
+  "properties": {
+    "auth": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Auth"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
   "additionalProperties": {
     "type": "string"
+  },
+  "$defs": {
+    "ApiKeyAuth": {
+      "description": "[`Auth::api_key`]: a static value sent as either a header or a query\nparameter.\n\n```text\nauth:\n  api_key:\n    in: header          # or: query\n    name: X-API-Key     # or a query param name\n    value: {{api_key}}\n```\n\n`in: header` sets the header named `name` to `value`, the same as an\nentry under `headers:` would. `in: query` adds `name`/`value` as an\nadditional query parameter through the same mechanism\n[`crate::Request::resolve_query`] already uses for `query:` — not a\nseparate ad-hoc code path — so it inherits that mechanism's percent-\nencoding and its \"the more structured source wins on a name collision\nwith the URL's own query string\" rule. See\n[`crate::Request::resolve_auth`] for exactly how.",
+      "type": "object",
+      "properties": {
+        "in": {
+          "$ref": "#/$defs/ApiKeyLocation"
+        },
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "in",
+        "name",
+        "value"
+      ]
+    },
+    "ApiKeyLocation": {
+      "description": "Where [`ApiKeyAuth`] places its `name`/`value` pair.",
+      "type": "string",
+      "enum": [
+        "header",
+        "query"
+      ]
+    },
+    "Auth": {
+      "description": "[`crate::Request::auth`]: exactly one of `bearer`, `basic` or `api_key`,\nenforced by [`Auth::validate_exclusivity`].\n\nThis is also the shape a default `auth:` at the environment level reuses\nunchanged (see [`crate::environment::Environment::auth`]) — `api_key`\njoins `bearer`/`basic` as a third mutually-exclusive case in that same\nshape, so kept as its own type rather than inlined onto `Request`, the\nsame way `MultipartPart` is its own type rather than an inline tuple.",
+      "type": "object",
+      "properties": {
+        "api_key": {
+          "description": "Sets a named header or query parameter to a static value — see\n[`ApiKeyAuth`].",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApiKeyAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "basic": {
+          "description": "Sets `Authorization: Basic <base64(user:pass)>`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BasicAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bearer": {
+          "description": "Sets `Authorization: Bearer <bearer>`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "BasicAuth": {
+      "description": "[`Auth::basic`]'s credentials, base64-encoded as `user:pass` by\n[`crate::Request::resolve_auth`].",
+      "type": "object",
+      "properties": {
+        "pass": {
+          "type": "string"
+        },
+        "user": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "user",
+        "pass"
+      ]
+    }
   }
 }

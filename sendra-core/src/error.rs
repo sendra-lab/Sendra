@@ -193,6 +193,24 @@ pub enum SendraError {
         source: serde_yaml::Error,
     },
 
+    /// An environment file parsed as valid YAML, but its `auth:` block broke
+    /// a rule `serde` cannot express: exactly one of `bearer`/`basic`/
+    /// `api_key` may be set — the same rule
+    /// [`Request::validate`](crate::Request::validate) enforces for a
+    /// request's own `auth:` block, reused here since an environment's
+    /// `auth:` is the exact same [`Auth`](crate::Auth) shape. Raised at
+    /// parse time, from [`Environment::from_yaml_str`](crate::Environment::from_yaml_str)/
+    /// [`from_path`](crate::Environment::from_path) — a collision between an
+    /// environment's default `auth:` and a request's own header/query is a
+    /// different failure, folded into [`InvalidRequest`](Self::InvalidRequest)
+    /// instead, since it can only be discovered once a specific request is
+    /// being substituted against this environment.
+    #[error("invalid environment ({}): {reason}", describe_environment(.path))]
+    InvalidEnvironment {
+        path: Option<PathBuf>,
+        reason: String,
+    },
+
     /// A request referenced `{{name}}` and the active environment has no such
     /// variable.
     ///

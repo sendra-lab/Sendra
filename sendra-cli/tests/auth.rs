@@ -363,3 +363,117 @@ fn a_pre_request_script_can_read_and_override_the_resolved_authorization_header(
     assert_eq!(captured.header("x-saw"), Some("Bearer original"));
     assert_eq!(captured.header("authorization"), Some("Bearer overridden"));
 }
+
+// --- environment-level default `auth:` --------------------------------------
+
+#[test]
+fn an_environment_level_bearer_auth_applies_to_a_request_with_no_auth_of_its_own() {
+    let server = CapturingServer::start();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir_all(dir.path().join(".sendra/environments")).unwrap();
+    std::fs::write(
+        dir.path().join(".sendra/environments/default.yaml"),
+        "auth:\n  bearer: from-the-environment\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        format!("method: GET\nurl: {}/\n", server.base_url()),
+    )
+    .unwrap();
+
+    assert_success(&sendra(dir.path(), &["run", "req.yaml"]));
+
+    let captured = server.captured();
+    assert_eq!(
+        captured.header("authorization"),
+        Some("Bearer from-the-environment")
+    );
+}
+
+#[test]
+fn a_requests_own_auth_overrides_the_environments_default_entirely() {
+    let server = CapturingServer::start();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir_all(dir.path().join(".sendra/environments")).unwrap();
+    std::fs::write(
+        dir.path().join(".sendra/environments/default.yaml"),
+        "auth:\n  bearer: from-the-environment\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        format!(
+            "method: GET\nurl: {}/\nauth:\n  bearer: from-the-request\n",
+            server.base_url()
+        ),
+    )
+    .unwrap();
+
+    assert_success(&sendra(dir.path(), &["run", "req.yaml"]));
+
+    // Only the request's own token is sent — not both, not a merge of the
+    // two, and not two `Authorization` headers.
+    let captured = server.captured();
+    assert_eq!(
+        captured.header("authorization"),
+        Some("Bearer from-the-request")
+    );
+    assert_eq!(
+        captured
+            .headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn environment_level_auth_values_are_substituted_from_the_same_environment() {
+    let server = CapturingServer::start();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir_all(dir.path().join(".sendra/environments")).unwrap();
+    std::fs::write(
+        dir.path().join(".sendra/environments/default.yaml"),
+        "token: from-the-environment\nauth:\n  bearer: '{{token}}'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        format!("method: GET\nurl: {}/\n", server.base_url()),
+    )
+    .unwrap();
+
+    assert_success(&sendra(dir.path(), &["run", "req.yaml"]));
+
+    let captured = server.captured();
+    assert_eq!(
+        captured.header("authorization"),
+        Some("Bearer from-the-environment")
+    );
+}
+
+#[test]
+fn a_malformed_environment_level_auth_block_fails_the_run_with_a_clear_error() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    std::fs::create_dir_all(dir.path().join(".sendra/environments")).unwrap();
+    std::fs::write(
+        dir.path().join(".sendra/environments/default.yaml"),
+        "auth:\n  bearer: x\n  basic:\n    user: a\n    pass: b\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        "method: GET\nurl: https://example.com\n",
+    )
+    .unwrap();
+
+    let output = sendra(dir.path(), &["run", "req.yaml"]);
+    assert_failure(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bearer") && stderr.contains("basic"),
+        "got {stderr}"
+    );
+}
