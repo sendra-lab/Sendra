@@ -1,0 +1,9 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sendra environment",
+  "description": "An environment file: a flat mapping of variable name to value, substituted for `{{name}}` in a request. Every value is read as a string — `port: 8080` defines the string \"8080\", not a number.",
+  "type": "object",
+  "additionalProperties": {
+    "type": "string"
+  }
+}

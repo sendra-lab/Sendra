@@ -544,6 +544,27 @@ pub(crate) enum Command {
     // the reasoning implicit.
     Init,
 
+    /// Write the JSON Schema files for request/collection/config/environment
+    /// files into `<output>/schema/` (the current directory if `--output` is
+    /// not given), for editor autocomplete and inline validation.
+    ///
+    /// The four files are baked into this binary at compile time, so this
+    /// works with no network access and no clone of the Sendra repository —
+    /// see the README's "JSON Schema / editor support" section for what each
+    /// file covers and its known limits, and for the `yaml.schemas` settings
+    /// this command's output is meant to be pointed at.
+    ///
+    /// Unlike `sendra init`, running this again overwrites rather than
+    /// refusing: nothing under `schema/` is meant to hold anything of yours,
+    /// so re-running after a `sendra` upgrade is the ordinary way to pick up
+    /// a newer schema.
+    Schema {
+        /// Directory to write `schema/` under. Defaults to the current
+        /// directory.
+        #[arg(long, value_name = "DIR")]
+        output: Option<PathBuf>,
+    },
+
     /// Convert another tool's command into a Sendra request file.
     Import {
         #[command(subcommand)]

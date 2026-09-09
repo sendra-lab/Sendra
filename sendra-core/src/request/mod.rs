@@ -25,6 +25,7 @@ use crate::request::multipart::MultipartPart;
 /// HTTP methods Sendra can send. Deliberately a closed set for now — an
 /// arbitrary-method escape hatch can be added when something needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Method {
     Get,
@@ -113,6 +114,7 @@ impl std::fmt::Display for Method {
 /// value in an [`Assertions`] block can be a float, and JSON floats are not
 /// `Eq`. Nothing keys a map on a request, so the bound was never load-bearing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,6 +126,10 @@ pub struct Request {
         skip_serializing_if = "Vec::is_empty",
         deserialize_with = "deserialize_headers",
         serialize_with = "serialize_headers"
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "headers::header_map_schema")
     )]
     pub headers: Vec<(String, String)>,
     /// Query parameters, merged onto whatever `url` already has and
@@ -159,6 +165,10 @@ pub struct Request {
         skip_serializing_if = "Vec::is_empty",
         deserialize_with = "deserialize_headers",
         serialize_with = "serialize_headers"
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "headers::header_map_schema")
     )]
     pub query: Vec<(String, String)>,
     /// Raw body, sent verbatim.
@@ -228,6 +238,10 @@ pub struct Request {
         skip_serializing_if = "Vec::is_empty",
         deserialize_with = "deserialize_headers",
         serialize_with = "serialize_headers"
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "headers::header_map_schema")
     )]
     pub form: Vec<(String, String)>,
     /// A body given as named parts, each either inline text or a file, sent
@@ -387,6 +401,7 @@ pub struct Request {
 /// How many extra times to try a request, and how long to wait between
 /// attempts, when it fails to get any response — see [`Request::retry`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct RetryConfig {
     /// Additional attempts beyond the first — `count: 2` means up to three

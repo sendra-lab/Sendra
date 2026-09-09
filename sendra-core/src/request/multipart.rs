@@ -11,6 +11,7 @@ use crate::error::SendraError;
 /// a file (`path`), never both and never neither — enforced by
 /// [`crate::Request::validate`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct MultipartPart {
     pub name: String,

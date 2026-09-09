@@ -33,6 +33,7 @@ use crate::request::Request;
 /// (`IndexMap`) to avoid it. Lookup by name is then a linear scan, which costs
 /// nothing at the sizes a hand-written collection reaches.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Collection {
     #[serde(default, skip_serializing_if = "Option::is_none")]

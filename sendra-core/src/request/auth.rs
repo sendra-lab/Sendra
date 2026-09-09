@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 /// own type rather than inlined onto `Request`, the same way `MultipartPart`
 /// is its own type rather than an inline tuple.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Auth {
     /// Sets `Authorization: Bearer <bearer>`.
@@ -25,6 +26,7 @@ pub struct Auth {
 /// [`Auth::basic`]'s credentials, base64-encoded as `user:pass` by
 /// [`crate::Request::resolve_auth`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct BasicAuth {
     pub user: String,

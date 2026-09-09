@@ -4,6 +4,30 @@
 
 use serde::Deserialize;
 
+/// The JSON Schema for `headers:`/`query:`/`form:`, mirroring
+/// [`deserialize_headers`] by hand since that function's actual accepted
+/// shape (a map whose values may be a string, a bare number/boolean coerced
+/// to one, or a list of strings) has no schemars derivation to fall back on —
+/// the Rust side is a plain `Vec<(String, String)>`, which is not the wire
+/// shape at all.
+#[cfg(feature = "schema")]
+pub(crate) fn header_map_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "description": "A header/query/form name to value mapping. A name that repeats is \
+            written once with a list of values instead of a scalar. An unquoted number or \
+            boolean is accepted and coerced to its string form.",
+        "additionalProperties": {
+            "anyOf": [
+                { "type": "string" },
+                { "type": "number" },
+                { "type": "boolean" },
+                { "type": "array", "items": { "type": "string" } }
+            ]
+        }
+    })
+}
+
 /// Deserialize a `headers:` mapping into ordered `(name, value)` pairs.
 ///
 /// A standard YAML mapping cannot have two keys with the same name, so a

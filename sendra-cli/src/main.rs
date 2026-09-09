@@ -9,6 +9,7 @@ mod import;
 mod init;
 mod output;
 mod run;
+mod schema;
 #[cfg(test)]
 mod test_support;
 
@@ -24,6 +25,7 @@ use crate::output::{
     reject_quiet_with_output, reject_verbose_with_quiet,
 };
 use crate::run::{run, test};
+use crate::schema::schema;
 
 /// `-q`/`--quiet` folded into `-o`/`--output`'s value: `None` (`-q` was not
 /// passed) leaves `output` untouched; `-q` alone (`output` was omitted)
@@ -164,6 +166,8 @@ async fn main() -> ExitCode {
         }
 
         Command::Init => init().into(),
+
+        Command::Schema { output } => schema(output).into(),
 
         Command::Import { target } => match target {
             ImportTarget::Curl { command, output } => import_curl(command, output).into(),

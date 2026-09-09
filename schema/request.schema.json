@@ -1,0 +1,464 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sendra request",
+  "description": "A single request, as described by one YAML file.\n\nThe on-disk shape is the contract other Sendra features build on:\n\n```text\nname: Get user\nmethod: GET\nurl: https://api.example.com/users/1\nheaders:\n  Accept: application/json\nbody: null\nassertions:\n  status: 200\n```\n\nEverything but `method` and `url` is optional.\n\n**Headers are a `Vec` of pairs, not a map** — matching [`Response::headers`](crate::Response::headers)\nand for the same reason: HTTP allows a header name to repeat (multiple\n`Set-Cookie`-shaped headers, repeated `X-Forwarded-For` values), and a map\ncannot represent that. Order is preserved exactly as written in the file.\n\nA standard YAML mapping still cannot have two keys with the same name, so\nwriting a repeated header names it once with a *list* of values instead of\na scalar:\n\n```text\nheaders:\n  Accept: application/json    # scalar: one header\n  X-Forwarded-For:            # list: one header per entry, in order\n    - 1.2.3.4\n    - 5.6.7.8\n```\n\nTwo entries with the same name *and* the same value are accepted rather\nthan rejected: Sendra's stance elsewhere is to reject ambiguity, not\nredundancy, and a client is allowed to send the same header twice even\nwhen doing so is pointless.\n\n`Eq` is deliberately absent where `PartialEq` is derived: an expected JSON\nvalue in an [`Assertions`] block can be a float, and JSON floats are not\n`Eq`. Nothing keys a map on a request, so the bound was never load-bearing.",
+  "type": "object",
+  "properties": {
+    "assertions": {
+      "description": "Declarative checks on the response, evaluated by\n[`Assertions::evaluate`] once it arrives.\n\n`None` — no `assertions:` key at all — is not the same as an empty\nblock, and both are kept distinct on the way back out to YAML. Neither\nchanges how the request is sent: assertions are read after the response,\nnever before it, and they do not decide the process exit code. See the\nmodule docs on [`assertions`](crate::assertions).",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Assertions"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "auth": {
+      "description": "How to authenticate this request: bearer token or basic credentials,\nresolved to a plain `Authorization` header before anything else sees\nit.\n\n```text\nauth:\n  bearer: {{token}}\n\n# or\n\nauth:\n  basic:\n    user: {{username}}\n    pass: {{password}}\n```\n\nExactly one of `bearer`/`basic` may be set — [`Request::validate`]\nrejects any other combination, the same shape as the five body\nfields above. A request may not set `auth` *and* an explicit\n`Authorization` header under `headers:`: both trying to control the\nsame header is far more likely a mistake than a deliberate layering\n(unlike, say, a config default header and a request header, where\n\"the request wins\" is a sensible answer), so `validate` rejects the\ncombination rather than silently picking one.\n\n[`Request::resolve_auth`] turns this into the `Authorization` header\nand clears the field, following the same \"scripts see the final\nresolved form\" precedent as [`Request::resolve_body`]: a\n`pre_request` script reads or overrides\n`request.headers[\"Authorization\"]` like any other header, with no\nseparate `request.auth` API.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Auth"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "body": {
+      "description": "Raw body, sent verbatim.\n\nOne of five ways to specify a body — `body`, [`json`](Self::json),\n[`body_file`](Self::body_file), [`form`](Self::form) or\n[`multipart`](Self::multipart) — and a request may set at most one of\nthem; [`Request::validate`] rejects any other combination at parse\ntime. By the time a `pre_request` script or [`send_prepared`](crate::send_prepared) sees a\nrequest, whichever of the five was set has already been resolved down\nto this field by [`Request::resolve_body`] — see there for exactly\nwhat each one becomes.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "body_file": {
+      "description": "A body read from a file, verbatim, sent exactly as `body` would be.\n\n```text\nbody_file: ./payload.json\n```\n\nThe path is resolved relative to the *request file's own directory*,\nnot the process's current working directory — see\n[`Request::resolve_body`] for why. Unlike [`json`](Self::json) and\n[`form`](Self::form), no `Content-Type` is set automatically: Sendra\ncannot know what an arbitrary file contains, so a request using this\nfield is responsible for its own `headers:` if the server needs one.\nThe file's content must be valid UTF-8 — see the module docs.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "capture": {
+      "description": "Values to pull out of the response and hand to the requests after this\none, as variable name to JSON path:\n\n```text\ncapture:\n  auth_token: $.token\n  user_id: $.user.id\n```\n\nEach name becomes usable as `{{name}}` in every request *after* this one\nin file order, within the same `sendra run` or `sendra test`\ninvocation — nothing is written to disk and a fresh process starts with\nnothing captured.\n\n`None` — no `capture:` key at all — is kept distinct from an empty\nblock on the way back out to YAML, the same way an `assertions` block\nis. Neither changes how this request is sent: a capture is read after\nthe response, never before it. See the [`capture`](crate::capture) module for what a\npath may select and for what happens when one does not match.\n\n**The block is not substituted.** A `{{var}}` in a capture path or name\nstays those characters; see [`Environment::apply`](crate::Environment::apply).",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Captures"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "form": {
+      "description": "A body given as name/value pairs, URL-encoded and sent as\n`application/x-www-form-urlencoded` — the same encoding an HTML form\nsubmission uses.\n\n```text\nform:\n  username: ada\n  remember_me: \"true\"\n```\n\nA plain YAML mapping cannot repeat a key, so unlike\n[`headers`](Self::headers) this has no list form for a repeated field\nname — nothing in Sendra has needed one yet. See\n[`Request::resolve_body`] for the `Content-Type` rule, which matches\n[`json`](Self::json)'s.\n\nDeserialized the same way [`headers`](Self::headers) is — a repeated\nfield name is written as a list rather than rejected as a duplicate\nkey — since a form field repeating (an HTML multi-select, say) is the\nsame shape of problem a repeated header already had a good answer for.",
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "headers": {
+      "description": "A header/query/form name to value mapping. A name that repeats is written once with a list of values instead of a scalar. An unquoted number or boolean is accepted and coerced to its string form.",
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "json": {
+      "description": "A body given as YAML — a mapping, a list, a string, whatever value —\nserialized to JSON and sent as `application/json`.\n\n```text\njson:\n  name: ada\n  roles: [admin, user]\n```\n\n[`Request::resolve_body`] sets `Content-Type: application/json` only\nwhen the request has not already set that header itself — an explicit\nheader always wins. See [`Request::body`] for how this relates to the\nother four ways of specifying a body."
+    },
+    "method": {
+      "$ref": "#/$defs/Method"
+    },
+    "multipart": {
+      "description": "A body given as named parts, each either inline text or a file, sent\nas `multipart/form-data`.\n\n```text\nmultipart:\n  - name: description\n    value: a photo of my cat\n  - name: photo\n    path: ./cat.jpg\n```\n\nEach part is exactly one of a text part (`value`) or a file part\n(`path`, resolved the same way [`body_file`](Self::body_file) is) —\n[`Request::validate`] rejects a part with both or neither. See the\nmodule docs for why a file part's content must be valid UTF-8 in this\nversion.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MultipartPart"
+      }
+    },
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "post_request": {
+      "description": "A script run against the response, before assertions are evaluated.\n\n```text\npost_request: |\n  if response.status != 201 {\n    throw \"expected 201, got \" + response.status;\n  }\n```\n\n`throw` is how it reports a failure. Like an assertion, that failure is\nvisible in the output and decides `sendra test`'s verdict without\nchanging `sendra run`'s exit code. Compiled before the request is sent,\nso a syntax error here stops the request rather than being discovered\nafter it.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "pre_request": {
+      "description": "A script run against this request just before it is sent, as inline\nRhai source.\n\nWritten as a YAML block scalar, which is what a multiline script needs\nand the reason the file format is YAML rather than JSON or TOML:\n\n```text\npre_request: |\n  request.headers[\"X-Request-Id\"] = \"abc-123\";\n```\n\nIt runs *after* environment substitution and *after* the config is\napplied, as the final mutation step before the wire. **Its own source is\nnever substituted** — a `{{var}}` inside a script is just those\ncharacters. See the [`script`](crate::script) module for both decisions and for what\nthe script can see.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "query": {
+      "description": "Query parameters, merged onto whatever `url` already has and\npercent-encoded properly — the alternative to hand-building a query\nstring inside `url` itself, where a value containing a space, `&`,\n`=` or non-ASCII character has to be encoded by hand or the request\nsilently means something different than intended.\n\n```text\nurl: https://api.example.com/search\nquery:\n  q: coffee & tea      # -> q=coffee+%26+tea\n  tag:                 # list: one `tag=` per entry, in order\n    - hot\n    - iced\n```\n\n[`Request::resolve_query`] merges this onto `url`'s own query string\n(if it has one) with **`query` winning**: a key present in both is\nsent only with the value(s) from here, not the URL's. `query` is the\nmore structured, explicit source, so a key repeated between the two\nis far more likely to be a stale copy left in `url` than a\ndeliberately duplicated value.\n\nDeserialized the same way [`headers`](Self::headers) is — a value may\nbe a scalar or, for a repeated key (`?tag=hot&tag=iced`), a list of\nscalars — since a repeated query parameter is the same shape of\nproblem a repeated header already had a good answer for. An unquoted\nnumber or boolean is coerced to its string form rather than rejected,\nmatching header values.",
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "retry": {
+      "description": "Retry this request on a true failure — no response at all: a DNS,\nconnection, TLS or timeout error — up to `count` additional attempts,\nwaiting `delay_ms` (default `0`, no wait) between each.\n\n```text\nretry:\n  count: 2\n  delay_ms: 200\n```\n\nOnly a failure to get *any* response triggers a retry. A 4xx/5xx is\nstill a response — [`send_prepared`](crate::send_prepared) returns it\nas `Ok`, not `Err` — so it is never retried by this field; retrying on\na specific status is a separate, more advanced feature this does not\nattempt. Simple, fixed backoff: no exponential delay or jitter.\n\n**Only the final attempt's outcome is reported.** A request that fails\ntwice and then succeeds is reported as a plain, ordinary success — the\ntwo failed attempts before it are never counted toward `sendra test`'s\nsummary or either subcommand's exit code, though each retry is logged\nto stderr for visibility. A request that exhausts every attempt is\nreported as the one failure it always would have been, with no\nseparate record of the attempts that came before it.\n\n`None` — no `retry:` key at all — means a request is sent once and\nwhatever happens is final, exactly as it was before this field\nexisted.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RetryConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "url": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "method",
+    "url"
+  ],
+  "$defs": {
+    "Assertions": {
+      "description": "The `assertions` block of a request, exactly as it appears on disk.\n\nEach field is a separate *kind* of check, and each entry within a field is\none assertion — `headers` with three entries is three assertions, reported\nindividually. All of them are evaluated on every response; none short-circuit\nthe others, because \"which of my expectations held\" is the question this\nfeature exists to answer and stopping at the first failure would answer it\nonly partially.\n\nUnknown keys are rejected, like everywhere else in Sendra's schema: an\nassertion silently ignored because of a typo is worse than no assertion at\nall, since it reads as a check that is passing.",
+      "type": "object",
+      "properties": {
+        "body_contains": {
+          "description": "A substring the response body must contain, matched case-sensitively on\nthe body as printed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_matches": {
+          "description": "A regular expression the response body must match, anywhere in it —\nthe same \"somewhere in the body\" reach as `body_contains`, not an\nanchored whole-body match, so `body_matches: '\"id\":\\s*\\d+'` finds that\npattern wherever it sits.\n\nThe engine is [`regex`](https://docs.rs/regex), already in the\ndependency tree as a transitive dependency of `jsonpath-rust` — this\nadds no new crate, only a direct declaration of one already being\nbuilt.\n\nThe pattern is checked when the assertion runs, not when the file is\nloaded, for the same reason a JSON path is: a stricter release of\n`regex` should not start rejecting files that used to load, for a\nrequest Sendra could still send. An invalid pattern is a failed\nassertion naming the parse error, not a panic or a load-time error.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "elapsed_ms_under": {
+          "description": "The response must have arrived in under this many milliseconds.\n\nBacked by [`Response::elapsed`], which is wall-clock time for the\nrequest as sent — DNS, connect and TLS included, the same number a\nperson timing the request by hand would get. A strict \"under\", not\n\"at or under\": a threshold is normally chosen as a round number the\nresponse should beat, and `elapsed_ms_under: 500` reads as \"faster\nthan half a second,\" which an exact 500ms response is not.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "headers": {
+          "description": "Headers the response must carry, by name.\n\nA value asserts the header is present *and* equal to it; a null value\n(`x-request-id:` with nothing after it) asserts only that the header is\nthere. One key covers both because they are the same assertion with and\nwithout an expectation about the value, and a second key\n(`headers_present`) would make the file say twice what the value's\npresence already says.\n\nNames are matched case-insensitively, because HTTP header names are.\nValues are matched exactly: `content-type: application/json` does *not*\nmatch `application/json; charset=utf-8`. That is the strict reading, and\nthe honest one — a substring match would quietly accept\n`application/json-seq` too. When a server decorates a value, assert the\nwhole value or drop to presence-only.\n\nA repeated header (`set-cookie`) passes if *any* of its values matches.",
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "json": {
+          "description": "JSON path expressions mapped to the value each must select.\n\n```yaml\njson:\n  $.user.id: 42\n  $.user.name: ada\n  $.tags: [a, b]\n```\n\nThe expected value is written as YAML and held as a [`serde_json::Value`]\n— parsed once, when the file is loaded, into the form it will be compared\nagainst, so a value that has no JSON equivalent is a parse error naming\nthe file rather than a surprise at response time.\n\nA path must select **exactly one** value. Nothing matched, or several\nmatched, is a failure with that stated: `$.users[*].id` against three\nusers is a question with no single answer, and picking the first would\nmake the assertion depend on ordering the author never specified.\n\nThe engine is [`jsonpath-rust`](https://docs.rs/jsonpath-rust), chosen\nover `serde_json_path`, the other RFC 9535 implementation, on\nmaintenance and stability: at the time of writing jsonpath-rust is at\n`1.0` with releases landing this year, while `serde_json_path` has not\nreleased since February 2025 and is still pre-`1.0`. Both are correct\nand both query `serde_json::Value` directly, which is what keeps this\ndependency swappable if that ever changes: it is confined to\n[`Assertions::evaluate`], behind a path string and a value comparison.\nBeyond a bare equality value, a path may map to an *operator object*\nwith exactly one of these keys:\n\n```yaml\njson:\n  $.count: { greater_than: 5 }             # numeric: actual > 5\n  $.count: { greater_than_or_equal: 5 }    # numeric: actual >= 5\n  $.count: { less_than: 5 }                # numeric: actual < 5\n  $.count: { less_than_or_equal: 5 }       # numeric: actual <= 5\n  $.tags: { contains: b }   # substring of a string, or array membership\n  $.tags: { length: 2 }                     # array/string length equals 2\n  $.tags: { length: { greater_than: 1 } }   # length compared, not just equal\n  $.id: { matches: '^[0-9a-f-]{36}$' }      # regex, scoped to this path's\n                                             # string value — see `body_matches`\n                                             # for the whole-body equivalent\n```\n\nSee the module docs for exactly how a bare value is told apart from an\noperator, and what that costs.",
+          "type": "object",
+          "additionalProperties": true
+        },
+        "not": {
+          "description": "Every assertion in this block, inverted: passes exactly when the\nwrapped one would have failed, and vice versa. See the module docs for\nwhat a wrapper buys over a `not_`-prefixed key per assertion type, and\nfor why a hard error underneath — a malformed path, an invalid regex,\na type mismatch — is not something this can turn into a pass.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NotAssertions"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "description": "The exact status code the response must carry.\n\nEquality against one code rather than a class (`2xx`) or a range: the\ntwo are not the same assertion, and \"this endpoint answers 201\" is the\none worth writing down. A class matcher can be added as its own key\nlater without changing what this one means.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "status_in": {
+          "description": "The status code must be one of these.\n\nIts own key rather than folding into `status` (a list there would\nchange what a bare `status: 200` means) — `status` is \"exactly this\ncode\", `status_in` is \"one of these codes\", and a file should be able\nto write either without the other's presence changing its meaning.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "Auth": {
+      "description": "[`crate::Request::auth`]: exactly one of `bearer` or `basic`, enforced by\n[`crate::Request::validate`].\n\nThis is also the shape a default `auth:` at the environment/config level\nis expected to reuse unchanged, and the shape a future `api_key` variant\nis expected to join as a third mutually-exclusive case — so kept as its\nown type rather than inlined onto `Request`, the same way `MultipartPart`\nis its own type rather than an inline tuple.",
+      "type": "object",
+      "properties": {
+        "basic": {
+          "description": "Sets `Authorization: Basic <base64(user:pass)>`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BasicAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "bearer": {
+          "description": "Sets `Authorization: Bearer <bearer>`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "BasicAuth": {
+      "description": "[`Auth::basic`]'s credentials, base64-encoded as `user:pass` by\n[`crate::Request::resolve_auth`].",
+      "type": "object",
+      "properties": {
+        "pass": {
+          "type": "string"
+        },
+        "user": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "user",
+        "pass"
+      ]
+    },
+    "CaptureSource": {
+      "description": "Where one `capture` entry reads its value from: a bare string is a JSON path into the response body; `{ header: <name> }` reads a response header; `{ status: true }` captures the numeric status code. `status: false` is invalid.",
+      "oneOf": [
+        {
+          "description": "A JSON path into the response body.",
+          "type": "string"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "header": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "header"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "boolean",
+              "const": true
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "status"
+          ]
+        }
+      ]
+    },
+    "Captures": {
+      "description": "The `capture` block of a request, exactly as it appears on disk: variable\nname to [`CaptureSource`].\n\nA map with author-chosen keys, so unlike every *struct* in Sendra's schema\nthere is no `deny_unknown_fields` to apply — every key here is data. The\nrule that a typo must not pass silently still holds, one level down: a path\nthat selects nothing is a reported failure rather than a variable that\nquietly does not exist.\n\nNames are not validated against a pattern. A variable is whatever\n`{{...}}` can spell, and an environment file has never restricted its own\nkeys either; a name nothing references is harmless, and one that cannot be\nreferenced is a mistake visible the moment it is used.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/CaptureSource"
+      }
+    },
+    "Method": {
+      "description": "HTTP methods Sendra can send. Deliberately a closed set for now — an\narbitrary-method escape hatch can be added when something needs it.",
+      "type": "string",
+      "enum": [
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "HEAD",
+        "OPTIONS"
+      ]
+    },
+    "MultipartPart": {
+      "description": "One part of a [`crate::Request::multipart`] body: either inline text (`value`) or\na file (`path`), never both and never neither — enforced by\n[`crate::Request::validate`].",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "NotAssertions": {
+      "description": "The inner block of a `not:` wrapper: every key `Assertions` has, except\n`not` itself.\n\nA separate type rather than `not: Option<Box<Assertions>>` with a runtime\ncheck against a nested `not`, so that `not: {not: {...}}` is rejected by\nthe same `deny_unknown_fields` machinery as every other unknown key,\nrather than by a bespoke check that could drift from it.",
+      "type": "object",
+      "properties": {
+        "body_contains": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "body_matches": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "elapsed_ms_under": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "json": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "status": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "status_in": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "RetryConfig": {
+      "description": "How many extra times to try a request, and how long to wait between\nattempts, when it fails to get any response — see [`Request::retry`].",
+      "type": "object",
+      "properties": {
+        "count": {
+          "description": "Additional attempts beyond the first — `count: 2` means up to three\nattempts total. `0` is accepted and means what writing no `retry:`\nblock at all already means.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "delay_ms": {
+          "description": "Milliseconds to wait before each retry. `None`/omitted is `0`: retry\nimmediately.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "count"
+      ]
+    }
+  }
+}
