@@ -160,7 +160,8 @@ mod tests {
     use crate::http::client::build_client;
     use crate::http::response::RedirectHop;
     use crate::test_support::{
-        get, ok_bytes, ok_response, redirect_response, start_mutual_tls_server,
+        get, ok_bytes, ok_response, redirect_response, redirect_with_cookie_response,
+        set_cookie_response, start_cookie_server, start_mutual_tls_server,
         start_proxy_recording_server, start_route_server, start_self_signed_tls_server,
         start_stalling_server, CountingServer, Stall,
     };
@@ -1071,6 +1072,172 @@ mod tests {
         assert!(
             plain.redirects.is_empty(),
             "the previous request's chain must not leak into this one"
+        );
+    }
+
+    // --- `cookie_jar` ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn cookie_jar_disabled_does_not_carry_a_cookie_to_a_later_request() {
+        // The opt-in default: without `cookie_jar`, a `Set-Cookie` from one
+        // request must not show up as a `Cookie` header on the next one, even
+        // through the one shared client every run already reuses.
+        let (addr, seen) = start_cookie_server(vec![
+            (
+                "/login",
+                set_cookie_response("session=abc123; Path=/", "logged in"),
+            ),
+            ("/profile", ok_response("profile")),
+        ]);
+
+        let config = Config::default();
+        assert!(!config.cookie_jar, "off by default");
+        let client = build_client(&config).expect("a client builds");
+
+        send(&get(&format!("http://{addr}/login")), &client, &config)
+            .await
+            .expect("login responds");
+        send(&get(&format!("http://{addr}/profile")), &client, &config)
+            .await
+            .expect("profile responds");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen[0], None,
+            "no cookie existed to send on the first request"
+        );
+        assert_eq!(
+            seen[1], None,
+            "with the jar off, the session cookie from /login must not reach /profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn cookie_jar_enabled_carries_a_cookie_to_a_later_request() {
+        // The counterpart to the test above, and the whole feature: with
+        // `cookie_jar` on, the same two requests through the same client now
+        // carry the session cookie automatically.
+        let (addr, seen) = start_cookie_server(vec![
+            (
+                "/login",
+                set_cookie_response("session=abc123; Path=/", "logged in"),
+            ),
+            ("/profile", ok_response("profile")),
+        ]);
+
+        let config = Config {
+            cookie_jar: true,
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a client builds");
+
+        send(&get(&format!("http://{addr}/login")), &client, &config)
+            .await
+            .expect("login responds");
+        send(&get(&format!("http://{addr}/profile")), &client, &config)
+            .await
+            .expect("profile responds");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], None, "no cookie existed yet for the login request");
+        assert_eq!(
+            seen[1].as_deref(),
+            Some("session=abc123"),
+            "the jar must resend the cookie /login set: got {:?}",
+            seen[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_cookie_header_is_sent_as_is_and_the_jar_is_not_consulted() {
+        // Investigated directly against reqwest's own `CookieService` rather
+        // than assumed: it fills in the jar's `Cookie` header only when the
+        // request does not already carry one, so an explicit `Cookie:`
+        // header on a request wins outright — no merge, and Sendra raises no
+        // conflict over it, unlike `auth:` plus an explicit `Authorization`
+        // header.
+        let (addr, seen) = start_cookie_server(vec![
+            (
+                "/login",
+                set_cookie_response("session=abc123; Path=/", "logged in"),
+            ),
+            ("/profile", ok_response("profile")),
+        ]);
+
+        let config = Config {
+            cookie_jar: true,
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a client builds");
+
+        send(&get(&format!("http://{addr}/login")), &client, &config)
+            .await
+            .expect("login responds, and the jar stores its session cookie");
+
+        let mut request = get(&format!("http://{addr}/profile"));
+        request.headers = vec![("Cookie".to_string(), "session=manual-override".to_string())];
+        send(&request, &client, &config)
+            .await
+            .expect("profile responds");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[1].as_deref(),
+            Some("session=manual-override"),
+            "the request's own Cookie header must reach the server unchanged, \
+             not merged with the jar's stored cookie: got {:?}",
+            seen[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn cookie_jar_captures_a_set_cookie_from_an_intermediate_redirect_hop() {
+        // The advantage over `capture`'s manual `Set-Cookie` capture, which
+        // can only see the final response's headers: reqwest's cookie
+        // handling sits underneath its redirect-following, so a `Set-Cookie`
+        // on an intermediate hop — never the final response here — is still
+        // picked up.
+        let (addr, seen) = start_cookie_server(vec![
+            (
+                "/start",
+                redirect_with_cookie_response(
+                    302,
+                    "Found",
+                    "/end",
+                    "session=from-a-redirect-hop; Path=/",
+                ),
+            ),
+            ("/end", ok_response("done")),
+            ("/profile", ok_response("profile")),
+        ]);
+
+        let config = Config {
+            cookie_jar: true,
+            ..Config::default()
+        };
+        let client = build_client(&config).expect("a client builds");
+
+        let response = send(&get(&format!("http://{addr}/start")), &client, &config)
+            .await
+            .expect("the redirect chain resolves");
+        assert_eq!(response.body, "done");
+
+        send(&get(&format!("http://{addr}/profile")), &client, &config)
+            .await
+            .expect("profile responds");
+
+        let seen = seen.lock().unwrap();
+        // Request 0 is `/start`, request 1 is `/end` (the followed redirect),
+        // request 2 is `/profile`.
+        assert_eq!(seen.len(), 3);
+        assert_eq!(
+            seen[2].as_deref(),
+            Some("session=from-a-redirect-hop"),
+            "a Set-Cookie on the intermediate /start->/end hop must still \
+             have been captured: got {:?}",
+            seen[2]
         );
     }
 }

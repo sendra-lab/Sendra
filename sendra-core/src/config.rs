@@ -291,6 +291,24 @@ pub struct ConfigFile {
     /// refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_cert: Option<ClientCertFile>,
+
+    /// Persist cookies received via `Set-Cookie` and send them back
+    /// automatically on later requests to the same host — the config-file
+    /// form of `--cookie-jar`.
+    ///
+    /// **Opt-in, off by default**, deliberately matching curl: `curl` does
+    /// not carry cookies between requests unless you pass `-c`/`-b`
+    /// yourself, and Sendra follows the same convention rather than
+    /// defaulting to "on" because it would be convenient for the
+    /// login-flow case this exists for. See
+    /// [`build_client`](crate::build_client) for where it is applied.
+    ///
+    /// In-memory only, for the duration of one invocation — nothing is
+    /// written to disk, and nothing survives between separate `sendra run`/
+    /// `sendra test` invocations, the same "no persistence across
+    /// invocations" rule [`crate::capture`] already follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie_jar: Option<bool>,
 }
 
 /// The `client_cert:` config key's on-disk shape: a cert path and a key
@@ -385,6 +403,7 @@ impl ConfigFile {
             insecure: self.insecure.or(base.insecure),
             proxy: self.proxy.or(base.proxy),
             client_cert: self.client_cert.or(base.client_cert),
+            cookie_jar: self.cookie_jar.or(base.cookie_jar),
         }
     }
 }
@@ -413,6 +432,9 @@ pub struct Config {
     pub client_cert: Option<PathBuf>,
     /// Private key matching `client_cert`. See [`ConfigFile::client_cert`].
     pub client_key: Option<PathBuf>,
+    /// Persist and resend cookies automatically for this run. See
+    /// [`ConfigFile::cookie_jar`].
+    pub cookie_jar: bool,
     /// The config files this was built from, in the order they were merged
     /// (global first). Empty when no config file was found anywhere.
     pub sources: Vec<PathBuf>,
@@ -433,6 +455,7 @@ impl Default for Config {
             proxy: None,
             client_cert: None,
             client_key: None,
+            cookie_jar: false,
             sources: Vec::new(),
         }
     }
@@ -504,6 +527,7 @@ impl Config {
             proxy: merged.proxy,
             client_cert,
             client_key,
+            cookie_jar: merged.cookie_jar.unwrap_or(false),
             sources,
         })
     }
@@ -974,6 +998,50 @@ mod tests {
         let config = Config::resolve_from(&root, Some(&global)).unwrap();
 
         assert!(config.insecure);
+    }
+
+    // --- `cookie_jar` ---------------------------------------------------------
+
+    #[test]
+    fn no_cookie_jar_key_resolves_to_false() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(temp.path(), "timeout_seconds: 5\n");
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        assert!(!config.cookie_jar);
+    }
+
+    #[test]
+    fn cookie_jar_true_resolves_to_true() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = project(temp.path(), "cookie_jar: true\n");
+
+        let config = Config::resolve_from(&root, None).unwrap();
+
+        assert!(config.cookie_jar);
+    }
+
+    #[test]
+    fn a_project_cookie_jar_overrides_a_global_one_wholesale() {
+        let temp = tempfile::tempdir().unwrap();
+        let global = global(temp.path(), "cookie_jar: true\n");
+        let root = project(temp.path(), "cookie_jar: false\n");
+
+        let config = Config::resolve_from(&root, Some(&global)).unwrap();
+
+        assert!(!config.cookie_jar, "the project's explicit false must win");
+    }
+
+    #[test]
+    fn a_global_cookie_jar_applies_when_the_project_says_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let global = global(temp.path(), "cookie_jar: true\n");
+        let root = project(temp.path(), "timeout_seconds: 5\n");
+
+        let config = Config::resolve_from(&root, Some(&global)).unwrap();
+
+        assert!(config.cookie_jar);
     }
 
     // --- `proxy` -------------------------------------------------------------

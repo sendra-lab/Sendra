@@ -249,6 +249,38 @@ pub(crate) enum Command {
         #[arg(long, value_name = "PATH")]
         client_key: Option<PathBuf>,
 
+        /// Store cookies received via `Set-Cookie` and send them back
+        /// automatically on later requests to the same host, for this
+        /// invocation only.
+        ///
+        /// **Off by default, deliberately**: matches curl, which does not
+        /// persist cookies across requests unless `-c`/`-b` is passed. For
+        /// a login-flow-style API that relies on a session cookie, this
+        /// automates what `capture`'s manual `Set-Cookie`-into-`Cookie`
+        /// substitution otherwise requires by hand — and, for cookies
+        /// specifically, sees every hop of a redirect chain rather than
+        /// only the final response, which `capture` cannot.
+        ///
+        /// Wins over `cookie_jar:` in either config file, the same "CLI
+        /// beats config" rule every other override here follows — but only
+        /// in the direction that turns it *on*, the same asymmetry
+        /// `--insecure` has: there is no `--no-cookie-jar` to force it back
+        /// off over a config that set `cookie_jar: true`.
+        ///
+        /// In-memory only, for the duration of this one invocation — never
+        /// written to disk, and never shared with a separate `sendra run`/
+        /// `sendra test` invocation afterwards. A request whose own
+        /// `headers:` sets `Cookie` is left alone: reqwest only fills in
+        /// the jar's `Cookie` header when the request does not already
+        /// carry one, so an explicit header always wins outright rather
+        /// than being merged with the jar.
+        ///
+        /// With `--repeat`, each pass starts with an empty jar — a fresh
+        /// jar for every pass, the same "each repeat is a clean run" rule
+        /// that already applies to captured variables.
+        #[arg(long)]
+        cookie_jar: bool,
+
         /// Exit 0 even when a response status is 4xx or 5xx.
         ///
         /// Responses are printed either way; this only changes the exit code,
@@ -465,6 +497,14 @@ pub(crate) enum Command {
         /// Behaves exactly as it does on `run` — see `run --help`.
         #[arg(long, value_name = "PATH")]
         client_key: Option<PathBuf>,
+
+        /// Store cookies received via `Set-Cookie` and send them back
+        /// automatically on later requests to the same host, for this
+        /// invocation only. Behaves exactly as it does on `run` — see
+        /// `run --help` for the full reasoning, including the manual-
+        /// `Cookie`-header interaction and the `--repeat` reset.
+        #[arg(long)]
+        cookie_jar: bool,
 
         /// Print one JSON object describing the whole run, instead of the
         /// human-readable output.
@@ -687,6 +727,7 @@ mod tests {
                 proxy,
                 client_cert,
                 client_key,
+                cookie_jar,
                 json,
                 show_captures,
                 junit,
@@ -706,6 +747,7 @@ mod tests {
                 assert_eq!(proxy, None, "no --proxy was passed");
                 assert_eq!(client_cert, None, "no --client-cert was passed");
                 assert_eq!(client_key, None, "no --client-key was passed");
+                assert!(!cookie_jar, "no --cookie-jar was passed");
                 assert!(!json, "the human output is what you get without --json");
                 assert!(!show_captures, "captures are redacted by default");
                 assert_eq!(junit, None, "no --junit was passed");
@@ -1126,6 +1168,41 @@ mod tests {
         let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--insecure"])
             .expect("`--insecure` is offered by `test`");
         assert!(matches!(cli.command, Command::Test { insecure: true, .. }));
+    }
+
+    // --- `--cookie-jar` ------------------------------------------------------
+
+    #[test]
+    fn cookie_jar_defaults_to_false_and_is_offered_by_both_subcommands() {
+        let cli =
+            Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`--cookie-jar` is optional");
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                cookie_jar: false,
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--cookie-jar"])
+            .expect("`--cookie-jar` is offered by `run`");
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                cookie_jar: true,
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--cookie-jar"])
+            .expect("`--cookie-jar` is offered by `test`");
+        assert!(matches!(
+            cli.command,
+            Command::Test {
+                cookie_jar: true,
+                ..
+            }
+        ));
     }
 
     // --- `--proxy` -------------------------------------------------------------
