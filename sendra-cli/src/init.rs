@@ -53,6 +53,28 @@ const CONFIG_TEMPLATE: &str = "\
 # `true` follows up to 10 (the default); `false` reports a 3xx response as-is
 # instead of chasing it; a number sets a custom maximum.
 # follow_redirects: true
+
+# Skip TLS certificate verification for every request this run sends. For a
+# self-signed or otherwise untrusted endpoint only — not for routine use
+# against the public internet.
+# insecure: false
+
+# Route every request through this HTTP proxy, credentials in the URL if it
+# needs them. Takes over proxying entirely: the standard HTTP_PROXY/
+# HTTPS_PROXY/NO_PROXY environment variables are not consulted once this is
+# set.
+# proxy: http://proxy.example.com:8080
+
+# Present a client certificate for mutual TLS. Both `cert` and `key` are
+# required together, and resolve relative to this file's own directory.
+# client_cert:
+#   cert: ./client.pem
+#   key: ./client-key.pem
+
+# Store cookies received via `Set-Cookie` and send them back automatically on
+# later requests to the same host — off by default, matching curl's own
+# default of not persisting cookies unless asked.
+# cookie_jar: false
 ";
 
 /// A variable or two, commented out, showing both reference syntaxes a
@@ -196,6 +218,12 @@ headers:
   Accept: application/json
 timeout_seconds: 30
 follow_redirects: true
+insecure: false
+proxy: http://proxy.example.com:8080
+client_cert:
+  cert: ./client.pem
+  key: ./client-key.pem
+cookie_jar: false
 ";
         let config =
             ConfigFile::from_yaml_str(uncommented).expect("the shown shape must actually parse");
@@ -204,6 +232,42 @@ follow_redirects: true
             Some("my-app")
         );
         assert_eq!(config.timeout_seconds, Some(30));
+        assert_eq!(config.insecure, Some(false));
+        assert_eq!(
+            config.proxy.as_deref(),
+            Some("http://proxy.example.com:8080")
+        );
+        assert_eq!(
+            config.client_cert,
+            Some(sendra_core::config::ClientCertFile {
+                cert: "./client.pem".to_string(),
+                key: "./client-key.pem".to_string(),
+            })
+        );
+        assert_eq!(config.cookie_jar, Some(false));
+    }
+
+    /// Every field [`ConfigFile`] knows must have a commented-out example in
+    /// [`CONFIG_TEMPLATE`] — this fails the moment a new `Config` field is
+    /// added and the template is not updated alongside it, rather than
+    /// letting the drift go unnoticed until someone happens to compare the
+    /// two by hand.
+    #[test]
+    fn every_config_field_has_a_commented_out_example_in_the_template() {
+        for key in [
+            "headers",
+            "timeout_seconds",
+            "follow_redirects",
+            "insecure",
+            "proxy",
+            "client_cert",
+            "cookie_jar",
+        ] {
+            assert!(
+                CONFIG_TEMPLATE.contains(&format!("# {key}:")),
+                "`{key}` has no commented-out example in CONFIG_TEMPLATE"
+            );
+        }
     }
 
     #[test]
