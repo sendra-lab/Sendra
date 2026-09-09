@@ -16,7 +16,7 @@
       ]
     },
     "auth": {
-      "description": "How to authenticate this request: bearer token or basic credentials,\nresolved to a plain `Authorization` header before anything else sees\nit.\n\n```text\nauth:\n  bearer: {{token}}\n\n# or\n\nauth:\n  basic:\n    user: {{username}}\n    pass: {{password}}\n```\n\nExactly one of `bearer`/`basic` may be set — [`Request::validate`]\nrejects any other combination, the same shape as the five body\nfields above. A request may not set `auth` *and* an explicit\n`Authorization` header under `headers:`: both trying to control the\nsame header is far more likely a mistake than a deliberate layering\n(unlike, say, a config default header and a request header, where\n\"the request wins\" is a sensible answer), so `validate` rejects the\ncombination rather than silently picking one.\n\n[`Request::resolve_auth`] turns this into the `Authorization` header\nand clears the field, following the same \"scripts see the final\nresolved form\" precedent as [`Request::resolve_body`]: a\n`pre_request` script reads or overrides\n`request.headers[\"Authorization\"]` like any other header, with no\nseparate `request.auth` API.",
+      "description": "How to authenticate this request: bearer token, basic credentials or\na static API key, resolved to a plain header (and, for `api_key` in\n`query` form, a query parameter) before anything else sees it.\n\n```text\nauth:\n  bearer: {{token}}\n\n# or\n\nauth:\n  basic:\n    user: {{username}}\n    pass: {{password}}\n\n# or\n\nauth:\n  api_key:\n    in: header          # or: query\n    name: X-API-Key     # or a query param name\n    value: {{api_key}}\n```\n\nExactly one of `bearer`/`basic`/`api_key` may be set — [`Request::validate`]\nrejects any other combination, the same shape as the five body\nfields above. A request may not set `auth` *and* an explicit header\n(or, for `api_key` in `query` form, query parameter) of the same\nname it would itself set: both trying to control the same header (or\nparameter) is far more likely a mistake than a deliberate layering\n(unlike, say, a config default header and a request header, where\n\"the request wins\" is a sensible answer), so `validate` rejects the\ncombination rather than silently picking one.\n\n[`Request::resolve_auth`] turns this into the final header (or query\nparameter) and clears the field, following the same \"scripts see the\nfinal resolved form\" precedent as [`Request::resolve_body`]: a\n`pre_request` script reads or overrides\n`request.headers[\"Authorization\"]` (or any other header `api_key`\nset) like any other header, with no separate `request.auth` API.",
       "anyOf": [
         {
           "$ref": "#/$defs/Auth"
@@ -174,6 +174,35 @@
     "url"
   ],
   "$defs": {
+    "ApiKeyAuth": {
+      "description": "[`Auth::api_key`]: a static value sent as either a header or a query\nparameter.\n\n```text\nauth:\n  api_key:\n    in: header          # or: query\n    name: X-API-Key     # or a query param name\n    value: {{api_key}}\n```\n\n`in: header` sets the header named `name` to `value`, the same as an\nentry under `headers:` would. `in: query` adds `name`/`value` as an\nadditional query parameter through the same mechanism\n[`crate::Request::resolve_query`] already uses for `query:` — not a\nseparate ad-hoc code path — so it inherits that mechanism's percent-\nencoding and its \"the more structured source wins on a name collision\nwith the URL's own query string\" rule. See\n[`crate::Request::resolve_auth`] for exactly how.",
+      "type": "object",
+      "properties": {
+        "in": {
+          "$ref": "#/$defs/ApiKeyLocation"
+        },
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "in",
+        "name",
+        "value"
+      ]
+    },
+    "ApiKeyLocation": {
+      "description": "Where [`ApiKeyAuth`] places its `name`/`value` pair.",
+      "type": "string",
+      "enum": [
+        "header",
+        "query"
+      ]
+    },
     "Assertions": {
       "description": "The `assertions` block of a request, exactly as it appears on disk.\n\nEach field is a separate *kind* of check, and each entry within a field is\none assertion — `headers` with three entries is three assertions, reported\nindividually. All of them are evaluated on every response; none short-circuit\nthe others, because \"which of my expectations held\" is the question this\nfeature exists to answer and stopping at the first failure would answer it\nonly partially.\n\nUnknown keys are rejected, like everywhere else in Sendra's schema: an\nassertion silently ignored because of a typo is worse than no assertion at\nall, since it reads as a check that is passing.",
       "type": "object",
@@ -254,9 +283,20 @@
       "additionalProperties": false
     },
     "Auth": {
-      "description": "[`crate::Request::auth`]: exactly one of `bearer` or `basic`, enforced by\n[`crate::Request::validate`].\n\nThis is also the shape a default `auth:` at the environment/config level\nis expected to reuse unchanged, and the shape a future `api_key` variant\nis expected to join as a third mutually-exclusive case — so kept as its\nown type rather than inlined onto `Request`, the same way `MultipartPart`\nis its own type rather than an inline tuple.",
+      "description": "[`crate::Request::auth`]: exactly one of `bearer`, `basic` or `api_key`,\nenforced by [`crate::Request::validate`].\n\nThis is also the shape a default `auth:` at the environment/config level\nis expected to reuse unchanged — `api_key` joins `bearer`/`basic` as a\nthird mutually-exclusive case in that same shape, so kept as its own type\nrather than inlined onto `Request`, the same way `MultipartPart` is its\nown type rather than an inline tuple.",
       "type": "object",
       "properties": {
+        "api_key": {
+          "description": "Sets a named header or query parameter to a static value — see\n[`ApiKeyAuth`].",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ApiKeyAuth"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "basic": {
           "description": "Sets `Authorization: Basic <base64(user:pass)>`.",
           "anyOf": [

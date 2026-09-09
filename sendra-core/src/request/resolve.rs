@@ -1,6 +1,6 @@
-//! The three "structured input becomes the final wire form" passes:
-//! [`Request::resolve_query`], [`Request::resolve_body`] and
-//! [`Request::resolve_auth`]. Each returns a new [`Request`] with its own
+//! The three "structured input becomes the final wire form" passes, run in
+//! this order: [`Request::resolve_auth`], [`Request::resolve_query`] and
+//! [`Request::resolve_body`]. Each returns a new [`Request`] with its own
 //! structured field(s) cleared and the plain wire-level field (`url`,
 //! `body`/headers, `Authorization` header) set instead — see each method's
 //! own doc comment for why the order among them and relative to the config
@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use crate::error::SendraError;
+use crate::request::auth::ApiKeyLocation;
 use crate::request::multipart::{encode_multipart, read_body_file};
 use crate::request::Request;
 
@@ -17,14 +18,15 @@ impl Request {
     /// properly, returning a request whose `url` is the final string that
     /// goes on the wire and whose `query` is empty.
     ///
-    /// Called right after environment substitution and before
+    /// Called right after [`resolve_auth`](Self::resolve_auth) — which, for
+    /// an `auth.api_key` in `query` form, has already appended its
+    /// `name`/`value` pair onto `query` so it merges through this exact
+    /// mechanism rather than a separate one — and before
     /// [`resolve_body`](Self::resolve_body), the config, or a `pre_request`
-    /// script ever see the request — the same "structured input becomes the
-    /// final wire form before anything else touches it" shape as
-    /// `resolve_body`. A `pre_request` script therefore sees `query`
-    /// parameters already merged into `request.url`, not a separate map, for
-    /// consistency with `resolve_body`'s "scripts see the final resolved
-    /// form" precedent.
+    /// script ever see the request. A `pre_request` script therefore sees
+    /// `query` parameters (including any from `auth.api_key`) already merged
+    /// into `request.url`, not a separate map, for consistency with
+    /// `resolve_body`'s "scripts see the final resolved form" precedent.
     ///
     /// A request with an empty `query` is returned with `url` untouched —
     /// not even reparsed — so a `url`-only request behaves exactly as it
@@ -142,38 +144,64 @@ impl Request {
         Ok(resolved)
     }
 
-    /// Resolve `auth` into the `Authorization` header that goes on the wire,
-    /// clearing `auth` on the way out.
+    /// Resolve `auth` into the header (`bearer`/`basic`/an `api_key` in
+    /// `header` form) or query parameter (an `api_key` in `query` form) that
+    /// goes on the wire, clearing `auth` on the way out.
     ///
-    /// Called after [`resolve_body`](Self::resolve_body) and before the
-    /// config is applied or a `pre_request` script runs — the same
-    /// "structured input becomes the final wire form before anything else
-    /// touches it" shape as `resolve_query` and `resolve_body`. A
-    /// `pre_request` script therefore sees a plain `Authorization` header
-    /// like any other, with no separate `request.auth` API.
+    /// Called right after environment substitution and before
+    /// [`resolve_query`](Self::resolve_query), [`resolve_body`](Self::resolve_body), the
+    /// config, or a `pre_request` script ever see the request. It runs
+    /// *before* `resolve_query` specifically so that an `auth.api_key` in
+    /// `query` form can hand its `name`/`value` pair to `query` and let
+    /// `resolve_query` do the actual merging onto `url` — the same
+    /// percent-encoding and "the more structured source wins on a name
+    /// collision with the URL's own query string" rule an ordinary `query:`
+    /// entry gets, rather than a second, parallel implementation. A
+    /// `pre_request` script therefore sees a plain `Authorization` (or other)
+    /// header like any other, with no separate `request.auth` API — and, for
+    /// the `query` form, sees the parameter already merged into
+    /// `request.url` by the time `resolve_query` has also run.
     ///
-    /// [`Request::validate`] has already rejected a request that sets both
-    /// `auth` and an explicit `Authorization` header, so this always adds
-    /// the header rather than needing [`config::insert_if_absent`](crate::config::insert_if_absent)'s
+    /// [`Request::validate`] has already rejected a request that sets `auth`
+    /// alongside an explicit header or query parameter of the same name it
+    /// would itself set, so this always adds the header/parameter rather than
+    /// needing [`config::insert_if_absent`](crate::config::insert_if_absent)'s
     /// suppression rule.
     pub fn resolve_auth(&self) -> Result<Request, SendraError> {
         let mut resolved = self.clone();
 
         if let Some(auth) = &self.auth {
-            let value = match (&auth.bearer, &auth.basic) {
-                (Some(token), None) => format!("Bearer {token}"),
-                (None, Some(basic)) => {
+            match (&auth.bearer, &auth.basic, &auth.api_key) {
+                (Some(token), None, None) => {
+                    resolved
+                        .headers
+                        .push(("Authorization".to_string(), format!("Bearer {token}")));
+                }
+                (None, Some(basic), None) => {
                     let credentials = format!("{}:{}", basic.user, basic.pass);
                     let encoded = base64::Engine::encode(
                         &base64::engine::general_purpose::STANDARD,
                         credentials,
                     );
-                    format!("Basic {encoded}")
+                    resolved
+                        .headers
+                        .push(("Authorization".to_string(), format!("Basic {encoded}")));
                 }
+                (None, None, Some(api_key)) => match api_key.r#in {
+                    ApiKeyLocation::Header => {
+                        resolved
+                            .headers
+                            .push((api_key.name.clone(), api_key.value.clone()));
+                    }
+                    ApiKeyLocation::Query => {
+                        resolved
+                            .query
+                            .push((api_key.name.clone(), api_key.value.clone()));
+                    }
+                },
                 // `validate` already rejected any other combination.
-                _ => unreachable!("Request::validate enforces exactly one of bearer/basic"),
+                _ => unreachable!("Request::validate enforces exactly one of bearer/basic/api_key"),
             };
-            resolved.headers.push(("Authorization".to_string(), value));
         }
         resolved.auth = None;
 
@@ -607,5 +635,114 @@ requests:
         let basic = auth.basic.expect("basic survives substitution");
         assert_eq!(basic.user, "ada");
         assert_eq!(basic.pass, "s3cr3t");
+    }
+
+    // --- auth: api_key -------------------------------------------------------
+
+    #[test]
+    fn auth_api_key_header_resolves_to_the_named_header() {
+        let request = request_with(
+            "auth:\n  api_key:\n    in: header\n    name: X-API-Key\n    value: s3cr3t\n",
+        );
+        let resolved = request.resolve_auth().expect("resolves");
+        assert_eq!(resolved.header("X-API-Key"), Some("s3cr3t"));
+        assert!(resolved.auth.is_none());
+    }
+
+    #[test]
+    fn auth_api_key_query_merges_through_resolve_query_not_a_parallel_path() {
+        let request =
+            get_with("auth:\n  api_key:\n    in: query\n    name: api_key\n    value: s3cr3t\n");
+        let resolved = request
+            .resolve_auth()
+            .and_then(|request| request.resolve_query())
+            .expect("resolves");
+        assert_eq!(resolved.url, "https://example.com/search?api_key=s3cr3t");
+        assert!(resolved.auth.is_none());
+        assert!(resolved.query.is_empty());
+    }
+
+    #[test]
+    fn auth_api_key_query_still_wins_over_an_existing_url_query_key_of_the_same_name() {
+        // Proves the api_key value flows through the exact same "query wins"
+        // precedence as an ordinary `query:` entry, not a separate rule.
+        let request = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com/search?api_key=stale\nauth:\n  api_key:\n    in: query\n    name: api_key\n    value: fresh\n",
+        )
+        .unwrap();
+        let resolved = request
+            .resolve_auth()
+            .and_then(|request| request.resolve_query())
+            .expect("resolves");
+        assert_eq!(resolved.url, "https://example.com/search?api_key=fresh");
+    }
+
+    #[test]
+    fn a_request_with_no_auth_field_resolves_to_no_api_key_header_or_query_param() {
+        let request = get_with("");
+        let resolved = request
+            .resolve_auth()
+            .and_then(|request| request.resolve_query())
+            .expect("nothing to resolve");
+        assert_eq!(resolved.url, "https://example.com/search");
+    }
+
+    #[test]
+    fn auth_naming_bearer_and_api_key_is_rejected_at_parse_time() {
+        let err = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nauth:\n  bearer: x\n  api_key:\n    in: header\n    name: X-API-Key\n    value: y\n",
+        )
+        .expect_err("bearer and api_key together must be rejected");
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("bearer") && reason.contains("api_key")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn auth_api_key_header_colliding_with_an_explicit_header_is_rejected_at_parse_time() {
+        let err = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nheaders:\n  X-API-Key: hand-written\nauth:\n  api_key:\n    in: header\n    name: X-API-Key\n    value: y\n",
+        )
+        .expect_err("api_key and an explicit header of the same name together must be rejected");
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("X-API-Key")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_api_key_header_collision_check_is_case_insensitive() {
+        let err = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nheaders:\n  x-api-key: hand-written\nauth:\n  api_key:\n    in: header\n    name: X-API-Key\n    value: y\n",
+        )
+        .expect_err("a differently-cased header name must still collide");
+        assert!(matches!(&err, SendraError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn auth_api_key_query_colliding_with_an_explicit_query_entry_is_rejected_at_parse_time() {
+        let err = Request::from_yaml_str(
+            "method: GET\nurl: https://example.com\nquery:\n  api_key: hand-written\nauth:\n  api_key:\n    in: query\n    name: api_key\n    value: y\n",
+        )
+        .expect_err("api_key and an explicit query entry of the same name together must be rejected");
+        assert!(
+            matches!(&err, SendraError::InvalidRequest { reason } if reason.contains("api_key")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn environment_substitution_reaches_api_key_name_and_value() {
+        let request = request_with(
+            "auth:\n  api_key:\n    in: header\n    name: '{{header_name}}'\n    value: '{{token}}'\n",
+        );
+        let environment =
+            crate::Environment::from_yaml_str("header_name: X-API-Key\ntoken: s3cr3t\n").unwrap();
+        let substituted = environment.apply(&request).expect("both are set");
+        let auth = substituted.auth.expect("auth survives substitution");
+        let api_key = auth.api_key.expect("api_key survives substitution");
+        assert_eq!(api_key.name, "X-API-Key");
+        assert_eq!(api_key.value, "s3cr3t");
     }
 }
