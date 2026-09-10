@@ -12,6 +12,7 @@ pub struct AppState {
 pub enum LoadState {
     #[default]
     Loading,
+    NoPathProvided,
     Loaded(Box<Document>),
     Failed(SendraError),
 }
@@ -20,6 +21,7 @@ pub enum LoadState {
 pub enum Message {
     Quit,
     Tick,
+    NoCollectionPath,
     CollectionLoaded(Box<Result<Document, SendraError>>),
 }
 
@@ -27,6 +29,7 @@ pub fn update(state: &mut AppState, msg: Message) {
     match msg {
         Message::Quit => state.should_quit = true,
         Message::Tick => {}
+        Message::NoCollectionPath => state.load_state = LoadState::NoPathProvided,
         Message::CollectionLoaded(result) => {
             state.load_state = match *result {
                 Ok(document) => LoadState::Loaded(Box::new(document)),
@@ -39,6 +42,7 @@ pub fn update(state: &mut AppState, msg: Message) {
 pub fn view(state: &AppState, frame: &mut Frame) {
     let text = match &state.load_state {
         LoadState::Loading => "Loading collection...".to_string(),
+        LoadState::NoPathProvided => "No collection path provided.".to_string(),
         LoadState::Loaded(document) => format!("Loaded {} request(s)", document.requests().len()),
         LoadState::Failed(error) => format!("Failed to load collection: {error}"),
     };
@@ -95,6 +99,15 @@ requests:
             LoadState::Loaded(document) => assert_eq!(document.requests().len(), 2),
             other => panic!("expected LoadState::Loaded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn no_collection_path_message_sets_no_path_provided() {
+        let mut state = AppState::default();
+
+        update(&mut state, Message::NoCollectionPath);
+
+        assert!(matches!(state.load_state, LoadState::NoPathProvided));
     }
 
     #[test]
