@@ -1,0 +1,15 @@
+[package]
+name = "sendra-tui"
+description = "Terminal UI for Sendra."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sendra-tui"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.29.0"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+sendra-core = { path = "../sendra-core" }
