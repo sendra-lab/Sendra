@@ -2,8 +2,10 @@ mod app;
 
 use std::io::{self, Stdout};
 use std::panic;
+use std::path::PathBuf;
 use std::time::Duration;
 
+use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -11,8 +13,16 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use sendra_core::Document;
 
 use app::{update, view, AppState, Message};
+
+#[derive(Parser)]
+#[command(name = "sendra-tui")]
+struct Cli {
+    /// Collection or request YAML file to load.
+    path: Option<PathBuf>,
+}
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
@@ -56,8 +66,12 @@ fn next_message() -> io::Result<Message> {
     }
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+fn run(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    initial_message: Message,
+) -> io::Result<()> {
     let mut state = AppState::default();
+    update(&mut state, initial_message);
 
     loop {
         terminal.draw(|frame| view(&state, frame))?;
@@ -74,8 +88,21 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
 fn main() -> io::Result<()> {
     install_panic_hook();
 
+    let cli = Cli::parse();
+
+    // Loading is plain sendra-core I/O — no terminal touched yet — and its
+    // result is handed to the event loop as an ordinary `Message`, so it
+    // flows through the same `update()` path every other event does rather
+    // than being special-cased. With no path given, there is nothing to load
+    // and no file to guess at — that goes through the same path as a real
+    // load outcome, rather than being decided before the architecture sees it.
+    let load_message = match cli.path {
+        Some(path) => Message::CollectionLoaded(Box::new(Document::from_path(&path))),
+        None => Message::NoCollectionPath,
+    };
+
     let mut terminal = init_terminal()?;
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, load_message);
     restore_terminal();
 
     result
