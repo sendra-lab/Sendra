@@ -4,7 +4,11 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
-use sendra_core::{Document, Environment, Request, Response, SendraError};
+use sendra_core::{
+    AssertionReport, CaptureReport, Document, Environment, Request, Response, SendraError,
+};
+
+use crate::run_request::RunOutcome;
 
 /// Body preview is capped rather than shown in full — scrolling through a
 /// large body is issue 13's job; this just keeps a multi-megabyte body from
@@ -47,6 +51,15 @@ pub struct AppState {
     /// changed request-list selection both reset it, in `update` and
     /// `select` respectively.
     pub response_scroll: usize,
+    /// Whether captured values are shown in the clear rather than masked —
+    /// `Message::ToggleRevealCaptures`, bound to `c`. Starts `false` (masked)
+    /// every time, is never written anywhere but this in-memory field, and is
+    /// reset back to `false` on the same two events that reset `run_state`
+    /// (a fresh `RunRequested`, a changed request-list selection) — see the
+    /// doc comment on `render_capture_section` for why "never persisted,
+    /// never auto-revealed on the next run" means resetting it there too,
+    /// not only at process start.
+    pub reveal_captures: bool,
 }
 
 #[derive(Debug, Default)]
@@ -93,10 +106,11 @@ pub enum Message {
     /// actually spawn the request via [`crate::run_request::spawn`].
     RunRequested,
     /// The spawned run finished, with the real `sendra-core` result —
-    /// success or failure — it produced. Always accepted, even while another
-    /// message would normally be blocked by an in-flight run, since this is
-    /// the message that ends that state.
-    RunCompleted(Result<Response, SendraError>),
+    /// success or failure — plus the assertion/capture reports evaluated
+    /// against it. Always accepted, even while another message would
+    /// normally be blocked by an in-flight run, since this is the message
+    /// that ends that state.
+    RunCompleted(RunOutcome),
     /// PageDown on the response panel: scrolls its text down a few lines.
     /// A no-op whenever there is nothing showing that could scroll — see
     /// `render_response_panel`, which is the only place `response_scroll` is
@@ -105,13 +119,18 @@ pub enum Message {
     /// PageUp on the response panel: scrolls its text up a few lines. See
     /// [`Message::ScrollResponseDown`].
     ScrollResponseUp,
+    /// `c`: flips `reveal_captures`. Masked values become visible, visible
+    /// values become masked again — a toggle rather than a one-way reveal,
+    /// so hiding them again does not need a second, differently-named key.
+    ToggleRevealCaptures,
 }
 
 /// What the selected request's most recent run did, if anything.
 ///
-/// Holds the real `sendra_core::Response`/`SendraError` a run produced, not
-/// a TUI-invented summary — `render_response_panel` formats it, but nothing
-/// about the data itself is reshaped or approximated first.
+/// Holds the real `sendra_core::Response`/`SendraError`, `AssertionReport`
+/// and `CaptureReport` a run produced (see [`RunOutcome`]), not a
+/// TUI-invented summary — `render_response_panel` formats it, but nothing
+/// about the data itself is reshaped, approximated or re-evaluated first.
 ///
 /// **Always about the currently selected request.** Nothing here tracks
 /// *which* request a completed run belongs to; instead, `select` resets this
@@ -123,7 +142,7 @@ pub enum RunState {
     #[default]
     Idle,
     InFlight,
-    Completed(Result<Response, SendraError>),
+    Completed(RunOutcome),
 }
 
 /// Moves `selected` by `delta` (`1` or `-1`) through `len` items, wrapping at
@@ -200,12 +219,16 @@ pub fn update(state: &mut AppState, msg: Message) {
             if request_is_selected(state) {
                 state.run_state = RunState::InFlight;
                 // A fresh run's text starts at the top, regardless of where
-                // a previous run's was left scrolled.
+                // a previous run's was left scrolled, and its captures start
+                // masked again regardless of whether the previous run's were
+                // revealed — "never auto-revealed on the next run" applies
+                // here, not only at startup.
                 state.response_scroll = 0;
+                state.reveal_captures = false;
             }
         }
-        Message::RunCompleted(result) => {
-            state.run_state = RunState::Completed(result);
+        Message::RunCompleted(outcome) => {
+            state.run_state = RunState::Completed(outcome);
         }
         Message::ScrollResponseDown => {
             state.response_scroll = state.response_scroll.saturating_add(SCROLL_STEP_LINES);
@@ -213,6 +236,7 @@ pub fn update(state: &mut AppState, msg: Message) {
         Message::ScrollResponseUp => {
             state.response_scroll = state.response_scroll.saturating_sub(SCROLL_STEP_LINES);
         }
+        Message::ToggleRevealCaptures => state.reveal_captures = !state.reveal_captures,
     }
 }
 
@@ -255,6 +279,7 @@ fn select(state: &mut AppState, delta: isize) {
             // meaning "the currently selected request's result".
             state.run_state = RunState::Idle;
             state.response_scroll = 0;
+            state.reveal_captures = false;
         }
         *selected = next;
     }
@@ -335,8 +360,14 @@ fn render_detail_pane(
         return;
     };
 
-    if let RunState::Completed(result) = &state.run_state {
-        render_response_panel(frame, area, result, state.response_scroll);
+    if let RunState::Completed(outcome) = &state.run_state {
+        render_response_panel(
+            frame,
+            area,
+            outcome,
+            state.response_scroll,
+            state.reveal_captures,
+        );
         return;
     }
 
@@ -388,10 +419,11 @@ fn render_detail_pane(
 fn render_response_panel(
     frame: &mut Frame,
     area: Rect,
-    result: &Result<Response, SendraError>,
+    outcome: &RunOutcome,
     scroll: usize,
+    reveal_captures: bool,
 ) {
-    let text = format_run_result(result);
+    let text = format_run_result(outcome, reveal_captures);
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -408,8 +440,15 @@ fn render_response_panel(
     frame.render_widget(paragraph, rows[0]);
 
     let last_visible = (scroll + content_height).min(total);
+    let reveal_hint = if outcome.capture.is_empty() {
+        String::new()
+    } else if reveal_captures {
+        "  |  c: hide captures".to_string()
+    } else {
+        "  |  c: reveal captures".to_string()
+    };
     let footer = format!(
-        "Line {}-{} of {total} — PgUp/PgDn to scroll",
+        "Line {}-{} of {total} — PgUp/PgDn to scroll{reveal_hint}",
         scroll.saturating_add(1).min(total.max(1)),
         last_visible,
     );
@@ -417,6 +456,115 @@ fn render_response_panel(
         Paragraph::new(footer).style(Style::new().add_modifier(Modifier::DIM)),
         rows[1],
     );
+}
+
+/// The text `render_response_panel` shows: on success, the response laid out
+/// by `format_response`, followed by the assertion and capture sections
+/// (`format_assertions`/`format_capture_section`) — always both, even when
+/// their reports are empty, so "no assertions declared" reads distinctly
+/// from either a passing or a failing assertion block, and likewise for
+/// captures. On failure, the real `SendraError`'s own `Display` — via
+/// `{error}`, the same `thiserror`-derived message `sendra run` itself would
+/// print for the same failure. There is no response to lay out and nothing
+/// was checked or captured, so that is the whole of it: the error, not a
+/// TUI-invented summary of it and not two sections falsely claiming "no
+/// assertions declared" for a request that may well have some.
+fn format_run_result(outcome: &RunOutcome, reveal_captures: bool) -> String {
+    match &outcome.result {
+        Ok(response) => {
+            let mut text = format_response(response);
+            text.push('\n');
+            text.push_str(&format_assertions(&outcome.assertions));
+            text.push('\n');
+            text.push_str(&format_capture_section(&outcome.capture, reveal_captures));
+            text
+        }
+        Err(error) => format!("Request failed:\n{error}"),
+    }
+}
+
+/// `assertions` heading, one line per check (`✓`/`✗` plus core's own
+/// expectation/failure wording — [`sendra_core::AssertionResult`] renders
+/// the words, this only lays them out), then a pass/fail count — the same
+/// per-assertion granularity and the same wording as sendra-cli's own
+/// `print_assertions` in `sendra-cli/src/output/human.rs`, reimplemented
+/// (uncoloured) rather than imported for the same cross-crate reason
+/// `body_for_display` is. **Declared distinctly from "declared and all
+/// passed"**: an empty report — no `assertions:` block, or an empty one —
+/// renders `no assertions declared` instead of silently matching the "0
+/// failed" case a passing block would also produce, mirroring the
+/// skipped-vs-passed distinction sendra-cli's own `--junit` output already
+/// makes for the same report type.
+fn format_assertions(report: &AssertionReport) -> String {
+    if report.is_empty() {
+        return "assertions\n  no assertions declared".to_string();
+    }
+
+    let mut lines = vec!["assertions".to_string()];
+    for result in report.results() {
+        match &result.failure {
+            None => lines.push(format!("  ✓ {}", result.expectation)),
+            Some(detail) => lines.push(format!("  ✗ {} — {detail}", result.expectation)),
+        }
+    }
+
+    if report.passed() {
+        lines.push(format!("  {} passed", report.passed_count()));
+    } else {
+        lines.push(format!(
+            "  {} passed, {} failed",
+            report.passed_count(),
+            report.failed_count()
+        ));
+    }
+
+    lines.join("\n")
+}
+
+/// A captured value that has not been revealed this session — the TUI's own
+/// interactive counterpart to `--show-captures`'s default, not a value
+/// sendra-cli itself ever prints to a terminal (its own `print_capture`
+/// never shows the value at all, revealed or not; only `--json` carries it,
+/// gated by that same flag). Same placeholder text `--json`'s
+/// `REDACTED_CAPTURE_VALUE` uses (`sendra-cli/src/output/json.rs`), so the
+/// two tools agree on what "hidden" is spelled as.
+const REDACTED_CAPTURE_VALUE: &str = "<redacted>";
+
+/// `capture` heading, one line per entry — a captured value shown as
+/// [`REDACTED_CAPTURE_VALUE`] unless `reveal` is true, a failed entry's real
+/// `CaptureFailure` message always shown regardless of `reveal` (a failure
+/// never carried a value to begin with, so there is nothing to redact — the
+/// same rule `--json`'s `CaptureRecord` follows: "failures is never
+/// redacted") — then, like [`format_assertions`], `no captures declared`
+/// for an empty report rather than looking like a capture block that
+/// declared nothing wrong.
+///
+/// `reveal` is `AppState::reveal_captures` — session-only and reset on every
+/// new run and every selection change (see its doc comment); nothing here
+/// writes it anywhere durable, so a masked capture is masked again the next
+/// time this function runs unless the user asks again.
+fn format_capture_section(report: &CaptureReport, reveal: bool) -> String {
+    if report.is_empty() {
+        return "capture\n  no captures declared".to_string();
+    }
+
+    let mut lines = vec!["capture".to_string()];
+    for result in report.results() {
+        let from = format!("{} from `{}`", result.variable, result.path);
+        match result.failure() {
+            None => {
+                let value = if reveal {
+                    result.value().unwrap_or_default()
+                } else {
+                    REDACTED_CAPTURE_VALUE
+                };
+                lines.push(format!("  ✓ {from} = {value}"));
+            }
+            Some(failure) => lines.push(format!("  ✗ {from} — {failure}")),
+        }
+    }
+
+    lines.join("\n")
 }
 
 /// Mirrors sendra-cli's own response layout
@@ -427,19 +575,6 @@ fn render_response_panel(
 /// then the body. Uncoloured, unlike the CLI's terminal output — colour is
 /// the one thing this deliberately does not reproduce, since ratatui styling
 /// is a separate concern from the data being correct.
-/// The text `render_response_panel` shows: `format_response`'s layout on
-/// success, or the real `SendraError`'s own `Display` — via `{error}`, the
-/// same `thiserror`-derived message `sendra run` itself would print for the
-/// same failure — on failure. On the failure path there is no response to
-/// lay out, so this is the whole of it: the error, not a TUI-invented
-/// summary of it.
-fn format_run_result(result: &Result<Response, SendraError>) -> String {
-    match result {
-        Ok(response) => format_response(response),
-        Err(error) => format!("Request failed:\n{error}"),
-    }
-}
-
 fn format_response(response: &Response) -> String {
     let mut lines = vec![format!(
         "{} {}  {} ms",
@@ -511,12 +646,24 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
             let frame_char = SPINNER_FRAMES[state.spinner_tick % SPINNER_FRAMES.len()];
             format!("{frame_char} Running request...")
         }
-        RunState::Completed(Ok(response)) => {
-            format!("Done — {} (Enter/r to run again)", response.status)
-        }
-        RunState::Completed(Err(error)) => {
-            format!("Failed — {error} (Enter/r to run again)")
-        }
+        RunState::Completed(outcome) => match &outcome.result {
+            Ok(response) => {
+                let assertions = if outcome.assertions.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " — {} passed, {} failed",
+                        outcome.assertions.passed_count(),
+                        outcome.assertions.failed_count()
+                    )
+                };
+                format!(
+                    "Done — {}{assertions} (Enter/r to run again)",
+                    response.status
+                )
+            }
+            Err(error) => format!("Failed — {error} (Enter/r to run again)"),
+        },
     };
     frame.render_widget(Paragraph::new(text), area);
 }
@@ -1029,6 +1176,26 @@ requests:
         }
     }
 
+    /// A successful `RunOutcome` with the given status and empty
+    /// assertion/capture reports — the "no assertions/captures declared"
+    /// case, which is what most `RunState`-plumbing tests below actually
+    /// need; tests about assertions/captures themselves build their own.
+    fn sample_outcome(status: u16) -> RunOutcome {
+        RunOutcome {
+            result: Ok(sample_response(status)),
+            assertions: AssertionReport::default(),
+            capture: CaptureReport::default(),
+        }
+    }
+
+    fn failed_outcome(error: SendraError) -> RunOutcome {
+        RunOutcome {
+            result: Err(error),
+            assertions: AssertionReport::default(),
+            capture: CaptureReport::default(),
+        }
+    }
+
     #[test]
     fn run_requested_moves_run_state_to_in_flight_when_a_request_is_selected() {
         let mut state = loaded_state(VALID_COLLECTION);
@@ -1052,11 +1219,16 @@ requests:
         let mut state = loaded_state(VALID_COLLECTION);
         update(&mut state, Message::RunRequested);
 
-        update(&mut state, Message::RunCompleted(Ok(sample_response(200))));
+        update(&mut state, Message::RunCompleted(sample_outcome(200)));
 
         match state.run_state {
-            RunState::Completed(Ok(response)) => assert_eq!(response.status, 200),
-            other => panic!("expected RunState::Completed(Ok(_)), got {other:?}"),
+            RunState::Completed(RunOutcome {
+                result: Ok(response),
+                ..
+            }) => assert_eq!(response.status, 200),
+            other => panic!(
+                "expected RunState::Completed(RunOutcome {{ result: Ok(_), .. }}), got {other:?}"
+            ),
         }
     }
 
@@ -1066,9 +1238,12 @@ requests:
         update(&mut state, Message::RunRequested);
         let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
 
-        update(&mut state, Message::RunCompleted(Err(error)));
+        update(&mut state, Message::RunCompleted(failed_outcome(error)));
 
-        assert!(matches!(state.run_state, RunState::Completed(Err(_))));
+        assert!(matches!(
+            state.run_state,
+            RunState::Completed(RunOutcome { result: Err(_), .. })
+        ));
     }
 
     #[test]
@@ -1106,10 +1281,13 @@ requests:
         let mut state = loaded_state(VALID_COLLECTION);
         update(&mut state, Message::RunRequested);
 
-        update(&mut state, Message::RunCompleted(Ok(sample_response(204))));
+        update(&mut state, Message::RunCompleted(sample_outcome(204)));
 
         assert!(
-            matches!(state.run_state, RunState::Completed(Ok(_))),
+            matches!(
+                state.run_state,
+                RunState::Completed(RunOutcome { result: Ok(_), .. })
+            ),
             "RunCompleted must end the in-flight state even though it would \
              otherwise be blocked by it"
         );
@@ -1119,7 +1297,7 @@ requests:
     fn navigation_works_again_once_a_run_has_completed() {
         let mut state = loaded_state(THREE_REQUEST_COLLECTION);
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(Ok(sample_response(200))));
+        update(&mut state, Message::RunCompleted(sample_outcome(200)));
 
         update(&mut state, Message::SelectNext);
 
@@ -1140,9 +1318,12 @@ requests:
     fn selecting_a_different_request_resets_run_state_and_scroll() {
         let mut state = loaded_state(THREE_REQUEST_COLLECTION);
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(Ok(sample_response(200))));
+        update(&mut state, Message::RunCompleted(sample_outcome(200)));
         update(&mut state, Message::ScrollResponseDown);
-        assert!(matches!(state.run_state, RunState::Completed(Ok(_))));
+        assert!(matches!(
+            state.run_state,
+            RunState::Completed(RunOutcome { result: Ok(_), .. })
+        ));
         assert_eq!(state.response_scroll, SCROLL_STEP_LINES);
 
         update(&mut state, Message::SelectNext);
@@ -1169,18 +1350,21 @@ requests:
             std::mem::swap(document.as_mut(), &mut trimmed);
         }
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(Ok(sample_response(200))));
+        update(&mut state, Message::RunCompleted(sample_outcome(200)));
 
         update(&mut state, Message::SelectNext);
 
-        assert!(matches!(state.run_state, RunState::Completed(Ok(_))));
+        assert!(matches!(
+            state.run_state,
+            RunState::Completed(RunOutcome { result: Ok(_), .. })
+        ));
     }
 
     #[test]
     fn starting_a_new_run_resets_the_previous_scroll_position() {
         let mut state = loaded_state(VALID_COLLECTION);
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(Ok(sample_response(200))));
+        update(&mut state, Message::RunCompleted(sample_outcome(200)));
         update(&mut state, Message::ScrollResponseDown);
         assert_eq!(state.response_scroll, SCROLL_STEP_LINES);
 
@@ -1288,12 +1472,293 @@ requests:
         )]));
     }
 
+    /// Parses a single request from `yaml` and evaluates its `assertions:`
+    /// block against `response` via the real `Assertions::evaluate` —
+    /// sendra-core's own machinery, the same thing `run_request::execute`
+    /// calls, not a hand-built `AssertionReport`, which the type's private
+    /// fields would not even allow from outside its own crate.
+    fn evaluate_assertions(yaml: &str, response: &Response) -> AssertionReport {
+        let request = Document::from_yaml_str(yaml)
+            .expect("valid test request")
+            .requests()[0]
+            .clone();
+        request
+            .assertions
+            .expect("the test YAML declares an `assertions:` block")
+            .evaluate(response)
+    }
+
+    /// Same as [`evaluate_assertions`] for a `capture:` block, via the real
+    /// `Captures::evaluate`.
+    fn evaluate_capture(yaml: &str, response: &Response) -> CaptureReport {
+        let request = Document::from_yaml_str(yaml)
+            .expect("valid test request")
+            .requests()[0]
+            .clone();
+        request
+            .capture
+            .expect("the test YAML declares a `capture:` block")
+            .evaluate(response, &Environment::default())
+    }
+
+    #[test]
+    fn format_assertions_marks_a_request_with_no_assertions_distinctly() {
+        let text = format_assertions(&AssertionReport::default());
+
+        assert_eq!(text, "assertions\n  no assertions declared");
+    }
+
+    #[test]
+    fn format_assertions_shows_every_result_individually_with_pass_fail() {
+        let response = response_with(&[], "");
+        let report = evaluate_assertions(
+            "method: GET\nurl: https://example.com\nassertions:\n  status: 201\n  status_in: [404]\n",
+            &response,
+        );
+
+        let text = format_assertions(&report);
+
+        assert!(
+            text.contains("✓ status is 201"),
+            "the passing assertion must be shown on its own line: {text}"
+        );
+        assert!(
+            text.contains("✗ status is one of [404]"),
+            "the failing assertion must be shown on its own line, not folded into an aggregate: {text}"
+        );
+        assert!(
+            text.contains("1 passed, 1 failed"),
+            "a mixed report must show both counts: {text}"
+        );
+        assert_ne!(
+            text,
+            format_assertions(&AssertionReport::default()),
+            "a report with real (even if all-failing) results must not read the same as \
+             \"no assertions declared\""
+        );
+    }
+
+    #[test]
+    fn format_assertions_all_passing_reads_differently_from_none_declared() {
+        let response = response_with(&[], "");
+        let report = evaluate_assertions(
+            "method: GET\nurl: https://example.com\nassertions:\n  status: 201\n",
+            &response,
+        );
+
+        let text = format_assertions(&report);
+
+        assert!(text.contains("1 passed"));
+        assert!(
+            !text.contains("no assertions declared"),
+            "an assertions block that all passed must not be confused with none being declared: {text}"
+        );
+    }
+
+    #[test]
+    fn format_capture_section_marks_a_request_with_no_captures_distinctly() {
+        let text = format_capture_section(&CaptureReport::default(), true);
+
+        assert_eq!(text, "capture\n  no captures declared");
+    }
+
+    #[test]
+    fn format_capture_section_masks_the_value_by_default() {
+        let response = response_with(&[("X-Token", "super-secret")], "");
+        let report = evaluate_capture(
+            "method: GET\nurl: https://example.com\ncapture:\n  token: {header: X-Token}\n",
+            &response,
+        );
+
+        let path = report.results()[0].path.clone();
+        let masked = format_capture_section(&report, false);
+
+        assert!(
+            masked.contains(&format!("token from `{path}` = {REDACTED_CAPTURE_VALUE}")),
+            "the value must be masked by default: {masked}"
+        );
+        assert!(
+            !masked.contains("super-secret"),
+            "the real captured value must not appear when not revealed: {masked}"
+        );
+    }
+
+    #[test]
+    fn format_capture_section_reveals_the_value_when_asked() {
+        let response = response_with(&[("X-Token", "super-secret")], "");
+        let report = evaluate_capture(
+            "method: GET\nurl: https://example.com\ncapture:\n  token: {header: X-Token}\n",
+            &response,
+        );
+
+        let path = report.results()[0].path.clone();
+        let revealed = format_capture_section(&report, true);
+
+        assert!(
+            revealed.contains(&format!("token from `{path}` = super-secret")),
+            "the real value must appear once revealed: {revealed}"
+        );
+    }
+
+    #[test]
+    fn format_capture_section_never_masks_a_failure() {
+        // No `X-Token` header in the response, so the capture fails — and a
+        // failure never had a value to redact in the first place, the same
+        // rule sendra-cli's own `--json` `CaptureRecord` follows.
+        let response = response_with(&[], "");
+        let report = evaluate_capture(
+            "method: GET\nurl: https://example.com\ncapture:\n  token: {header: X-Token}\n",
+            &response,
+        );
+
+        let path = report.results()[0].path.clone();
+        let masked = format_capture_section(&report, false);
+        let revealed = format_capture_section(&report, true);
+
+        assert_eq!(
+            masked, revealed,
+            "a failed capture has no value, so masking it must not change its rendering"
+        );
+        assert!(
+            !masked.contains(REDACTED_CAPTURE_VALUE),
+            "a failure is shown as a failure, not as a redacted value: {masked}"
+        );
+        assert!(masked.contains(&format!("✗ token from `{path}`")));
+    }
+
+    #[test]
+    fn toggle_reveal_captures_flips_and_flips_back() {
+        let mut state = AppState::default();
+        assert!(!state.reveal_captures);
+
+        update(&mut state, Message::ToggleRevealCaptures);
+        assert!(state.reveal_captures);
+
+        update(&mut state, Message::ToggleRevealCaptures);
+        assert!(!state.reveal_captures);
+    }
+
+    #[test]
+    fn reveal_captures_is_not_carried_over_to_the_next_run() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        update(&mut state, Message::ToggleRevealCaptures);
+        assert!(state.reveal_captures);
+        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        assert!(
+            state.reveal_captures,
+            "revealing must survive until the run it was revealed for is replaced"
+        );
+
+        // A second run on the same request — proof this is not "persisted",
+        // just held for the run that was on screen when it was revealed.
+        update(&mut state, Message::RunRequested);
+
+        assert!(
+            !state.reveal_captures,
+            "a fresh run must start with captures masked again, never auto-revealed"
+        );
+    }
+
+    #[test]
+    fn reveal_captures_resets_when_the_selection_changes() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        update(&mut state, Message::ToggleRevealCaptures);
+        assert!(state.reveal_captures);
+
+        update(&mut state, Message::SelectNext);
+
+        assert!(
+            !state.reveal_captures,
+            "moving to a different request must not carry a reveal over to it"
+        );
+    }
+
+    /// End-to-end proof, through the real `view()`: a captured value is
+    /// masked on first render, the real value appears once
+    /// `ToggleRevealCaptures` is applied, and a fresh run puts the mask back
+    /// — the three states the proof requirement asks for, read back from the
+    /// actual character buffer rather than from `format_capture_section` in
+    /// isolation.
+    #[test]
+    fn view_masks_captures_by_default_reveals_on_toggle_and_remasks_on_a_new_run() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut state = loaded_state(VALID_COLLECTION);
+        let response = response_with(&[("X-Token", "super-secret")], "");
+        let capture = evaluate_capture(
+            "method: GET\nurl: https://example.com\ncapture:\n  token: {header: X-Token}\n",
+            &response,
+        );
+        let outcome = || RunOutcome {
+            result: Ok(response.clone()),
+            assertions: AssertionReport::default(),
+            capture: capture.clone(),
+        };
+
+        let render = |state: &AppState| {
+            let backend = TestBackend::new(100, 15);
+            let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+            terminal
+                .draw(|frame| view(state, frame))
+                .expect("rendering must not panic");
+            buffer_to_string(terminal.backend().buffer())
+        };
+
+        // A masked/revealed capture *line* is what's under test —
+        // `= <redacted>` vs `= super-secret` — not whether "super-secret"
+        // appears anywhere on screen at all: the raw `X-Token` response
+        // header carries the same value and is shown in full regardless (by
+        // design; see the doc comment on `format_capture_section`), so a
+        // whole-screen search for the string would fail for the wrong
+        // reason even when masking is working correctly.
+        let capture_line_contains = |screen: &str, needle: &str| {
+            screen
+                .lines()
+                .any(|line| line.contains("token from") && line.contains(needle))
+        };
+
+        update(&mut state, Message::RunRequested);
+        update(&mut state, Message::RunCompleted(outcome()));
+        let masked_screen = render(&state);
+        assert!(
+            capture_line_contains(&masked_screen, REDACTED_CAPTURE_VALUE),
+            "captures must be masked by default:\n{masked_screen}"
+        );
+        assert!(
+            !capture_line_contains(&masked_screen, "super-secret"),
+            "the capture line must not show the real value by default:\n{masked_screen}"
+        );
+
+        update(&mut state, Message::ToggleRevealCaptures);
+        let revealed_screen = render(&state);
+        assert!(
+            capture_line_contains(&revealed_screen, "super-secret"),
+            "the real value must be on the capture line after the reveal keybinding:\n{revealed_screen}"
+        );
+
+        update(&mut state, Message::RunRequested);
+        update(&mut state, Message::RunCompleted(outcome()));
+        let next_run_screen = render(&state);
+        assert!(
+            capture_line_contains(&next_run_screen, REDACTED_CAPTURE_VALUE),
+            "a new run must not carry the reveal over — masked again by default:\n{next_run_screen}"
+        );
+        assert!(
+            !capture_line_contains(&next_run_screen, "super-secret"),
+            "a new run's capture line must not still show the real value:\n{next_run_screen}"
+        );
+    }
+
     #[test]
     fn run_completed_err_renders_the_real_sendra_error_text() {
         let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
         let expected = error.to_string();
 
-        let text = format_run_result(&Err(error));
+        let text = format_run_result(&failed_outcome(error), false);
 
         assert!(
             text.contains(&expected),
@@ -1315,11 +1780,16 @@ requests:
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let result: Result<Response, SendraError> = Ok(response_with(&[], &huge_body));
+        let outcome = RunOutcome {
+            result: Ok(response_with(&[], &huge_body)),
+            assertions: AssertionReport::default(),
+            capture: CaptureReport::default(),
+        };
 
-        // 5000 body lines, plus the status line and the blank separator line
-        // `format_response` always puts ahead of a non-empty body.
-        let total_lines = 5002;
+        // Computed from the real formatted text rather than hand-counted,
+        // so this stays correct however `format_run_result` lays out the
+        // status/headers/body plus the assertions/capture sections below it.
+        let total_lines = format_run_result(&outcome, false).lines().count();
         let backend = TestBackend::new(60, 5);
         let mut terminal = Terminal::new(backend).expect("a test terminal builds");
 
@@ -1329,7 +1799,7 @@ requests:
         // reporting a scroll position past `total`.
         terminal
             .draw(|frame| {
-                render_response_panel(frame, frame.area(), &result, usize::MAX);
+                render_response_panel(frame, frame.area(), &outcome, usize::MAX, false);
             })
             .expect("drawing a huge, over-scrolled body must not panic");
 
@@ -1361,7 +1831,14 @@ requests:
         let mut state = loaded_state(VALID_COLLECTION);
         update(&mut state, Message::RunRequested);
         let response = response_with(&[("X-Request-Id", "abc123")], "hello world");
-        update(&mut state, Message::RunCompleted(Ok(response)));
+        update(
+            &mut state,
+            Message::RunCompleted(RunOutcome {
+                result: Ok(response),
+                assertions: AssertionReport::default(),
+                capture: CaptureReport::default(),
+            }),
+        );
 
         let backend = TestBackend::new(100, 15);
         let mut terminal = Terminal::new(backend).expect("a test terminal builds");
@@ -1395,7 +1872,7 @@ requests:
         update(&mut state, Message::RunRequested);
         let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
         let expected_message = error.to_string();
-        update(&mut state, Message::RunCompleted(Err(error)));
+        update(&mut state, Message::RunCompleted(failed_outcome(error)));
 
         let backend = TestBackend::new(100, 15);
         let mut terminal = Terminal::new(backend).expect("a test terminal builds");

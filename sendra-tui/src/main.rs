@@ -151,6 +151,7 @@ fn next_message(overlay_open: bool) -> io::Result<Message> {
                 KeyCode::Enter | KeyCode::Char('r') => Ok(Message::RunRequested),
                 KeyCode::PageDown => Ok(Message::ScrollResponseDown),
                 KeyCode::PageUp => Ok(Message::ScrollResponseUp),
+                KeyCode::Char('c') => Ok(Message::ToggleRevealCaptures),
                 _ => Ok(Message::Tick),
             }
         }
