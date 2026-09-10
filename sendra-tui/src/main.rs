@@ -1,3 +1,5 @@
+mod app;
+
 use std::io::{self, Stdout};
 use std::panic;
 use std::time::Duration;
@@ -9,6 +11,8 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+
+use app::{update, view, AppState, Message};
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
@@ -30,24 +34,39 @@ fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
-    loop {
-        terminal.draw(|frame| {
-            frame.render_widget(ratatui::widgets::Clear, frame.area());
-        })?;
+/// The only place allowed to touch crossterm event types directly — translates
+/// a poll/read result into a `Message`, keeping `update`/`view` crossterm-agnostic.
+fn next_message() -> io::Result<Message> {
+    if !event::poll(Duration::from_millis(100))? {
+        return Ok(Message::Tick);
+    }
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                let is_quit = key.code == KeyCode::Char('q')
-                    || (key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL));
-                if is_quit {
-                    return Ok(());
-                }
+    match event::read()? {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            let is_quit = key.code == KeyCode::Char('q')
+                || (key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL));
+            if is_quit {
+                Ok(Message::Quit)
+            } else {
+                Ok(Message::Tick)
             }
+        }
+        _ => Ok(Message::Tick),
+    }
+}
+
+fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+    let mut state = AppState::default();
+
+    loop {
+        terminal.draw(|frame| view(&state, frame))?;
+
+        let msg = next_message()?;
+        update(&mut state, msg);
+
+        if state.should_quit {
+            return Ok(());
         }
     }
 }
