@@ -131,10 +131,41 @@ pub enum Message {
     /// A no-op whenever there is nothing showing that could scroll — see
     /// `render_response_panel`, which is the only place `response_scroll` is
     /// read and where the actual clamping against content length happens.
+    ///
+    /// **Keybinding model (issue 13):** arrow keys (and `j`/`k`) always move
+    /// the request-list selection, full stop — never the response scroll,
+    /// regardless of whether a response happens to be showing. The response
+    /// panel's own scroll lives entirely on `PageUp`/`PageDown` (this
+    /// variant and [`Message::ScrollResponseUp`]) plus `Home`/`End`
+    /// ([`Message::ScrollResponseTop`]/[`Message::ScrollResponseBottom`]
+    /// below). A focus-switch model (where arrows mean different things
+    /// depending on whether the response panel currently has "focus") was
+    /// considered and rejected: it would make the same physical key do two
+    /// different things depending on state the help bar cannot fully convey
+    /// at a glance, exactly the ambiguity this issue asks to avoid. Four
+    /// keys with one meaning each, never two keys sharing a meaning that
+    /// depends on invisible state, is the simpler and more predictable rule.
+    /// `main::next_message` is the one place that turns these keys into
+    /// messages; `status_help_text` is what tells the user which apply.
     ScrollResponseDown,
     /// PageUp on the response panel: scrolls its text up a few lines. See
     /// [`Message::ScrollResponseDown`].
     ScrollResponseUp,
+    /// `Home` on the response panel: jumps straight to the top (line 0)
+    /// rather than requiring repeated `PageUp` presses — the "finer/complete
+    /// scrolling" half of issue 13 that doesn't collide with the
+    /// request-list's own arrow-key bindings, since `Home`/`End` are not
+    /// bound to anything else anywhere in the app. See
+    /// [`Message::ScrollResponseDown`] for the full keybinding model this is
+    /// part of.
+    ScrollResponseTop,
+    /// `End` on the response panel: jumps to the last visible page rather
+    /// than requiring repeated `PageDown` presses. Implemented by setting
+    /// `response_scroll` to `usize::MAX` and letting `render_response_panel`
+    /// clamp it against the real content height at render time — the same
+    /// clamp every other scroll value already goes through, so this needs
+    /// no separate "what's the last valid position" calculation here.
+    ScrollResponseBottom,
     /// `c`: flips `reveal_captures`. Masked values become visible, visible
     /// values become masked again — a toggle rather than a one-way reveal,
     /// so hiding them again does not need a second, differently-named key.
@@ -271,6 +302,12 @@ pub fn update(state: &mut AppState, msg: Message) {
         Message::ScrollResponseUp => {
             state.response_scroll = state.response_scroll.saturating_sub(SCROLL_STEP_LINES);
         }
+        Message::ScrollResponseTop => state.response_scroll = 0,
+        // See the doc comment on this variant: the real clamp happens in
+        // `render_response_panel`, against whatever area is current at
+        // render time, the same way an over-scroll from any other source
+        // already does.
+        Message::ScrollResponseBottom => state.response_scroll = usize::MAX,
         Message::ToggleRevealCaptures => state.reveal_captures = !state.reveal_captures,
         // See the doc comment on `Message::Resize` — the redraw itself
         // comes from `terminal.draw` re-running `view` against the
@@ -395,6 +432,21 @@ fn render_error(frame: &mut Frame, area: Rect, heading: &str, error: &impl std::
     );
 }
 
+/// A `ListState` built fresh every frame, `offset` always starting at `0`,
+/// deliberately — nothing in `AppState` tracks a scroll/viewport position
+/// for this list. That is not a gap: ratatui's `List` widget computes its
+/// own visible window from `state.selected` and `state.offset` on every
+/// render (`ratatui_widgets::list::rendering::List::get_items_bounds`),
+/// walking the offset forward or back as needed until the selected index
+/// falls inside the area actually available — so handing it a fresh
+/// `offset: 0` and the real `selected` index each frame reliably scrolls
+/// the list to keep the selection visible, including the two directions a
+/// hand-rolled viewport-window calculation would have to special-case
+/// itself: scrolling down past the bottom of the current window, and
+/// wrap-around (`move_selection` in this file) snapping straight from the
+/// last item back to the first, or the first back to the last, which must
+/// re-scroll the window to the opposite end in one step. Verified, not
+/// assumed — see `collection_browser_scrolls_to_keep_selection_visible`.
 fn render_request_list(frame: &mut Frame, area: Rect, document: &Document, selected: usize) {
     let items: Vec<ListItem> = document
         .requests()
@@ -799,7 +851,7 @@ fn status_help_text(state: &AppState) -> String {
                 "  c reveal/hide captures"
             };
             format!(
-                "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn scroll{reveal}  e env  q quit"
+                "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn/Home/End scroll{reveal}  e env  q quit"
             )
         }
     }
@@ -1043,6 +1095,19 @@ requests:
 
     const MALFORMED_YAML: &str = "requests: [this is not valid yaml";
 
+    /// A collection of `n` requests named `Request0`..`Request{n-1}` — used
+    /// to build a collection taller than a small test terminal, to exercise
+    /// the request list's own scrolling.
+    fn many_request_collection(n: usize) -> String {
+        let mut yaml = String::from("name: test\nrequests:\n");
+        for i in 0..n {
+            yaml.push_str(&format!(
+                "  - name: Request{i}\n    method: GET\n    url: https://example.com/{i}\n"
+            ));
+        }
+        yaml
+    }
+
     fn loaded_state(yaml: &str) -> AppState {
         let mut state = AppState::default();
         let document = Document::from_yaml_str(yaml).expect("valid test YAML");
@@ -1204,6 +1269,97 @@ requests:
         update(&mut state, Message::SelectPrevious);
 
         assert!(matches!(state.load_state, LoadState::Loading));
+    }
+
+    /// A collection with far more requests than fit on screen, driven
+    /// through the real `update()` + `view()` exactly as a keypress would:
+    /// scrolling down past the bottom of the visible window, scrolling back
+    /// up, and the two wrap-around jumps (last-to-first, first-to-last) that
+    /// `move_selection` produces — each must bring the newly selected
+    /// request into view, never leave the highlight off-screen with nothing
+    /// visibly selected.
+    #[test]
+    fn collection_browser_scrolls_to_keep_selection_visible() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        const REQUEST_COUNT: usize = 30;
+        let mut state = loaded_state(&many_request_collection(REQUEST_COUNT));
+
+        // 10 rows total: 9 for the panes, 1 for the status bar — so well
+        // under half of the 30 requests can be on screen at once.
+        let render = |state: &AppState| {
+            let backend = TestBackend::new(60, 10);
+            let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+            terminal
+                .draw(|frame| view(state, frame))
+                .expect("rendering must not panic");
+            buffer_to_string(terminal.backend().buffer())
+        };
+
+        let top_screen = render(&state);
+        assert!(
+            top_screen.contains("Request0"),
+            "the first request must be visible at the very top:\n{top_screen}"
+        );
+        assert!(
+            !top_screen.contains("Request29"),
+            "the last request must not already be visible before scrolling down to it:\n{top_screen}"
+        );
+
+        // Move well past the bottom of the initial visible window.
+        for _ in 0..20 {
+            update(&mut state, Message::SelectNext);
+        }
+        assert_eq!(selected(&state), 20);
+        let scrolled_down_screen = render(&state);
+        assert!(
+            scrolled_down_screen.contains("Request20"),
+            "the newly selected request must have scrolled into view:\n{scrolled_down_screen}"
+        );
+        assert!(
+            !scrolled_down_screen.contains("Request0"),
+            "the list must have actually scrolled — the far-away top item must no longer \
+             be on screen:\n{scrolled_down_screen}"
+        );
+
+        // Wrap forward from somewhere in the middle straight past the last
+        // item back to the first.
+        for _ in 0..10 {
+            update(&mut state, Message::SelectNext);
+        }
+        assert_eq!(
+            selected(&state),
+            0,
+            "SelectNext must wrap from the last request to the first"
+        );
+        let wrapped_to_top_screen = render(&state);
+        assert!(
+            wrapped_to_top_screen.contains("Request0"),
+            "wrapping to the first request must scroll the list back to the top:\n{wrapped_to_top_screen}"
+        );
+        assert!(
+            !wrapped_to_top_screen.contains("Request29"),
+            "the list must not still be showing the bottom after wrapping to the top:\n{wrapped_to_top_screen}"
+        );
+
+        // And the reverse wrap: from the first request straight back to the
+        // last.
+        update(&mut state, Message::SelectPrevious);
+        assert_eq!(
+            selected(&state),
+            REQUEST_COUNT - 1,
+            "SelectPrevious must wrap from the first request to the last"
+        );
+        let wrapped_to_bottom_screen = render(&state);
+        assert!(
+            wrapped_to_bottom_screen.contains("Request29"),
+            "wrapping to the last request must scroll the list down to show it:\n{wrapped_to_bottom_screen}"
+        );
+        assert!(
+            !wrapped_to_bottom_screen.contains("Request0"),
+            "the list must not still be showing the top after wrapping to the bottom:\n{wrapped_to_bottom_screen}"
+        );
     }
 
     #[test]
@@ -1567,6 +1723,32 @@ requests:
         update(&mut state, Message::ScrollResponseUp);
 
         assert_eq!(state.response_scroll, 0);
+    }
+
+    #[test]
+    fn scroll_top_jumps_straight_to_zero_from_anywhere() {
+        let mut state = AppState {
+            response_scroll: 5_000,
+            ..AppState::default()
+        };
+
+        update(&mut state, Message::ScrollResponseTop);
+
+        assert_eq!(state.response_scroll, 0);
+    }
+
+    #[test]
+    fn scroll_bottom_sets_scroll_past_any_real_content_for_render_time_clamping() {
+        let mut state = AppState::default();
+
+        update(&mut state, Message::ScrollResponseBottom);
+
+        assert_eq!(
+            state.response_scroll,
+            usize::MAX,
+            "End hands off the real clamp to render_response_panel, the same as any \
+             other over-scroll"
+        );
     }
 
     fn response_with(headers: &[(&str, &str)], body: &str) -> Response {
@@ -1990,6 +2172,59 @@ requests:
         assert!(
             !footer_row.contains(&format!("of {}", total_lines + 1)),
             "an over-scroll must not be reported as if it went past the real total"
+        );
+    }
+
+    /// `Home`/`End` end to end, through the real `update()` + `view()`: `End`
+    /// jumps straight to the bottom of a long body in one step (no repeated
+    /// `PageDown`s needed), and `Home` from there jumps straight back to the
+    /// top — the two keys this issue adds to round out response scrolling.
+    #[test]
+    fn home_and_end_jump_the_response_panel_to_the_real_top_and_bottom() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let body = (0..300)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let outcome = RunOutcome {
+            result: Ok(response_with(&[], &body)),
+            assertions: AssertionReport::default(),
+            capture: CaptureReport::default(),
+        };
+        let total_lines = format_run_result(&outcome, false).lines().count();
+
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        update(&mut state, Message::RunCompleted(outcome));
+
+        let render = |state: &AppState| {
+            let backend = TestBackend::new(60, 10);
+            let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+            terminal
+                .draw(|frame| view(state, frame))
+                .expect("rendering must not panic");
+            buffer_to_string(terminal.backend().buffer())
+        };
+
+        update(&mut state, Message::ScrollResponseBottom);
+        let bottom_screen = render(&state);
+        assert!(
+            bottom_screen.contains(&format!("-{total_lines} of {total_lines}")),
+            "End must jump straight to the real end of the body in one step, not \
+             partway through it:\n{bottom_screen}"
+        );
+
+        update(&mut state, Message::ScrollResponseTop);
+        let top_screen = render(&state);
+        assert!(
+            top_screen.contains("Line 1-"),
+            "Home must jump straight back to the real top of the response:\n{top_screen}"
+        );
+        assert!(
+            top_screen.contains("201 Created"),
+            "the top of the response must show the status line:\n{top_screen}"
         );
     }
 
