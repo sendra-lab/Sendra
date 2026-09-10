@@ -29,6 +29,16 @@ pub struct AppState {
     pub load_state: LoadState,
     /// Every environment discovered at startup, sorted by name.
     pub environments: Vec<NamedEnvironment>,
+    /// Every environment file `main::load_environments` found but could not
+    /// load — a name that exists in `.sendra/environments/` alongside
+    /// whatever `Environment::from_path` said was wrong with it. Previously
+    /// swallowed outright (`.ok()?` inside a `filter_map`, dropping both the
+    /// name and the reason on the floor); now carried through the same
+    /// `Message::EnvironmentsLoaded` as the environments that *did* load, so
+    /// a malformed or unreadable file is a visible, in-app error — shown in
+    /// the overlay via [`render_error`] — rather than a file that silently
+    /// never appears in the list with no indication anything went wrong.
+    pub environment_errors: Vec<(String, SendraError)>,
     /// Index into `environments` for the environment the detail pane
     /// resolves against, or `None` — the honest starting state from issue 5
     /// — until the user picks one in the overlay.
@@ -87,7 +97,13 @@ pub enum Message {
         base_dir: PathBuf,
         result: Box<Result<Document, SendraError>>,
     },
-    EnvironmentsLoaded(Vec<NamedEnvironment>),
+    /// The environments `main::load_environments` found at startup — the
+    /// ones that loaded, and, separately, the ones that were found but
+    /// failed to load (see `AppState::environment_errors`).
+    EnvironmentsLoaded {
+        environments: Vec<NamedEnvironment>,
+        errors: Vec<(String, SendraError)>,
+    },
     /// Moves the collection-browser selection when the overlay is closed, or
     /// the overlay's own cursor when it is open — the same two messages
     /// issue 4 already wired to arrows/j-k, routed by `update()` to whichever
@@ -193,7 +209,13 @@ pub fn update(state: &mut AppState, msg: Message) {
                 Err(error) => LoadState::Failed(error),
             };
         }
-        Message::EnvironmentsLoaded(environments) => state.environments = environments,
+        Message::EnvironmentsLoaded {
+            environments,
+            errors,
+        } => {
+            state.environments = environments;
+            state.environment_errors = errors;
+        }
         Message::SelectNext => select(state, 1),
         Message::SelectPrevious => select(state, -1),
         Message::OpenEnvironmentOverlay => {
@@ -286,22 +308,30 @@ fn select(state: &mut AppState, delta: isize) {
 }
 
 pub fn view(state: &AppState, frame: &mut Frame) {
+    // The bottom row is reserved in every `LoadState`, not only `Loaded` —
+    // an error state must not dead-end the app, and the help bar showing
+    // which keys still work (at minimum quit, per `status_help_text`) is
+    // exactly what makes that visible rather than assumed. See that
+    // function's own doc comment for how it reads `load_state` to keep this
+    // honest instead of always claiming nav/run apply.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(frame.area());
+
     match &state.load_state {
-        LoadState::Loading => render_message(frame, "Loading collection..."),
-        LoadState::NoPathProvided => render_message(frame, "No collection path provided."),
+        LoadState::Loading => render_message(frame, rows[0], "Loading collection..."),
+        LoadState::NoPathProvided => {
+            render_message(frame, rows[0], "No collection path provided.");
+        }
         LoadState::Failed(error) => {
-            render_message(frame, &format!("Failed to load collection: {error}"));
+            render_error(frame, rows[0], "Failed to load collection", error);
         }
         LoadState::Loaded {
             document,
             selected,
             base_dir,
         } => {
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(1)])
-                .split(frame.area());
-
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
@@ -309,17 +339,42 @@ pub fn view(state: &AppState, frame: &mut Frame) {
 
             render_request_list(frame, panes[0], document, *selected);
             render_detail_pane(frame, panes[1], document, *selected, base_dir, state);
-            render_status_bar(frame, rows[1], state);
         }
     }
+
+    render_status_bar(frame, rows[1], state);
 
     if let Some(cursor) = state.environment_overlay {
         render_environment_overlay(frame, state, cursor);
     }
 }
 
-fn render_message(frame: &mut Frame, text: &str) {
-    frame.render_widget(Paragraph::new(text.to_string()), frame.area());
+fn render_message(frame: &mut Frame, area: Rect, text: &str) {
+    frame.render_widget(Paragraph::new(text.to_string()), area);
+}
+
+/// One error, formatted the same way everywhere sendra-tui shows one: a
+/// short heading naming *what* failed, then the real error's own `Display`
+/// text, verbatim, on the line(s) under it — never paraphrased or
+/// re-summarized. Every place with an error to show (a collection that
+/// failed to load, an environment file that failed to load, a preview that
+/// could not be resolved, a run that failed) builds its text through this,
+/// so there is one error box style in the whole crate rather than three or
+/// four ad hoc ones that happen to drift apart over time.
+fn format_error(heading: &str, error: &impl std::fmt::Display) -> String {
+    format!("⚠ {heading}\n{error}")
+}
+
+/// [`format_error`], rendered into `area` as a wrapped `Paragraph` — the
+/// standalone-error half of the pair; [`format_error`] alone is what the
+/// call sites that embed an error inside other text (the request preview,
+/// the response panel) use instead, since those need the string, not a
+/// widget of their own.
+fn render_error(frame: &mut Frame, area: Rect, heading: &str, error: &impl std::fmt::Display) {
+    frame.render_widget(
+        Paragraph::new(format_error(heading, error)).wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn render_request_list(frame: &mut Frame, area: Rect, document: &Document, selected: usize) {
@@ -383,11 +438,17 @@ fn render_detail_pane(
         // environment specifically does not define the variable — either
         // way, the real sendra-core error is shown, never a faked value.
         Err(error) => match active {
-            Some(named) => format!(
-                "Could not resolve preview against environment '{}':\n{error}",
-                named.name
+            Some(named) => format_error(
+                &format!(
+                    "Could not resolve preview against environment '{}'",
+                    named.name
+                ),
+                &error,
             ),
-            None => format!("Could not resolve preview (no environment selected yet):\n{error}"),
+            None => format_error(
+                "Could not resolve preview (no environment selected yet)",
+                &error,
+            ),
         },
     };
 
@@ -463,12 +524,16 @@ fn render_response_panel(
 /// (`format_assertions`/`format_capture_section`) — always both, even when
 /// their reports are empty, so "no assertions declared" reads distinctly
 /// from either a passing or a failing assertion block, and likewise for
-/// captures. On failure, the real `SendraError`'s own `Display` — via
-/// `{error}`, the same `thiserror`-derived message `sendra run` itself would
-/// print for the same failure. There is no response to lay out and nothing
-/// was checked or captured, so that is the whole of it: the error, not a
-/// TUI-invented summary of it and not two sections falsely claiming "no
-/// assertions declared" for a request that may well have some.
+/// captures. On failure, [`format_error`] over the real
+/// [`run_request::RunError`]'s own `Display` — the same wording
+/// `sendra run` itself would print for the same `sendra_core::SendraError`
+/// (`RunError::Core`), or, for the one failure that is not core's to report
+/// (`RunError::RuntimeUnavailable` — see that variant's doc comment), the
+/// honest reason the pipeline never even reached the network. Either way
+/// there is no response to lay out and nothing was checked or captured, so
+/// this is the whole of it: the real error, not a TUI-invented summary of
+/// it and not two sections falsely claiming "no assertions declared" for a
+/// request that may well have some.
 fn format_run_result(outcome: &RunOutcome, reveal_captures: bool) -> String {
     match &outcome.result {
         Ok(response) => {
@@ -479,7 +544,7 @@ fn format_run_result(outcome: &RunOutcome, reveal_captures: bool) -> String {
             text.push_str(&format_capture_section(&outcome.capture, reveal_captures));
             text
         }
-        Err(error) => format!("Request failed:\n{error}"),
+        Err(error) => format_error("Request failed", error),
     }
 }
 
@@ -648,31 +713,44 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 /// The bottom bar's full text — status where there is one, then the
 /// keybindings currently live — chosen from exactly the state `update()`
 /// itself branches on, so this can never say a key does something `update()`
-/// would actually refuse, or omit one it would accept. Four contexts, in the
+/// would actually refuse, or omit one it would accept. Five contexts, in the
 /// same priority order `update()`'s own InFlight guard and `view()`'s own
 /// overlay-vs-response-panel-vs-preview dispatch already imply:
 ///
 /// 1. **The environment overlay is open** (`environment_overlay.is_some()`,
 ///    the same condition `view()` checks to draw it) — only the overlay's
 ///    own keys apply, checked first because the overlay is drawn on top of
-///    everything else and is what has the user's attention.
-/// 2. **A run is in flight** (`RunState::InFlight`) — `update()`'s own guard
+///    everything else and is what has the user's attention, and because
+///    nothing about `next_message` stops it opening over a `load_state`
+///    that isn't `Loaded` (see the next context).
+/// 2. **No collection is loaded** (`load_state` is `Loading`,
+///    `NoPathProvided` or `Failed` — see `view()`'s own match on it): there
+///    is no request list and nothing to run, so nav/run are not offered;
+///    the environment overlay and quit are the only two keys that do
+///    anything, and both keep working, which is the whole point of this
+///    context existing — a failed collection load must not read as a dead
+///    end.
+/// 3. **A run is in flight** (`RunState::InFlight`) — `update()`'s own guard
 ///    at the top of the function refuses every navigation/overlay/run
 ///    message while this holds, so `q` (never blocked — see that guard's own
 ///    comment) is genuinely the only key left to advertise.
-/// 3. **A run has completed** (`RunState::Completed`) — the response panel
+/// 4. **A run has completed** (`RunState::Completed`) — the response panel
 ///    is what `render_detail_pane` is showing (see its own doc comment), so
 ///    this is where the scroll keys and, when there is something to reveal,
 ///    the capture-reveal key belong; nav/run/env/quit are back too, since
 ///    the InFlight guard no longer applies.
-/// 4. **Otherwise** (`RunState::Idle`) — the ordinary collection browser,
-///    showing the request preview.
+/// 5. **Otherwise** (`RunState::Idle`, a collection is loaded) — the
+///    ordinary collection browser, showing the request preview.
 ///
 /// No key is added here that `update`/`main::next_message` do not already
 /// bind — this only narrates keys issues 1-9 already wired.
 fn status_help_text(state: &AppState) -> String {
     if state.environment_overlay.is_some() {
         return "↑/↓ nav  enter confirm  esc cancel  q quit".to_string();
+    }
+
+    if !matches!(state.load_state, LoadState::Loaded { .. }) {
+        return "e env  q quit".to_string();
     }
 
     match &state.run_state {
@@ -833,18 +911,54 @@ fn render_environment_overlay(frame: &mut Frame, state: &AppState, cursor: usize
 
     let inner = inset(area);
 
+    // Environments that were found in `.sendra/environments/` but failed to
+    // load (see `AppState::environment_errors`'s own doc comment) get a
+    // fixed strip at the bottom of the overlay, through the same
+    // `format_error` every other error in the crate goes through — no
+    // second, differently-styled error box for this one. Reserved only when
+    // there is something to show, so an overlay with nothing wrong draws
+    // exactly as it always has.
+    let error_rows = if state.environment_errors.is_empty() {
+        0
+    } else {
+        // A rough, not exact, line budget — good enough to make the errors
+        // readable without starving the list below it; getting the wrapped
+        // line count exactly right would need the width `Layout::split`
+        // itself is about to decide, which is not available yet.
+        ((state.environment_errors.len() * 2) as u16).min(inner.height / 2)
+    };
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(error_rows)])
+        .split(inner);
+    let (list_area, error_area) = (sections[0], sections[1]);
+
+    if !state.environment_errors.is_empty() {
+        let text = state
+            .environment_errors
+            .iter()
+            .map(|(name, error)| {
+                format_error(&format!("Environment '{name}' failed to load"), error)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), error_area);
+    }
+
     if state.environments.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No environments found in .sendra/environments/."),
-            inner,
-        );
+        let text = if state.environment_errors.is_empty() {
+            "No environments found in .sendra/environments/."
+        } else {
+            "No environments loaded successfully — see the errors below."
+        };
+        frame.render_widget(Paragraph::new(text), list_area);
         return;
     }
 
     let panes = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(inner);
+        .split(list_area);
 
     let items: Vec<ListItem> = state
         .environments
@@ -1144,7 +1258,10 @@ requests:
 
         update(
             &mut state,
-            Message::EnvironmentsLoaded(vec![named_environment("default", &[])]),
+            Message::EnvironmentsLoaded {
+                environments: vec![named_environment("default", &[])],
+                errors: Vec::new(),
+            },
         );
 
         assert_eq!(state.environments.len(), 1);
@@ -1231,7 +1348,7 @@ requests:
 
     fn failed_outcome(error: SendraError) -> RunOutcome {
         RunOutcome {
-            result: Err(error),
+            result: Err(error.into()),
             assertions: AssertionReport::default(),
             capture: CaptureReport::default(),
         }
@@ -2124,5 +2241,227 @@ requests:
         assert_ne!(browsing_screen, completed_screen);
         assert_ne!(browsing_screen, overlay_screen);
         assert_ne!(completed_screen, overlay_screen);
+    }
+
+    // --- error-handling audit (issue 11) ---------------------------------
+
+    #[test]
+    fn format_error_shows_a_heading_and_the_real_error_verbatim() {
+        let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
+        let expected = error.to_string();
+
+        let text = format_error("Failed to load collection", &error);
+
+        assert!(text.starts_with('⚠'), "{text}");
+        assert!(text.contains("Failed to load collection"), "{text}");
+        assert!(
+            text.contains(&expected),
+            "the real error text must appear verbatim: {text}"
+        );
+    }
+
+    #[test]
+    fn environments_loaded_message_stores_errors_alongside_environments() {
+        let mut state = AppState::default();
+        let bad_error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
+
+        update(
+            &mut state,
+            Message::EnvironmentsLoaded {
+                environments: vec![named_environment("default", &[])],
+                errors: vec![("broken".to_string(), bad_error)],
+            },
+        );
+
+        assert_eq!(state.environments.len(), 1);
+        assert_eq!(state.environment_errors.len(), 1);
+        assert_eq!(state.environment_errors[0].0, "broken");
+    }
+
+    /// A failed collection load must not be a dead end: quitting and
+    /// opening the environment overlay — the two keys `status_help_text`
+    /// advertises for this context — must still actually work.
+    #[test]
+    fn app_stays_responsive_after_a_collection_load_failure() {
+        let mut state = AppState::default();
+        let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
+        update(
+            &mut state,
+            Message::CollectionLoaded {
+                base_dir: PathBuf::from("."),
+                result: Box::new(Err(error)),
+            },
+        );
+        assert!(matches!(state.load_state, LoadState::Failed(_)));
+
+        state.environments = vec![named_environment("default", &[])];
+        update(&mut state, Message::OpenEnvironmentOverlay);
+        assert_eq!(
+            state.environment_overlay,
+            Some(0),
+            "the environment overlay must still open after a failed collection load"
+        );
+
+        update(&mut state, Message::Quit);
+        assert!(
+            state.should_quit,
+            "quit must still work after a failed collection load"
+        );
+    }
+
+    /// The same guarantee, for a run that itself failed (an unreachable
+    /// host, say): navigation and re-running must both still work
+    /// afterward, not just quit.
+    #[test]
+    fn app_stays_responsive_after_a_failed_run() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
+        update(&mut state, Message::RunCompleted(failed_outcome(error)));
+        assert!(matches!(
+            state.run_state,
+            RunState::Completed(RunOutcome { result: Err(_), .. })
+        ));
+
+        update(&mut state, Message::SelectNext);
+        assert_eq!(
+            selected(&state),
+            1,
+            "selection must still move after a failed run"
+        );
+
+        update(&mut state, Message::RunRequested);
+        assert!(
+            matches!(state.run_state, RunState::InFlight),
+            "a request must still be runnable again after a previous run failed"
+        );
+
+        update(&mut state, Message::Quit);
+        assert!(state.should_quit, "quit must still work after a failed run");
+    }
+
+    #[test]
+    fn help_bar_offers_only_env_and_quit_with_no_collection_loaded() {
+        for state in [
+            AppState::default(),
+            {
+                let mut s = AppState::default();
+                update(&mut s, Message::NoCollectionPath);
+                s
+            },
+            {
+                let mut s = AppState::default();
+                let error =
+                    Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
+                update(
+                    &mut s,
+                    Message::CollectionLoaded {
+                        base_dir: PathBuf::from("."),
+                        result: Box::new(Err(error)),
+                    },
+                );
+                s
+            },
+        ] {
+            let text = status_help_text(&state);
+            assert!(text.contains("env"), "{text}");
+            assert!(text.contains('q'), "{text}");
+            assert!(
+                !text.contains("nav") && !text.contains("run"),
+                "no collection means nothing to navigate or run: {text}"
+            );
+        }
+    }
+
+    /// End-to-end proof, through the real `view()`, of the three triggers
+    /// the audit asks for: a malformed collection, a malformed environment
+    /// file, and — separately, in `run_request`'s own tests — an
+    /// unreachable host. Each must show a readable message via the same
+    /// [`format_error`] path, and the bar underneath must still say `q quit`
+    /// works.
+    #[test]
+    fn view_shows_a_readable_error_for_a_malformed_collection_and_stays_responsive() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut state = AppState::default();
+        let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
+        let expected = error.to_string();
+        update(
+            &mut state,
+            Message::CollectionLoaded {
+                base_dir: PathBuf::from("."),
+                result: Box::new(Err(error)),
+            },
+        );
+
+        let backend = TestBackend::new(100, 15);
+        let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+        terminal
+            .draw(|frame| view(&state, frame))
+            .expect("rendering a load failure must not panic");
+
+        let screen = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            screen.contains(&expected),
+            "the real parse error must be readable on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains('q'),
+            "the help bar must still show quit works:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn view_shows_a_readable_error_for_a_malformed_environment_file() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut state = loaded_state(VALID_COLLECTION);
+        let bad_error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
+        let expected = bad_error.to_string();
+        update(
+            &mut state,
+            Message::EnvironmentsLoaded {
+                environments: Vec::new(),
+                errors: vec![("staging".to_string(), bad_error)],
+            },
+        );
+        update(&mut state, Message::OpenEnvironmentOverlay);
+
+        let backend = TestBackend::new(100, 15);
+        let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+        terminal
+            .draw(|frame| view(&state, frame))
+            .expect("rendering an environment load failure must not panic");
+
+        let screen = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            screen.contains("staging"),
+            "the broken environment's name must be visible:\n{screen}"
+        );
+        assert!(
+            screen.contains(&expected),
+            "the real environment error must be readable on screen:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn run_error_display_covers_both_the_core_and_runtime_variants() {
+        // `Core` displays as the wrapped `SendraError`'s own `Display` —
+        // core's fixed wording for this variant, not the raw `io::Error`
+        // `#[source]` alone does not interpolate into it.
+        let core_error = crate::run_request::RunError::from(SendraError::CurrentDir(
+            std::io::Error::other("boom"),
+        ));
+        assert_eq!(
+            core_error.to_string(),
+            SendraError::CurrentDir(std::io::Error::other("boom")).to_string()
+        );
+
+        let runtime_error =
+            crate::run_request::RunError::RuntimeUnavailable(std::io::Error::other("no threads"));
+        assert!(runtime_error.to_string().contains("no threads"));
+        assert!(runtime_error.to_string().contains("runtime"));
     }
 }
