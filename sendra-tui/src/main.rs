@@ -1,8 +1,10 @@
 mod app;
+mod run_request;
 
 use std::io::{self, Stdout};
 use std::panic;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::Parser;
@@ -16,7 +18,9 @@ use ratatui::Terminal;
 use sendra_core::environment::find_environment;
 use sendra_core::{Document, Environment};
 
-use app::{update, view, AppState, Message, NamedEnvironment};
+use app::{
+    active_environment, update, view, AppState, LoadState, Message, NamedEnvironment, RunState,
+};
 
 #[derive(Parser)]
 #[command(name = "sendra-tui")]
@@ -144,11 +148,37 @@ fn next_message(overlay_open: bool) -> io::Result<Message> {
                 KeyCode::Char('e') => Ok(Message::OpenEnvironmentOverlay),
                 KeyCode::Down | KeyCode::Char('j') => Ok(Message::SelectNext),
                 KeyCode::Up | KeyCode::Char('k') => Ok(Message::SelectPrevious),
+                KeyCode::Enter | KeyCode::Char('r') => Ok(Message::RunRequested),
                 _ => Ok(Message::Tick),
             }
         }
         _ => Ok(Message::Tick),
     }
+}
+
+/// Extracts what a run needs — the selected request, the active environment
+/// (an empty one when none is active, matching the detail pane's own
+/// fallback), and the collection's `base_dir` — right after `update()` has
+/// just moved `run_state` to `InFlight` for a `Message::RunRequested`.
+///
+/// A plain function rather than inlined at the one call site so the
+/// `LoadState::Loaded` destructure — the same shape `render_detail_pane`
+/// already matches on — has a name, and so a future second call site (there
+/// is none today) would not have to duplicate it.
+fn selected_run(state: &AppState) -> Option<(sendra_core::Request, Environment, PathBuf)> {
+    let LoadState::Loaded {
+        document,
+        selected,
+        base_dir,
+    } = &state.load_state
+    else {
+        return None;
+    };
+    let request = document.requests().get(*selected)?.clone();
+    let environment = active_environment(state)
+        .map(|named| named.environment.clone())
+        .unwrap_or_default();
+    Some((request, environment, base_dir.clone()))
 }
 
 fn run(
@@ -160,11 +190,43 @@ fn run(
     update(&mut state, load_message);
     update(&mut state, Message::EnvironmentsLoaded(environments));
 
+    // Carries `Message::RunCompleted` back from whichever thread
+    // `run_request::spawn` put the send on into this loop, which is the only
+    // place allowed to call `update()` — the same rule every other message
+    // source (crossterm events, the startup loads above) already follows.
+    let (run_tx, run_rx) = mpsc::channel::<Message>();
+
     loop {
         terminal.draw(|frame| view(&state, frame))?;
 
+        // Drained before the next blocking key poll below, so a run that
+        // finished while the terminal was waiting for a keypress is reflected
+        // on the very next frame instead of waiting for the user to press
+        // something first.
+        while let Ok(msg) = run_rx.try_recv() {
+            update(&mut state, msg);
+        }
+
         let msg = next_message(state.environment_overlay.is_some())?;
+        let is_run_request = matches!(msg, Message::RunRequested);
+        let was_already_running = matches!(state.run_state, RunState::InFlight);
         update(&mut state, msg);
+
+        // Spawn exactly when this message is the one that just moved
+        // `run_state` from anything else to `InFlight` — `was_already_running`
+        // rules out a `RunRequested` that `update()` refused because a run
+        // was already in flight, so this never spawns a second send on top of
+        // one still running.
+        if is_run_request && !was_already_running {
+            if let (RunState::InFlight, Some((request, environment, base_dir))) =
+                (&state.run_state, selected_run(&state))
+            {
+                let tx = run_tx.clone();
+                run_request::spawn(request, environment, base_dir, move |result| {
+                    let _ = tx.send(Message::RunCompleted(result));
+                });
+            }
+        }
 
         if state.should_quit {
             return Ok(());
