@@ -138,12 +138,23 @@ fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// same physical keys mean different things depending on whether the
 /// environment overlay is on screen, without leaking that decision into
 /// `update`/`view` as raw key codes.
+///
+/// `Event::Resize` gets its own explicit arm to `Message::Resize` rather than
+/// falling into the catch-all `Message::Tick` below — see that variant's doc
+/// comment in `app.rs` for why no further action is needed here: ratatui's
+/// `Terminal::draw` (called at the top of every loop iteration in `run`)
+/// already autoresizes against the backend's real size before rendering, so
+/// simply returning any message — waking the loop for its next `draw` call —
+/// is what actually re-layouts the screen. Verified against
+/// `ratatui_core::terminal::render`/`resize` (ratatui 0.30 / ratatui-core
+/// 0.1.2) rather than assumed.
 fn next_message(overlay_open: bool) -> io::Result<Message> {
     if !event::poll(Duration::from_millis(100))? {
         return Ok(Message::Tick);
     }
 
     match event::read()? {
+        Event::Resize(_, _) => Ok(Message::Resize),
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             let is_quit = key.code == KeyCode::Char('q')
                 || (key.code == KeyCode::Char('c')
