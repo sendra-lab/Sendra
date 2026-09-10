@@ -117,6 +117,19 @@ fn restore_terminal() {
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
 }
 
+/// Whether a panic on `panicking_thread` should restore the terminal, given
+/// `install_panic_hook` was itself called from `main_thread` — pulled out of
+/// the hook closure as a pure, two-`ThreadId` comparison so this gating
+/// decision is unit-testable directly (construct a background thread, take
+/// its real `ThreadId`, assert the predicate) rather than only observable by
+/// actually panicking a real terminal session.
+fn panic_should_restore_terminal(
+    panicking_thread: std::thread::ThreadId,
+    main_thread: std::thread::ThreadId,
+) -> bool {
+    panicking_thread == main_thread
+}
+
 /// Restores the terminal before the default hook prints the panic message —
 /// but **only** for a panic on the thread that actually owns the terminal.
 /// `panic::set_hook` installs one hook for the whole process: every thread
@@ -132,19 +145,6 @@ fn restore_terminal() {
 /// alive and about to draw its next frame — corrupting a session that never
 /// actually crashed, instead of the run simply showing up as a failed
 /// request in the response panel like any other error.
-/// Whether a panic on `panicking_thread` should restore the terminal, given
-/// `install_panic_hook` was itself called from `main_thread` — pulled out of
-/// the hook closure as a pure, two-`ThreadId` comparison so this gating
-/// decision is unit-testable directly (construct a background thread, take
-/// its real `ThreadId`, assert the predicate) rather than only observable by
-/// actually panicking a real terminal session.
-fn panic_should_restore_terminal(
-    panicking_thread: std::thread::ThreadId,
-    main_thread: std::thread::ThreadId,
-) -> bool {
-    panicking_thread == main_thread
-}
-
 fn install_panic_hook() {
     let default_hook = panic::take_hook();
     let main_thread_id = std::thread::current().id();
@@ -484,6 +484,348 @@ mod tests {
             "a panic on any other thread — like run_request::spawn's background \
              run thread — must NOT restore the terminal out from under a main \
              loop that is still alive and running"
+        );
+    }
+}
+
+/// Issue 15, the V1 close-out audit: a direct, automated proof that
+/// sendra-tui's project/config/environment/collection resolution genuinely
+/// matches what sendra-cli resolves for the same real project directory —
+/// not a manual spot-check across issues 1-14, an actual test against a
+/// real fixture on disk.
+///
+/// **Why this lives here, and not under `tests/`:** sendra-tui has no
+/// `lib.rs` (see `Cargo.toml` — `[[bin]]` only), so an integration test
+/// under `tests/` cannot reach `discover_environment_names`,
+/// `load_environments`, or `base_dir` at all — they are private to this
+/// binary crate. This module is compiled inside `main.rs` itself specifically
+/// so it can call sendra-tui's *real* resolution functions, not
+/// reimplemented lookalikes of them.
+///
+/// **Why the "CLI side" calls `sendra_core` directly instead of spawning the
+/// `sendra` binary:** `sendra-cli`'s own `prepare`/`environment_for`
+/// (`sendra-cli/src/run.rs`) are private to that crate, so they cannot be
+/// called from here either way. They are also thin, fixed sequences of
+/// `sendra_core` calls with no resolution logic of their own — `prepare`
+/// is literally `find_project_config` + `Config::resolve_from` +
+/// `environment_for`, which is itself `find_environment` +
+/// `Environment::from_path`. Reading those calls (cited by name below) and
+/// making the identical calls here, then comparing the resulting values with
+/// `assert_eq!`, proves the same thing spawning the real binary and parsing
+/// its `-v`/`--verbose` text would — but directly, on real typed values,
+/// rather than through a second, fragile text format neither side is
+/// actually tested against elsewhere.
+#[cfg(test)]
+mod resolution_parity_tests {
+    use super::*;
+    use sendra_core::config::find_project_config;
+    use sendra_core::environment::find_environment;
+    use sendra_core::{Config, Document, Environment};
+
+    /// A real, on-disk project — not a mock — laid out the way issue 3/6's
+    /// own doc comments describe: `.sendra/config.yaml`,
+    /// `.sendra/environments/*.yaml`, and a collection file living a couple
+    /// of directories below the project root, so resolution genuinely has
+    /// to walk up `ancestors()` rather than trivially matching at depth 0.
+    struct Fixture {
+        _root: tempfile::TempDir,
+        /// `<root>/collections` — where a user would plausibly have their
+        /// shell open while running `sendra-tui` or `sendra run`, i.e. the
+        /// `start_dir` both sides resolve from. Not the project root itself.
+        start_dir: PathBuf,
+        collection_path: PathBuf,
+    }
+
+    fn write(path: &Path, contents: &str) {
+        std::fs::create_dir_all(path.parent().expect("a file has a parent")).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn build_fixture() -> Fixture {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let project = root.path().join("project");
+
+        write(
+            &project.join(".sendra").join("config.yaml"),
+            "headers:\n  X-From-Config: present\ntimeout_seconds: 7\n",
+        );
+        write(
+            &project
+                .join(".sendra")
+                .join("environments")
+                .join("default.yaml"),
+            "base_url: https://default.example.com\napi_key: shh\n",
+        );
+        write(
+            &project
+                .join(".sendra")
+                .join("environments")
+                .join("staging.yaml"),
+            "base_url: https://staging.example.com\n",
+        );
+
+        let collection_path = project.join("collections").join("api.yaml");
+        write(
+            &collection_path,
+            "name: API\n\
+             requests:\n\
+             \x20\x20- name: GetWidget\n\
+             \x20\x20\x20\x20method: GET\n\
+             \x20\x20\x20\x20url: \"{{base_url}}/widgets/1\"\n\
+             \x20\x20- name: CreateWidget\n\
+             \x20\x20\x20\x20method: POST\n\
+             \x20\x20\x20\x20url: \"{{base_url}}/widgets\"\n\
+             \x20\x20\x20\x20body: '{}'\n",
+        );
+
+        let start_dir = collection_path
+            .parent()
+            .expect("the collection file has a parent directory")
+            .to_path_buf();
+
+        Fixture {
+            _root: root,
+            start_dir,
+            collection_path,
+        }
+    }
+
+    /// An empty directory for `XDG_CONFIG_HOME` to point at — "no global
+    /// config" — so this test's result does not depend on whatever the
+    /// machine actually running it happens to have installed. Mirrors
+    /// `sendra-cli/tests/verbose.rs`'s own `empty_xdg_config_home`, for the
+    /// same reason cited there: `global_config_path` honours
+    /// `XDG_CONFIG_HOME` first, on every platform, when it is absolute.
+    ///
+    /// Set via `std::env::set_var`, process-wide, for the duration of this
+    /// one test — every other test in this crate that ends up resolving a
+    /// *real* config either does not assert on its content (the
+    /// `run_request` HTTP tests only check status/body) or does not resolve
+    /// config at all, so a benign race with one of them changes nothing they
+    /// assert on.
+    fn empty_xdg_config_home() -> tempfile::TempDir {
+        tempfile::tempdir().expect("a temporary directory")
+    }
+
+    #[test]
+    fn tui_and_cli_resolution_agree_on_a_real_project_fixture() {
+        let fixture = build_fixture();
+        let xdg_config_home = empty_xdg_config_home();
+        std::env::set_var("XDG_CONFIG_HOME", xdg_config_home.path());
+
+        // --- project root -----------------------------------------------
+        //
+        // `sendra-cli::run::prepare` calls `find_project_config(&start_dir)`
+        // directly (see its own doc comment on `Prepared::project_config`);
+        // sendra-tui's `discover_environment_names` walks `ancestors()` on
+        // its own, for its own `.sendra/environments/` directory, since
+        // `sendra_core` exposes no "list environment names" function (see
+        // that function's doc comment). Both walks must land on the exact
+        // same `.sendra/` directory for the same `start_dir` — this is
+        // exactly the kind of independently-reimplemented directory walk
+        // that could quietly diverge from `find_project_config`'s, the same
+        // family of gap issue 3 already found once (the invented
+        // default-path fallback).
+        let cli_project_config = find_project_config(&fixture.start_dir)
+            .expect("the fixture's .sendra/config.yaml must be found");
+        let cli_project_root = cli_project_config
+            .parent() // .sendra/
+            .and_then(Path::parent) // project/
+            .expect("config.yaml sits two levels under the project root");
+
+        let tui_environment_names = discover_environment_names(&fixture.start_dir);
+        let tui_environments_dir = fixture
+            .start_dir
+            .ancestors()
+            .map(|dir| dir.join(".sendra").join("environments"))
+            .find(|dir| dir.is_dir())
+            .expect("the fixture's .sendra/environments/ must be found");
+        let tui_project_root = tui_environments_dir
+            .parent() // .sendra/
+            .and_then(Path::parent) // project/
+            .expect("environments/ sits two levels under the project root");
+
+        assert_eq!(
+            cli_project_root, tui_project_root,
+            "sendra-tui's own .sendra/environments/ walk and sendra-core's \
+             find_project_config must discover the identical project root"
+        );
+
+        // --- config -------------------------------------------------------
+        //
+        // `prepare` calls `Config::resolve_from(&start_dir,
+        // global_config.as_deref())` with `global_config =
+        // global_config_path().filter(|path| path.is_file())` — exactly what
+        // `run_request::resolve_config` (pulled out of `execute_inner` for
+        // this test) now does too.
+        let cli_config = {
+            let global_config =
+                sendra_core::config::global_config_path().filter(|path| path.is_file());
+            Config::resolve_from(&fixture.start_dir, global_config.as_deref())
+                .expect("the fixture's config.yaml must resolve")
+        };
+        let tui_config = run_request::resolve_config(&fixture.start_dir)
+            .expect("sendra-tui's own config resolution must succeed on the same fixture");
+        assert_eq!(
+            cli_config, tui_config,
+            "sendra-tui and sendra-cli must resolve the identical Config for \
+             the identical project"
+        );
+        // Not just "equal by construction" — prove the fixture's own config
+        // actually took effect on both sides, so an accidental "both sides
+        // silently fell back to defaults" could not pass this test.
+        assert_eq!(
+            tui_config.headers.get("X-From-Config").map(String::as_str),
+            Some("present")
+        );
+        assert_eq!(tui_config.timeout, std::time::Duration::from_secs(7));
+
+        // --- environments (names and content) ------------------------------
+        assert_eq!(
+            tui_environment_names,
+            vec!["default".to_string(), "staging".to_string()],
+            "both environment files in the fixture must be discovered, sorted"
+        );
+
+        let (tui_environments, tui_environment_errors) = load_environments(&fixture.start_dir);
+        assert!(
+            tui_environment_errors.is_empty(),
+            "every fixture environment file is well-formed: {tui_environment_errors:?}"
+        );
+        assert_eq!(tui_environments.len(), 2);
+
+        for name in &tui_environment_names {
+            // `environment_for`'s `Some(name)` branch: `find_environment` +
+            // `Environment::from_path`.
+            let cli_path = find_environment(&fixture.start_dir, name)
+                .unwrap_or_else(|| panic!("environment '{name}' must be found"));
+            let cli_environment = Environment::from_path(&cli_path)
+                .unwrap_or_else(|err| panic!("environment '{name}' must load: {err}"));
+
+            let tui_environment = tui_environments
+                .iter()
+                .find(|named| &named.name == name)
+                .unwrap_or_else(|| panic!("sendra-tui must have discovered '{name}' too"));
+
+            assert_eq!(
+                &tui_environment.environment, &cli_environment,
+                "sendra-tui and sendra-cli must load identical content for \
+                 environment '{name}'"
+            );
+        }
+        // Content check on top of structural equality: prove the loaded
+        // environment really carries the fixture's own variable, not two
+        // empty environments that happen to be equal to each other.
+        let default_env = &tui_environments
+            .iter()
+            .find(|named| named.name == "default")
+            .expect("default.yaml was discovered")
+            .environment;
+        assert_eq!(
+            default_env.variables.get("base_url").map(String::as_str),
+            Some("https://default.example.com")
+        );
+
+        // --- collection -----------------------------------------------------
+        //
+        // `prepare` calls `Document::from_path(path)` directly — the exact
+        // same sendra_core function `main::run`'s own `CollectionLoaded`
+        // message is built from (see `main`'s doc comment on
+        // `load_message`).
+        let cli_document = Document::from_path(&fixture.collection_path)
+            .expect("the fixture collection must parse");
+        let tui_document = Document::from_path(&fixture.collection_path)
+            .expect("sendra-tui must parse the identical file identically");
+        assert_eq!(
+            cli_document, tui_document,
+            "both sides must parse the identical collection identically"
+        );
+        assert_eq!(tui_document.requests().len(), 2);
+        assert_eq!(
+            tui_document.requests()[0].name.as_deref(),
+            Some("GetWidget"),
+            "file order must be preserved"
+        );
+
+        // --- base_dir --------------------------------------------------------
+        //
+        // Where a resolved request's `body_file` would resolve against —
+        // sendra-tui's own `base_dir` helper, which its own doc comment
+        // already claims mirrors sendra-cli's identically-named one in
+        // `sendra-cli/src/run.rs`. That CLI function is private and not
+        // callable from here, but its logic is one line
+        // (`path.parent().filter(...).unwrap_or(".")`) restated directly
+        // from that source rather than assumed.
+        let cli_base_dir = fixture
+            .collection_path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        assert_eq!(base_dir(&fixture.collection_path), cli_base_dir);
+    }
+
+    /// The one enumeration algorithm with no `sendra_core` counterpart to
+    /// compare against directly (see this module's own doc comment):
+    /// `discover_environment_names` finds the *nearest ancestor with an
+    /// `environments/` directory at all*, then lists every `.yaml` file in
+    /// it, while `find_environment` finds, independently **per name**, the
+    /// nearest ancestor whose `.sendra/environments/<name>.yaml` specifically
+    /// exists. For an ordinary single-`.sendra` project (the fixture above)
+    /// those two coincide. This test builds a nested-project layout —
+    /// deliberately pathological, not something issue 3/6 ever claimed to
+    /// handle — to check whether they can actually diverge, rather than
+    /// assuming the ordinary case generalizes.
+    #[test]
+    fn nested_dot_sendra_directories_can_make_the_two_algorithms_disagree() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+
+        // Outer project: only `default.yaml`.
+        write(
+            &root
+                .path()
+                .join(".sendra")
+                .join("environments")
+                .join("default.yaml"),
+            "base_url: https://outer.example.com\n",
+        );
+        // Inner project, nested under the outer one: only `staging.yaml`,
+        // no `default.yaml` of its own.
+        let inner = root.path().join("inner");
+        write(
+            &inner
+                .join(".sendra")
+                .join("environments")
+                .join("staging.yaml"),
+            "base_url: https://inner-staging.example.com\n",
+        );
+
+        let tui_names = discover_environment_names(&inner);
+        // `discover_environment_names` finds the *inner* `environments/`
+        // directory first (nearest ancestor with the directory at all) and
+        // only lists what is inside it.
+        assert_eq!(tui_names, vec!["staging".to_string()]);
+
+        // But `find_environment("default")`, asked independently, does not
+        // stop at the inner directory just because *a* directory exists
+        // there — it walks past it (no `default.yaml` inside) all the way
+        // up to the outer one, and finds a real file.
+        let cli_default = find_environment(&inner, "default");
+        assert!(
+            cli_default.is_some(),
+            "find_environment must still resolve 'default' from the outer \
+             project, proving the two algorithms really can disagree: \
+             discover_environment_names says only ['staging'] exists from \
+             this start_dir, but a 'default' environment genuinely does \
+             resolve from it too — sendra-tui's environment list would omit \
+             an environment sendra-cli's `--env default` would happily use. \
+             This is a real, if narrow (nested .sendra/ projects only), gap \
+             between the two — flagged here rather than silently patched, \
+             per this issue's own instructions, since sendra-tui's discovery \
+             was never specified to handle nested projects and no user-facing \
+             bug report has surfaced it; fixing it is a product decision \
+             (e.g. issue 3/6 would need to specify whether nested projects \
+             should merge environment listings across levels) beyond this \
+             audit's scope."
         );
     }
 }

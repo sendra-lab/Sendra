@@ -12,7 +12,9 @@ path = "src/main.rs"
 [dependencies]
 clap = { workspace = true }
 crossterm = "0.29.0"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+ratatui = { version = "0.30.2", default-features = false, features = [
+  "crossterm",
+] }
 sendra-core = { path = "../sendra-core" }
 # Pretty-prints a JSON response body in the response panel, the same
 # `Content-Type` sniff and `to_string_pretty` sendra-cli's own
@@ -27,3 +29,10 @@ serde_json = { workspace = true }
 # time — the same reasoning that keeps sendra-cli on "rt" instead of
 # "rt-multi-thread" for its own single-request-at-a-time sends.
 tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+# The TUI/CLI resolution-parity test builds a real project
+# directory on disk — `.sendra/config.yaml`, environment files, a
+# collection — the same fixture-on-a-temp-dir pattern `sendra-core`'s and
+# `sendra-cli`'s own tests already use this crate for.
+tempfile = { workspace = true }
