@@ -31,9 +31,9 @@ use sendra_core::{
     SendraError,
 };
 
-/// What running a request produced: the response or the real `sendra-core`
-/// error that stopped it — never a TUI-invented summary — plus whatever the
-/// request's own `assertions`/`capture` blocks say about it.
+/// What running a request produced: the response or the error that stopped
+/// it — never a TUI-invented summary — plus whatever the request's own
+/// `assertions`/`capture` blocks say about it.
 ///
 /// `assertions`/`capture` are always the empty report when `result` is
 /// `Err`: nothing was checked or captured, because there is no response to
@@ -44,9 +44,45 @@ use sendra_core::{
 /// need to tell "not evaluated" apart from "evaluated, nothing declared".
 #[derive(Debug)]
 pub struct RunOutcome {
-    pub result: Result<Response, SendraError>,
+    pub result: Result<Response, RunError>,
     pub assertions: AssertionReport,
     pub capture: CaptureReport,
+}
+
+/// Every way a run can fail: everything sendra-core itself can report
+/// (`Core`), plus the one failure that happens before sendra-core is even
+/// reached — the per-run tokio runtime (see [`spawn`]) failing to start.
+/// That is not a `sendra_core::SendraError` (nothing in core is involved
+/// yet), but it is a real, if rare, failure mode — OS-level thread/resource
+/// exhaustion — and belongs in `RunOutcome::result` exactly like any other
+/// reason a run did not get a response, rather than behind an `.expect()`
+/// that would silently strand the run in `RunState::InFlight` forever (no
+/// `RunCompleted` message would ever arrive) or, if the calling thread were
+/// ever anything other than the dedicated one `spawn` creates, panic it
+/// outright.
+#[derive(Debug)]
+pub enum RunError {
+    Core(SendraError),
+    /// `tokio::runtime::Builder::build()` failed for this run's dedicated
+    /// runtime — see [`spawn`].
+    RuntimeUnavailable(std::io::Error),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunError::Core(error) => write!(f, "{error}"),
+            RunError::RuntimeUnavailable(error) => {
+                write!(f, "could not start a runtime to send this request: {error}")
+            }
+        }
+    }
+}
+
+impl From<SendraError> for RunError {
+    fn from(error: SendraError) -> Self {
+        RunError::Core(error)
+    }
 }
 
 /// Runs `request` against `environment` on a dedicated OS thread, each with
@@ -65,11 +101,22 @@ pub fn spawn(
     on_complete: impl FnOnce(RunOutcome) + Send + 'static,
 ) {
     std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let outcome = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("failed to start a tokio runtime for the request");
-        on_complete(runtime.block_on(execute(request, environment, base_dir)));
+        {
+            Ok(runtime) => runtime.block_on(execute(request, environment, base_dir)),
+            // See `RunError::RuntimeUnavailable`: reported through the same
+            // `RunOutcome` a network failure would be, not panicked — the
+            // run ends up in `RunState::Completed(Err(_))`, exactly as
+            // reachable and exactly as recoverable as any other failed run.
+            Err(error) => RunOutcome {
+                result: Err(RunError::RuntimeUnavailable(error)),
+                assertions: AssertionReport::default(),
+                capture: CaptureReport::default(),
+            },
+        };
+        on_complete(outcome);
     });
 }
 
@@ -99,7 +146,7 @@ async fn execute_inner(
     request: Request,
     environment: Environment,
     base_dir: PathBuf,
-) -> Result<(Response, AssertionReport, CaptureReport), SendraError> {
+) -> Result<(Response, AssertionReport, CaptureReport), RunError> {
     let start_dir = std::env::current_dir().map_err(SendraError::CurrentDir)?;
     let global_config = global_config_path().filter(|path| path.is_file());
     let config = Config::resolve_from(&start_dir, global_config.as_deref())?;

@@ -16,7 +16,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use sendra_core::environment::find_environment;
-use sendra_core::{Document, Environment};
+use sendra_core::{Document, Environment, SendraError};
 
 use app::{
     active_environment, update, view, AppState, LoadState, Message, NamedEnvironment, RunState,
@@ -82,16 +82,34 @@ fn discover_environment_names(start_dir: &Path) -> Vec<String> {
 /// `Environment::from_path` — the exact functions sendra-cli's own
 /// `environment_for` uses for a single named environment (see
 /// `sendra-cli/src/run.rs`) — skipping (rather than failing the whole list
-/// over) any one file that turns out unreadable.
-fn load_environments(start_dir: &Path) -> Vec<NamedEnvironment> {
-    discover_environment_names(start_dir)
-        .into_iter()
-        .filter_map(|name| {
-            let path = find_environment(start_dir, &name)?;
-            let environment = Environment::from_path(path).ok()?;
-            Some(NamedEnvironment { name, environment })
-        })
-        .collect()
+/// over) any one file that turns out unreadable, but **not silently**: the
+/// name and the real `SendraError` `Environment::from_path` returned are
+/// collected into the second half of the return value rather than dropped,
+/// so a malformed or unreadable environment file becomes a visible error in
+/// the overlay (`app::render_error`) instead of a file that just never
+/// appears in the list with nothing to say why.
+///
+/// A file `find_environment` can no longer find at all (deleted between
+/// `discover_environment_names`'s directory listing and this lookup) is the
+/// one case still skipped with no error: there is no `SendraError` to show
+/// for a path that is simply gone, and the far likelier explanation — it was
+/// never there to begin with — is exactly what `discover_environment_names`
+/// already ruled out by listing the directory itself.
+fn load_environments(start_dir: &Path) -> (Vec<NamedEnvironment>, Vec<(String, SendraError)>) {
+    let mut environments = Vec::new();
+    let mut errors = Vec::new();
+
+    for name in discover_environment_names(start_dir) {
+        let Some(path) = find_environment(start_dir, &name) else {
+            continue;
+        };
+        match Environment::from_path(path) {
+            Ok(environment) => environments.push(NamedEnvironment { name, environment }),
+            Err(error) => errors.push((name, error)),
+        }
+    }
+
+    (environments, errors)
 }
 
 fn restore_terminal() {
@@ -188,10 +206,17 @@ fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     load_message: Message,
     environments: Vec<NamedEnvironment>,
+    environment_errors: Vec<(String, SendraError)>,
 ) -> io::Result<()> {
     let mut state = AppState::default();
     update(&mut state, load_message);
-    update(&mut state, Message::EnvironmentsLoaded(environments));
+    update(
+        &mut state,
+        Message::EnvironmentsLoaded {
+            environments,
+            errors: environment_errors,
+        },
+    );
 
     // Carries `Message::RunCompleted` back from whichever thread
     // `run_request::spawn` put the send on into this loop, which is the only
@@ -256,10 +281,15 @@ fn main() -> io::Result<()> {
         },
         None => Message::NoCollectionPath,
     };
-    let environments = load_environments(&start_dir);
+    let (environments, environment_errors) = load_environments(&start_dir);
 
     let mut terminal = init_terminal()?;
-    let result = run(&mut terminal, load_message, environments);
+    let result = run(
+        &mut terminal,
+        load_message,
+        environments,
+        environment_errors,
+    );
     restore_terminal();
 
     result
