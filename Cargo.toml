@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["sendra-core", "sendra-cli", "xtask"]
+members = ["sendra-core", "sendra-cli", "sendra-tui", "xtask"]
 
 [workspace.package]
 version = "0.1.0"
