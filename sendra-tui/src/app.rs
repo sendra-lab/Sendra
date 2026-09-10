@@ -1,7 +1,15 @@
+use std::path::{Path, PathBuf};
+
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
-use sendra_core::{Document, SendraError};
+use sendra_core::{Document, Environment, Request, SendraError};
+
+/// Body preview is capped rather than shown in full — scrolling through a
+/// large body is issue 13's job; this just keeps a multi-megabyte body from
+/// making every draw slower without ever crashing on one.
+const MAX_BODY_PREVIEW_CHARS: usize = 2000;
 
 #[derive(Debug, Default)]
 pub struct AppState {
@@ -17,6 +25,10 @@ pub enum LoadState {
     Loaded {
         document: Box<Document>,
         selected: usize,
+        /// Directory `body_file`/multipart paths in the resolved preview
+        /// resolve relative to — the directory containing the collection's
+        /// own YAML file, exactly as `Request::resolve_body` expects.
+        base_dir: PathBuf,
     },
     Failed(SendraError),
 }
@@ -26,7 +38,10 @@ pub enum Message {
     Quit,
     Tick,
     NoCollectionPath,
-    CollectionLoaded(Box<Result<Document, SendraError>>),
+    CollectionLoaded {
+        base_dir: PathBuf,
+        result: Box<Result<Document, SendraError>>,
+    },
     SelectNext,
     SelectPrevious,
 }
@@ -48,22 +63,29 @@ pub fn update(state: &mut AppState, msg: Message) {
         Message::Quit => state.should_quit = true,
         Message::Tick => {}
         Message::NoCollectionPath => state.load_state = LoadState::NoPathProvided,
-        Message::CollectionLoaded(result) => {
+        Message::CollectionLoaded { base_dir, result } => {
             state.load_state = match *result {
                 Ok(document) => LoadState::Loaded {
                     document: Box::new(document),
                     selected: 0,
+                    base_dir,
                 },
                 Err(error) => LoadState::Failed(error),
             };
         }
         Message::SelectNext => {
-            if let LoadState::Loaded { document, selected } = &mut state.load_state {
+            if let LoadState::Loaded {
+                document, selected, ..
+            } = &mut state.load_state
+            {
                 *selected = move_selection(*selected, document.requests().len(), 1);
             }
         }
         Message::SelectPrevious => {
-            if let LoadState::Loaded { document, selected } = &mut state.load_state {
+            if let LoadState::Loaded {
+                document, selected, ..
+            } = &mut state.load_state
+            {
                 *selected = move_selection(*selected, document.requests().len(), -1);
             }
         }
@@ -77,7 +99,19 @@ pub fn view(state: &AppState, frame: &mut Frame) {
         LoadState::Failed(error) => {
             render_message(frame, &format!("Failed to load collection: {error}"));
         }
-        LoadState::Loaded { document, selected } => render_request_list(frame, document, *selected),
+        LoadState::Loaded {
+            document,
+            selected,
+            base_dir,
+        } => {
+            let panes = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+                .split(frame.area());
+
+            render_request_list(frame, panes[0], document, *selected);
+            render_detail_pane(frame, panes[1], document, *selected, base_dir);
+        }
     }
 }
 
@@ -85,7 +119,7 @@ fn render_message(frame: &mut Frame, text: &str) {
     frame.render_widget(Paragraph::new(text.to_string()), frame.area());
 }
 
-fn render_request_list(frame: &mut Frame, document: &Document, selected: usize) {
+fn render_request_list(frame: &mut Frame, area: Rect, document: &Document, selected: usize) {
     let items: Vec<ListItem> = document
         .requests()
         .iter()
@@ -98,7 +132,92 @@ fn render_request_list(frame: &mut Frame, document: &Document, selected: usize) 
     let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
 
     let mut list_state = ListState::default().with_selected(Some(selected));
-    frame.render_stateful_widget(list, frame.area(), &mut list_state);
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn render_detail_pane(
+    frame: &mut Frame,
+    area: Rect,
+    document: &Document,
+    selected: usize,
+    base_dir: &Path,
+) {
+    let Some(request) = document.requests().get(selected) else {
+        frame.render_widget(Paragraph::new("No request selected."), area);
+        return;
+    };
+
+    let text = match resolve_preview(request, base_dir) {
+        Ok(resolved) => format_resolved_request(&resolved),
+        // No environment is selectable yet (that lands in a later issue), so
+        // this runs substitution against an empty environment: a request with
+        // no `{{var}}` placeholders resolves exactly as it will once
+        // environments exist, and one that does reference a variable surfaces
+        // the real `SendraError::VariableNotFound` core itself would raise,
+        // shown as-is rather than faked.
+        Err(error) => format!("Could not resolve preview (no environment selected yet):\n{error}"),
+    };
+
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
+}
+
+/// The same substitution + auth/query/body resolution pipeline sendra-cli's
+/// `--dry-run` runs before sending, reused directly rather than
+/// reimplemented. Deliberately narrower than the CLI's full pipeline in two
+/// ways, both because this is a preview, not a run: it skips OAuth token
+/// acquisition (`Request::resolve_oauth`), a real network call with no place
+/// in drawing a frame, and it skips `Config::apply`, since the TUI has no
+/// project `Config` loaded anywhere yet — so the headers shown here are the
+/// request's own, substituted, not the final wire-level set an actual run
+/// would send after config defaults are layered on.
+fn resolve_preview(request: &Request, base_dir: &Path) -> Result<Request, SendraError> {
+    Environment::default()
+        .apply(request)
+        .and_then(|request| request.resolve_auth())
+        .and_then(|request| request.resolve_query())
+        .and_then(|request| request.resolve_body(base_dir))
+}
+
+fn format_resolved_request(request: &Request) -> String {
+    let mut lines = vec![
+        format!("Method: {}", request.method),
+        format!("URL:    {}", request.url),
+        String::new(),
+        "Headers:".to_string(),
+    ];
+
+    if request.headers.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for (name, value) in &request.headers {
+            lines.push(format!("  {name}: {value}"));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Body:".to_string());
+    match request.body.as_deref().filter(|body| !body.is_empty()) {
+        Some(body) => {
+            let (preview, truncated) = truncate_body(body);
+            lines.push(preview);
+            if truncated {
+                lines.push(format!(
+                    "... [truncated to {MAX_BODY_PREVIEW_CHARS} characters]"
+                ));
+            }
+        }
+        None => lines.push("  (none)".to_string()),
+    }
+
+    lines.join("\n")
+}
+
+fn truncate_body(body: &str) -> (String, bool) {
+    if body.chars().count() <= MAX_BODY_PREVIEW_CHARS {
+        (body.to_string(), false)
+    } else {
+        (body.chars().take(MAX_BODY_PREVIEW_CHARS).collect(), true)
+    }
 }
 
 #[cfg(test)]
@@ -137,7 +256,10 @@ requests:
         let document = Document::from_yaml_str(yaml).expect("valid test YAML");
         update(
             &mut state,
-            Message::CollectionLoaded(Box::new(Ok(document))),
+            Message::CollectionLoaded {
+                base_dir: PathBuf::from("."),
+                result: Box::new(Ok(document)),
+            },
         );
         state
     }
@@ -175,11 +297,16 @@ requests:
 
         update(
             &mut state,
-            Message::CollectionLoaded(Box::new(Ok(document))),
+            Message::CollectionLoaded {
+                base_dir: PathBuf::from("."),
+                result: Box::new(Ok(document)),
+            },
         );
 
         match state.load_state {
-            LoadState::Loaded { document, selected } => {
+            LoadState::Loaded {
+                document, selected, ..
+            } => {
                 assert_eq!(document.requests().len(), 2);
                 assert_eq!(selected, 0);
             }
@@ -201,7 +328,13 @@ requests:
         let mut state = AppState::default();
         let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
 
-        update(&mut state, Message::CollectionLoaded(Box::new(Err(error))));
+        update(
+            &mut state,
+            Message::CollectionLoaded {
+                base_dir: PathBuf::from("."),
+                result: Box::new(Err(error)),
+            },
+        );
 
         assert!(matches!(state.load_state, LoadState::Failed(_)));
     }
@@ -256,5 +389,51 @@ requests:
         update(&mut state, Message::SelectPrevious);
 
         assert!(matches!(state.load_state, LoadState::Loading));
+    }
+
+    #[test]
+    fn resolve_preview_succeeds_for_a_request_with_no_placeholders() {
+        let document = Document::from_yaml_str(
+            "name: One\nmethod: GET\nurl: https://example.com\nheaders:\n  Accept: application/json\n",
+        )
+        .expect("valid single request");
+        let request = &document.requests()[0];
+
+        let resolved =
+            resolve_preview(request, Path::new(".")).expect("no placeholders to fail on");
+
+        assert_eq!(resolved.url, "https://example.com");
+    }
+
+    #[test]
+    fn resolve_preview_surfaces_variable_not_found_with_no_environment() {
+        let document = Document::from_yaml_str(
+            "name: One\nmethod: GET\nurl: https://example.com/{{user_id}}\n",
+        )
+        .expect("valid single request");
+        let request = &document.requests()[0];
+
+        let error = resolve_preview(request, Path::new(".")).expect_err(
+            "a placeholder with no active environment must surface a real resolution error",
+        );
+
+        assert!(matches!(error, SendraError::VariableNotFound { .. }));
+    }
+
+    #[test]
+    fn body_under_the_cap_is_shown_in_full() {
+        let (preview, truncated) = truncate_body("short body");
+        assert_eq!(preview, "short body");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn body_over_the_cap_is_truncated_not_panicked_on() {
+        let huge = "x".repeat(MAX_BODY_PREVIEW_CHARS * 3);
+
+        let (preview, truncated) = truncate_body(&huge);
+
+        assert_eq!(preview.chars().count(), MAX_BODY_PREVIEW_CHARS);
+        assert!(truncated);
     }
 }

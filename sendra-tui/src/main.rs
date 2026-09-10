@@ -2,7 +2,7 @@ mod app;
 
 use std::io::{self, Stdout};
 use std::panic;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Parser;
@@ -22,6 +22,19 @@ use app::{update, view, AppState, Message};
 struct Cli {
     /// Collection or request YAML file to load.
     path: Option<PathBuf>,
+}
+
+/// Where a resolved request's `body_file`/multipart paths resolve against:
+/// the directory containing the collection's own YAML file, not the
+/// process's current directory — mirrors sendra-cli's own `base_dir` helper
+/// (`sendra-cli/src/run.rs`) for the same reason: `body_file: ./payload.json`
+/// written inside a collection means the file beside it, wherever the
+/// command was typed from. A bare filename with no parent resolves against
+/// `.`, the same thing it already means to `path` itself.
+fn base_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 fn restore_terminal() {
@@ -101,7 +114,10 @@ fn main() -> io::Result<()> {
     // and no file to guess at — that goes through the same path as a real
     // load outcome, rather than being decided before the architecture sees it.
     let load_message = match cli.path {
-        Some(path) => Message::CollectionLoaded(Box::new(Document::from_path(&path))),
+        Some(path) => Message::CollectionLoaded {
+            base_dir: base_dir(&path).to_path_buf(),
+            result: Box::new(Document::from_path(&path)),
+        },
         None => Message::NoCollectionPath,
     };
 
