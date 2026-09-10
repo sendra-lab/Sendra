@@ -634,38 +634,79 @@ fn claims_json(headers: &[(String, String)]) -> bool {
 /// spinner, no library, since ratatui ships no widget for one.
 const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
 
-/// The one-line status bar under the panes: idle hint, in-flight spinner, or
-/// a one-line summary of what `render_response_panel` is showing in full
-/// above it — this line never carries anything the panel doesn't already
-/// say, it just makes the outcome visible even when the panel itself has
-/// scrolled somewhere else.
+/// The one-line status/help bar under the panes: a status summary (in
+/// flight, or what the last run did) where there is one, and — always — the
+/// keybindings that actually do something right now.
+///
+/// Built entirely from [`status_help_text`], which is also what the tests
+/// below exercise directly: this function's only job is handing that string
+/// to a `Paragraph`.
 fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
-    let text = match &state.run_state {
-        RunState::Idle => "Enter/r: run selected request".to_string(),
+    frame.render_widget(Paragraph::new(status_help_text(state)), area);
+}
+
+/// The bottom bar's full text — status where there is one, then the
+/// keybindings currently live — chosen from exactly the state `update()`
+/// itself branches on, so this can never say a key does something `update()`
+/// would actually refuse, or omit one it would accept. Four contexts, in the
+/// same priority order `update()`'s own InFlight guard and `view()`'s own
+/// overlay-vs-response-panel-vs-preview dispatch already imply:
+///
+/// 1. **The environment overlay is open** (`environment_overlay.is_some()`,
+///    the same condition `view()` checks to draw it) — only the overlay's
+///    own keys apply, checked first because the overlay is drawn on top of
+///    everything else and is what has the user's attention.
+/// 2. **A run is in flight** (`RunState::InFlight`) — `update()`'s own guard
+///    at the top of the function refuses every navigation/overlay/run
+///    message while this holds, so `q` (never blocked — see that guard's own
+///    comment) is genuinely the only key left to advertise.
+/// 3. **A run has completed** (`RunState::Completed`) — the response panel
+///    is what `render_detail_pane` is showing (see its own doc comment), so
+///    this is where the scroll keys and, when there is something to reveal,
+///    the capture-reveal key belong; nav/run/env/quit are back too, since
+///    the InFlight guard no longer applies.
+/// 4. **Otherwise** (`RunState::Idle`) — the ordinary collection browser,
+///    showing the request preview.
+///
+/// No key is added here that `update`/`main::next_message` do not already
+/// bind — this only narrates keys issues 1-9 already wired.
+fn status_help_text(state: &AppState) -> String {
+    if state.environment_overlay.is_some() {
+        return "↑/↓ nav  enter confirm  esc cancel  q quit".to_string();
+    }
+
+    match &state.run_state {
+        RunState::Idle => "↑/↓ nav  enter/r run  e env  q quit".to_string(),
         RunState::InFlight => {
             let frame_char = SPINNER_FRAMES[state.spinner_tick % SPINNER_FRAMES.len()];
-            format!("{frame_char} Running request...")
+            format!("{frame_char} Running request...  |  q quit")
         }
-        RunState::Completed(outcome) => match &outcome.result {
-            Ok(response) => {
-                let assertions = if outcome.assertions.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        " — {} passed, {} failed",
-                        outcome.assertions.passed_count(),
-                        outcome.assertions.failed_count()
-                    )
-                };
-                format!(
-                    "Done — {}{assertions} (Enter/r to run again)",
-                    response.status
-                )
-            }
-            Err(error) => format!("Failed — {error} (Enter/r to run again)"),
-        },
-    };
-    frame.render_widget(Paragraph::new(text), area);
+        RunState::Completed(outcome) => {
+            let status = match &outcome.result {
+                Ok(response) => {
+                    let assertions = if outcome.assertions.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " — {} passed, {} failed",
+                            outcome.assertions.passed_count(),
+                            outcome.assertions.failed_count()
+                        )
+                    };
+                    format!("Done — {}{assertions}", response.status)
+                }
+                Err(error) => format!("Failed — {error}"),
+            };
+            let reveal = if outcome.capture.is_empty() {
+                ""
+            } else {
+                "  c reveal/hide captures"
+            };
+            format!(
+                "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn scroll{reveal}  e env  q quit"
+            )
+        }
+    }
 }
 
 /// The environment the detail pane resolves against and a run sends
@@ -1897,5 +1938,191 @@ requests:
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // --- status_help_text: the bar's single source of truth -------------
+
+    #[test]
+    fn help_bar_shows_browser_keys_when_idle() {
+        let state = loaded_state(VALID_COLLECTION);
+
+        let text = status_help_text(&state);
+
+        assert!(text.contains("nav"), "{text}");
+        assert!(text.contains("run"), "{text}");
+        assert!(text.contains("env"), "{text}");
+        assert!(text.contains('q'), "{text}");
+        // Not yet relevant while idle: nothing has run, so nothing to
+        // scroll or reveal.
+        assert!(!text.contains("scroll"), "{text}");
+        assert!(!text.contains("reveal"), "{text}");
+    }
+
+    #[test]
+    fn help_bar_shows_only_overlay_keys_when_the_overlay_is_open() {
+        let mut state = state_with_environments(&["default", "staging"]);
+        update(&mut state, Message::OpenEnvironmentOverlay);
+
+        let text = status_help_text(&state);
+
+        assert!(text.contains("confirm"), "{text}");
+        assert!(text.contains("cancel"), "{text}");
+        assert!(text.contains('q'), "{text}");
+        // The overlay owns the keyboard: the browser's own run/env keys
+        // must not be advertised alongside it.
+        assert!(!text.contains("run"), "{text}");
+        assert!(!text.contains("env"), "{text}");
+    }
+
+    #[test]
+    fn help_bar_shows_only_quit_while_a_run_is_in_flight() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        assert!(matches!(state.run_state, RunState::InFlight));
+
+        let text = status_help_text(&state);
+
+        assert!(text.contains('q'), "{text}");
+        // Every one of these is genuinely refused right now by `update`'s
+        // own InFlight guard, so none of them belongs in the hint.
+        assert!(!text.contains("nav"), "{text}");
+        assert!(!text.contains("run again"), "{text}");
+        assert!(!text.contains("env"), "{text}");
+        assert!(!text.contains("scroll"), "{text}");
+    }
+
+    #[test]
+    fn help_bar_shows_scroll_and_nav_keys_once_a_run_has_completed() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+
+        let text = status_help_text(&state);
+
+        assert!(text.contains("scroll"), "{text}");
+        assert!(text.contains("nav"), "{text}");
+        assert!(text.contains("run again"), "{text}");
+        assert!(text.contains("env"), "{text}");
+        assert!(text.contains('q'), "{text}");
+    }
+
+    #[test]
+    fn help_bar_only_mentions_capture_reveal_when_there_is_something_to_reveal() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        let no_captures_text = status_help_text(&state);
+        assert!(
+            !no_captures_text.contains("reveal"),
+            "a run with no `capture:` block has nothing to reveal: {no_captures_text}"
+        );
+
+        let response = response_with(&[("X-Token", "super-secret")], "");
+        let capture = evaluate_capture(
+            "method: GET\nurl: https://example.com\ncapture:\n  token: {header: X-Token}\n",
+            &response,
+        );
+        update(&mut state, Message::RunRequested);
+        update(
+            &mut state,
+            Message::RunCompleted(RunOutcome {
+                result: Ok(response),
+                assertions: AssertionReport::default(),
+                capture,
+            }),
+        );
+
+        let with_captures_text = status_help_text(&state);
+        assert!(
+            with_captures_text.contains("reveal"),
+            "a run with a non-empty `capture:` block must advertise the reveal key: {with_captures_text}"
+        );
+    }
+
+    /// The four contexts must not all read the same — the whole point of a
+    /// *context-sensitive* bar, proven here as one assertion over the same
+    /// four states the tests above exercise individually.
+    #[test]
+    fn help_bar_text_differs_across_all_four_contexts() {
+        let idle = loaded_state(VALID_COLLECTION);
+
+        let mut overlaid = state_with_environments(&["default"]);
+        update(&mut overlaid, Message::OpenEnvironmentOverlay);
+
+        let mut in_flight = loaded_state(VALID_COLLECTION);
+        update(&mut in_flight, Message::RunRequested);
+
+        let mut completed = loaded_state(VALID_COLLECTION);
+        update(&mut completed, Message::RunRequested);
+        update(&mut completed, Message::RunCompleted(sample_outcome(200)));
+
+        let texts = [
+            status_help_text(&idle),
+            status_help_text(&overlaid),
+            status_help_text(&in_flight),
+            status_help_text(&completed),
+        ];
+
+        for (i, a) in texts.iter().enumerate() {
+            for (j, b) in texts.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        a, b,
+                        "contexts {i} and {j} must show different help text, both got: {a:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// End-to-end proof, through the real `view()`, that the bottom row
+    /// actually changes as the bar's own state changes — not just that
+    /// `status_help_text` returns different strings in isolation.
+    #[test]
+    fn view_renders_different_help_bar_text_across_contexts() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let render = |state: &AppState| {
+            let backend = TestBackend::new(100, 15);
+            let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+            terminal
+                .draw(|frame| view(state, frame))
+                .expect("rendering must not panic");
+            buffer_to_string(terminal.backend().buffer())
+        };
+
+        let mut state = loaded_state(VALID_COLLECTION);
+        let browsing_screen = render(&state);
+        assert!(browsing_screen.contains("nav"));
+        assert!(!browsing_screen.contains("scroll"));
+
+        update(&mut state, Message::RunRequested);
+        let in_flight_screen = render(&state);
+        assert!(in_flight_screen.contains("Running request"));
+        assert!(!in_flight_screen.contains("nav"));
+
+        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        let completed_screen = render(&state);
+        assert!(completed_screen.contains("scroll"));
+        assert!(completed_screen.contains("nav"));
+
+        // Back to idle, then the fourth context: the environment overlay.
+        // `state_with_environments` alone has no loaded collection, so this
+        // goes through `loaded_state` plus environments instead, to prove
+        // the bottom row still renders correctly underneath the popup.
+        let mut overlaid = loaded_state(VALID_COLLECTION);
+        overlaid.environments = vec![named_environment("default", &[])];
+        update(&mut overlaid, Message::OpenEnvironmentOverlay);
+        let overlay_screen = render(&overlaid);
+        assert!(overlay_screen.contains("confirm"));
+        assert!(overlay_screen.contains("cancel"));
+        assert!(!overlay_screen.contains("run again"));
+
+        assert_ne!(browsing_screen, in_flight_screen);
+        assert_ne!(in_flight_screen, completed_screen);
+        assert_ne!(browsing_screen, completed_screen);
+        assert_ne!(browsing_screen, overlay_screen);
+        assert_ne!(completed_screen, overlay_screen);
     }
 }
