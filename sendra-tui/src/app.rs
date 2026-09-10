@@ -139,6 +139,19 @@ pub enum Message {
     /// values become masked again — a toggle rather than a one-way reveal,
     /// so hiding them again does not need a second, differently-named key.
     ToggleRevealCaptures,
+    /// A crossterm `Event::Resize` reaching the translation layer in
+    /// `main::next_message`. Carries no data and `update` treats it as a
+    /// no-op: ratatui's `Terminal::draw` already calls `Terminal::autoresize`
+    /// on every frame (see `ratatui_core::terminal::render`/`resize`), which
+    /// re-queries the backend's real size, resizes its internal buffers and
+    /// clears before the next render whenever that size changed — so the
+    /// very next `terminal.draw(|frame| view(...))` call after a resize
+    /// already lays out against the new size with no leftover cells from the
+    /// old one. This variant exists only so a resize is a distinctly named
+    /// event through the loop rather than silently falling into the
+    /// catch-all `Message::Tick` arm in `next_message`, which would
+    /// incorrectly advance the spinner on a resize alone.
+    Resize,
 }
 
 /// What the selected request's most recent run did, if anything.
@@ -259,6 +272,11 @@ pub fn update(state: &mut AppState, msg: Message) {
             state.response_scroll = state.response_scroll.saturating_sub(SCROLL_STEP_LINES);
         }
         Message::ToggleRevealCaptures => state.reveal_captures = !state.reveal_captures,
+        // See the doc comment on `Message::Resize` — the redraw itself
+        // comes from `terminal.draw` re-running `view` against the
+        // already-resized backend on the loop's next iteration; there is no
+        // state here for a resize to change.
+        Message::Resize => {}
     }
 }
 
@@ -892,8 +910,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 /// bordered `Block` drawn over the same `area`.
 fn inset(area: Rect) -> Rect {
     Rect {
-        x: area.x + 1,
-        y: area.y + 1,
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     }
@@ -2463,5 +2481,190 @@ requests:
             crate::run_request::RunError::RuntimeUnavailable(std::io::Error::other("no threads"));
         assert!(runtime_error.to_string().contains("no threads"));
         assert!(runtime_error.to_string().contains("runtime"));
+    }
+
+    // --- resize handling ---------------------------------------------
+
+    /// The `Message::Resize` no-op, end to end: a resized backend, re-drawn
+    /// through the real `view()` between two calls with no `update()` call
+    /// for the resize itself in between (mirroring how `main::run` actually
+    /// handles it — `Message::Resize` changes no state; the next
+    /// `terminal.draw` picks up the new size on its own). Both a shrink and
+    /// a subsequent grow are exercised on a completed run's response panel,
+    /// scrolled deep into a long body, so this also proves `response_scroll`
+    /// re-clamps against whichever area is current at render time rather
+    /// than pointing past a now-gone taller viewport.
+    #[test]
+    fn resizing_between_renders_relayouts_without_panicking() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let body = (0..500)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let outcome = RunOutcome {
+            result: Ok(response_with(&[], &body)),
+            assertions: AssertionReport::default(),
+            capture: CaptureReport::default(),
+        };
+        let total_lines = format_run_result(&outcome, false).lines().count();
+
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        update(&mut state, Message::RunCompleted(outcome));
+        // Deep enough to be well past what any of the sizes below can show,
+        // so every draw below exercises the render-time clamp.
+        state.response_scroll = 10_000;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+        terminal
+            .draw(|frame| view(&state, frame))
+            .expect("initial draw must not panic");
+
+        // Shrink drastically — down to a sliver of a terminal — and redraw.
+        terminal.backend_mut().resize(20, 6);
+        terminal
+            .draw(|frame| view(&state, frame))
+            .expect("drawing after a drastic shrink must not panic");
+        let shrunk = terminal.backend().buffer();
+        assert_eq!(
+            shrunk.area,
+            Rect::new(0, 0, 20, 6),
+            "the buffer must track the new, smaller size exactly — no leftover \
+             cells from the previous 100x30 frame"
+        );
+        let shrunk_screen = buffer_to_string(shrunk);
+        // At 20 columns wide the footer's `of {total}` tail is clipped off
+        // screen, so what actually proves the clamp worked is the line
+        // range itself ending at (not past) the real total.
+        assert!(
+            shrunk_screen.contains(&format!("-{total_lines}")),
+            "the footer's visible range must end exactly at the real total \
+             line count ({total_lines}) once scrolled past the end, not \
+             beyond it or blank:\n{shrunk_screen}"
+        );
+
+        // Grow back past the original size and redraw again.
+        terminal.backend_mut().resize(150, 40);
+        terminal
+            .draw(|frame| view(&state, frame))
+            .expect("drawing after growing must not panic");
+        let grown = terminal.backend().buffer();
+        assert_eq!(
+            grown.area,
+            Rect::new(0, 0, 150, 40),
+            "the buffer must track the new, larger size exactly"
+        );
+        let grown_screen = buffer_to_string(grown);
+        assert!(
+            grown_screen.contains("line 4"),
+            "the grown frame must show real body content, not a blank pane \
+             left over from the shrunk size:\n{grown_screen}"
+        );
+    }
+
+    /// Every top-level `view()` state — loading, a failed load, the request
+    /// browser, a completed response panel, and the environment overlay on
+    /// top of it — drawn into a terminal shrunk to a single-digit size, the
+    /// smallest a real terminal resize could plausibly produce. Content is
+    /// necessarily cramped or clipped; nothing may panic.
+    #[test]
+    fn every_screen_survives_a_very_small_terminal_size() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let draw = |state: &AppState, width: u16, height: u16| {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+            terminal
+                .draw(|frame| view(state, frame))
+                .unwrap_or_else(|err| panic!("{width}x{height} draw must not panic: {err}"));
+        };
+
+        let sizes: [(u16, u16); 4] = [(1, 1), (2, 1), (1, 2), (4, 3)];
+
+        for (width, height) in sizes {
+            draw(&AppState::default(), width, height);
+
+            let mut browsing = loaded_state(THREE_REQUEST_COLLECTION);
+            draw(&browsing, width, height);
+
+            update(&mut browsing, Message::RunRequested);
+            update(&mut browsing, Message::RunCompleted(sample_outcome(200)));
+            browsing.response_scroll = 9_999;
+            draw(&browsing, width, height);
+
+            let mut overlaid = loaded_state(VALID_COLLECTION);
+            overlaid.environments = vec![
+                named_environment("default", &[("token", "abc")]),
+                named_environment("staging", &[]),
+            ];
+            update(&mut overlaid, Message::OpenEnvironmentOverlay);
+            draw(&overlaid, width, height);
+
+            let mut failed = AppState::default();
+            let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
+            update(
+                &mut failed,
+                Message::CollectionLoaded {
+                    base_dir: PathBuf::from("."),
+                    result: Box::new(Err(error)),
+                },
+            );
+            draw(&failed, width, height);
+        }
+    }
+
+    /// The response panel's own scroll clamp (`render_response_panel`),
+    /// isolated from `view()`: a scroll offset that was valid for a tall
+    /// area must not be trusted after the area shrinks — it must be
+    /// re-clamped against the *current* area on every draw, never carried
+    /// over from a previous, larger one.
+    #[test]
+    fn response_panel_scroll_reclamps_to_a_shrunk_area() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let body = (0..200)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let outcome = RunOutcome {
+            result: Ok(response_with(&[], &body)),
+            assertions: AssertionReport::default(),
+            capture: CaptureReport::default(),
+        };
+        let total_lines = format_run_result(&outcome, false).lines().count();
+
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+        // A scroll position that was in range for an 80x40 area but is
+        // nowhere close to the top of the much shorter area used below.
+        let deep_scroll = total_lines - 5;
+
+        terminal
+            .draw(|frame| {
+                render_response_panel(frame, frame.area(), &outcome, deep_scroll, false);
+            })
+            .expect("initial draw must not panic");
+
+        terminal.backend_mut().resize(80, 4);
+        terminal
+            .draw(|frame| {
+                render_response_panel(frame, frame.area(), &outcome, deep_scroll, false);
+            })
+            .expect("drawing the same stale scroll offset into a shrunk area must not panic");
+
+        let screen = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            !screen.trim().is_empty(),
+            "a re-clamped scroll must still show real content, not a blank pane:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("of {total_lines}")),
+            "the footer must report the real total even after the area shrank:\n{screen}"
+        );
     }
 }
