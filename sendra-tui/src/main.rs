@@ -13,9 +13,10 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use sendra_core::Document;
+use sendra_core::environment::find_environment;
+use sendra_core::{Document, Environment};
 
-use app::{update, view, AppState, Message};
+use app::{update, view, AppState, Message, NamedEnvironment};
 
 #[derive(Parser)]
 #[command(name = "sendra-tui")]
@@ -35,6 +36,58 @@ fn base_dir(path: &Path) -> &Path {
     path.parent()
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
+}
+
+/// Every environment name found in the nearest `.sendra/environments/`
+/// walking up from `start_dir` — the same `ancestors()` walk
+/// `find_project_config`/`find_environment` use internally to locate
+/// `.sendra/`, applied here for enumeration rather than a single lookup by
+/// name. sendra-core has a function to resolve *one named* environment
+/// (`find_environment`) but none to list what names exist, so this is the
+/// one piece of directory-walking sendra-tui does itself; loading each name
+/// once found is handed straight to `find_environment` +
+/// `Environment::from_path` below, sendra-core's own functions, not
+/// reimplemented parsing.
+fn discover_environment_names(start_dir: &Path) -> Vec<String> {
+    let Some(environments_dir) = start_dir
+        .ancestors()
+        .map(|dir| dir.join(".sendra").join("environments"))
+        .find(|dir| dir.is_dir())
+    else {
+        return Vec::new();
+    };
+
+    let mut names: Vec<String> = std::fs::read_dir(&environments_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
+                return None;
+            }
+            path.file_stem()?.to_str().map(str::to_string)
+        })
+        .collect();
+
+    names.sort();
+    names
+}
+
+/// Loads every discovered environment via `find_environment` +
+/// `Environment::from_path` — the exact functions sendra-cli's own
+/// `environment_for` uses for a single named environment (see
+/// `sendra-cli/src/run.rs`) — skipping (rather than failing the whole list
+/// over) any one file that turns out unreadable.
+fn load_environments(start_dir: &Path) -> Vec<NamedEnvironment> {
+    discover_environment_names(start_dir)
+        .into_iter()
+        .filter_map(|name| {
+            let path = find_environment(start_dir, &name)?;
+            let environment = Environment::from_path(path).ok()?;
+            Some(NamedEnvironment { name, environment })
+        })
+        .collect()
 }
 
 fn restore_terminal() {
@@ -59,7 +112,11 @@ fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 
 /// The only place allowed to touch crossterm event types directly — translates
 /// a poll/read result into a `Message`, keeping `update`/`view` crossterm-agnostic.
-fn next_message() -> io::Result<Message> {
+/// `overlay_open` is the one piece of context this translation needs: the
+/// same physical keys mean different things depending on whether the
+/// environment overlay is on screen, without leaking that decision into
+/// `update`/`view` as raw key codes.
+fn next_message(overlay_open: bool) -> io::Result<Message> {
     if !event::poll(Duration::from_millis(100))? {
         return Ok(Message::Tick);
     }
@@ -73,7 +130,18 @@ fn next_message() -> io::Result<Message> {
                 return Ok(Message::Quit);
             }
 
+            if overlay_open {
+                return Ok(match key.code {
+                    KeyCode::Esc => Message::CloseEnvironmentOverlay,
+                    KeyCode::Enter => Message::ConfirmEnvironmentSelection,
+                    KeyCode::Down | KeyCode::Char('j') => Message::SelectNext,
+                    KeyCode::Up | KeyCode::Char('k') => Message::SelectPrevious,
+                    _ => Message::Tick,
+                });
+            }
+
             match key.code {
+                KeyCode::Char('e') => Ok(Message::OpenEnvironmentOverlay),
                 KeyCode::Down | KeyCode::Char('j') => Ok(Message::SelectNext),
                 KeyCode::Up | KeyCode::Char('k') => Ok(Message::SelectPrevious),
                 _ => Ok(Message::Tick),
@@ -85,15 +153,17 @@ fn next_message() -> io::Result<Message> {
 
 fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    initial_message: Message,
+    load_message: Message,
+    environments: Vec<NamedEnvironment>,
 ) -> io::Result<()> {
     let mut state = AppState::default();
-    update(&mut state, initial_message);
+    update(&mut state, load_message);
+    update(&mut state, Message::EnvironmentsLoaded(environments));
 
     loop {
         terminal.draw(|frame| view(&state, frame))?;
 
-        let msg = next_message()?;
+        let msg = next_message(state.environment_overlay.is_some())?;
         update(&mut state, msg);
 
         if state.should_quit {
@@ -106,6 +176,7 @@ fn main() -> io::Result<()> {
     install_panic_hook();
 
     let cli = Cli::parse();
+    let start_dir = std::env::current_dir()?;
 
     // Loading is plain sendra-core I/O — no terminal touched yet — and its
     // result is handed to the event loop as an ordinary `Message`, so it
@@ -120,9 +191,10 @@ fn main() -> io::Result<()> {
         },
         None => Message::NoCollectionPath,
     };
+    let environments = load_environments(&start_dir);
 
     let mut terminal = init_terminal()?;
-    let result = run(&mut terminal, load_message);
+    let result = run(&mut terminal, load_message, environments);
     restore_terminal();
 
     result
