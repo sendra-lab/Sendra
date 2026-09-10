@@ -57,9 +57,13 @@ fn next_message() -> io::Result<Message> {
                 || (key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL));
             if is_quit {
-                Ok(Message::Quit)
-            } else {
-                Ok(Message::Tick)
+                return Ok(Message::Quit);
+            }
+
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => Ok(Message::SelectNext),
+                KeyCode::Up | KeyCode::Char('k') => Ok(Message::SelectPrevious),
+                _ => Ok(Message::Tick),
             }
         }
         _ => Ok(Message::Tick),
