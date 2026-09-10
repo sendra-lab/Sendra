@@ -14,3 +14,10 @@ clap = { workspace = true }
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 sendra-core = { path = "../sendra-core" }
+# Drives the request execution pipeline (`sendra_core::send`, which reqwest
+# needs a runtime under). Current-thread only ("rt"): each run spins up its
+# own runtime on its own OS thread (see `run_request::spawn`) rather than
+# sharing one across the app, so there is never more than one task on it at a
+# time — the same reasoning that keeps sendra-cli on "rt" instead of
+# "rt-multi-thread" for its own single-request-at-a-time sends.
+tokio = { workspace = true, features = ["rt"] }

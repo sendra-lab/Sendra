@@ -4,7 +4,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
-use sendra_core::{Document, Environment, Request, SendraError};
+use sendra_core::{Document, Environment, Request, Response, SendraError};
 
 /// Body preview is capped rather than shown in full — scrolling through a
 /// large body is issue 13's job; this just keeps a multi-megabyte body from
@@ -34,6 +34,13 @@ pub struct AppState {
     /// `active_environment`, so browsing the list and cancelling
     /// (`Message::CloseEnvironmentOverlay`) never touches what is active.
     pub environment_overlay: Option<usize>,
+    /// The selected request's most recent run, if any has been started.
+    pub run_state: RunState,
+    /// Advanced by one on every `Message::Tick` (roughly every 100ms — see
+    /// `next_message` in `main.rs`), and read only to pick which spinner
+    /// glyph `render_status_bar` draws while `run_state` is `InFlight`. Not
+    /// meaningful on its own; it exists purely to make the spinner animate.
+    pub spinner_tick: usize,
 }
 
 #[derive(Debug, Default)]
@@ -74,6 +81,30 @@ pub enum Message {
     CloseEnvironmentOverlay,
     /// Confirm: sets `active_environment` to the overlay's cursor, then closes it.
     ConfirmEnvironmentSelection,
+    /// Enter or `r` on the selected request. A no-op — see [`update`] — when a
+    /// run is already in flight or nothing is loaded/selected; otherwise
+    /// moves `run_state` to `RunState::InFlight`, which is `main`'s cue to
+    /// actually spawn the request via [`crate::run_request::spawn`].
+    RunRequested,
+    /// The spawned run finished, with the real `sendra-core` result —
+    /// success or failure — it produced. Always accepted, even while another
+    /// message would normally be blocked by an in-flight run, since this is
+    /// the message that ends that state.
+    RunCompleted(Result<Response, SendraError>),
+}
+
+/// What the selected request's most recent run did, if anything.
+///
+/// Deliberately holds the real `sendra_core::Response`/`SendraError` a run
+/// produced, not a TUI-invented summary — rendering that content in full is
+/// issue 8's job; this only has to get it into state correctly. A
+/// placeholder "done" indicator in `view()` is enough to prove that for now.
+#[derive(Debug, Default)]
+pub enum RunState {
+    #[default]
+    Idle,
+    InFlight,
+    Completed(Result<Response, SendraError>),
 }
 
 /// Moves `selected` by `delta` (`1` or `-1`) through `len` items, wrapping at
@@ -89,9 +120,30 @@ fn move_selection(selected: usize, len: usize, delta: isize) -> usize {
 }
 
 pub fn update(state: &mut AppState, msg: Message) {
+    // While a run is in flight, every navigation/overlay/run message is
+    // refused outright — the simplest correct behavior, and the one that
+    // avoids the concurrent-state edge cases a second in-flight run, or a
+    // selection change out from under one, would open up. `Quit`, `Tick` and
+    // `RunCompleted` are exempt: quitting and the clock keep working
+    // regardless, and `RunCompleted` is exactly the message that ends this
+    // state, so blocking it would make the block permanent.
+    if matches!(state.run_state, RunState::InFlight)
+        && matches!(
+            msg,
+            Message::SelectNext
+                | Message::SelectPrevious
+                | Message::OpenEnvironmentOverlay
+                | Message::CloseEnvironmentOverlay
+                | Message::ConfirmEnvironmentSelection
+                | Message::RunRequested
+        )
+    {
+        return;
+    }
+
     match msg {
         Message::Quit => state.should_quit = true,
-        Message::Tick => {}
+        Message::Tick => state.spinner_tick = state.spinner_tick.wrapping_add(1),
         Message::NoCollectionPath => state.load_state = LoadState::NoPathProvided,
         Message::CollectionLoaded { base_dir, result } => {
             state.load_state = match *result {
@@ -119,7 +171,32 @@ pub fn update(state: &mut AppState, msg: Message) {
                 }
             }
         }
+        Message::RunRequested => {
+            // A no-op with nothing loaded or nothing selected — there is no
+            // request to run. `main` reads this same condition (a request
+            // actually being selected) before deciding to spawn anything, so
+            // the two checks have to agree: this one is what lets `main`
+            // trust that "`run_state` became `InFlight`" means "there really
+            // is a selected request to send".
+            if request_is_selected(state) {
+                state.run_state = RunState::InFlight;
+            }
+        }
+        Message::RunCompleted(result) => {
+            state.run_state = RunState::Completed(result);
+        }
     }
+}
+
+/// Whether the collection browser currently has a request selected — true
+/// exactly when `load_state` is `Loaded` and `selected` indexes a real
+/// request, which is always the case for a non-empty collection but not for
+/// an empty one.
+fn request_is_selected(state: &AppState) -> bool {
+    matches!(
+        &state.load_state,
+        LoadState::Loaded { document, selected, .. } if document.requests().get(*selected).is_some()
+    )
 }
 
 /// Routes `SelectNext`/`SelectPrevious` to the overlay's cursor when it is
@@ -151,13 +228,19 @@ pub fn view(state: &AppState, frame: &mut Frame) {
             selected,
             base_dir,
         } => {
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(frame.area());
+
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-                .split(frame.area());
+                .split(rows[0]);
 
             render_request_list(frame, panes[0], document, *selected);
             render_detail_pane(frame, panes[1], document, *selected, base_dir, state);
+            render_status_bar(frame, rows[1], state);
         }
     }
 
@@ -222,7 +305,37 @@ fn render_detail_pane(
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
 }
 
-fn active_environment(state: &AppState) -> Option<&NamedEnvironment> {
+/// Cycled by `spinner_tick` while a run is in flight — an ordinary braille
+/// spinner, no library, since ratatui ships no widget for one.
+const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+
+/// The one-line status bar under the panes: idle hint, in-flight spinner, or
+/// the placeholder completion indicator issue 6 asks for — the real
+/// status/headers/body rendering of a completed run is issue 8's job, not
+/// this one's.
+fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
+    let text = match &state.run_state {
+        RunState::Idle => "Enter/r: run selected request".to_string(),
+        RunState::InFlight => {
+            let frame_char = SPINNER_FRAMES[state.spinner_tick % SPINNER_FRAMES.len()];
+            format!("{frame_char} Running request...")
+        }
+        RunState::Completed(Ok(response)) => {
+            format!("Done — {} (Enter/r to run again)", response.status)
+        }
+        RunState::Completed(Err(error)) => {
+            format!("Failed — {error} (Enter/r to run again)")
+        }
+    };
+    frame.render_widget(Paragraph::new(text), area);
+}
+
+/// The environment the detail pane resolves against and a run sends
+/// against — the one `active_environment` names, or `None` before the user
+/// has picked one. `pub` (not `fn`-private) because `main` needs the exact
+/// same lookup to resolve a run's request against, rather than a second
+/// implementation of "which environment is active" living outside `app.rs`.
+pub fn active_environment(state: &AppState) -> Option<&NamedEnvironment> {
     state
         .active_environment
         .and_then(|index| state.environments.get(index))
@@ -712,5 +825,123 @@ requests:
             Some(0),
             "cancel must leave the previously active environment untouched"
         );
+    }
+
+    fn sample_response(status: u16) -> Response {
+        Response {
+            status,
+            status_text: "OK".to_string(),
+            headers: Vec::new(),
+            body: String::new(),
+            elapsed: std::time::Duration::from_millis(1),
+            redirects: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn run_requested_moves_run_state_to_in_flight_when_a_request_is_selected() {
+        let mut state = loaded_state(VALID_COLLECTION);
+
+        update(&mut state, Message::RunRequested);
+
+        assert!(matches!(state.run_state, RunState::InFlight));
+    }
+
+    #[test]
+    fn run_requested_is_a_no_op_with_nothing_loaded() {
+        let mut state = AppState::default();
+
+        update(&mut state, Message::RunRequested);
+
+        assert!(matches!(state.run_state, RunState::Idle));
+    }
+
+    #[test]
+    fn run_completed_stores_the_real_response_in_run_state() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+
+        update(&mut state, Message::RunCompleted(Ok(sample_response(200))));
+
+        match state.run_state {
+            RunState::Completed(Ok(response)) => assert_eq!(response.status, 200),
+            other => panic!("expected RunState::Completed(Ok(_)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_completed_stores_the_real_error_in_run_state() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
+
+        update(&mut state, Message::RunCompleted(Err(error)));
+
+        assert!(matches!(state.run_state, RunState::Completed(Err(_))));
+    }
+
+    #[test]
+    fn navigation_and_a_second_run_are_blocked_while_a_run_is_in_flight() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        state.environments = ["default", "staging"]
+            .into_iter()
+            .map(|name| named_environment(name, &[]))
+            .collect();
+        update(&mut state, Message::RunRequested);
+        assert!(matches!(state.run_state, RunState::InFlight));
+
+        update(&mut state, Message::SelectNext);
+        update(&mut state, Message::SelectPrevious);
+        update(&mut state, Message::OpenEnvironmentOverlay);
+        update(&mut state, Message::RunRequested);
+
+        assert_eq!(
+            selected(&state),
+            0,
+            "selection must not move while a run is in flight"
+        );
+        assert_eq!(
+            state.environment_overlay, None,
+            "the environment overlay must not open while a run is in flight"
+        );
+        assert!(
+            matches!(state.run_state, RunState::InFlight),
+            "a second RunRequested must not restart or otherwise disturb the in-flight run"
+        );
+    }
+
+    #[test]
+    fn run_completed_is_accepted_while_a_run_is_in_flight() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+
+        update(&mut state, Message::RunCompleted(Ok(sample_response(204))));
+
+        assert!(
+            matches!(state.run_state, RunState::Completed(Ok(_))),
+            "RunCompleted must end the in-flight state even though it would \
+             otherwise be blocked by it"
+        );
+    }
+
+    #[test]
+    fn navigation_works_again_once_a_run_has_completed() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        update(&mut state, Message::RunCompleted(Ok(sample_response(200))));
+
+        update(&mut state, Message::SelectNext);
+
+        assert_eq!(selected(&state), 1);
+    }
+
+    #[test]
+    fn quit_still_works_while_a_run_is_in_flight() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+
+        update(&mut state, Message::Quit);
+
+        assert!(state.should_quit);
     }
 }
