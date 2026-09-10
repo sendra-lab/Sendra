@@ -148,6 +148,13 @@ fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// is what actually re-layouts the screen. Verified against
 /// `ratatui_core::terminal::render`/`resize` (ratatui 0.30 / ratatui-core
 /// 0.1.2) rather than assumed.
+///
+/// `Down`/`Up`/`j`/`k` are bound to `SelectNext`/`SelectPrevious` outside the
+/// overlay branch below and to nothing else — see the doc comment on
+/// [`app::Message::ScrollResponseDown`] for why the response panel's own
+/// scroll deliberately lives on a disjoint set of keys (`PageUp`/`PageDown`/
+/// `Home`/`End`) instead of overloading the same arrows based on which pane
+/// currently "has focus".
 fn next_message(overlay_open: bool) -> io::Result<Message> {
     if !event::poll(Duration::from_millis(100))? {
         return Ok(Message::Tick);
@@ -180,6 +187,8 @@ fn next_message(overlay_open: bool) -> io::Result<Message> {
                 KeyCode::Enter | KeyCode::Char('r') => Ok(Message::RunRequested),
                 KeyCode::PageDown => Ok(Message::ScrollResponseDown),
                 KeyCode::PageUp => Ok(Message::ScrollResponseUp),
+                KeyCode::Home => Ok(Message::ScrollResponseTop),
+                KeyCode::End => Ok(Message::ScrollResponseBottom),
                 KeyCode::Char('c') => Ok(Message::ToggleRevealCaptures),
                 _ => Ok(Message::Tick),
             }
