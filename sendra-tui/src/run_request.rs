@@ -163,4 +163,27 @@ mod tests {
             "a refused connection must fail fast, not hang: took {elapsed:?}"
         );
     }
+
+    /// Manual parity check against `sendra run` on the exact same request —
+    /// `#[ignore]`d because it needs real internet access, not something a
+    /// normal `cargo test` run should depend on. Run explicitly with
+    /// `cargo test -p sendra-tui -- --ignored --nocapture` and compare the
+    /// printed status/headers/body against `sendra run req.yaml` where
+    /// `req.yaml` is `method: GET\nurl: https://httpbin.org/json\n` — the
+    /// same request this test sends through the same pipeline `spawn` uses.
+    #[test]
+    #[ignore = "hits the real network (httpbin.org); run explicitly for a parity check against `sendra run`"]
+    fn parity_check_against_sendra_run_httpbin_json() {
+        let request = request("method: GET\nurl: https://httpbin.org/json\n");
+
+        let outcome = run_and_wait(request);
+
+        let response = outcome.expect("httpbin.org should be reachable");
+        eprintln!("status: {} {}", response.status, response.status_text);
+        for (name, value) in &response.headers {
+            eprintln!("{name}: {value}");
+        }
+        eprintln!();
+        eprintln!("{}", response.body);
+    }
 }

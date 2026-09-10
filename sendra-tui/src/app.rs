@@ -41,6 +41,12 @@ pub struct AppState {
     /// glyph `render_status_bar` draws while `run_state` is `InFlight`. Not
     /// meaningful on its own; it exists purely to make the spinner animate.
     pub spinner_tick: usize,
+    /// How many lines into the response panel's text the view is scrolled —
+    /// see `render_response_panel`. Reset to `0` whenever it would otherwise
+    /// point at a different run's text: a fresh `RunRequested` and a
+    /// changed request-list selection both reset it, in `update` and
+    /// `select` respectively.
+    pub response_scroll: usize,
 }
 
 #[derive(Debug, Default)]
@@ -91,14 +97,27 @@ pub enum Message {
     /// message would normally be blocked by an in-flight run, since this is
     /// the message that ends that state.
     RunCompleted(Result<Response, SendraError>),
+    /// PageDown on the response panel: scrolls its text down a few lines.
+    /// A no-op whenever there is nothing showing that could scroll — see
+    /// `render_response_panel`, which is the only place `response_scroll` is
+    /// read and where the actual clamping against content length happens.
+    ScrollResponseDown,
+    /// PageUp on the response panel: scrolls its text up a few lines. See
+    /// [`Message::ScrollResponseDown`].
+    ScrollResponseUp,
 }
 
 /// What the selected request's most recent run did, if anything.
 ///
-/// Deliberately holds the real `sendra_core::Response`/`SendraError` a run
-/// produced, not a TUI-invented summary — rendering that content in full is
-/// issue 8's job; this only has to get it into state correctly. A
-/// placeholder "done" indicator in `view()` is enough to prove that for now.
+/// Holds the real `sendra_core::Response`/`SendraError` a run produced, not
+/// a TUI-invented summary — `render_response_panel` formats it, but nothing
+/// about the data itself is reshaped or approximated first.
+///
+/// **Always about the currently selected request.** Nothing here tracks
+/// *which* request a completed run belongs to; instead, `select` resets this
+/// back to `Idle` the moment the request-list selection actually moves, so
+/// `Completed` can never be misread as an answer for a request other than
+/// the one it was sent for.
 #[derive(Debug, Default)]
 pub enum RunState {
     #[default]
@@ -180,13 +199,28 @@ pub fn update(state: &mut AppState, msg: Message) {
             // is a selected request to send".
             if request_is_selected(state) {
                 state.run_state = RunState::InFlight;
+                // A fresh run's text starts at the top, regardless of where
+                // a previous run's was left scrolled.
+                state.response_scroll = 0;
             }
         }
         Message::RunCompleted(result) => {
             state.run_state = RunState::Completed(result);
         }
+        Message::ScrollResponseDown => {
+            state.response_scroll = state.response_scroll.saturating_add(SCROLL_STEP_LINES);
+        }
+        Message::ScrollResponseUp => {
+            state.response_scroll = state.response_scroll.saturating_sub(SCROLL_STEP_LINES);
+        }
     }
 }
+
+/// Lines moved per `PageUp`/`PageDown` on the response panel. Not tied to
+/// the pane's actual height — this is the minimal scroll the issue asks
+/// for, not the full viewport-aware paging of issue 13 — so a fixed step
+/// that comfortably outruns typical pane heights is simplest.
+const SCROLL_STEP_LINES: usize = 10;
 
 /// Whether the collection browser currently has a request selected — true
 /// exactly when `load_state` is `Loaded` and `selected` indexes a real
@@ -212,7 +246,17 @@ fn select(state: &mut AppState, delta: isize) {
         document, selected, ..
     } = &mut state.load_state
     {
-        *selected = move_selection(*selected, document.requests().len(), delta);
+        let next = move_selection(*selected, document.requests().len(), delta);
+        if next != *selected {
+            // A different request's preview/response is about to show, so a
+            // previous run's result — and its scroll position — belong to a
+            // request no longer on screen. See the doc comment on
+            // `RunState` for why this is what keeps `Completed` always
+            // meaning "the currently selected request's result".
+            state.run_state = RunState::Idle;
+            state.response_scroll = 0;
+        }
+        *selected = next;
     }
 }
 
@@ -269,6 +313,15 @@ fn render_request_list(frame: &mut Frame, area: Rect, document: &Document, selec
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
+/// Once a run has completed for the currently selected request, this pane
+/// shows the result **instead of** the request preview — replace, not a
+/// toggle or a second tab. Two reasons: there is no natural third state to
+/// toggle back and forth between once the answer to "what did this request
+/// actually do" exists (the preview is only ever a stand-in for that
+/// answer), and `RunState` already resets to `Idle` on every request-list
+/// selection change (see its doc comment), so the preview reappears on its
+/// own the moment it is relevant again — a toggle key would be one more
+/// binding for a state that already un-does itself.
 fn render_detail_pane(
     frame: &mut Frame,
     area: Rect,
@@ -281,6 +334,11 @@ fn render_detail_pane(
         frame.render_widget(Paragraph::new("No request selected."), area);
         return;
     };
+
+    if let RunState::Completed(result) = &state.run_state {
+        render_response_panel(frame, area, result, state.response_scroll);
+        return;
+    }
 
     let active = active_environment(state);
     let environment = active.map_or_else(Environment::default, |named| named.environment.clone());
@@ -305,14 +363,147 @@ fn render_detail_pane(
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
 }
 
+/// The completed-run half of the detail pane: a real response's status,
+/// headers and body, or the real `SendraError` that stopped it — pulled
+/// straight from the `Response`/`SendraError` already sitting in
+/// `RunState::Completed`, nothing recomputed or re-derived.
+///
+/// **Not wrapped, and scrolled by whole lines only.** The request preview
+/// above wraps long lines because a request body is authored by the same
+/// person reading it and rarely wide; a response body has no such
+/// guarantee — a minified JSON payload is one line that can run to
+/// thousands of characters — so wrapping it would make `response_scroll`'s
+/// "line N" meaningless (a wrapped line renders as several visual rows,
+/// and the count depends on pane width). Scrolling raw lines and letting a
+/// too-wide one clip at the pane edge is the same trade-off `less` (without
+/// `-S`) and most response viewers make, and it is what keeps the scroll
+/// math in this function simple and always correct rather than an
+/// approximation of ratatui's own wrapping.
+///
+/// The last line is always a footer — `Line a-b of n` plus the scroll keys
+/// — never only shown once content overflows, so the pane never scrolls
+/// silently: there is always something on screen saying whether there is
+/// more, exactly the same posture `truncate_body` takes with its own
+/// `[truncated to N characters]` marker.
+fn render_response_panel(
+    frame: &mut Frame,
+    area: Rect,
+    result: &Result<Response, SendraError>,
+    scroll: usize,
+) {
+    let text = format_run_result(result);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let content_height = rows[0].height as usize;
+    let max_scroll = total.saturating_sub(content_height.max(1));
+    let scroll = scroll.min(max_scroll);
+
+    let paragraph = Paragraph::new(text.clone()).scroll((scroll.min(u16::MAX as usize) as u16, 0));
+    frame.render_widget(paragraph, rows[0]);
+
+    let last_visible = (scroll + content_height).min(total);
+    let footer = format!(
+        "Line {}-{} of {total} — PgUp/PgDn to scroll",
+        scroll.saturating_add(1).min(total.max(1)),
+        last_visible,
+    );
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::new().add_modifier(Modifier::DIM)),
+        rows[1],
+    );
+}
+
+/// Mirrors sendra-cli's own response layout
+/// (`sendra-cli/src/output/human.rs::print_response`/`print_status_line`)
+/// closely enough that the two are a direct side-by-side match for the same
+/// response: status code, status text and elapsed time on one line, every
+/// header in the order the response actually carried them, a blank line,
+/// then the body. Uncoloured, unlike the CLI's terminal output — colour is
+/// the one thing this deliberately does not reproduce, since ratatui styling
+/// is a separate concern from the data being correct.
+/// The text `render_response_panel` shows: `format_response`'s layout on
+/// success, or the real `SendraError`'s own `Display` — via `{error}`, the
+/// same `thiserror`-derived message `sendra run` itself would print for the
+/// same failure — on failure. On the failure path there is no response to
+/// lay out, so this is the whole of it: the error, not a TUI-invented
+/// summary of it.
+fn format_run_result(result: &Result<Response, SendraError>) -> String {
+    match result {
+        Ok(response) => format_response(response),
+        Err(error) => format!("Request failed:\n{error}"),
+    }
+}
+
+fn format_response(response: &Response) -> String {
+    let mut lines = vec![format!(
+        "{} {}  {} ms",
+        response.status,
+        response.status_text,
+        response.elapsed.as_millis()
+    )];
+
+    for (name, value) in &response.headers {
+        lines.push(format!("{name}: {value}"));
+    }
+
+    if !response.body.is_empty() {
+        lines.push(String::new());
+        lines.push(body_for_display(response));
+    }
+
+    lines.join("\n")
+}
+
+/// Pretty-prints the body when `Content-Type` claims JSON and it actually
+/// parses as JSON, otherwise returns it unchanged — the same rule, sniffed
+/// the same way, as sendra-cli's `body_for_display`/`claims_json` in
+/// `output/human.rs`. Reimplemented here rather than imported, since
+/// sendra-tui depends on sendra-core and not on sendra-cli, and this is
+/// display formatting, not something sendra-core itself does or should do.
+fn body_for_display(response: &Response) -> String {
+    if !claims_json(&response.headers) {
+        return response.body.clone();
+    }
+
+    match serde_json::from_str::<serde_json::Value>(&response.body) {
+        Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_else(|_| response.body.clone()),
+        Err(_) => response.body.clone(),
+    }
+}
+
+/// Whether these response headers say the body is JSON — see the doc
+/// comment on [`body_for_display`] for why this mirrors sendra-cli's own
+/// `claims_json` instead of calling it.
+fn claims_json(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        .any(|(_, value)| {
+            let media_type = value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            media_type == "application/json" || media_type.ends_with("+json")
+        })
+}
+
 /// Cycled by `spinner_tick` while a run is in flight — an ordinary braille
 /// spinner, no library, since ratatui ships no widget for one.
 const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
 
 /// The one-line status bar under the panes: idle hint, in-flight spinner, or
-/// the placeholder completion indicator issue 6 asks for — the real
-/// status/headers/body rendering of a completed run is issue 8's job, not
-/// this one's.
+/// a one-line summary of what `render_response_panel` is showing in full
+/// above it — this line never carries anything the panel doesn't already
+/// say, it just makes the outcome visible even when the panel itself has
+/// scrolled somewhere else.
 fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     let text = match &state.run_state {
         RunState::Idle => "Enter/r: run selected request".to_string(),
@@ -943,5 +1134,291 @@ requests:
         update(&mut state, Message::Quit);
 
         assert!(state.should_quit);
+    }
+
+    #[test]
+    fn selecting_a_different_request_resets_run_state_and_scroll() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        update(&mut state, Message::RunCompleted(Ok(sample_response(200))));
+        update(&mut state, Message::ScrollResponseDown);
+        assert!(matches!(state.run_state, RunState::Completed(Ok(_))));
+        assert_eq!(state.response_scroll, SCROLL_STEP_LINES);
+
+        update(&mut state, Message::SelectNext);
+
+        assert!(
+            matches!(state.run_state, RunState::Idle),
+            "a previous run's result must not be attributed to the newly selected request"
+        );
+        assert_eq!(state.response_scroll, 0);
+    }
+
+    #[test]
+    fn selecting_the_same_request_again_does_not_reset_run_state() {
+        // A collection of one: `SelectNext`/`SelectPrevious` always land back
+        // on the same request, so nothing about the result should be
+        // disturbed — only an actual change of selection resets it.
+        let mut state = loaded_state(VALID_COLLECTION);
+        // Trim to a single request so every `SelectNext` is a no-op move.
+        if let LoadState::Loaded { document, .. } = &mut state.load_state {
+            let mut trimmed = Document::from_yaml_str(
+                "name: test\nrequests:\n  - name: One\n    method: GET\n    url: https://example.com\n",
+            )
+            .unwrap();
+            std::mem::swap(document.as_mut(), &mut trimmed);
+        }
+        update(&mut state, Message::RunRequested);
+        update(&mut state, Message::RunCompleted(Ok(sample_response(200))));
+
+        update(&mut state, Message::SelectNext);
+
+        assert!(matches!(state.run_state, RunState::Completed(Ok(_))));
+    }
+
+    #[test]
+    fn starting_a_new_run_resets_the_previous_scroll_position() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        update(&mut state, Message::RunCompleted(Ok(sample_response(200))));
+        update(&mut state, Message::ScrollResponseDown);
+        assert_eq!(state.response_scroll, SCROLL_STEP_LINES);
+
+        update(&mut state, Message::RunRequested);
+
+        assert_eq!(state.response_scroll, 0);
+    }
+
+    #[test]
+    fn scroll_down_then_up_returns_to_the_top() {
+        let mut state = AppState::default();
+
+        update(&mut state, Message::ScrollResponseDown);
+        assert_eq!(state.response_scroll, SCROLL_STEP_LINES);
+
+        update(&mut state, Message::ScrollResponseUp);
+        assert_eq!(state.response_scroll, 0);
+    }
+
+    #[test]
+    fn scroll_up_from_the_top_saturates_at_zero() {
+        let mut state = AppState::default();
+
+        update(&mut state, Message::ScrollResponseUp);
+
+        assert_eq!(state.response_scroll, 0);
+    }
+
+    fn response_with(headers: &[(&str, &str)], body: &str) -> Response {
+        Response {
+            status: 201,
+            status_text: "Created".to_string(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            body: body.to_string(),
+            elapsed: std::time::Duration::from_millis(42),
+            redirects: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn format_response_matches_the_status_headers_body_layout() {
+        let response = response_with(&[("X-Request-Id", "abc123")], "plain text body");
+
+        let text = format_response(&response);
+
+        assert_eq!(
+            text,
+            "201 Created  42 ms\nX-Request-Id: abc123\n\nplain text body"
+        );
+    }
+
+    #[test]
+    fn format_response_omits_the_body_section_when_the_body_is_empty() {
+        let response = response_with(&[], "");
+
+        let text = format_response(&response);
+
+        assert_eq!(text, "201 Created  42 ms");
+    }
+
+    #[test]
+    fn body_for_display_pretty_prints_a_json_content_type() {
+        let response = response_with(
+            &[("Content-Type", "application/json; charset=utf-8")],
+            "{\"id\":1,\"name\":\"widget\"}",
+        );
+
+        let displayed = body_for_display(&response);
+
+        assert_eq!(displayed, "{\n  \"id\": 1,\n  \"name\": \"widget\"\n}");
+    }
+
+    #[test]
+    fn body_for_display_leaves_non_json_content_types_untouched() {
+        let response = response_with(&[("Content-Type", "text/plain")], "{\"id\":1}");
+
+        let displayed = body_for_display(&response);
+
+        assert_eq!(
+            displayed, "{\"id\":1}",
+            "a non-JSON content type must not be re-formatted"
+        );
+    }
+
+    #[test]
+    fn body_for_display_leaves_malformed_json_untouched() {
+        let response = response_with(&[("Content-Type", "application/json")], "not json");
+
+        let displayed = body_for_display(&response);
+
+        assert_eq!(
+            displayed, "not json",
+            "a JSON content type whose body does not actually parse must be shown verbatim, not dropped or panicked on"
+        );
+    }
+
+    #[test]
+    fn claims_json_matches_a_vendor_json_suffix() {
+        assert!(claims_json(&[(
+            "content-type".to_string(),
+            "application/vnd.api+json".to_string()
+        )]));
+    }
+
+    #[test]
+    fn run_completed_err_renders_the_real_sendra_error_text() {
+        let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
+        let expected = error.to_string();
+
+        let text = format_run_result(&Err(error));
+
+        assert!(
+            text.contains(&expected),
+            "the panel must show the real SendraError text, got: {text}"
+        );
+    }
+
+    /// A large body, drawn into a small area, must not overflow the pane,
+    /// panic, or scroll past its own content — the actual `render_widget`
+    /// call proves this rather than just the scroll-offset arithmetic
+    /// (`format_response`/`format_run_result` above), since ratatui's own
+    /// clipping is part of what makes this safe.
+    #[test]
+    fn a_large_body_renders_into_a_small_area_without_panicking() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let huge_body = (0..5000)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result: Result<Response, SendraError> = Ok(response_with(&[], &huge_body));
+
+        // 5000 body lines, plus the status line and the blank separator line
+        // `format_response` always puts ahead of a non-empty body.
+        let total_lines = 5002;
+        let backend = TestBackend::new(60, 5);
+        let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+
+        // Scrolled absurdly far past the end of the content — proving the
+        // clamp in `render_response_panel` (not just ratatui's own
+        // clipping) keeps the footer's line numbers sane rather than
+        // reporting a scroll position past `total`.
+        terminal
+            .draw(|frame| {
+                render_response_panel(frame, frame.area(), &result, usize::MAX);
+            })
+            .expect("drawing a huge, over-scrolled body must not panic");
+
+        let buffer = terminal.backend().buffer();
+        let footer_row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
+            .collect();
+        assert!(
+            footer_row.contains(&format!("of {total_lines}")),
+            "the footer must report the real total line count, got: {footer_row:?}"
+        );
+        assert!(
+            !footer_row.contains(&format!("of {}", total_lines + 1)),
+            "an over-scroll must not be reported as if it went past the real total"
+        );
+    }
+
+    /// Renders a completed successful run through the real `view()` — not
+    /// just `format_response`/`render_response_panel` in isolation — and
+    /// reads the actual character buffer back, so this is what the terminal
+    /// would really show: proof the status, a header and the body all land
+    /// on screen together, replacing the request preview as documented on
+    /// `render_detail_pane`.
+    #[test]
+    fn view_renders_a_completed_success_as_a_real_response_panel() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        let response = response_with(&[("X-Request-Id", "abc123")], "hello world");
+        update(&mut state, Message::RunCompleted(Ok(response)));
+
+        let backend = TestBackend::new(100, 15);
+        let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+        terminal
+            .draw(|frame| view(&state, frame))
+            .expect("rendering a completed run must not panic");
+
+        let screen = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            screen.contains("201 Created"),
+            "the real status must be on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("X-Request-Id: abc123"),
+            "a real response header must be on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("hello world"),
+            "the real response body must be on screen:\n{screen}"
+        );
+    }
+
+    /// Same as above for the failure path: a real `SendraError`'s message
+    /// must appear on screen, not a generic "failed" placeholder.
+    #[test]
+    fn view_renders_a_completed_failure_with_the_real_error_message() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
+        let expected_message = error.to_string();
+        update(&mut state, Message::RunCompleted(Err(error)));
+
+        let backend = TestBackend::new(100, 15);
+        let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+        terminal
+            .draw(|frame| view(&state, frame))
+            .expect("rendering a failed run must not panic");
+
+        let screen = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            screen.contains(&expected_message),
+            "the real SendraError message must be on screen, not a generic \
+             placeholder:\n{screen}\nexpected to find: {expected_message}"
+        );
+    }
+
+    fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

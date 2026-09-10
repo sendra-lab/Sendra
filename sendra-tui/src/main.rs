@@ -149,6 +149,8 @@ fn next_message(overlay_open: bool) -> io::Result<Message> {
                 KeyCode::Down | KeyCode::Char('j') => Ok(Message::SelectNext),
                 KeyCode::Up | KeyCode::Char('k') => Ok(Message::SelectPrevious),
                 KeyCode::Enter | KeyCode::Char('r') => Ok(Message::RunRequested),
+                KeyCode::PageDown => Ok(Message::ScrollResponseDown),
+                KeyCode::PageUp => Ok(Message::ScrollResponseUp),
                 _ => Ok(Message::Tick),
             }
         }
