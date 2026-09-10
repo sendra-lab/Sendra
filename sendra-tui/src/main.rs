@@ -1,7 +1,7 @@
 mod app;
 mod run_request;
 
-use std::io::{self, Stdout};
+use std::io::{self, IsTerminal, Stdout};
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -117,10 +117,41 @@ fn restore_terminal() {
     let _ = execute!(io::stdout(), LeaveAlternateScreen);
 }
 
+/// Restores the terminal before the default hook prints the panic message —
+/// but **only** for a panic on the thread that actually owns the terminal.
+/// `panic::set_hook` installs one hook for the whole process: every thread
+/// that panics runs it, including the run-request thread `run_request::spawn`
+/// puts each HTTP send on. That thread's panics are caught with
+/// `catch_unwind` and turned into a failed run (see that function's doc
+/// comment) rather than ever reaching here as an unwind, but the hook itself
+/// still fires at the moment of the panic regardless of whether something
+/// upstack goes on to catch it — `catch_unwind` does not suppress hook
+/// invocation. Without this thread check, a bug in the request pipeline
+/// would call `restore_terminal()` (disabling raw mode, leaving the
+/// alternate screen) out from under a main loop that is still very much
+/// alive and about to draw its next frame — corrupting a session that never
+/// actually crashed, instead of the run simply showing up as a failed
+/// request in the response panel like any other error.
+/// Whether a panic on `panicking_thread` should restore the terminal, given
+/// `install_panic_hook` was itself called from `main_thread` — pulled out of
+/// the hook closure as a pure, two-`ThreadId` comparison so this gating
+/// decision is unit-testable directly (construct a background thread, take
+/// its real `ThreadId`, assert the predicate) rather than only observable by
+/// actually panicking a real terminal session.
+fn panic_should_restore_terminal(
+    panicking_thread: std::thread::ThreadId,
+    main_thread: std::thread::ThreadId,
+) -> bool {
+    panicking_thread == main_thread
+}
+
 fn install_panic_hook() {
     let default_hook = panic::take_hook();
+    let main_thread_id = std::thread::current().id();
     panic::set_hook(Box::new(move |info| {
-        restore_terminal();
+        if panic_should_restore_terminal(std::thread::current().id(), main_thread_id) {
+            restore_terminal();
+        }
         default_hook(info);
     }));
 }
@@ -160,40 +191,54 @@ fn next_message(overlay_open: bool) -> io::Result<Message> {
         return Ok(Message::Tick);
     }
 
-    match event::read()? {
-        Event::Resize(_, _) => Ok(Message::Resize),
+    Ok(translate_event(event::read()?, overlay_open))
+}
+
+/// The pure key/resize-to-`Message` mapping `next_message` reads off the
+/// real crossterm event stream — split out so it takes a plain `Event`
+/// value instead of calling `event::poll`/`event::read` itself, which is
+/// what makes it unit-testable with hand-built `Event`s (no real terminal
+/// needed) rather than only reachable by actually typing at one. Issue 13's
+/// clean-exit audit relies on this directly: `q` and Ctrl+C are two
+/// different physical keys that both need to reach the *identical*
+/// `Message::Quit` so that whatever `main::run`/`restore_terminal` do for
+/// one, they provably do for the other — not two independently-written quit
+/// paths that could quietly drift apart.
+fn translate_event(event: Event, overlay_open: bool) -> Message {
+    match event {
+        Event::Resize(_, _) => Message::Resize,
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             let is_quit = key.code == KeyCode::Char('q')
                 || (key.code == KeyCode::Char('c')
                     && key.modifiers.contains(KeyModifiers::CONTROL));
             if is_quit {
-                return Ok(Message::Quit);
+                return Message::Quit;
             }
 
             if overlay_open {
-                return Ok(match key.code {
+                return match key.code {
                     KeyCode::Esc => Message::CloseEnvironmentOverlay,
                     KeyCode::Enter => Message::ConfirmEnvironmentSelection,
                     KeyCode::Down | KeyCode::Char('j') => Message::SelectNext,
                     KeyCode::Up | KeyCode::Char('k') => Message::SelectPrevious,
                     _ => Message::Tick,
-                });
+                };
             }
 
             match key.code {
-                KeyCode::Char('e') => Ok(Message::OpenEnvironmentOverlay),
-                KeyCode::Down | KeyCode::Char('j') => Ok(Message::SelectNext),
-                KeyCode::Up | KeyCode::Char('k') => Ok(Message::SelectPrevious),
-                KeyCode::Enter | KeyCode::Char('r') => Ok(Message::RunRequested),
-                KeyCode::PageDown => Ok(Message::ScrollResponseDown),
-                KeyCode::PageUp => Ok(Message::ScrollResponseUp),
-                KeyCode::Home => Ok(Message::ScrollResponseTop),
-                KeyCode::End => Ok(Message::ScrollResponseBottom),
-                KeyCode::Char('c') => Ok(Message::ToggleRevealCaptures),
-                _ => Ok(Message::Tick),
+                KeyCode::Char('e') => Message::OpenEnvironmentOverlay,
+                KeyCode::Down | KeyCode::Char('j') => Message::SelectNext,
+                KeyCode::Up | KeyCode::Char('k') => Message::SelectPrevious,
+                KeyCode::Enter | KeyCode::Char('r') => Message::RunRequested,
+                KeyCode::PageDown => Message::ScrollResponseDown,
+                KeyCode::PageUp => Message::ScrollResponseUp,
+                KeyCode::Home => Message::ScrollResponseTop,
+                KeyCode::End => Message::ScrollResponseBottom,
+                KeyCode::Char('c') => Message::ToggleRevealCaptures,
+                _ => Message::Tick,
             }
         }
-        _ => Ok(Message::Tick),
+        _ => Message::Tick,
     }
 }
 
@@ -282,7 +327,36 @@ fn run(
     }
 }
 
+/// A clear, up-front refusal when stdout is not a real terminal (piped to a
+/// file or another process, e.g. `sendra-tui > output.txt` or
+/// `sendra-tui | cat`), checked before `init_terminal` ever calls
+/// `enable_raw_mode`/`EnterAlternateScreen`. Without this, those calls either
+/// fail with a raw crossterm/OS error whose message says nothing about *why*
+/// (no such thing as raw mode on a pipe), or — worse, depending on platform —
+/// succeed on a redirected stdout and start writing ANSI escape sequences
+/// into whatever file or pipe is on the other end, silently producing
+/// garbage instead of a TUI. Checking `stdout` specifically (not `stdin`)
+/// matches how this actually gets triggered in practice: piping the *output*
+/// of an interactive full-screen program somewhere it cannot be interactive.
+///
+/// Printed directly with `eprintln!` and exited here, rather than returned
+/// as an `io::Error` for `main`'s `?` to propagate: `main`'s `io::Result`
+/// return type prints an error via `Debug` (`Error: Custom { kind: ..., .. }`),
+/// which is exactly the confusing, implementation-flavored message this
+/// check exists to avoid — the point is one plain, human-readable line.
+fn require_interactive_stdout() {
+    if io::stdout().is_terminal() {
+        return;
+    }
+    eprintln!(
+        "sendra-tui requires an interactive terminal on stdout; it looks like \
+         stdout has been redirected or piped. Run it directly in a terminal."
+    );
+    std::process::exit(1);
+}
+
 fn main() -> io::Result<()> {
+    require_interactive_stdout();
     install_panic_hook();
 
     let cli = Cli::parse();
@@ -313,4 +387,103 @@ fn main() -> io::Result<()> {
     restore_terminal();
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+
+    fn press(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn press_with(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    // --- clean-exit audit: q and Ctrl+C must be provably identical -------
+
+    #[test]
+    fn q_and_ctrl_c_both_translate_to_the_identical_quit_message() {
+        let from_q = translate_event(press(KeyCode::Char('q')), false);
+        let from_ctrl_c =
+            translate_event(press_with(KeyCode::Char('c'), KeyModifiers::CONTROL), false);
+
+        assert!(matches!(from_q, Message::Quit));
+        assert!(matches!(from_ctrl_c, Message::Quit));
+    }
+
+    #[test]
+    fn q_and_ctrl_c_quit_even_while_the_environment_overlay_is_open() {
+        // `update`'s InFlight guard exempts `Quit` specifically so it can
+        // never be blocked (see its own doc comment); the overlay must not
+        // re-introduce that gap from the translation side.
+        let from_q = translate_event(press(KeyCode::Char('q')), true);
+        let from_ctrl_c =
+            translate_event(press_with(KeyCode::Char('c'), KeyModifiers::CONTROL), true);
+
+        assert!(matches!(from_q, Message::Quit));
+        assert!(matches!(from_ctrl_c, Message::Quit));
+    }
+
+    #[test]
+    fn plain_c_without_control_does_not_quit() {
+        // `c` alone is `ToggleRevealCaptures` (outside the overlay) — only
+        // `c` *with* the control modifier means quit. A translation that
+        // conflated the two would make an ordinary keystroke exit the app.
+        let message = translate_event(press(KeyCode::Char('c')), false);
+
+        assert!(!matches!(message, Message::Quit));
+    }
+
+    #[test]
+    fn a_key_release_event_is_not_treated_as_a_press() {
+        let message = translate_event(
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )),
+            false,
+        );
+
+        assert!(
+            !matches!(message, Message::Quit),
+            "a key *release* must not itself trigger quit — only a Press"
+        );
+    }
+
+    #[test]
+    fn resize_events_translate_to_the_resize_message() {
+        let message = translate_event(Event::Resize(40, 20), false);
+
+        assert!(matches!(message, Message::Resize));
+    }
+
+    // --- clean-exit audit: panic-hook thread gating -----------------------
+
+    #[test]
+    fn panic_hook_restores_the_terminal_only_for_the_thread_that_installed_it() {
+        let main_thread = std::thread::current().id();
+        assert!(
+            panic_should_restore_terminal(main_thread, main_thread),
+            "a panic on the same thread the hook was installed from (the real \
+             main thread, in production) must restore the terminal"
+        );
+
+        let background_thread = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .expect("the helper thread must not itself panic");
+        assert_ne!(
+            background_thread, main_thread,
+            "the test setup must actually produce two distinct thread ids"
+        );
+        assert!(
+            !panic_should_restore_terminal(background_thread, main_thread),
+            "a panic on any other thread — like run_request::spawn's background \
+             run thread — must NOT restore the terminal out from under a main \
+             loop that is still alive and running"
+        );
+    }
 }

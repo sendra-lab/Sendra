@@ -66,6 +66,16 @@ pub enum RunError {
     /// `tokio::runtime::Builder::build()` failed for this run's dedicated
     /// runtime — see [`spawn`].
     RuntimeUnavailable(std::io::Error),
+    /// The run thread itself panicked somewhere in the pipeline below — a
+    /// bug in this crate, not a network/parsing failure. Without
+    /// `spawn`'s `catch_unwind`, a panic here would unwind the whole thread
+    /// before `on_complete` ever ran, and `RunState` would stay
+    /// `InFlight` forever with no `RunCompleted` message ever arriving —
+    /// the exact silent-hang shape issue 11 already fixed for other error
+    /// paths. Carrying the panic payload through `RunOutcome` the same way
+    /// any other run failure travels keeps that guarantee: every run ends
+    /// in a `RunCompleted`, even this one.
+    Panicked(String),
 }
 
 impl std::fmt::Display for RunError {
@@ -74,6 +84,9 @@ impl std::fmt::Display for RunError {
             RunError::Core(error) => write!(f, "{error}"),
             RunError::RuntimeUnavailable(error) => {
                 write!(f, "could not start a runtime to send this request: {error}")
+            }
+            RunError::Panicked(message) => {
+                write!(f, "the run thread panicked: {message}")
             }
         }
     }
@@ -94,6 +107,17 @@ impl From<SendraError> for RunError {
 /// failure alike; the caller is expected to forward its argument back into
 /// the event loop as a `Message::RunCompleted`, exactly like a crossterm
 /// event would be.
+///
+/// **Always calls `on_complete` exactly once, even if the pipeline panics.**
+/// The whole run — runtime build, `block_on`, everything — is wrapped in
+/// `catch_unwind` so a bug anywhere in `execute` cannot unwind this thread
+/// out from under `on_complete` and leave the caller's `RunState` stuck at
+/// `InFlight` with no `RunCompleted` ever coming (see [`RunError::Panicked`]).
+/// A caught panic still runs the process's global panic hook first — that
+/// hook (`main::install_panic_hook`) only restores the terminal for a panic
+/// on the *main* thread, specifically so a panic caught and recovered here,
+/// on this background thread, never tears down a terminal session that
+/// never actually crashed.
 pub fn spawn(
     request: Request,
     environment: Environment,
@@ -101,23 +125,67 @@ pub fn spawn(
     on_complete: impl FnOnce(RunOutcome) + Send + 'static,
 ) {
     std::thread::spawn(move || {
-        let outcome = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime.block_on(execute(request, environment, base_dir)),
-            // See `RunError::RuntimeUnavailable`: reported through the same
-            // `RunOutcome` a network failure would be, not panicked — the
-            // run ends up in `RunState::Completed(Err(_))`, exactly as
-            // reachable and exactly as recoverable as any other failed run.
-            Err(error) => RunOutcome {
-                result: Err(RunError::RuntimeUnavailable(error)),
-                assertions: AssertionReport::default(),
-                capture: CaptureReport::default(),
-            },
-        };
+        let outcome = run_catching_panics(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(execute(request, environment, base_dir)),
+                // See `RunError::RuntimeUnavailable`: reported through the
+                // same `RunOutcome` a network failure would be, not
+                // panicked — the run ends up in `RunState::Completed(Err(_))`,
+                // exactly as reachable and exactly as recoverable as any
+                // other failed run.
+                Err(error) => RunOutcome {
+                    result: Err(RunError::RuntimeUnavailable(error)),
+                    assertions: AssertionReport::default(),
+                    capture: CaptureReport::default(),
+                },
+            }
+        });
         on_complete(outcome);
     });
+}
+
+/// Runs `f`, catching any panic and turning it into `RunOutcome { result:
+/// Err(RunError::Panicked(_)), .. }` instead of letting it unwind past this
+/// point — the mechanism [`spawn`] relies on to guarantee `on_complete`
+/// always runs exactly once, panic or not. Factored out from `spawn` itself
+/// so this recovery behavior is directly unit-testable with a closure that
+/// deliberately panics, rather than only reachable by getting a real bug to
+/// misfire somewhere inside `execute`'s real HTTP pipeline.
+fn run_catching_panics(f: impl FnOnce() -> RunOutcome + std::panic::UnwindSafe) -> RunOutcome {
+    std::panic::catch_unwind(f).unwrap_or_else(|payload| RunOutcome {
+        result: Err(RunError::Panicked(panic_payload_message(&payload))),
+        assertions: AssertionReport::default(),
+        capture: CaptureReport::default(),
+    })
+}
+
+/// The panic message from a `catch_unwind` payload, for the two shapes
+/// `panic!`/`.unwrap()`/`.expect()` actually produce (`&str` for a string
+/// literal message, `String` for a formatted one) — anything else (a panic
+/// with a non-string payload, rare in practice) falls back to a fixed,
+/// still-honest message rather than a blank one.
+///
+/// Takes `&Box<dyn Any + Send>` and derefs it explicitly (`&*payload`)
+/// rather than a plain `&(dyn Any + Send)` parameter relying on the call
+/// site's implicit `&payload` deref-coercion — the two are not
+/// interchangeable here: the implicit coercion at the `unwrap_or_else` call
+/// site was observed to produce a reference `downcast_ref` silently never
+/// matches against either `&str` or `String`, even for a payload that
+/// genuinely is one, while the explicit `&*payload` deref downcasts
+/// correctly. Verified with a minimal repro outside this crate before
+/// settling on this signature, not assumed.
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    let payload: &(dyn std::any::Any + Send) = &**payload;
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 /// The pipeline itself: config, then substitution/auth/query/body
@@ -240,6 +308,106 @@ mod tests {
         );
         rx.recv_timeout(Duration::from_secs(10))
             .expect("the run must complete, not hang")
+    }
+
+    // --- clean-exit audit: a panicking run thread must not hang ----------
+
+    /// The exact mechanism `spawn` relies on (see its doc comment),
+    /// exercised directly with a closure that deliberately panics — proof
+    /// that a bug anywhere in the real pipeline `spawn` wraps this way
+    /// becomes a real `RunError::Panicked`, carrying the real panic
+    /// message, rather than unwinding past `on_complete` and leaving the
+    /// caller's `RunState` stuck at `InFlight` forever.
+    #[test]
+    fn run_catching_panics_converts_a_panic_into_a_run_error_instead_of_unwinding() {
+        let outcome = run_catching_panics(|| panic!("simulated bug in the pipeline"));
+
+        match outcome.result {
+            Err(RunError::Panicked(message)) => {
+                assert!(
+                    message.contains("simulated bug in the pipeline"),
+                    "the real panic message must be preserved, got: {message}"
+                );
+            }
+            other => panic!("expected Err(RunError::Panicked(_)), got {other:?}"),
+        }
+        assert!(
+            outcome.assertions.is_empty() && outcome.capture.is_empty(),
+            "a panicked run checked/captured nothing, same as any other failed run"
+        );
+    }
+
+    /// The full `spawn`-shaped scenario end to end: a real OS thread whose
+    /// work panics. This is what issue 13's audit calls for directly — "a
+    /// bug inside run_request.rs" on the run thread — proven not to hang by
+    /// blocking on the very same `mpsc` completion signal `main`'s real loop
+    /// waits on, with a timeout that fails the test outright if it ever
+    /// does hang instead of asserting a negative.
+    #[test]
+    fn a_panic_on_the_run_thread_still_completes_instead_of_hanging_forever() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = run_catching_panics(|| panic!("boom from the run thread"));
+            let _ = tx.send(outcome);
+        });
+
+        let outcome = rx.recv_timeout(Duration::from_secs(5)).expect(
+            "a panicking run thread must still send a completion, exactly like a \
+             successful or a network-failed one would — never hang silently",
+        );
+
+        assert!(
+            matches!(outcome.result, Err(RunError::Panicked(_))),
+            "the panic must surface as a real, inspectable RunError"
+        );
+    }
+
+    /// Quitting while a run is still in flight drops `main::run`'s own
+    /// `run_tx`/`run_rx` — the receiver this `on_complete` closure's cloned
+    /// `Sender` eventually sends into. `mpsc::Sender::send` on a channel
+    /// whose only `Receiver` has already been dropped returns `Err`, never
+    /// panics (the std library's own documented behavior) — this proves
+    /// that holds for `spawn`'s specific `on_complete` pattern
+    /// (`let _ = tx.send(result);`, exactly as `main.rs` writes it) rather
+    /// than assuming it from the docs alone: the run thread must still run
+    /// to completion and return normally with the receiver already gone.
+    #[test]
+    fn sending_the_completed_run_to_an_already_dropped_receiver_does_not_panic() {
+        use std::sync::{Arc, Condvar, Mutex};
+
+        let addr = start_ok_server();
+        let req = request(&format!("method: GET\nurl: http://{addr}/\n"));
+
+        let (tx, rx) = mpsc::channel::<RunOutcome>();
+        drop(rx); // The app quit; nothing is listening anymore.
+
+        let finished = Arc::new((Mutex::new(false), Condvar::new()));
+        let finished_writer = Arc::clone(&finished);
+        spawn(
+            req,
+            Environment::default(),
+            PathBuf::from("."),
+            move |result| {
+                // The exact pattern `main::run` uses: discard the Result,
+                // never unwrap it. If this panicked instead, the run thread
+                // would die silently and `finished` would never flip.
+                let _ = tx.send(result);
+                let (lock, condvar) = &*finished_writer;
+                *lock.lock().expect("lock is not poisoned") = true;
+                condvar.notify_one();
+            },
+        );
+
+        let (lock, condvar) = &*finished;
+        let guard = lock.lock().expect("lock is not poisoned");
+        let (guard, wait_result) = condvar
+            .wait_timeout_while(guard, Duration::from_secs(10), |finished| !*finished)
+            .expect("lock is not poisoned");
+        assert!(
+            *guard && !wait_result.timed_out(),
+            "the run thread must complete normally (not hang or die silently) even \
+             when sending its result to an already-dropped receiver"
+        );
     }
 
     #[test]
