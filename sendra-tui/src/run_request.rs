@@ -11,6 +11,13 @@
 //! and reporting on top. No HTTP logic and no `resolve_*` call is
 //! reimplemented here; this only sequences sendra-core's own functions.
 //!
+//! On a successful send, the resolved request's own `assertions`/`capture`
+//! blocks are evaluated the same way `sendra-cli run`/`test`'s `send` does
+//! — `Assertions::evaluate`/`Captures::evaluate`, sendra-core's own
+//! machinery, not a parallel check reimplemented here — so a run through
+//! the TUI produces the same [`AssertionReport`]/[`CaptureReport`] the CLI
+//! would for the identical request.
+//!
 //! Config is resolved fresh per run, from the process's current directory,
 //! the same way sendra-cli's `prepare` resolves it once per invocation —
 //! each run here *is* one invocation's worth of work, just triggered by a
@@ -19,11 +26,28 @@
 use std::path::PathBuf;
 
 use sendra_core::config::global_config_path;
-use sendra_core::{Config, Environment, OAuthTokenCache, Request, Response, SendraError};
+use sendra_core::{
+    AssertionReport, CaptureReport, Config, Environment, OAuthTokenCache, Request, Response,
+    SendraError,
+};
 
-/// What running a request produced: a real response, or the real
-/// `sendra-core` error that stopped it — never a TUI-invented summary.
-pub type RunOutcome = Result<Response, SendraError>;
+/// What running a request produced: the response or the real `sendra-core`
+/// error that stopped it — never a TUI-invented summary — plus whatever the
+/// request's own `assertions`/`capture` blocks say about it.
+///
+/// `assertions`/`capture` are always the empty report when `result` is
+/// `Err`: nothing was checked or captured, because there is no response to
+/// check or capture from. That is the same rule sendra-cli's own `send`
+/// follows — see `sendra-cli/src/run.rs` — an empty report there means
+/// exactly the same thing an absent `assertions`/`capture` block does
+/// (nothing declared), which is why `AppState`/the response panel do not
+/// need to tell "not evaluated" apart from "evaluated, nothing declared".
+#[derive(Debug)]
+pub struct RunOutcome {
+    pub result: Result<Response, SendraError>,
+    pub assertions: AssertionReport,
+    pub capture: CaptureReport,
+}
 
 /// Runs `request` against `environment` on a dedicated OS thread, each with
 /// its own current-thread tokio runtime built just for this one send — see
@@ -53,8 +77,29 @@ pub fn spawn(
 /// resolution (`environment.apply`, `resolve_oauth`, `resolve_auth`,
 /// `resolve_query`, `resolve_body` — the same chain `resolve_preview` in
 /// `app.rs` runs, plus `resolve_oauth`, which a preview has no reason to
-/// pay for), then the actual send via [`sendra_core::send`].
+/// pay for), then the actual send via [`sendra_core::send`], then — only on
+/// a successful send — assertions and captures against the response that
+/// came back.
 async fn execute(request: Request, environment: Environment, base_dir: PathBuf) -> RunOutcome {
+    match execute_inner(request, environment, base_dir).await {
+        Ok((response, assertions, capture)) => RunOutcome {
+            result: Ok(response),
+            assertions,
+            capture,
+        },
+        Err(err) => RunOutcome {
+            result: Err(err),
+            assertions: AssertionReport::default(),
+            capture: CaptureReport::default(),
+        },
+    }
+}
+
+async fn execute_inner(
+    request: Request,
+    environment: Environment,
+    base_dir: PathBuf,
+) -> Result<(Response, AssertionReport, CaptureReport), SendraError> {
     let start_dir = std::env::current_dir().map_err(SendraError::CurrentDir)?;
     let global_config = global_config_path().filter(|path| path.is_file());
     let config = Config::resolve_from(&start_dir, global_config.as_deref())?;
@@ -69,7 +114,28 @@ async fn execute(request: Request, environment: Environment, base_dir: PathBuf) 
         .resolve_query()?
         .resolve_body(&base_dir)?;
 
-    sendra_core::send(&resolved, &client, &config).await
+    let response = sendra_core::send(&resolved, &client, &config).await?;
+
+    // Evaluated against the same `resolved` request `send` just sent, and
+    // the same `environment` value the substitution above applied — exactly
+    // the pairing `sendra-cli`'s own `send` evaluates against, so a
+    // `capture` colliding with an environment-defined name is refused here
+    // the same way it would be from the CLI. `resolved.assertions`/
+    // `resolved.capture` are the request's own declared blocks, untouched
+    // by substitution or auth/query/body resolution — those only ever
+    // change `url`/`headers`/`body`/`auth`/`query`, never these two fields.
+    let assertions = resolved
+        .assertions
+        .as_ref()
+        .map(|assertions| assertions.evaluate(&response))
+        .unwrap_or_default();
+    let capture = resolved
+        .capture
+        .as_ref()
+        .map(|capture| capture.evaluate(&response, &environment))
+        .unwrap_or_default();
+
+    Ok((response, assertions, capture))
 }
 
 #[cfg(test)]
@@ -136,7 +202,9 @@ mod tests {
 
         let outcome = run_and_wait(request);
 
-        let response = outcome.expect("a reachable server must yield a real response");
+        let response = outcome
+            .result
+            .expect("a reachable server must yield a real response");
         assert_eq!(response.status, 200);
         assert_eq!(response.body, "ok");
     }
@@ -155,12 +223,77 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(
-            outcome.is_err(),
+            outcome.result.is_err(),
             "an unreachable host must produce a clear failure, not a fabricated response"
+        );
+        assert!(
+            outcome.assertions.is_empty(),
+            "there is no response to have checked anything against"
+        );
+        assert!(
+            outcome.capture.is_empty(),
+            "there is no response to have captured anything from"
         );
         assert!(
             elapsed < Duration::from_secs(5),
             "a refused connection must fail fast, not hang: took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_assertions_or_capture_yields_empty_reports() {
+        let addr = start_ok_server();
+        let request = request(&format!("method: GET\nurl: http://{addr}/\n"));
+
+        let outcome = run_and_wait(request);
+
+        assert!(outcome.result.is_ok());
+        assert!(
+            outcome.assertions.is_empty(),
+            "a request with no `assertions:` block must report an empty, not a failing, result"
+        );
+        assert!(
+            outcome.capture.is_empty(),
+            "a request with no `capture:` block must report an empty, not a failing, result"
+        );
+    }
+
+    #[test]
+    fn assertions_are_evaluated_against_the_real_response() {
+        let addr = start_ok_server();
+        let request = request(&format!(
+            "method: GET\nurl: http://{addr}/\nassertions:\n  status: 200\n  status_in: [404]\n"
+        ));
+
+        let outcome = run_and_wait(request);
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.assertions.len(), 2);
+        assert_eq!(
+            outcome.assertions.passed_count(),
+            1,
+            "the real server answered 200, so `status: 200` must pass and `status_in: [404]` must fail"
+        );
+        assert_eq!(outcome.assertions.failed_count(), 1);
+    }
+
+    #[test]
+    fn captures_are_evaluated_against_the_real_response() {
+        // The hand-rolled server always answers a fixed body ("ok") that is
+        // not JSON, so a header capture — which does not touch the body at
+        // all — is what proves this reaches the real response rather than
+        // an empty stand-in.
+        let addr = start_ok_server();
+        let request = request(&format!(
+            "method: GET\nurl: http://{addr}/\ncapture:\n  length: {{header: Content-Length}}\n"
+        ));
+
+        let outcome = run_and_wait(request);
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(
+            outcome.capture.values().get("length").map(String::as_str),
+            Some("2")
         );
     }
 
@@ -178,12 +311,83 @@ mod tests {
 
         let outcome = run_and_wait(request);
 
-        let response = outcome.expect("httpbin.org should be reachable");
+        let response = outcome.result.expect("httpbin.org should be reachable");
         eprintln!("status: {} {}", response.status, response.status_text);
         for (name, value) in &response.headers {
             eprintln!("{name}: {value}");
         }
         eprintln!();
         eprintln!("{}", response.body);
+    }
+
+    /// Manual parity check for assertions/captures: the same request run
+    /// above `sendra run req.yaml`, where `req.yaml` is:
+    ///
+    /// ```yaml
+    /// name: MixedAssertions
+    /// method: GET
+    /// url: https://httpbin.org/json
+    /// assertions:
+    ///   status: 200
+    ///   status_in: [404, 500]
+    ///   headers:
+    ///     content-type: application/json
+    /// capture:
+    ///   server_header: {header: server}
+    /// ```
+    ///
+    /// `sendra run` on this file prints:
+    ///
+    /// ```text
+    /// assertions
+    ///   ✓ status is 200
+    ///   ✗ status is one of [404, 500] — got 200
+    ///   ✓ header `content-type` is `application/json`
+    ///   2 passed, 1 failed
+    ///
+    /// capture
+    ///   ✓ server_header from `header `server``
+    /// ```
+    ///
+    /// which is exactly what this test's `eprintln!`s should match.
+    #[test]
+    #[ignore = "hits the real network (httpbin.org); run explicitly for a parity check against `sendra run`"]
+    fn parity_check_mixed_assertions_and_capture() {
+        let request = request(
+            "name: MixedAssertions\nmethod: GET\nurl: https://httpbin.org/json\n\
+             assertions:\n  status: 200\n  status_in: [404, 500]\n  \
+             headers:\n    content-type: application/json\n\
+             capture:\n  server_header: {header: server}\n",
+        );
+
+        let outcome = run_and_wait(request);
+
+        assert!(outcome.result.is_ok(), "httpbin.org should be reachable");
+
+        eprintln!("assertions");
+        for result in outcome.assertions.results() {
+            match &result.failure {
+                None => eprintln!("  ✓ {}", result.expectation),
+                Some(detail) => eprintln!("  ✗ {} — {detail}", result.expectation),
+            }
+        }
+        eprintln!(
+            "  {} passed, {} failed",
+            outcome.assertions.passed_count(),
+            outcome.assertions.failed_count()
+        );
+        eprintln!();
+        eprintln!("capture");
+        for result in outcome.capture.results() {
+            let from = format!("{} from `{}`", result.variable, result.path);
+            match result.failure() {
+                None => eprintln!("  ✓ {from}"),
+                Some(failure) => eprintln!("  ✗ {from} — {failure}"),
+            }
+        }
+
+        assert_eq!(outcome.assertions.passed_count(), 2);
+        assert_eq!(outcome.assertions.failed_count(), 1);
+        assert!(outcome.capture.results()[0].passed());
     }
 }
