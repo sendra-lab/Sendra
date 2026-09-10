@@ -210,14 +210,25 @@ async fn execute(request: Request, environment: Environment, base_dir: PathBuf) 
     }
 }
 
+/// The config half of `execute_inner`'s pipeline, on its own: global config
+/// path lookup, filtered to a file that actually exists, then merged with
+/// whatever project config `start_dir` resolves to — pulled out so
+/// sendra-tui's TUI/CLI resolution-parity test (`main.rs`) can call the
+/// exact code a real run resolves its config through, against a fixture
+/// directory, without needing a real HTTP send (or the real process
+/// current directory — `execute_inner` still reads that itself) around it.
+pub(crate) fn resolve_config(start_dir: &std::path::Path) -> Result<Config, SendraError> {
+    let global_config = global_config_path().filter(|path| path.is_file());
+    Config::resolve_from(start_dir, global_config.as_deref())
+}
+
 async fn execute_inner(
     request: Request,
     environment: Environment,
     base_dir: PathBuf,
 ) -> Result<(Response, AssertionReport, CaptureReport), RunError> {
     let start_dir = std::env::current_dir().map_err(SendraError::CurrentDir)?;
-    let global_config = global_config_path().filter(|path| path.is_file());
-    let config = Config::resolve_from(&start_dir, global_config.as_deref())?;
+    let config = resolve_config(&start_dir)?;
     let client = sendra_core::build_client(&config)?;
     let oauth_cache = OAuthTokenCache::new();
 
