@@ -42,39 +42,50 @@ fn base_dir(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-/// Every environment name found in the nearest `.sendra/environments/`
-/// walking up from `start_dir` — the same `ancestors()` walk
-/// `find_project_config`/`find_environment` use internally to locate
-/// `.sendra/`, applied here for enumeration rather than a single lookup by
-/// name. sendra-core has a function to resolve *one named* environment
-/// (`find_environment`) but none to list what names exist, so this is the
-/// one piece of directory-walking sendra-tui does itself; loading each name
-/// once found is handed straight to `find_environment` +
-/// `Environment::from_path` below, sendra-core's own functions, not
-/// reimplemented parsing.
+/// Every environment name that `find_environment` could resolve from
+/// `start_dir` — the union of every `.yaml` file stem across *every*
+/// ancestor's `.sendra/environments/` directory, not just the nearest one.
+///
+/// `find_environment` resolves a name by walking `ancestors()` and, for that
+/// one name, stopping at the first ancestor whose
+/// `.sendra/environments/<name>.yaml` exists — it does not stop just because
+/// *some* `environments/` directory exists closer in. Originally this
+/// function instead found the single nearest ancestor with an
+/// `environments/` directory at all and listed only its contents, which
+/// meant a nested `.sendra/` (an inner project shadowing an outer one) could
+/// hide an outer-only environment that `find_environment` would happily
+/// still resolve (see
+/// `nested_dot_sendra_directories_can_make_the_two_algorithms_disagree`
+/// below). Walking every ancestor's `environments/` directory here — rather
+/// than reimplementing `find_environment`'s per-name walk once per
+/// candidate name — keeps this the one piece of directory-walking
+/// sendra-tui does itself for *enumeration*, while still guaranteeing every
+/// name returned really does resolve: `load_environments` below hands each
+/// one straight to `find_environment` + `Environment::from_path`,
+/// sendra-core's own functions, which is what actually decides which file
+/// wins for a name that exists at more than one level.
 fn discover_environment_names(start_dir: &Path) -> Vec<String> {
-    let Some(environments_dir) = start_dir
+    let mut names: Vec<String> = start_dir
         .ancestors()
         .map(|dir| dir.join(".sendra").join("environments"))
-        .find(|dir| dir.is_dir())
-    else {
-        return Vec::new();
-    };
-
-    let mut names: Vec<String> = std::fs::read_dir(&environments_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
-                return None;
-            }
-            path.file_stem()?.to_str().map(str::to_string)
+        .filter(|dir| dir.is_dir())
+        .flat_map(|environments_dir| {
+            std::fs::read_dir(&environments_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .filter_map(|entry| {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("yaml") {
+                        return None;
+                    }
+                    path.file_stem()?.to_str().map(str::to_string)
+                })
         })
         .collect();
 
     names.sort();
+    names.dedup();
     names
 }
 
@@ -764,19 +775,19 @@ mod resolution_parity_tests {
         assert_eq!(base_dir(&fixture.collection_path), cli_base_dir);
     }
 
-    /// The one enumeration algorithm with no `sendra_core` counterpart to
-    /// compare against directly (see this module's own doc comment):
-    /// `discover_environment_names` finds the *nearest ancestor with an
-    /// `environments/` directory at all*, then lists every `.yaml` file in
-    /// it, while `find_environment` finds, independently **per name**, the
-    /// nearest ancestor whose `.sendra/environments/<name>.yaml` specifically
-    /// exists. For an ordinary single-`.sendra` project (the fixture above)
-    /// those two coincide. This test builds a nested-project layout —
-    /// deliberately pathological, not something issue 3/6 ever claimed to
-    /// handle — to check whether they can actually diverge, rather than
-    /// assuming the ordinary case generalizes.
+    /// `discover_environment_names` must agree with `find_environment` even
+    /// on a nested-`.sendra/` layout — an inner project shadowing an outer
+    /// one. It previously did not: it found only the *nearest ancestor with
+    /// an `environments/` directory at all* and listed just that directory's
+    /// contents, while `find_environment` resolves, independently **per
+    /// name**, the nearest ancestor whose
+    /// `.sendra/environments/<name>.yaml` specifically exists — so an
+    /// outer-only environment name could be missing from the list while
+    /// `find_environment` would still happily resolve it. This test builds
+    /// that exact pathological fixture and now asserts the two agree on
+    /// every name, rather than merely documenting the disagreement.
     #[test]
-    fn nested_dot_sendra_directories_can_make_the_two_algorithms_disagree() {
+    fn nested_dot_sendra_directories_agree_with_find_environment() {
         let root = tempfile::tempdir().expect("a temporary directory");
 
         // Outer project: only `default.yaml`.
@@ -800,32 +811,58 @@ mod resolution_parity_tests {
         );
 
         let tui_names = discover_environment_names(&inner);
-        // `discover_environment_names` finds the *inner* `environments/`
-        // directory first (nearest ancestor with the directory at all) and
-        // only lists what is inside it.
-        assert_eq!(tui_names, vec!["staging".to_string()]);
+        // Both the inner-only `staging` and the outer-only `default` must
+        // now be discovered — the union across every ancestor's
+        // `environments/` directory, not just the nearest one.
+        assert_eq!(
+            tui_names,
+            vec!["default".to_string(), "staging".to_string()],
+            "discover_environment_names must list every name find_environment \
+             can resolve, including one that only exists in an outer, \
+             shadowed .sendra/ directory"
+        );
 
-        // But `find_environment("default")`, asked independently, does not
-        // stop at the inner directory just because *a* directory exists
-        // there — it walks past it (no `default.yaml` inside) all the way
-        // up to the outer one, and finds a real file.
-        let cli_default = find_environment(&inner, "default");
-        assert!(
-            cli_default.is_some(),
-            "find_environment must still resolve 'default' from the outer \
-             project, proving the two algorithms really can disagree: \
-             discover_environment_names says only ['staging'] exists from \
-             this start_dir, but a 'default' environment genuinely does \
-             resolve from it too — sendra-tui's environment list would omit \
-             an environment sendra-cli's `--env default` would happily use. \
-             This is a real, if narrow (nested .sendra/ projects only), gap \
-             between the two — flagged here rather than silently patched, \
-             per this issue's own instructions, since sendra-tui's discovery \
-             was never specified to handle nested projects and no user-facing \
-             bug report has surfaced it; fixing it is a product decision \
-             (e.g. issue 3/6 would need to specify whether nested projects \
-             should merge environment listings across levels) beyond this \
-             audit's scope."
+        // And for every name it lists, find_environment must actually
+        // resolve it — proving the list is not just names, but names that
+        // truly resolve, and to the file each level's own environment
+        // predicts.
+        for name in &tui_names {
+            let resolved = find_environment(&inner, name)
+                .unwrap_or_else(|| panic!("find_environment must resolve '{name}' too"));
+            assert!(resolved.is_file());
+        }
+        let default_path = find_environment(&inner, "default").expect("outer default resolves");
+        assert_eq!(
+            default_path,
+            root.path()
+                .join(".sendra")
+                .join("environments")
+                .join("default.yaml")
+        );
+        let staging_path = find_environment(&inner, "staging").expect("inner staging resolves");
+        assert_eq!(
+            staging_path,
+            inner
+                .join(".sendra")
+                .join("environments")
+                .join("staging.yaml")
+        );
+    }
+
+    /// Regression guard for the fix above: an ordinary single-`.sendra`
+    /// project (no nesting at all) must discover exactly the same names as
+    /// before — merging across ancestors must not add or duplicate anything
+    /// when there is only one `environments/` directory to find.
+    #[test]
+    fn single_dot_sendra_project_discovery_is_unchanged() {
+        let fixture = build_fixture();
+        let names = discover_environment_names(&fixture.start_dir);
+        assert_eq!(
+            names,
+            vec!["default".to_string(), "staging".to_string()],
+            "an ordinary single-.sendra project must discover exactly its \
+             own environments/ directory contents, unaffected by the \
+             nested-project fix"
         );
     }
 }
