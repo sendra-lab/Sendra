@@ -197,8 +197,16 @@ fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// [`app::Message::ScrollResponseDown`] for why the response panel's own
 /// scroll deliberately lives on a disjoint set of keys (`PageUp`/`PageDown`/
 /// `Home`/`End`) instead of overloading the same arrows based on which pane
-/// currently "has focus".
-fn next_message(overlay_open: bool, edit_mode_open: bool) -> io::Result<Message> {
+/// currently "has focus". `body_focused` extends that same disjoint-keys
+/// idea into edit mode: `Enter`/`Up`/`Down` mean "insert a newline"/"move a
+/// line" only while the body field specifically has focus (see
+/// `app::EditField::Body`) — every other edit-mode field is single-line, so
+/// those keys stay meaningless there exactly as they always have been.
+fn next_message(
+    overlay_open: bool,
+    edit_mode_open: bool,
+    body_focused: bool,
+) -> io::Result<Message> {
     if !event::poll(Duration::from_millis(100))? {
         return Ok(Message::Tick);
     }
@@ -207,6 +215,7 @@ fn next_message(overlay_open: bool, edit_mode_open: bool) -> io::Result<Message>
         event::read()?,
         overlay_open,
         edit_mode_open,
+        body_focused,
     ))
 }
 
@@ -220,7 +229,12 @@ fn next_message(overlay_open: bool, edit_mode_open: bool) -> io::Result<Message>
 /// `Message::Quit` so that whatever `main::run`/`restore_terminal` do for
 /// one, they provably do for the other — not two independently-written quit
 /// paths that could quietly drift apart.
-fn translate_event(event: Event, overlay_open: bool, edit_mode_open: bool) -> Message {
+fn translate_event(
+    event: Event,
+    overlay_open: bool,
+    edit_mode_open: bool,
+    body_focused: bool,
+) -> Message {
     match event {
         Event::Resize(_, _) => Message::Resize,
         Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -282,6 +296,16 @@ fn translate_event(event: Event, overlay_open: bool, edit_mode_open: bool) -> Me
                     KeyCode::Delete => Message::EditDelete,
                     KeyCode::Left => Message::EditCursorLeft,
                     KeyCode::Right => Message::EditCursorRight,
+                    // Only meaningful for the multi-line body field — see
+                    // this function's own doc comment on `body_focused`.
+                    // Checked ahead of the catch-all `_ => Message::Tick`
+                    // below so that, while the body has focus, `Enter`
+                    // types a newline instead of doing nothing (its
+                    // ordinary edit-mode meaning) and `Up`/`Down` move the
+                    // cursor instead of falling through unbound.
+                    KeyCode::Enter if body_focused => Message::EditInsertChar('\n'),
+                    KeyCode::Up if body_focused => Message::EditCursorUp,
+                    KeyCode::Down if body_focused => Message::EditCursorDown,
                     // Any other control combination (Ctrl+<letter>) is not
                     // a character this field should insert — crossterm
                     // still reports the plain letter as `Char`, so this
@@ -373,6 +397,7 @@ fn run(
         let msg = next_message(
             state.environment_overlay.is_some(),
             state.edit_mode.is_some(),
+            state.body_focused(),
         )?;
         let is_run_request = matches!(msg, Message::RunRequested);
         let was_already_running = matches!(state.run_state, RunState::InFlight);
@@ -479,9 +504,10 @@ mod tests {
 
     #[test]
     fn q_and_ctrl_c_both_translate_to_the_identical_quit_message() {
-        let from_q = translate_event(press(KeyCode::Char('q')), false, false);
+        let from_q = translate_event(press(KeyCode::Char('q')), false, false, false);
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
             false,
             false,
         );
@@ -495,10 +521,11 @@ mod tests {
         // `update`'s InFlight guard exempts `Quit` specifically so it can
         // never be blocked (see its own doc comment); the overlay must not
         // re-introduce that gap from the translation side.
-        let from_q = translate_event(press(KeyCode::Char('q')), true, false);
+        let from_q = translate_event(press(KeyCode::Char('q')), true, false, false);
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
             true,
+            false,
             false,
         );
 
@@ -513,11 +540,12 @@ mod tests {
         // must insert, not quit. Ctrl+C is unaffected: it is never a
         // character a text field would otherwise accept, so it stays the
         // one quit key that works everywhere, editing included.
-        let from_q = translate_event(press(KeyCode::Char('q')), false, true);
+        let from_q = translate_event(press(KeyCode::Char('q')), false, true, false);
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
             false,
             true,
+            false,
         );
 
         assert!(matches!(from_q, Message::EditInsertChar('q')));
@@ -529,7 +557,7 @@ mod tests {
         // `c` alone is `ToggleRevealCaptures` (outside the overlay) — only
         // `c` *with* the control modifier means quit. A translation that
         // conflated the two would make an ordinary keystroke exit the app.
-        let message = translate_event(press(KeyCode::Char('c')), false, false);
+        let message = translate_event(press(KeyCode::Char('c')), false, false, false);
 
         assert!(!matches!(message, Message::Quit));
     }
@@ -544,6 +572,7 @@ mod tests {
             )),
             false,
             false,
+            false,
         );
 
         assert!(
@@ -554,7 +583,7 @@ mod tests {
 
     #[test]
     fn resize_events_translate_to_the_resize_message() {
-        let message = translate_event(Event::Resize(40, 20), false, false);
+        let message = translate_event(Event::Resize(40, 20), false, false, false);
 
         assert!(matches!(message, Message::Resize));
     }
@@ -563,11 +592,12 @@ mod tests {
 
     #[test]
     fn esc_cancels_edit_and_ctrl_s_saves_it_while_editing() {
-        let cancel = translate_event(press(KeyCode::Esc), false, true);
+        let cancel = translate_event(press(KeyCode::Esc), false, true, false);
         let save = translate_event(
             press_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
             false,
             true,
+            false,
         );
 
         assert!(matches!(cancel, Message::CancelEdit));
@@ -582,12 +612,15 @@ mod tests {
         // through to `Tick` — but keys with no text-field meaning at all
         // (arrow-key navigation not bound to cursor movement, Enter/run)
         // still must not leak through, the same guarantee the overlay
-        // branch already gives its own keys.
+        // branch already gives its own keys. `body_focused: false` here —
+        // this is exactly the case where those keys must stay meaningless,
+        // covered separately (with `body_focused: true`) below.
         for code in [KeyCode::Down, KeyCode::Up, KeyCode::Enter] {
-            let message = translate_event(press(code), false, true);
+            let message = translate_event(press(code), false, true, false);
             assert!(
                 matches!(message, Message::Tick),
-                "expected {code:?} to be a no-op while editing, got {message:?}"
+                "expected {code:?} to be a no-op while editing outside the body field, \
+                 got {message:?}"
             );
         }
     }
@@ -599,7 +632,7 @@ mod tests {
         // contain — the same reasoning `ctrl_c_quits_while_editing_but_
         // bare_q_types_a_character_instead` applies to `q`.
         for ch in ['r', 'e', 'i'] {
-            let message = translate_event(press(KeyCode::Char(ch)), false, true);
+            let message = translate_event(press(KeyCode::Char(ch)), false, true, false);
             assert!(
                 matches!(message, Message::EditInsertChar(c) if c == ch),
                 "expected {ch:?} to insert while editing, got {message:?}"
@@ -610,28 +643,44 @@ mod tests {
     #[test]
     fn edit_mode_text_input_keys_translate_correctly() {
         assert!(matches!(
-            translate_event(press(KeyCode::Tab), false, true),
+            translate_event(press(KeyCode::Tab), false, true, false),
             Message::EditFocusNext
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::BackTab), false, true),
+            translate_event(press(KeyCode::BackTab), false, true, false),
             Message::EditFocusPrev
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::Backspace), false, true),
+            translate_event(press(KeyCode::Backspace), false, true, false),
             Message::EditBackspace
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::Delete), false, true),
+            translate_event(press(KeyCode::Delete), false, true, false),
             Message::EditDelete
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::Left), false, true),
+            translate_event(press(KeyCode::Left), false, true, false),
             Message::EditCursorLeft
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::Right), false, true),
+            translate_event(press(KeyCode::Right), false, true, false),
             Message::EditCursorRight
+        ));
+    }
+
+    #[test]
+    fn body_focused_enter_up_down_edit_the_multiline_body_instead_of_doing_nothing() {
+        assert!(matches!(
+            translate_event(press(KeyCode::Enter), false, true, true),
+            Message::EditInsertChar('\n')
+        ));
+        assert!(matches!(
+            translate_event(press(KeyCode::Up), false, true, true),
+            Message::EditCursorUp
+        ));
+        assert!(matches!(
+            translate_event(press(KeyCode::Down), false, true, true),
+            Message::EditCursorDown
         ));
     }
 
@@ -641,11 +690,13 @@ mod tests {
             press_with(KeyCode::Char('n'), KeyModifiers::CONTROL),
             false,
             true,
+            false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
             false,
             true,
+            false,
         );
 
         assert!(matches!(add, Message::AddHeaderRow));
@@ -662,13 +713,14 @@ mod tests {
             press_with(KeyCode::Char('a'), KeyModifiers::CONTROL),
             false,
             true,
+            false,
         );
         assert!(matches!(message, Message::Tick));
     }
 
     #[test]
     fn i_enters_edit_mode_outside_the_overlay_and_outside_edit_mode() {
-        let message = translate_event(press(KeyCode::Char('i')), false, false);
+        let message = translate_event(press(KeyCode::Char('i')), false, false, false);
         assert!(matches!(message, Message::EnterEditMode));
     }
 

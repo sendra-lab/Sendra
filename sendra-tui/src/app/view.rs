@@ -17,7 +17,9 @@ use sendra_core::{
 
 use crate::run_request::RunOutcome;
 
-use super::state::{AppState, EditField, EditState, LoadState, NamedEnvironment, RunState};
+use super::state::{
+    AppState, BodyEdit, EditField, EditState, LoadState, NamedEnvironment, RunState,
+};
 
 /// Body preview is capped rather than shown in full — scrolling through a
 /// large body is a separate concern from the preview pane; this just keeps
@@ -220,13 +222,25 @@ fn render_detail_pane(
 /// Edit mode's own half of the detail pane: `method` and `url` as live,
 /// cursor-addressable text fields, then a `Headers:` section listing every
 /// header row the same way (`▶` marking whichever `EditState::focus`
-/// currently points at, independently for a row's key and its value),
-/// `method_error` shown inline right under the field it is about, and the
-/// keybinding reminder every other pane in this file puts in its own
-/// footer/status text. The real terminal cursor is placed on the focused
-/// field's `TextField::cursor_chars` via `Frame::set_cursor_position`, not
-/// just implied by the `▶` marker — an ordinary text field shows a real
-/// blinking cursor, not merely which line is active.
+/// currently points at, independently for a row's key and its value), then
+/// a `Body` section — either the raw/JSON text area (see
+/// `BodyEdit::Editable`) or a read-only line naming what isn't editable
+/// here (see `BodyEdit::Unsupported`) — `method_error`/`body_error` shown
+/// inline right under the field each is about, and the keybinding reminder
+/// every other pane in this file puts in its own footer/status text. The
+/// real terminal cursor is placed on the focused field's real position via
+/// `Frame::set_cursor_position`, not just implied by the `▶` marker — an
+/// ordinary text field shows a real blinking cursor, not merely which line
+/// is active.
+///
+/// **A caveat shared with every field in this pane, not new here**: the
+/// whole pane wraps (`Wrap { trim: false }`), so a line wider than the pane
+/// (a long URL, a long header value, a long body line) wraps onto extra
+/// visual rows that the row/column math below does not know about — the
+/// real cursor can land a little off for such a line. Solving that would
+/// mean switching to unwrapped rendering with horizontal scroll for every
+/// field, a change orthogonal to what this issue asked for; not attempted
+/// here.
 fn render_edit_pane(frame: &mut Frame, area: Rect, edit: &EditState) {
     let method_marker = if edit.focus == EditField::Method {
         "▶"
@@ -273,9 +287,40 @@ fn render_edit_pane(frame: &mut Frame, area: Rect, edit: &EditState) {
     }
 
     lines.push(String::new());
+    let body_marker = if edit.focus == EditField::Body {
+        "▶"
+    } else {
+        " "
+    };
+    // Only set for `BodyEdit::Editable`, and only ever read back for
+    // `EditField::Body`'s own cursor placement below — a focus that only
+    // exists in the first place when the body actually is `Editable` (see
+    // `EditField::next`/`prev`'s `has_body` parameter), so the `0` default
+    // for `Unsupported` is never actually read as a real position.
+    let mut body_start_line = 0;
+    match &edit.body {
+        BodyEdit::Unsupported { description } => {
+            lines.push(format!("Body: {description}"));
+        }
+        BodyEdit::Editable { text, is_json } => {
+            let kind = if *is_json { "json" } else { "raw" };
+            lines.push(format!("{body_marker} Body ({kind}):"));
+            // Like `method_error` above, this row is reserved only when the
+            // body could ever have an error at all — a plain (`raw`) body
+            // is never JSON-validated (see `validate_body_for_save`), so it
+            // never gets a wasted blank error line under it.
+            if *is_json {
+                lines.push(format!("  ⚠ {}", edit.body_error.as_deref().unwrap_or("")));
+            }
+            body_start_line = lines.len();
+            lines.extend(text.value().split('\n').map(str::to_string));
+        }
+    }
+
+    lines.push(String::new());
     lines.push(
         "Tab/Shift+Tab move focus  Ctrl+N add header  Ctrl+D delete header  \
-         Ctrl+S save  Esc cancel"
+         Ctrl+S save  Esc cancel  (in Body: Enter for newline, ↑/↓ move lines)"
             .to_string(),
     );
 
@@ -306,6 +351,16 @@ fn render_edit_pane(frame: &mut Frame, area: Rect, edit: &EditState) {
                 headers_start_line + index,
                 prefix.chars().count() as u16 + cursor as u16,
             )
+        }
+        EditField::Body => {
+            let BodyEdit::Editable { text, .. } = &edit.body else {
+                unreachable!(
+                    "focus is never Body while the body is Unsupported — see \
+                     EditField::next/prev"
+                );
+            };
+            let (line_offset, column) = text.cursor_row_col();
+            (body_start_line + line_offset, column as u16)
         }
     };
     frame.set_cursor_position((area.x + column, area.y + row as u16));
@@ -2272,6 +2327,166 @@ requests:
             screen.contains("X-Env"),
             "the remaining row must still be on screen:\n{screen}"
         );
+    }
+
+    const REQUEST_WITH_PLAIN_BODY: &str = "\
+name: test
+requests:
+  - name: One
+    method: POST
+    url: https://example.com
+    body: hello world
+";
+
+    const REQUEST_WITH_JSON_BODY: &str = "\
+name: test
+requests:
+  - name: One
+    method: POST
+    url: https://example.com
+    json:
+      name: ada
+";
+
+    const REQUEST_WITH_BODY_FILE: &str = "\
+name: test
+requests:
+  - name: One
+    method: POST
+    url: https://example.com
+    body_file: ./payload.json
+";
+
+    const REQUEST_WITH_FORM_BODY: &str = "\
+name: test
+requests:
+  - name: One
+    method: POST
+    url: https://example.com
+    form:
+      username: ada
+";
+
+    const REQUEST_WITH_MULTIPART_BODY: &str = "\
+name: test
+requests:
+  - name: One
+    method: POST
+    url: https://example.com
+    multipart:
+      - name: description
+        value: a photo of my cat
+";
+
+    #[test]
+    fn edit_pane_shows_a_plain_text_body_as_an_editable_raw_area() {
+        let mut state = loaded_state(REQUEST_WITH_PLAIN_BODY);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_state(&state);
+
+        assert!(screen.contains("Body (raw)"));
+        assert!(screen.contains("hello world"));
+    }
+
+    #[test]
+    fn edit_pane_shows_a_json_body_pretty_printed_and_editable() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_BODY);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_state(&state);
+
+        assert!(screen.contains("Body (json)"));
+        assert!(screen.contains("\"name\""));
+        assert!(screen.contains("\"ada\""));
+    }
+
+    #[test]
+    fn edit_pane_shows_body_file_as_read_only_with_its_path_visible() {
+        let mut state = loaded_state(REQUEST_WITH_BODY_FILE);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_state(&state);
+
+        assert!(
+            screen.contains("./payload.json"),
+            "the path must be visible so the limitation is honest, not just documented:\n{screen}"
+        );
+        assert!(screen.contains("not editable"));
+        // No text area marker for a field that isn't there.
+        assert!(!screen.contains("▶ Body"));
+    }
+
+    #[test]
+    fn edit_pane_shows_form_body_as_read_only_with_field_count() {
+        let mut state = loaded_state(REQUEST_WITH_FORM_BODY);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_state(&state);
+
+        assert!(screen.contains("form body"));
+        assert!(screen.contains("not editable"));
+    }
+
+    #[test]
+    fn edit_pane_shows_multipart_body_as_read_only_with_part_count() {
+        let mut state = loaded_state(REQUEST_WITH_MULTIPART_BODY);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_state(&state);
+
+        assert!(screen.contains("multipart body"));
+        assert!(screen.contains("not editable"));
+    }
+
+    #[test]
+    fn tab_reaches_the_body_field_and_shows_its_focus_marker() {
+        let mut state = loaded_state(REQUEST_WITH_PLAIN_BODY);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Body;
+
+        let screen = render_state(&state);
+
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.contains("Body (raw)") && line.trim_start().starts_with('▶')),
+            "the Body heading must carry the focus marker:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn invalid_json_body_shows_an_inline_error_on_screen_after_a_failed_save() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_BODY);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Body;
+        type_into_focused_field(&mut state, "not valid json at all");
+
+        update(&mut state, Message::SaveEdit);
+        let screen = render_state(&state);
+
+        assert!(
+            screen.contains("not valid JSON") || screen.contains("Body is not valid JSON"),
+            "the JSON parse error must be visible in the pane itself:\n{screen}"
+        );
+        assert!(
+            screen.contains("not valid json at all"),
+            "the invalid text the user typed must still be shown, not discarded:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_multiline_body_renders_every_line() {
+        let mut state = loaded_state(REQUEST_WITH_PLAIN_BODY);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Body;
+        update(&mut state, Message::EditInsertChar('\n'));
+        type_into_focused_field(&mut state, "second line");
+
+        let screen = render_state(&state);
+
+        assert!(screen.contains("hello world"));
+        assert!(screen.contains("second line"));
     }
 
     #[test]
