@@ -218,14 +218,15 @@ fn render_detail_pane(
 }
 
 /// Edit mode's own half of the detail pane: `method` and `url` as live,
-/// cursor-addressable text fields (`▶` marking whichever `EditState::focus`
-/// currently points at), `method_error` shown inline right under the field
-/// it is about, and the keybinding reminder every other pane in this file
-/// puts in its own footer/status text. The real terminal cursor is placed
-/// on the focused field's `TextField::cursor_chars` via
-/// `Frame::set_cursor_position`, not just implied by the `▶` marker — an
-/// ordinary text field shows a real blinking cursor, not merely which line
-/// is active.
+/// cursor-addressable text fields, then a `Headers:` section listing every
+/// header row the same way (`▶` marking whichever `EditState::focus`
+/// currently points at, independently for a row's key and its value),
+/// `method_error` shown inline right under the field it is about, and the
+/// keybinding reminder every other pane in this file puts in its own
+/// footer/status text. The real terminal cursor is placed on the focused
+/// field's `TextField::cursor_chars` via `Frame::set_cursor_position`, not
+/// just implied by the `▶` marker — an ordinary text field shows a real
+/// blinking cursor, not merely which line is active.
 fn render_edit_pane(frame: &mut Frame, area: Rect, edit: &EditState) {
     let method_marker = if edit.focus == EditField::Method {
         "▶"
@@ -238,13 +239,13 @@ fn render_edit_pane(frame: &mut Frame, area: Rect, edit: &EditState) {
         " "
     };
 
-    let mut lines = [
+    let mut lines = vec![
         format!("{method_marker} Method: {}", edit.method.value()),
         format!("  ⚠ {}", edit.method_error.as_deref().unwrap_or("")),
         String::new(),
         format!("{url_marker} URL:    {}", edit.url.value()),
         String::new(),
-        "Tab switch field  Ctrl+S save  Esc cancel".to_string(),
+        "Headers:".to_string(),
     ];
     // An empty error line still reserves its row (see the `⚠ {}` line
     // above) rather than the whole pane shifting up and down every time a
@@ -257,6 +258,27 @@ fn render_edit_pane(frame: &mut Frame, area: Rect, edit: &EditState) {
         lines[1] = String::new();
     }
 
+    // The first line index a header row could occupy — needed below to turn
+    // a `HeaderKey(i)`/`HeaderValue(i)` focus into the real row/column the
+    // terminal cursor goes on. Recorded here, right before pushing the
+    // header rows themselves (or the `(none)` placeholder), so it always
+    // matches however many fixed lines precede them, however those change.
+    let headers_start_line = lines.len();
+    if edit.headers.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for (index, row) in edit.headers.iter().enumerate() {
+            lines.push(header_row_line(edit.focus, index, row));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "Tab/Shift+Tab move focus  Ctrl+N add header  Ctrl+D delete header  \
+         Ctrl+S save  Esc cancel"
+            .to_string(),
+    );
+
     frame.render_widget(
         Paragraph::new(lines.join("\n")).wrap(Wrap { trim: false }),
         area,
@@ -266,12 +288,67 @@ fn render_edit_pane(frame: &mut Frame, area: Rect, edit: &EditState) {
     // cells) by construction — `"Method: "` and `"URL:    "` are both
     // 8 characters — so one constant serves both fields' cursor placement.
     const FIELD_PREFIX_WIDTH: u16 = 2 + 8;
-    let (row, field) = match edit.focus {
-        EditField::Method => (0, &edit.method),
-        EditField::Url => (3, &edit.url),
+    let (row, column) = match edit.focus {
+        EditField::Method => (0, FIELD_PREFIX_WIDTH + edit.method.cursor_chars() as u16),
+        EditField::Url => (3, FIELD_PREFIX_WIDTH + edit.url.cursor_chars() as u16),
+        EditField::HeaderKey(index) => {
+            let prefix = header_key_prefix(index);
+            let cursor = edit.headers[index].key.cursor_chars();
+            (
+                headers_start_line + index,
+                prefix.chars().count() as u16 + cursor as u16,
+            )
+        }
+        EditField::HeaderValue(index) => {
+            let prefix = header_value_prefix(index, edit.headers[index].key.value());
+            let cursor = edit.headers[index].value.cursor_chars();
+            (
+                headers_start_line + index,
+                prefix.chars().count() as u16 + cursor as u16,
+            )
+        }
     };
-    let column = area.x + FIELD_PREFIX_WIDTH + field.cursor_chars() as u16;
-    frame.set_cursor_position((column, area.y + row));
+    frame.set_cursor_position((area.x + column, area.y + row as u16));
+}
+
+/// The prefix of a header row's line up to (not including) the key field's
+/// own text — `header_row_line` builds the same prefix inline; kept as its
+/// own function so the cursor-column math below can measure it without
+/// duplicating the literal spacing. The marker character itself is not part
+/// of what varies the width — `▶` and `" "` are both exactly one `char`
+/// wide — so a plain space stands in for whichever one is actually showing.
+fn header_key_prefix(index: usize) -> String {
+    format!(" [{index}] Key: ")
+}
+
+/// Like [`header_key_prefix`], but up to (not including) the value field's
+/// own text — needs `key_value` since the value field's column depends on
+/// how long the key text ahead of it is.
+fn header_value_prefix(index: usize, key_value: &str) -> String {
+    format!("{}{key_value}   Value: ", header_key_prefix(index))
+}
+
+/// One header row's display line: independent `▶` markers for the key and
+/// value fields, since exactly one of a row's two fields can be focused at a
+/// time (or neither, for every row but the focused one) — mirrors the
+/// `method_marker`/`url_marker` pattern `render_edit_pane` already uses for
+/// method/URL, just per-row instead of per-field.
+fn header_row_line(focus: EditField, index: usize, row: &super::state::HeaderRow) -> String {
+    let key_marker = if focus == EditField::HeaderKey(index) {
+        "▶"
+    } else {
+        " "
+    };
+    let value_marker = if focus == EditField::HeaderValue(index) {
+        "▶"
+    } else {
+        " "
+    };
+    format!(
+        "{key_marker}[{index}] Key: {}   {value_marker}Value: {}",
+        row.key.value(),
+        row.value.value()
+    )
 }
 
 /// The completed-run half of the detail pane: a real response's status,
@@ -590,7 +667,8 @@ pub(super) fn status_help_text(state: &AppState) -> String {
             ""
         };
         return format!(
-            "Editing{dirty}{invalid}  |  tab switch field  ctrl+s save  esc cancel  q quit"
+            "Editing{dirty}{invalid}  |  tab/shift+tab switch field  ctrl+n add header  \
+             ctrl+d delete header  ctrl+s save  esc cancel  q quit"
         );
     }
 
@@ -2078,6 +2156,121 @@ mod tests {
         assert!(
             focus_moved_screen.contains("▶ URL"),
             "focus must have moved to the URL field:\n{focus_moved_screen}"
+        );
+    }
+
+    fn render_state(state: &AppState) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(80, 15);
+        let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+        terminal
+            .draw(|frame| view(state, frame))
+            .expect("rendering must not panic");
+        buffer_to_string(terminal.backend().buffer())
+    }
+
+    const REQUEST_WITH_HEADERS: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    headers:
+      Accept: application/json
+      X-Env: staging
+";
+
+    #[test]
+    fn edit_pane_shows_no_headers_placeholder_for_a_request_with_none() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_state(&state);
+
+        assert!(screen.contains("Headers:"));
+        assert!(
+            screen.contains("(none)"),
+            "an edit with no headers must say so, not just show a bare heading:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn edit_pane_lists_every_header_row_with_its_key_and_value() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_state(&state);
+
+        assert!(screen.contains("Key: Accept"));
+        assert!(screen.contains("Value: application/json"));
+        assert!(screen.contains("Key: X-Env"));
+        assert!(screen.contains("Value: staging"));
+    }
+
+    #[test]
+    fn edit_pane_marks_whichever_header_side_has_focus() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::HeaderKey(0);
+
+        let key_focused = render_state(&state);
+        let key_line = key_focused
+            .lines()
+            .find(|line| line.contains("Key: Accept"))
+            .expect("the Accept row must be on screen");
+        assert!(
+            key_line.trim_start().starts_with('▶'),
+            "the key side must carry the focus marker:\n{key_line}"
+        );
+
+        state.edit_mode.as_mut().unwrap().focus = EditField::HeaderValue(0);
+        let value_focused = render_state(&state);
+        let value_line = value_focused
+            .lines()
+            .find(|line| line.contains("Key: Accept"))
+            .expect("the Accept row must be on screen");
+        assert!(
+            !value_line.trim_start().starts_with('▶'),
+            "focus moved off the key side, so it must no longer carry the marker:\n{value_line}"
+        );
+        assert!(
+            value_line.contains('▶'),
+            "the value side must now carry the focus marker:\n{value_line}"
+        );
+    }
+
+    #[test]
+    fn add_header_row_key_bind_shows_up_as_a_new_empty_row_on_screen() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        update(&mut state, Message::EnterEditMode);
+
+        update(&mut state, Message::AddHeaderRow);
+        let screen = render_state(&state);
+
+        assert!(
+            screen.contains("[2] Key:"),
+            "a third, empty header row must now be on screen:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn delete_header_row_key_bind_removes_a_row_from_screen() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::HeaderKey(0);
+
+        update(&mut state, Message::DeleteHeaderRow);
+        let screen = render_state(&state);
+
+        assert!(
+            !screen.contains("Accept"),
+            "the deleted row's key must no longer be on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("X-Env"),
+            "the remaining row must still be on screen:\n{screen}"
         );
     }
 

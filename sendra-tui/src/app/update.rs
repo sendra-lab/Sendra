@@ -185,6 +185,13 @@ pub fn update(state: &mut AppState, msg: Message) {
                                 request.method = method;
                             }
                             request.url = edit.url.value().to_string();
+                            request.headers = edit
+                                .headers
+                                .iter()
+                                .map(|row| {
+                                    (row.key.value().to_string(), row.value.value().to_string())
+                                })
+                                .collect();
                         }
                         state.dirty_requests.remove(selected);
                     }
@@ -205,9 +212,16 @@ pub fn update(state: &mut AppState, msg: Message) {
         }
         Message::EditFocusNext => {
             if let Some(edit) = &mut state.edit_mode {
-                edit.focus = edit.focus.next();
+                edit.focus = edit.focus.next(edit.headers.len());
             }
         }
+        Message::EditFocusPrev => {
+            if let Some(edit) = &mut state.edit_mode {
+                edit.focus = edit.focus.prev(edit.headers.len());
+            }
+        }
+        Message::AddHeaderRow => edit_state_mutate(state, EditState::add_header_row),
+        Message::DeleteHeaderRow => edit_state_mutate(state, EditState::delete_focused_header_row),
         Message::EditInsertChar(ch) => edit_mutate(state, |field| field.insert_char(ch)),
         Message::EditBackspace => edit_mutate(state, TextField::backspace),
         Message::EditDelete => edit_mutate(state, TextField::delete),
@@ -281,6 +295,23 @@ fn edit_mutate(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
     if edit.focus == EditField::Method {
         edit.method_error = validate_method_text(edit.method.value()).err();
     }
+    if let LoadState::Loaded { selected, .. } = &state.load_state {
+        state.dirty_requests.insert(*selected);
+    }
+}
+
+/// Like `edit_mutate`, but for a mutation to `EditState` itself rather than
+/// to whichever `TextField` is focused — what `Message::AddHeaderRow`/
+/// `DeleteHeaderRow` use, since adding or removing a whole row is still an
+/// edit (marks `dirty`/`dirty_requests`) but isn't a `TextField` operation.
+/// Unlike `edit_mutate`, this never touches `method_error`: neither
+/// operation can change what `method` says.
+fn edit_state_mutate(state: &mut AppState, mutate: impl FnOnce(&mut EditState)) {
+    let Some(edit) = &mut state.edit_mode else {
+        return;
+    };
+    mutate(edit);
+    edit.dirty = true;
     if let LoadState::Loaded { selected, .. } = &state.load_state {
         state.dirty_requests.insert(*selected);
     }
@@ -894,6 +925,211 @@ mod tests {
             "cancel must remove the dirty marker"
         );
         assert!(!status_help_text(&state).contains("unsaved changes"));
+    }
+
+    // --- Header editing ----------------------------------------------------
+
+    const REQUEST_WITH_HEADERS: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    headers:
+      Accept: application/json
+      X-Env: staging
+";
+
+    #[test]
+    fn enter_edit_mode_seeds_header_rows_from_the_real_request() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+
+        update(&mut state, Message::EnterEditMode);
+
+        let edit = state.edit_mode.as_ref().expect("edit mode just entered");
+        assert_eq!(edit.headers.len(), 2);
+        assert_eq!(edit.headers[0].key.value(), "Accept");
+        assert_eq!(edit.headers[0].value.value(), "application/json");
+        assert_eq!(edit.headers[1].key.value(), "X-Env");
+        assert_eq!(edit.headers[1].value.value(), "staging");
+    }
+
+    #[test]
+    fn tab_moves_focus_from_url_into_the_first_header_rows_key_and_value() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        update(&mut state, Message::EnterEditMode);
+        update(&mut state, Message::EditFocusNext); // Method -> Url
+
+        update(&mut state, Message::EditFocusNext); // Url -> HeaderKey(0)
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::HeaderKey(0)
+        );
+
+        update(&mut state, Message::EditFocusNext); // HeaderKey(0) -> HeaderValue(0)
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::HeaderValue(0)
+        );
+    }
+
+    #[test]
+    fn shift_tab_moves_focus_backward_through_the_same_fields() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::HeaderKey(1);
+
+        update(&mut state, Message::EditFocusPrev);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::HeaderValue(0)
+        );
+
+        update(&mut state, Message::EditFocusPrev);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::HeaderKey(0)
+        );
+
+        update(&mut state, Message::EditFocusPrev);
+        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Url);
+    }
+
+    #[test]
+    fn tab_wraps_from_the_last_header_values_field_back_to_method() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::HeaderValue(1);
+
+        update(&mut state, Message::EditFocusNext);
+
+        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Method);
+    }
+
+    #[test]
+    fn typing_into_a_focused_header_field_edits_the_working_copy_and_marks_dirty() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::HeaderValue(0);
+        backspace_n(&mut state, "application/json".len());
+
+        type_into_focused_field(&mut state, "text/plain");
+
+        let edit = state.edit_mode.as_ref().unwrap();
+        assert_eq!(edit.headers[0].value.value(), "text/plain");
+        assert!(edit.dirty);
+        assert!(state.dirty_requests.contains(&0));
+    }
+
+    #[test]
+    fn add_header_row_appends_a_new_row_and_focuses_its_key() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        update(&mut state, Message::EnterEditMode);
+
+        update(&mut state, Message::AddHeaderRow);
+
+        let edit = state.edit_mode.as_ref().unwrap();
+        assert_eq!(edit.headers.len(), 3);
+        assert_eq!(edit.headers[2].key.value(), "");
+        assert_eq!(edit.focus, EditField::HeaderKey(2));
+        assert!(edit.dirty);
+    }
+
+    #[test]
+    fn delete_header_row_removes_it_and_shifts_focus_to_the_previous_row() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::HeaderValue(1); // X-Env
+
+        update(&mut state, Message::DeleteHeaderRow);
+
+        let edit = state.edit_mode.as_ref().unwrap();
+        assert_eq!(edit.headers.len(), 1);
+        assert_eq!(edit.headers[0].key.value(), "Accept");
+        assert_eq!(edit.focus, EditField::HeaderKey(0));
+        assert!(edit.dirty);
+    }
+
+    #[test]
+    fn delete_header_row_is_a_no_op_while_focus_is_on_method_or_url() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        update(&mut state, Message::EnterEditMode);
+        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Method);
+
+        update(&mut state, Message::DeleteHeaderRow);
+
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().headers.len(),
+            2,
+            "nothing should be deleted while focus is on method"
+        );
+    }
+
+    #[test]
+    fn save_edit_writes_added_edited_and_deleted_headers_into_the_loaded_document() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        update(&mut state, Message::EnterEditMode);
+
+        // Delete "Accept" (index 0).
+        state.edit_mode.as_mut().unwrap().focus = EditField::HeaderKey(0);
+        update(&mut state, Message::DeleteHeaderRow);
+
+        // Edit "X-Env"'s value (now index 0).
+        state.edit_mode.as_mut().unwrap().focus = EditField::HeaderValue(0);
+        backspace_n(&mut state, "staging".len());
+        type_into_focused_field(&mut state, "production");
+
+        // Add a brand-new row.
+        update(&mut state, Message::AddHeaderRow);
+        type_into_focused_field(&mut state, "X-New");
+        update(&mut state, Message::EditFocusNext);
+        type_into_focused_field(&mut state, "added");
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(state.edit_mode.is_none());
+        let request = match &state.load_state {
+            LoadState::Loaded {
+                document, selected, ..
+            } => &document.requests()[*selected],
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        assert_eq!(
+            request.headers,
+            vec![
+                ("X-Env".to_string(), "production".to_string()),
+                ("X-New".to_string(), "added".to_string()),
+            ],
+            "the saved request's real headers must reflect the delete, edit and add \
+             exactly, in order"
+        );
+    }
+
+    #[test]
+    fn cancel_edit_discards_every_header_change() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        let before_document = match &state.load_state {
+            LoadState::Loaded { document, .. } => (**document).clone(),
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        update(&mut state, Message::EnterEditMode);
+        update(&mut state, Message::AddHeaderRow);
+        type_into_focused_field(&mut state, "X-New");
+        state.edit_mode.as_mut().unwrap().focus = EditField::HeaderKey(0);
+        update(&mut state, Message::DeleteHeaderRow);
+
+        update(&mut state, Message::CancelEdit);
+
+        assert!(state.edit_mode.is_none());
+        match &state.load_state {
+            LoadState::Loaded { document, .. } => {
+                assert_eq!(
+                    **document, before_document,
+                    "cancel must leave the real request's headers completely untouched"
+                );
+            }
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
     }
 
     #[test]
