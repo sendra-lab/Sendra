@@ -214,8 +214,8 @@ fn next_message(overlay_open: bool, edit_mode_open: bool) -> io::Result<Message>
 /// real crossterm event stream — split out so it takes a plain `Event`
 /// value instead of calling `event::poll`/`event::read` itself, which is
 /// what makes it unit-testable with hand-built `Event`s (no real terminal
-/// needed) rather than only reachable by actually typing at one. Issue 13's
-/// clean-exit audit relies on this directly: `q` and Ctrl+C are two
+/// needed) rather than only reachable by actually typing at one. The
+/// clean-exit guarantee relies on this directly: `q` and Ctrl+C are two
 /// different physical keys that both need to reach the *identical*
 /// `Message::Quit` so that whatever `main::run`/`restore_terminal` do for
 /// one, they provably do for the other — not two independently-written quit
@@ -226,17 +226,15 @@ fn translate_event(event: Event, overlay_open: bool, edit_mode_open: bool) -> Me
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             let is_ctrl_c =
                 key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
-            // Bare `q` quits everywhere *except* while editing: issue 17
-            // could make `q` a global quit key because edit mode had no
-            // text fields yet, but issue 18 gives it real ones, and a
-            // method or URL is entirely likely to contain the letter `q`
-            // (`?query=...`) — quitting the whole app on that keystroke
-            // would make such a URL unable to be typed at all. Ctrl+C stays
-            // a quit key everywhere, editing included: it is never a
-            // character a text field would otherwise accept (crossterm
-            // reports it as `Char('c')` plus the control modifier, not
-            // plain text input), and leaving *some* always-on quit key is
-            // what issue 13's clean-exit audit relies on.
+            // Bare `q` quits everywhere *except* while editing: edit mode's
+            // text fields can hold a method or URL that is entirely likely
+            // to contain the letter `q` (`?query=...`) — quitting the whole
+            // app on that keystroke would make such a URL unable to be
+            // typed at all. Ctrl+C stays a quit key everywhere, editing
+            // included: it is never a character a text field would
+            // otherwise accept (crossterm reports it as `Char('c')` plus
+            // the control modifier, not plain text input), and leaving
+            // *some* always-on quit key matters for a clean exit.
             let is_quit = is_ctrl_c || (key.code == KeyCode::Char('q') && !edit_mode_open);
             if is_quit {
                 return Message::Quit;
@@ -257,8 +255,8 @@ fn translate_event(event: Event, overlay_open: bool, edit_mode_open: bool) -> Me
             // Everything here (including `e`/nav/run, which reach an
             // ordinary character insert instead — see `Char(ch)` below)
             // falls through to `Message::Tick` only for a control
-            // combination or a non-character key this issue gives no
-            // meaning to, exactly the way the overlay branch above already
+            // combination or a non-character key with no assigned
+            // meaning, exactly the way the overlay branch above already
             // discards keys that are not its own, rather than reaching the
             // ordinary browsing keymap below and relying on `update()`'s
             // edit-mode guard alone to refuse it.
@@ -499,12 +497,11 @@ mod tests {
 
     #[test]
     fn ctrl_c_quits_while_editing_but_bare_q_types_a_character_instead() {
-        // Issue 17 could make bare `q` a global quit key because edit mode
-        // had no text fields yet; issue 18 gives it real ones (method/URL),
-        // and a URL containing `q` (`?query=...`) must be typeable — so `q`
-        // while editing must insert, not quit. Ctrl+C is unaffected: it is
-        // never a character a text field would otherwise accept, so it
-        // stays the one quit key that works everywhere, editing included.
+        // Edit mode's text fields (method/URL) can hold a URL containing
+        // `q` (`?query=...`), which must be typeable — so `q` while editing
+        // must insert, not quit. Ctrl+C is unaffected: it is never a
+        // character a text field would otherwise accept, so it stays the
+        // one quit key that works everywhere, editing included.
         let from_q = translate_event(press(KeyCode::Char('q')), false, true);
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -670,11 +667,10 @@ mod tests {
     }
 }
 
-/// Issue 15, the V1 close-out audit: a direct, automated proof that
-/// sendra-tui's project/config/environment/collection resolution genuinely
-/// matches what sendra-cli resolves for the same real project directory —
-/// not a manual spot-check across issues 1-14, an actual test against a
-/// real fixture on disk.
+/// A direct, automated proof that sendra-tui's
+/// project/config/environment/collection resolution genuinely matches what
+/// sendra-cli resolves for the same real project directory — not a manual
+/// spot-check, an actual test against a real fixture on disk.
 ///
 /// **Why this lives here, and not under `tests/`:** sendra-tui has no
 /// `lib.rs` (see `Cargo.toml` — `[[bin]]` only), so an integration test
@@ -704,8 +700,8 @@ mod resolution_parity_tests {
     use sendra_core::environment::find_environment;
     use sendra_core::{Config, Document, Environment};
 
-    /// A real, on-disk project — not a mock — laid out the way issue 3/6's
-    /// own doc comments describe: `.sendra/config.yaml`,
+    /// A real, on-disk project — not a mock — laid out the way a genuine
+    /// Sendra project is: `.sendra/config.yaml`,
     /// `.sendra/environments/*.yaml`, and a collection file living a couple
     /// of directories below the project root, so resolution genuinely has
     /// to walk up `ancestors()` rather than trivially matching at depth 0.
@@ -805,9 +801,7 @@ mod resolution_parity_tests {
         // that function's doc comment). Both walks must land on the exact
         // same `.sendra/` directory for the same `start_dir` — this is
         // exactly the kind of independently-reimplemented directory walk
-        // that could quietly diverge from `find_project_config`'s, the same
-        // family of gap issue 3 already found once (the invented
-        // default-path fallback).
+        // that could quietly diverge from `find_project_config`'s.
         let cli_project_config = find_project_config(&fixture.start_dir)
             .expect("the fixture's .sendra/config.yaml must be found");
         let cli_project_root = cli_project_config
