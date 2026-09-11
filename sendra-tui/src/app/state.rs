@@ -124,9 +124,29 @@ impl TextField {
     }
 }
 
-/// Which of edit mode's fields `Message::EditFocusNext` (`Tab`) is currently
-/// pointed at, and so which one `Message::EditInsertChar`/`EditBackspace`/etc.
-/// act on. Two variants today (method, URL); if headers/auth/body ever gain
+/// One editable header row: a key and a value, each its own [`TextField`] so
+/// the same insert/backspace/delete/cursor-movement machinery every other
+/// edit-mode field already uses applies here too, rather than a second
+/// hand-rolled text-input mechanism just for headers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeaderRow {
+    pub key: TextField,
+    pub value: TextField,
+}
+
+impl HeaderRow {
+    fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            key: TextField::new(key),
+            value: TextField::new(value),
+        }
+    }
+}
+
+/// Which of edit mode's fields `Message::EditFocusNext`/`EditFocusPrev`
+/// (`Tab`/`Shift+Tab`) is currently pointed at, and so which one
+/// `Message::EditInsertChar`/`EditBackspace`/etc. act on. `HeaderKey(i)`/
+/// `HeaderValue(i)` index into `EditState::headers`; if auth/body ever gain
 /// their own fields, this and `EditState::focused_field_mut` are exactly
 /// where those new variants would slot in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -134,14 +154,54 @@ pub enum EditField {
     #[default]
     Method,
     Url,
+    HeaderKey(usize),
+    HeaderValue(usize),
 }
 
 impl EditField {
-    /// Visible to `super::update`'s `Message::EditFocusNext` arm.
-    pub(super) fn next(self) -> Self {
+    /// Visible to `super::update`'s `Message::EditFocusNext` arm. Needs
+    /// `header_count` (rather than being a pure function of `self` alone,
+    /// the way it was before headers existed) since whether `Url` steps into
+    /// the first header row, and whether the last header row's value wraps
+    /// back to `Method`, both depend on how many header rows currently
+    /// exist. Order: Method → URL → each header row's key then value, in
+    /// index order → back to Method.
+    pub(super) fn next(self, header_count: usize) -> Self {
         match self {
             EditField::Method => EditField::Url,
+            EditField::Url => {
+                if header_count == 0 {
+                    EditField::Method
+                } else {
+                    EditField::HeaderKey(0)
+                }
+            }
+            EditField::HeaderKey(index) => EditField::HeaderValue(index),
+            EditField::HeaderValue(index) => {
+                if index + 1 < header_count {
+                    EditField::HeaderKey(index + 1)
+                } else {
+                    EditField::Method
+                }
+            }
+        }
+    }
+
+    /// The exact reverse of [`Self::next`] — visible to `super::update`'s
+    /// `Message::EditFocusPrev` arm (`Shift+Tab`).
+    pub(super) fn prev(self, header_count: usize) -> Self {
+        match self {
+            EditField::Method => {
+                if header_count == 0 {
+                    EditField::Url
+                } else {
+                    EditField::HeaderValue(header_count - 1)
+                }
+            }
             EditField::Url => EditField::Method,
+            EditField::HeaderKey(0) => EditField::Url,
+            EditField::HeaderKey(index) => EditField::HeaderValue(index - 1),
+            EditField::HeaderValue(index) => EditField::HeaderKey(index),
         }
     }
 }
@@ -157,6 +217,11 @@ pub struct EditState {
     pub dirty: bool,
     pub method: TextField,
     pub url: TextField,
+    /// Working copies of the request's headers, in the same order as
+    /// `Request::headers` — seeded once by `EditState::new` and written back
+    /// wholesale by `Message::SaveEdit`, the same round-trip `method`/`url`
+    /// already go through.
+    pub headers: Vec<HeaderRow>,
     pub focus: EditField,
     /// `Some(message)` whenever `method`'s current text does not parse as a
     /// real `sendra_core::Method` — recomputed on every keystroke that
@@ -175,10 +240,16 @@ impl EditState {
     pub(super) fn new(request: &Request) -> Self {
         let method = TextField::new(request.method.as_str());
         let method_error = validate_method_text(method.value()).err();
+        let headers = request
+            .headers
+            .iter()
+            .map(|(name, value)| HeaderRow::new(name.clone(), value.clone()))
+            .collect();
         Self {
             dirty: false,
             method,
             url: TextField::new(request.url.clone()),
+            headers,
             focus: EditField::default(),
             method_error,
         }
@@ -189,7 +260,36 @@ impl EditState {
         match self.focus {
             EditField::Method => &mut self.method,
             EditField::Url => &mut self.url,
+            EditField::HeaderKey(index) => &mut self.headers[index].key,
+            EditField::HeaderValue(index) => &mut self.headers[index].value,
         }
+    }
+
+    /// Appends a new, empty header row at the end and moves focus straight
+    /// to its key field — visible to `super::update`'s `Message::AddHeaderRow`
+    /// arm.
+    pub(super) fn add_header_row(&mut self) {
+        self.headers.push(HeaderRow::default());
+        self.focus = EditField::HeaderKey(self.headers.len() - 1);
+    }
+
+    /// Removes whichever header row `focus` currently points at — a no-op
+    /// when focus is not on a header row at all (there is nothing to
+    /// delete). Focus afterward never dangles on a removed row: it moves to
+    /// the previous row's key (or, if the deleted row was the first one,
+    /// the new first row's key), or to `Url` if no header rows remain.
+    /// Visible to `super::update`'s `Message::DeleteHeaderRow` arm.
+    pub(super) fn delete_focused_header_row(&mut self) {
+        let index = match self.focus {
+            EditField::HeaderKey(index) | EditField::HeaderValue(index) => index,
+            EditField::Method | EditField::Url => return,
+        };
+        self.headers.remove(index);
+        self.focus = if self.headers.is_empty() {
+            EditField::Url
+        } else {
+            EditField::HeaderKey(index.saturating_sub(1).min(self.headers.len() - 1))
+        };
     }
 }
 
@@ -409,11 +509,22 @@ pub enum Message {
     /// clears `dirty_requests` for the edited index without ever having
     /// written anything back.
     CancelEdit,
-    /// `Tab` while editing: moves focus to the other field (see
-    /// `EditField::next`) — the only two exist today, so this simply
-    /// alternates; a third field added later would only need
-    /// `EditField::next` to grow, not this message.
+    /// `Tab` while editing: moves focus to the next field in order (see
+    /// `EditField::next`) — method, URL, then each header row's key and
+    /// value in turn, wrapping back to method.
     EditFocusNext,
+    /// `Shift+Tab` while editing: the exact reverse of `EditFocusNext` (see
+    /// `EditField::prev`).
+    EditFocusPrev,
+    /// A keybinding while editing (not a plain character, so it can't land
+    /// inside whatever field is currently focused): appends a new, empty
+    /// header row and focuses its key — see `EditState::add_header_row`.
+    AddHeaderRow,
+    /// A keybinding while editing: removes whichever header row is
+    /// currently focused, a no-op if focus is on method or URL — see
+    /// `EditState::delete_focused_header_row` for where focus lands
+    /// afterward.
+    DeleteHeaderRow,
     /// An ordinary printable character typed into whichever field is
     /// currently focused — inserted at the cursor via `TextField::insert_char`.
     EditInsertChar(char),
@@ -550,9 +661,173 @@ mod tests {
     }
 
     #[test]
-    fn edit_field_next_alternates_between_method_and_url() {
-        assert_eq!(EditField::Method.next(), EditField::Url);
-        assert_eq!(EditField::Url.next(), EditField::Method);
+    fn edit_field_next_alternates_between_method_and_url_with_no_headers() {
+        assert_eq!(EditField::Method.next(0), EditField::Url);
+        assert_eq!(EditField::Url.next(0), EditField::Method);
+    }
+
+    #[test]
+    fn edit_field_next_walks_through_header_rows_in_order() {
+        assert_eq!(EditField::Url.next(2), EditField::HeaderKey(0));
+        assert_eq!(EditField::HeaderKey(0).next(2), EditField::HeaderValue(0));
+        assert_eq!(EditField::HeaderValue(0).next(2), EditField::HeaderKey(1));
+        assert_eq!(EditField::HeaderKey(1).next(2), EditField::HeaderValue(1));
+        assert_eq!(
+            EditField::HeaderValue(1).next(2),
+            EditField::Method,
+            "the last header row's value wraps back to Method"
+        );
+    }
+
+    #[test]
+    fn edit_field_next_and_prev_are_exact_inverses() {
+        let header_count = 3;
+        let every_field = [
+            EditField::Method,
+            EditField::Url,
+            EditField::HeaderKey(0),
+            EditField::HeaderValue(0),
+            EditField::HeaderKey(1),
+            EditField::HeaderValue(1),
+            EditField::HeaderKey(2),
+            EditField::HeaderValue(2),
+        ];
+        for field in every_field {
+            assert_eq!(
+                field.next(header_count).prev(header_count),
+                field,
+                "prev must exactly undo next for {field:?}"
+            );
+            assert_eq!(
+                field.prev(header_count).next(header_count),
+                field,
+                "next must exactly undo prev for {field:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_field_prev_from_method_wraps_to_the_last_header_value_when_headers_exist() {
+        assert_eq!(EditField::Method.prev(2), EditField::HeaderValue(1));
+    }
+
+    #[test]
+    fn edit_field_prev_from_method_wraps_to_url_with_no_headers() {
+        assert_eq!(EditField::Method.prev(0), EditField::Url);
+    }
+
+    // --- EditState: headers -----------------------------------------------
+
+    fn request_with_headers(headers: &[(&str, &str)]) -> Request {
+        let mut yaml = String::from("method: GET\nurl: https://example.com\n");
+        if !headers.is_empty() {
+            yaml.push_str("headers:\n");
+            for (name, value) in headers {
+                // Quoted so a value like `*/*` (a YAML alias sigil at the
+                // start of a plain scalar) parses as the literal string it
+                // is, not as YAML alias syntax.
+                yaml.push_str(&format!("  {name}: \"{value}\"\n"));
+            }
+        }
+        Request::from_yaml_str(&yaml).expect("valid test request")
+    }
+
+    #[test]
+    fn edit_state_new_seeds_header_rows_from_the_real_request_in_order() {
+        let request = request_with_headers(&[("Accept", "application/json"), ("X-Env", "prod")]);
+
+        let edit = EditState::new(&request);
+
+        assert_eq!(edit.headers.len(), 2);
+        assert_eq!(edit.headers[0].key.value(), "Accept");
+        assert_eq!(edit.headers[0].value.value(), "application/json");
+        assert_eq!(edit.headers[1].key.value(), "X-Env");
+        assert_eq!(edit.headers[1].value.value(), "prod");
+    }
+
+    #[test]
+    fn edit_state_new_with_no_headers_starts_with_an_empty_list() {
+        let request = request_with_headers(&[]);
+
+        let edit = EditState::new(&request);
+
+        assert!(edit.headers.is_empty());
+    }
+
+    #[test]
+    fn add_header_row_appends_an_empty_row_and_focuses_its_key() {
+        let request = request_with_headers(&[("Accept", "*/*")]);
+        let mut edit = EditState::new(&request);
+
+        edit.add_header_row();
+
+        assert_eq!(edit.headers.len(), 2);
+        assert_eq!(edit.headers[1].key.value(), "");
+        assert_eq!(edit.headers[1].value.value(), "");
+        assert_eq!(edit.focus, EditField::HeaderKey(1));
+    }
+
+    #[test]
+    fn delete_focused_header_row_removes_the_focused_row_and_focuses_the_previous_one() {
+        let request = request_with_headers(&[("A", "1"), ("B", "2"), ("C", "3")]);
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::HeaderValue(1); // "B"
+
+        edit.delete_focused_header_row();
+
+        assert_eq!(edit.headers.len(), 2);
+        assert_eq!(edit.headers[0].key.value(), "A");
+        assert_eq!(edit.headers[1].key.value(), "C");
+        assert_eq!(
+            edit.focus,
+            EditField::HeaderKey(0),
+            "focus must shift to the previous row, not dangle on the removed row"
+        );
+    }
+
+    #[test]
+    fn delete_focused_header_row_deleting_the_first_row_focuses_the_new_first_row() {
+        let request = request_with_headers(&[("A", "1"), ("B", "2")]);
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::HeaderKey(0); // "A"
+
+        edit.delete_focused_header_row();
+
+        assert_eq!(edit.headers.len(), 1);
+        assert_eq!(edit.headers[0].key.value(), "B");
+        assert_eq!(edit.focus, EditField::HeaderKey(0));
+    }
+
+    #[test]
+    fn delete_focused_header_row_with_only_one_row_left_focuses_url() {
+        let request = request_with_headers(&[("A", "1")]);
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::HeaderKey(0);
+
+        edit.delete_focused_header_row();
+
+        assert!(edit.headers.is_empty());
+        assert_eq!(
+            edit.focus,
+            EditField::Url,
+            "focus must not dangle once no header rows remain"
+        );
+    }
+
+    #[test]
+    fn delete_focused_header_row_is_a_no_op_when_focus_is_not_on_a_header_row() {
+        let request = request_with_headers(&[("A", "1")]);
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::Method;
+
+        edit.delete_focused_header_row();
+
+        assert_eq!(
+            edit.headers.len(),
+            1,
+            "deleting must only ever act on a focused header row"
+        );
+        assert_eq!(edit.focus, EditField::Method);
     }
 
     // --- Method validation ----------------------------------------------------

@@ -266,7 +266,18 @@ fn translate_event(event: Event, overlay_open: bool, edit_mode_open: bool) -> Me
                     KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         Message::SaveEdit
                     }
+                    // Ctrl+N/Ctrl+D, like Ctrl+S above, add/remove a header
+                    // row — checked ahead of the plain-`Char` arm below the
+                    // same way Ctrl+S already is, so they never fall through
+                    // to inserting a literal 'n'/'d' into the focused field.
+                    KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::AddHeaderRow
+                    }
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::DeleteHeaderRow
+                    }
                     KeyCode::Tab => Message::EditFocusNext,
+                    KeyCode::BackTab => Message::EditFocusPrev,
                     KeyCode::Backspace => Message::EditBackspace,
                     KeyCode::Delete => Message::EditDelete,
                     KeyCode::Left => Message::EditCursorLeft,
@@ -603,6 +614,10 @@ mod tests {
             Message::EditFocusNext
         ));
         assert!(matches!(
+            translate_event(press(KeyCode::BackTab), false, true),
+            Message::EditFocusPrev
+        ));
+        assert!(matches!(
             translate_event(press(KeyCode::Backspace), false, true),
             Message::EditBackspace
         ));
@@ -621,7 +636,24 @@ mod tests {
     }
 
     #[test]
-    fn control_letter_combinations_other_than_ctrl_s_do_nothing_while_editing() {
+    fn ctrl_n_and_ctrl_d_add_and_delete_a_header_row_while_editing() {
+        let add = translate_event(
+            press_with(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            false,
+            true,
+        );
+        let delete = translate_event(
+            press_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            false,
+            true,
+        );
+
+        assert!(matches!(add, Message::AddHeaderRow));
+        assert!(matches!(delete, Message::DeleteHeaderRow));
+    }
+
+    #[test]
+    fn control_letter_combinations_other_than_ctrl_s_n_d_do_nothing_while_editing() {
         // Ctrl+A is not a character this field should insert — crossterm
         // still reports the plain letter as `Char('a')`, so without the
         // control-modifier guard in `translate_event` this would silently
