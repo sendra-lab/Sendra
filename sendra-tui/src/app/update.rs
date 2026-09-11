@@ -7,7 +7,8 @@
 use sendra_core::{Document, Request};
 
 use super::state::{
-    validate_method_text, AppState, EditField, EditState, LoadState, Message, RunState, TextField,
+    validate_method_text, AppState, BodyEdit, EditField, EditState, LoadState, Message, RunState,
+    TextField,
 };
 
 /// Moves `selected` by `delta` (`1` or `-1`) through `len` items, wrapping at
@@ -157,18 +158,25 @@ pub fn update(state: &mut AppState, msg: Message) {
             }
         }
         Message::SaveEdit => {
+            // Body validation happens exactly here, once per save attempt —
+            // see `EditState::body_error`'s doc comment for why it is never
+            // computed on every keystroke the way `method_error` is.
+            if let Some(edit) = &mut state.edit_mode {
+                edit.body_error = validate_body_for_save(&edit.body);
+            }
             // Refuses to save — but, deliberately, does *not* clear
-            // `edit_mode` — while `method_error` is set: an invalid method
-            // must never reach the loaded document, but the user must not
-            // be locked out of fixing it either, which dropping `edit_mode`
-            // here (as `CancelEdit` does) would do by discarding what they
-            // typed. Leaving edit mode active with the same bad text still
-            // in `method` is what keeps the field "still editable
-            // afterward" rather than stuck.
+            // `edit_mode` — while `method_error` or `body_error` is set: an
+            // invalid method or an invalid JSON body must never reach the
+            // loaded document, but the user must not be locked out of
+            // fixing either one, which dropping `edit_mode` here (as
+            // `CancelEdit` does) would do by discarding what they typed.
+            // Leaving edit mode active with the same bad text still in
+            // place is what keeps the field "still editable afterward"
+            // rather than stuck.
             let can_save = state
                 .edit_mode
                 .as_ref()
-                .is_some_and(|edit| edit.method_error.is_none());
+                .is_some_and(|edit| edit.method_error.is_none() && edit.body_error.is_none());
             if can_save {
                 if let Some(edit) = state.edit_mode.take() {
                     if let LoadState::Loaded {
@@ -192,6 +200,7 @@ pub fn update(state: &mut AppState, msg: Message) {
                                     (row.key.value().to_string(), row.value.value().to_string())
                                 })
                                 .collect();
+                            apply_body_edit(request, &edit.body);
                         }
                         state.dirty_requests.remove(selected);
                     }
@@ -212,12 +221,14 @@ pub fn update(state: &mut AppState, msg: Message) {
         }
         Message::EditFocusNext => {
             if let Some(edit) = &mut state.edit_mode {
-                edit.focus = edit.focus.next(edit.headers.len());
+                let has_body = edit.has_editable_body();
+                edit.focus = edit.focus.next(edit.headers.len(), has_body);
             }
         }
         Message::EditFocusPrev => {
             if let Some(edit) = &mut state.edit_mode {
-                edit.focus = edit.focus.prev(edit.headers.len());
+                let has_body = edit.has_editable_body();
+                edit.focus = edit.focus.prev(edit.headers.len(), has_body);
             }
         }
         Message::AddHeaderRow => edit_state_mutate(state, EditState::add_header_row),
@@ -227,6 +238,8 @@ pub fn update(state: &mut AppState, msg: Message) {
         Message::EditDelete => edit_mutate(state, TextField::delete),
         Message::EditCursorLeft => edit_move(state, TextField::move_left),
         Message::EditCursorRight => edit_move(state, TextField::move_right),
+        Message::EditCursorUp => edit_move(state, TextField::move_up),
+        Message::EditCursorDown => edit_move(state, TextField::move_down),
         // See the doc comment on `Message::Resize` — the redraw itself
         // comes from `terminal.draw` re-running `view` against the
         // already-resized backend on the loop's next iteration; there is no
@@ -279,6 +292,63 @@ fn request_mut(document: &mut Document, index: usize) -> Option<&mut Request> {
     }
 }
 
+/// The one place body text is actually checked against JSON's grammar —
+/// called only from `Message::SaveEdit`, never on every keystroke (see
+/// `EditState::body_error`'s own doc comment for why). `None` covers three
+/// cases that are all "nothing to reject": the body isn't in `json:` mode at
+/// all (`is_json: false`), it's `Unsupported` (`body_file`/`form`/
+/// `multipart` were never offered a text area to type invalid JSON into),
+/// or the text is empty/blank — treated as "no body" by `apply_body_edit`
+/// below, not as the empty string failing to parse as JSON (which it would,
+/// since `""` is not valid JSON on its own).
+fn validate_body_for_save(body: &BodyEdit) -> Option<String> {
+    let BodyEdit::Editable {
+        text,
+        is_json: true,
+    } = body
+    else {
+        return None;
+    };
+    if text.value().trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(text.value())
+        .err()
+        .map(|error| format!("Body is not valid JSON: {error}"))
+}
+
+/// Writes `body` back into `request`'s real `body`/`json` fields — the body
+/// half of what `Message::SaveEdit` does for `method`/`url`/`headers`.
+/// `Unsupported` bodies (`body_file`/`form`/`multipart`) are left completely
+/// untouched: `EditState`/`BodyEdit` never held a working copy of them to
+/// begin with (see `BodyEdit`'s own doc comment), so there is nothing here
+/// to write back, the same way `CancelEdit` never had anything to undo for
+/// `method`/`url`/`headers`.
+fn apply_body_edit(request: &mut Request, body: &BodyEdit) {
+    let BodyEdit::Editable { text, is_json } = body else {
+        return;
+    };
+    if text.value().trim().is_empty() {
+        request.body = None;
+        request.json = None;
+        return;
+    }
+    if *is_json {
+        // `Message::SaveEdit` already ran this same text through
+        // `validate_body_for_save` and refused to reach this call at all on
+        // `Err` — matched rather than trusted blindly, so a bug in that
+        // invariant leaves the request's body untouched instead of
+        // panicking or saving something that never actually parsed.
+        if let Ok(value) = serde_json::from_str(text.value()) {
+            request.json = Some(value);
+            request.body = None;
+        }
+    } else {
+        request.body = Some(text.value().to_string());
+        request.json = None;
+    }
+}
+
 /// Applies `mutate` to whichever field `EditState::focus` currently points
 /// at, then marks the edit (and the request being edited) dirty and, if the
 /// method field is the one that just changed, recomputes `method_error` —
@@ -294,6 +364,15 @@ fn edit_mutate(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
     edit.dirty = true;
     if edit.focus == EditField::Method {
         edit.method_error = validate_method_text(edit.method.value()).err();
+    }
+    // `body_error` is deliberately not recomputed here the way `method_error`
+    // just was — see its own doc comment for why body validation waits for
+    // `Message::SaveEdit` — but a stale error from a previous failed save
+    // must not keep showing once the user has started fixing it, so editing
+    // the body clears it immediately rather than leaving it to look current
+    // until the next save attempt.
+    if edit.focus == EditField::Body {
+        edit.body_error = None;
     }
     if let LoadState::Loaded { selected, .. } = &state.load_state {
         state.dirty_requests.insert(*selected);
@@ -996,10 +1075,26 @@ requests:
     }
 
     #[test]
-    fn tab_wraps_from_the_last_header_values_field_back_to_method() {
+    fn tab_moves_from_the_last_header_values_field_into_the_body_field() {
+        // `REQUEST_WITH_HEADERS` has no `body`/`json`/`body_file`/`form`/
+        // `multipart` set, which `BodyEdit::new` treats as an editable
+        // (empty) body — so `Body` is next in the focus cycle after the
+        // last header row, not a wrap straight back to `Method`. See
+        // `tab_wraps_from_the_body_field_back_to_method` for that wrap.
         let mut state = loaded_state(REQUEST_WITH_HEADERS);
         update(&mut state, Message::EnterEditMode);
         state.edit_mode.as_mut().unwrap().focus = EditField::HeaderValue(1);
+
+        update(&mut state, Message::EditFocusNext);
+
+        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Body);
+    }
+
+    #[test]
+    fn tab_wraps_from_the_body_field_back_to_method() {
+        let mut state = loaded_state(REQUEST_WITH_HEADERS);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Body;
 
         update(&mut state, Message::EditFocusNext);
 
@@ -1130,6 +1225,274 @@ requests:
             }
             other => panic!("expected LoadState::Loaded, got {other:?}"),
         }
+    }
+
+    // --- Body editing -------------------------------------------------------
+
+    const REQUEST_WITH_PLAIN_BODY: &str = "\
+name: test
+requests:
+  - name: One
+    method: POST
+    url: https://example.com
+    body: hello world
+";
+
+    const REQUEST_WITH_JSON_BODY: &str = "\
+name: test
+requests:
+  - name: One
+    method: POST
+    url: https://example.com
+    json:
+      name: ada
+";
+
+    const REQUEST_WITH_BODY_FILE: &str = "\
+name: test
+requests:
+  - name: One
+    method: POST
+    url: https://example.com
+    body_file: ./payload.json
+";
+
+    const REQUEST_WITH_FORM_BODY: &str = "\
+name: test
+requests:
+  - name: One
+    method: POST
+    url: https://example.com
+    form:
+      username: ada
+";
+
+    fn focus_body(state: &mut AppState) {
+        state.edit_mode.as_mut().unwrap().focus = EditField::Body;
+    }
+
+    fn saved_request(state: &AppState) -> &Request {
+        match &state.load_state {
+            LoadState::Loaded {
+                document, selected, ..
+            } => &document.requests()[*selected],
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+    }
+
+    /// The current length of the editable body's own text — used to clear a
+    /// seeded body with exactly the right number of `Message::EditBackspace`s
+    /// before typing a replacement, the same purpose `backspace_n` is always
+    /// used for elsewhere in this file.
+    fn body_text_len(state: &AppState) -> usize {
+        match &state.edit_mode.as_ref().unwrap().body {
+            BodyEdit::Editable { text, .. } => text.value().len(),
+            other => panic!("expected BodyEdit::Editable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn editing_and_saving_a_plain_text_body_reflects_in_the_real_request() {
+        let mut state = loaded_state(REQUEST_WITH_PLAIN_BODY);
+        update(&mut state, Message::EnterEditMode);
+        focus_body(&mut state);
+        backspace_n(&mut state, "hello world".len());
+
+        type_into_focused_field(&mut state, "goodbye world");
+        update(&mut state, Message::SaveEdit);
+
+        assert!(state.edit_mode.is_none());
+        let request = saved_request(&state);
+        assert_eq!(request.body.as_deref(), Some("goodbye world"));
+        assert_eq!(request.json, None);
+    }
+
+    #[test]
+    fn editing_and_saving_a_valid_json_body_reflects_in_the_real_request() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_BODY);
+        update(&mut state, Message::EnterEditMode);
+        focus_body(&mut state);
+        // Replace the whole pretty-printed `{ "name": "ada" }` with new JSON.
+        let seeded_len = body_text_len(&state);
+        backspace_n(&mut state, seeded_len);
+
+        type_into_focused_field(&mut state, "{\"name\": \"grace\", \"active\": true}");
+        update(&mut state, Message::SaveEdit);
+
+        assert!(state.edit_mode.is_none());
+        let request = saved_request(&state);
+        assert_eq!(request.body, None, "a saved json body must clear `body:`");
+        let json = request.json.as_ref().expect("json must be set");
+        assert_eq!(json["name"], "grace");
+        assert_eq!(json["active"], true);
+    }
+
+    #[test]
+    fn invalid_json_body_blocks_save_shows_an_inline_error_and_keeps_the_typed_text() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_BODY);
+        update(&mut state, Message::EnterEditMode);
+        focus_body(&mut state);
+        type_into_focused_field(&mut state, " this is not json {{{");
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(
+            state.edit_mode.is_some(),
+            "SaveEdit must refuse to leave edit mode with invalid JSON in a json body"
+        );
+        let edit = state.edit_mode.as_ref().unwrap();
+        assert!(
+            edit.body_error.is_some(),
+            "an invalid JSON body must produce an inline error"
+        );
+        let text = match &edit.body {
+            BodyEdit::Editable { text, .. } => text.value(),
+            other => panic!("expected BodyEdit::Editable, got {other:?}"),
+        };
+        assert!(
+            text.contains("this is not json"),
+            "the invalid text the user typed must not be discarded: {text}"
+        );
+        // The real request must be untouched by the refused save.
+        let request = saved_request(&state);
+        assert_eq!(request.json.as_ref().unwrap()["name"], "ada");
+    }
+
+    #[test]
+    fn fixing_invalid_json_and_saving_again_succeeds() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_BODY);
+        update(&mut state, Message::EnterEditMode);
+        focus_body(&mut state);
+        let seeded_len = body_text_len(&state);
+        backspace_n(&mut state, seeded_len);
+        type_into_focused_field(&mut state, "not json");
+        update(&mut state, Message::SaveEdit);
+        assert!(state.edit_mode.as_ref().unwrap().body_error.is_some());
+
+        backspace_n(&mut state, "not json".len());
+        type_into_focused_field(&mut state, "{\"ok\": true}");
+        update(&mut state, Message::SaveEdit);
+
+        assert!(state.edit_mode.is_none(), "save must now succeed");
+        assert_eq!(saved_request(&state).json.as_ref().unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn typing_into_the_body_clears_a_stale_error_immediately() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_BODY);
+        update(&mut state, Message::EnterEditMode);
+        focus_body(&mut state);
+        type_into_focused_field(&mut state, "not json");
+        update(&mut state, Message::SaveEdit);
+        assert!(state.edit_mode.as_ref().unwrap().body_error.is_some());
+
+        type_into_focused_field(&mut state, "x");
+
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().body_error,
+            None,
+            "a stale error must clear the moment the body is edited again, \
+             not linger until the next save attempt"
+        );
+    }
+
+    #[test]
+    fn clearing_a_body_entirely_saves_as_no_body() {
+        let mut state = loaded_state(REQUEST_WITH_PLAIN_BODY);
+        update(&mut state, Message::EnterEditMode);
+        focus_body(&mut state);
+        backspace_n(&mut state, "hello world".len());
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(state.edit_mode.is_none());
+        let request = saved_request(&state);
+        assert_eq!(request.body, None);
+        assert_eq!(request.json, None);
+    }
+
+    #[test]
+    fn body_file_is_unsupported_focus_never_reaches_it_and_save_leaves_it_untouched() {
+        let mut state = loaded_state(REQUEST_WITH_BODY_FILE);
+        update(&mut state, Message::EnterEditMode);
+        assert!(
+            !state.edit_mode.as_ref().unwrap().has_editable_body(),
+            "body_file must not offer an editable body field"
+        );
+
+        // Tab all the way around the whole focus cycle — Body must never be
+        // reachable, since there is nothing editable to focus.
+        for _ in 0..6 {
+            update(&mut state, Message::EditFocusNext);
+            assert_ne!(state.edit_mode.as_ref().unwrap().focus, EditField::Body);
+        }
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(state.edit_mode.is_none());
+        let request = saved_request(&state);
+        assert_eq!(
+            request.body_file.as_deref(),
+            Some("./payload.json"),
+            "an Unsupported body must be left completely untouched by save"
+        );
+    }
+
+    #[test]
+    fn form_body_is_unsupported_and_untouched_by_save() {
+        let mut state = loaded_state(REQUEST_WITH_FORM_BODY);
+        update(&mut state, Message::EnterEditMode);
+        assert!(!state.edit_mode.as_ref().unwrap().has_editable_body());
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(state.edit_mode.is_none());
+        let request = saved_request(&state);
+        assert_eq!(
+            request.form,
+            vec![("username".to_string(), "ada".to_string())]
+        );
+    }
+
+    #[test]
+    fn cancel_edit_discards_body_changes_too() {
+        let mut state = loaded_state(REQUEST_WITH_PLAIN_BODY);
+        let before_document = match &state.load_state {
+            LoadState::Loaded { document, .. } => (**document).clone(),
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        update(&mut state, Message::EnterEditMode);
+        focus_body(&mut state);
+        backspace_n(&mut state, "hello world".len());
+        type_into_focused_field(&mut state, "completely different");
+
+        update(&mut state, Message::CancelEdit);
+
+        assert!(state.edit_mode.is_none());
+        match &state.load_state {
+            LoadState::Loaded { document, .. } => {
+                assert_eq!(**document, before_document);
+            }
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_focused_reports_true_only_when_focus_is_on_the_body_field() {
+        let mut state = loaded_state(REQUEST_WITH_PLAIN_BODY);
+        assert!(!state.body_focused(), "not editing at all yet");
+
+        update(&mut state, Message::EnterEditMode);
+        assert!(!state.body_focused(), "focus starts on Method");
+
+        focus_body(&mut state);
+        assert!(state.body_focused());
+
+        update(&mut state, Message::EditFocusNext);
+        assert!(
+            !state.body_focused(),
+            "focus must have wrapped back to Method"
+        );
     }
 
     #[test]

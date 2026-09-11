@@ -20,25 +20,35 @@ pub struct NamedEnvironment {
     pub environment: Environment,
 }
 
-/// A single-line, cursor-addressable text buffer — the minimal text-input
-/// primitive every field edit mode touches shares (method and URL today;
-/// future fields like headers/auth/body can reuse it too), rather than each
-/// hand-rolling its own insert/delete/cursor-movement logic.
+/// A cursor-addressable text buffer — the minimal text-input primitive
+/// every field edit mode touches shares (method, URL and headers as
+/// single-line fields; the request body as a multi-line one), rather than
+/// each hand-rolling its own insert/delete/cursor-movement logic.
 ///
 /// A dependency like `tui-input` was considered and rejected: every field
-/// this crate will ever edit is a single line of plain text with no
-/// undo/redo, no multi-line, no IME composition, and no need for anything
-/// beyond insert/backspace/delete/left/right — exactly what this type
-/// covers in well under a hundred lines including its own tests. Pulling in
-/// an external crate would trade a dependency (plus its own `Input`/event
-/// API to learn and wire into `Message`/`update`, and its own opinions on
-/// things like scrolling a field wider than its viewport, unneeded here)
-/// for something this hand-rolls more simply and keeps fully under this
-/// crate's own tests, the same reasoning `body_for_display`'s doc comment
-/// gives for reimplementing rather than depending across a crate boundary.
-/// Revisit if a later field genuinely needs more than this (multi-line
-/// input, unicode grapheme-aware cursor movement instead of per-`char`,
-/// undo).
+/// this crate edits is plain text with no undo/redo, no IME composition,
+/// and no need for anything beyond insert/backspace/delete/cursor movement
+/// — exactly what this type covers in well under two hundred lines
+/// including its own tests. Pulling in an external crate would trade a
+/// dependency (plus its own `Input`/event API to learn and wire into
+/// `Message`/`update`, and its own opinions on things like scrolling a
+/// field wider than its viewport, unneeded here) for something this
+/// hand-rolls more simply and keeps fully under this crate's own tests, the
+/// same reasoning `body_for_display`'s doc comment gives for reimplementing
+/// rather than depending across a crate boundary.
+///
+/// **Multi-line.** `insert_char`/`backspace`/`delete`/`move_left`/
+/// `move_right` were already multi-line-capable without any change: they
+/// operate per-`char`, and a `'\n'` is just another `char` to them — typing
+/// one inserts a line break, `Backspace` right after one merges the two
+/// lines by deleting it like any other character, and so on. Only line-wise
+/// concerns needed adding for the body editor, which is genuinely
+/// multi-line where method/URL/headers never are: `cursor_row_col` (a
+/// multi-line text area's real terminal row/column, where `cursor_chars`
+/// alone stopped being enough) and `move_up`/`move_down` (there is no
+/// single-line equivalent of moving a cursor vertically). Revisit if a
+/// later field genuinely needs more than this still (unicode
+/// grapheme-aware cursor movement instead of per-`char`, undo).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TextField {
     value: String,
@@ -109,6 +119,64 @@ impl TextField {
         }
     }
 
+    /// The cursor's position as `(row, column)`, both zero-based and both in
+    /// `char`s — a multi-line text area's real terminal row and column,
+    /// where `cursor_chars` (which only ever meant "how far into the one
+    /// row") stopped being enough. `row` is how many `'\n'`s precede the
+    /// cursor; `column` is `cursor_chars` measured from the start of that
+    /// row instead of the start of the whole value.
+    pub fn cursor_row_col(&self) -> (usize, usize) {
+        let before_cursor = &self.value[..self.cursor];
+        let row = before_cursor.matches('\n').count();
+        let column = before_cursor
+            .rsplit('\n')
+            .next()
+            .unwrap_or("")
+            .chars()
+            .count();
+        (row, column)
+    }
+
+    /// Moves the cursor up one line, keeping the same column where the line
+    /// above is at least that wide and clamping to its end otherwise — the
+    /// same "ragged edge" behavior an ordinary text editor's up/down arrows
+    /// have. A no-op on the first line, where there is nowhere up to go.
+    pub(super) fn move_up(&mut self) {
+        let (row, column) = self.cursor_row_col();
+        if row == 0 {
+            return;
+        }
+        self.move_to_row_col(row - 1, column);
+    }
+
+    /// The exact mirror of [`Self::move_up`] — a no-op on the last line.
+    pub(super) fn move_down(&mut self) {
+        let (row, column) = self.cursor_row_col();
+        if row >= self.value.matches('\n').count() {
+            return;
+        }
+        self.move_to_row_col(row + 1, column);
+    }
+
+    /// Places the cursor at `column` `char`s into line `row` (clamped to
+    /// that line's own length), counting lines the same way
+    /// `cursor_row_col` does. Shared by `move_up`/`move_down`, the only two
+    /// callers that ever need to address a line other than the one the
+    /// cursor is already on.
+    fn move_to_row_col(&mut self, row: usize, column: usize) {
+        let mut offset = 0;
+        for (index, line) in self.value.split('\n').enumerate() {
+            if index == row {
+                let clamped_column = column.min(line.chars().count());
+                let byte_offset: usize =
+                    line.chars().take(clamped_column).map(char::len_utf8).sum();
+                self.cursor = offset + byte_offset;
+                return;
+            }
+            offset += line.len() + 1; // +1 for the '\n' this `split` consumed.
+        }
+    }
+
     fn prev_char_boundary(&self) -> Option<usize> {
         self.value[..self.cursor]
             .chars()
@@ -146,9 +214,11 @@ impl HeaderRow {
 /// Which of edit mode's fields `Message::EditFocusNext`/`EditFocusPrev`
 /// (`Tab`/`Shift+Tab`) is currently pointed at, and so which one
 /// `Message::EditInsertChar`/`EditBackspace`/etc. act on. `HeaderKey(i)`/
-/// `HeaderValue(i)` index into `EditState::headers`; if auth/body ever gain
-/// their own fields, this and `EditState::focused_field_mut` are exactly
-/// where those new variants would slot in.
+/// `HeaderValue(i)` index into `EditState::headers`; `Body` is the raw body
+/// text area (see `BodyEdit`) and only ever appears in the focus cycle when
+/// `EditState::body` is actually editable — see `next`/`prev`'s own
+/// `has_body` parameter. If auth ever gains its own field, this and
+/// `EditState::focused_field_mut` are exactly where that would slot in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EditField {
     #[default]
@@ -156,52 +226,176 @@ pub enum EditField {
     Url,
     HeaderKey(usize),
     HeaderValue(usize),
+    Body,
 }
 
 impl EditField {
-    /// Visible to `super::update`'s `Message::EditFocusNext` arm. Needs
-    /// `header_count` (rather than being a pure function of `self` alone,
-    /// the way it was before headers existed) since whether `Url` steps into
-    /// the first header row, and whether the last header row's value wraps
-    /// back to `Method`, both depend on how many header rows currently
-    /// exist. Order: Method → URL → each header row's key then value, in
-    /// index order → back to Method.
-    pub(super) fn next(self, header_count: usize) -> Self {
+    /// Visible to `super::update`'s `Message::EditFocusNext` arm. Takes
+    /// `header_count` and `has_body` (rather than being a pure function of
+    /// `self` alone) since whether `Url` steps straight into the first
+    /// header row or into `Body`, and where the cycle wraps back to
+    /// `Method` from, both depend on how many header rows currently exist
+    /// and whether there is an editable body field at all right now (see
+    /// `BodyEdit::Unsupported`, which has no field to focus). Order: Method
+    /// → URL → each header row's key then value, in index order → Body (if
+    /// editable) → back to Method.
+    pub(super) fn next(self, header_count: usize, has_body: bool) -> Self {
         match self {
             EditField::Method => EditField::Url,
             EditField::Url => {
-                if header_count == 0 {
-                    EditField::Method
-                } else {
+                if header_count > 0 {
                     EditField::HeaderKey(0)
+                } else if has_body {
+                    EditField::Body
+                } else {
+                    EditField::Method
                 }
             }
             EditField::HeaderKey(index) => EditField::HeaderValue(index),
             EditField::HeaderValue(index) => {
                 if index + 1 < header_count {
                     EditField::HeaderKey(index + 1)
+                } else if has_body {
+                    EditField::Body
                 } else {
                     EditField::Method
                 }
             }
+            EditField::Body => EditField::Method,
         }
     }
 
     /// The exact reverse of [`Self::next`] — visible to `super::update`'s
     /// `Message::EditFocusPrev` arm (`Shift+Tab`).
-    pub(super) fn prev(self, header_count: usize) -> Self {
+    pub(super) fn prev(self, header_count: usize, has_body: bool) -> Self {
         match self {
             EditField::Method => {
-                if header_count == 0 {
-                    EditField::Url
-                } else {
+                if has_body {
+                    EditField::Body
+                } else if header_count > 0 {
                     EditField::HeaderValue(header_count - 1)
+                } else {
+                    EditField::Url
                 }
             }
             EditField::Url => EditField::Method,
             EditField::HeaderKey(0) => EditField::Url,
             EditField::HeaderKey(index) => EditField::HeaderValue(index - 1),
             EditField::HeaderValue(index) => EditField::HeaderKey(index),
+            EditField::Body => {
+                if header_count > 0 {
+                    EditField::HeaderValue(header_count - 1)
+                } else {
+                    EditField::Url
+                }
+            }
+        }
+    }
+}
+
+/// How the selected request's body participates in edit mode — decided once
+/// by `BodyEdit::new` from whichever of the five body-bearing fields
+/// (`body`/`json`/`body_file`/`form`/`multipart`) the request actually has
+/// set (`Request::validate` guarantees at most one), and unchanged for the
+/// rest of the edit session even if what gets typed would also fit a
+/// different shape (see `Editable`'s own doc comment).
+///
+/// **Scoping decision for this issue**: only a request with no body, a
+/// plain `body:`, or a `json:` body gets a real editor here — the three
+/// remaining shapes (`body_file`, `form`, `multipart`) are shown read-only
+/// (`Unsupported`, surfaced by `render_edit_pane` as plain text, never a
+/// text area) rather than partially or fully editable. This is a deliberate
+/// line, not a gap that slipped through: `body_file` names a file on disk
+/// that some other tool may already have open, editing it from inside
+/// sendra-tui would mean either silently overwriting that file on save (a
+/// surprising side effect for a "request" edit) or inventing a separate
+/// "detach from the file" step this issue was never asked to design; `form`
+/// and `multipart` are structured (name/value pairs, and file parts for the
+/// latter) and would need their own list-of-rows editor in the shape of
+/// `HeaderRow`'s, which is a real feature in its own right, not a natural
+/// fit for a raw text area. Both are honest gaps to revisit as their own
+/// issues, not silently dropped: `Unsupported`'s `description` is exactly
+/// what tells the user, in the pane itself, that this body exists but isn't
+/// editable here.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BodyEdit {
+    // `Editable`/`Unsupported` documented below; `Default` is implemented
+    // manually (an empty, plain-text `Editable` — the same "no body"
+    // starting point `EditState::new` builds for a request with none) only
+    // so `#[derive(Default)]` on `EditState` itself has something to build
+    // from before any real request is loaded.
+    /// A `body:`/`json:` body, or no body at all — editable as raw text in
+    /// one shared text area. `is_json` remembers which of `Request::body`/
+    /// `Request::json` `Message::SaveEdit` writes the parsed text back
+    /// into: `true` for a request that had `json:` set (the text starts out
+    /// pretty-printed from that value, and is parsed back into JSON on
+    /// save — see `validate_body_for_save`/`apply_body_edit` in `update`),
+    /// `false` for `body:` or no body at all (written back as plain text,
+    /// never parsed or validated). Fixed for the whole edit session: typing
+    /// JSON-shaped text into a plain-body request does not switch it into
+    /// JSON mode (which would surprise a user who never asked for
+    /// validation), and typing non-JSON text into a `json:` body's editor
+    /// is exactly the invalid-JSON case `Message::SaveEdit` is meant to
+    /// catch, not a silent fallback to a plain string.
+    Editable { text: TextField, is_json: bool },
+    /// `body_file`, `form`, or `multipart` — not editable through this
+    /// text area; see this enum's own doc comment for why. `description`
+    /// is exactly what `render_edit_pane` shows in place of a text area.
+    Unsupported { description: String },
+}
+
+impl Default for BodyEdit {
+    fn default() -> Self {
+        BodyEdit::Editable {
+            text: TextField::default(),
+            is_json: false,
+        }
+    }
+}
+
+impl BodyEdit {
+    /// Visible to `super::update`'s `Message::EnterEditMode` arm via
+    /// `EditState::new`.
+    fn new(request: &Request) -> Self {
+        if let Some(path) = &request.body_file {
+            return BodyEdit::Unsupported {
+                description: format!(
+                    "body_file: {path} (not editable here — edit the file itself, then re-open this request)"
+                ),
+            };
+        }
+        if !request.form.is_empty() {
+            return BodyEdit::Unsupported {
+                description: format!(
+                    "form body ({} field{}) — not editable here",
+                    request.form.len(),
+                    if request.form.len() == 1 { "" } else { "s" }
+                ),
+            };
+        }
+        if !request.multipart.is_empty() {
+            return BodyEdit::Unsupported {
+                description: format!(
+                    "multipart body ({} part{}) — not editable here",
+                    request.multipart.len(),
+                    if request.multipart.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+            };
+        }
+        if let Some(value) = &request.json {
+            let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+            return BodyEdit::Editable {
+                text: TextField::new(text),
+                is_json: true,
+            };
+        }
+        BodyEdit::Editable {
+            text: TextField::new(request.body.clone().unwrap_or_default()),
+            is_json: false,
         }
     }
 }
@@ -222,6 +416,9 @@ pub struct EditState {
     /// wholesale by `Message::SaveEdit`, the same round-trip `method`/`url`
     /// already go through.
     pub headers: Vec<HeaderRow>,
+    /// The selected request's body, however it participates in this edit —
+    /// see `BodyEdit`'s own doc comment for what is and isn't editable.
+    pub body: BodyEdit,
     pub focus: EditField,
     /// `Some(message)` whenever `method`'s current text does not parse as a
     /// real `sendra_core::Method` — recomputed on every keystroke that
@@ -232,6 +429,19 @@ pub struct EditState {
     /// refuses to save while this is `Some`, but never clears `edit_mode`
     /// over it — see that arm's own comment.
     pub method_error: Option<String>,
+    /// `Some(message)` whenever the body is a `json:`-mode `BodyEdit::Editable`
+    /// whose current text does not parse as JSON. Unlike `method_error`,
+    /// this is deliberately **not** recomputed on every keystroke — a body
+    /// mid-edit is expected to pass through many syntactically-invalid
+    /// states between meaningful ones (an open brace with nothing after it
+    /// yet, say), and flagging every one of them would make ordinary typing
+    /// look like a wall of errors. Instead `Message::SaveEdit` computes this
+    /// fresh only when save is actually attempted (see
+    /// `update::validate_body_for_save`), and typing anything into the body
+    /// field after a failed save clears the stale message immediately (see
+    /// `update::edit_mutate`) rather than leaving a now-possibly-wrong error
+    /// on screen until the next save attempt.
+    pub body_error: Option<String>,
 }
 
 impl EditState {
@@ -250,8 +460,10 @@ impl EditState {
             method,
             url: TextField::new(request.url.clone()),
             headers,
+            body: BodyEdit::new(request),
             focus: EditField::default(),
             method_error,
+            body_error: None,
         }
     }
 
@@ -262,6 +474,14 @@ impl EditState {
             EditField::Url => &mut self.url,
             EditField::HeaderKey(index) => &mut self.headers[index].key,
             EditField::HeaderValue(index) => &mut self.headers[index].value,
+            EditField::Body => match &mut self.body {
+                BodyEdit::Editable { text, .. } => text,
+                BodyEdit::Unsupported { .. } => unreachable!(
+                    "focus is never Body while the body is Unsupported — see \
+                     EditField::next/prev, which only ever move focus onto Body \
+                     when has_body is true"
+                ),
+            },
         }
     }
 
@@ -282,7 +502,7 @@ impl EditState {
     pub(super) fn delete_focused_header_row(&mut self) {
         let index = match self.focus {
             EditField::HeaderKey(index) | EditField::HeaderValue(index) => index,
-            EditField::Method | EditField::Url => return,
+            EditField::Method | EditField::Url | EditField::Body => return,
         };
         self.headers.remove(index);
         self.focus = if self.headers.is_empty() {
@@ -290,6 +510,14 @@ impl EditState {
         } else {
             EditField::HeaderKey(index.saturating_sub(1).min(self.headers.len() - 1))
         };
+    }
+
+    /// Whether `body` currently has a real text field to focus at all — what
+    /// `EditField::next`/`prev` need to decide whether `Body` belongs in the
+    /// focus cycle right now. `true` for `BodyEdit::Editable`, `false` for
+    /// `BodyEdit::Unsupported`.
+    pub(super) fn has_editable_body(&self) -> bool {
+        matches!(self.body, BodyEdit::Editable { .. })
     }
 }
 
@@ -390,6 +618,20 @@ pub struct AppState {
     /// have unsaved TUI-local edits" is sendra-tui's own bookkeeping, not
     /// something a collection file format should have to represent.
     pub dirty_requests: HashSet<usize>,
+}
+
+impl AppState {
+    /// Whether the body field specifically has focus right now — what
+    /// `main::translate_event` needs to decide whether `Enter`/`Up`/`Down`
+    /// mean "edit the body" (a newline, a line up/down) instead of their
+    /// ordinary edit-mode meaning of nothing at all, which is what those
+    /// keys do on every other, single-line field. `false` whenever edit
+    /// mode isn't even active, the same as focus meaning nothing then.
+    pub fn body_focused(&self) -> bool {
+        self.edit_mode
+            .as_ref()
+            .is_some_and(|edit| edit.focus == EditField::Body)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -538,6 +780,12 @@ pub enum Message {
     EditCursorLeft,
     /// `Right` on the focused field: moves the cursor forward one character.
     EditCursorRight,
+    /// `Up`, only bound while the body field is focused (see
+    /// `main::translate_event`) — every other field is single-line, where
+    /// vertical movement has no meaning. See `TextField::move_up`.
+    EditCursorUp,
+    /// `Down`, the mirror of `EditCursorUp`. See `TextField::move_down`.
+    EditCursorDown,
     /// A crossterm `Event::Resize` reaching the translation layer in
     /// `main::next_message`. Carries no data and `update` treats it as a
     /// no-op: ratatui's `Terminal::draw` already calls `Terminal::autoresize`
@@ -660,60 +908,228 @@ mod tests {
         assert_eq!(field.value(), "caf");
     }
 
-    #[test]
-    fn edit_field_next_alternates_between_method_and_url_with_no_headers() {
-        assert_eq!(EditField::Method.next(0), EditField::Url);
-        assert_eq!(EditField::Url.next(0), EditField::Method);
-    }
+    // --- TextField: multi-line (the body editor) ------------------------------
 
     #[test]
-    fn edit_field_next_walks_through_header_rows_in_order() {
-        assert_eq!(EditField::Url.next(2), EditField::HeaderKey(0));
-        assert_eq!(EditField::HeaderKey(0).next(2), EditField::HeaderValue(0));
-        assert_eq!(EditField::HeaderValue(0).next(2), EditField::HeaderKey(1));
-        assert_eq!(EditField::HeaderKey(1).next(2), EditField::HeaderValue(1));
+    fn insert_char_with_a_newline_creates_a_second_line() {
+        let mut field = TextField::new("ab");
+        field.move_left(); // cursor between 'a' and 'b'
+
+        field.insert_char('\n');
+
+        assert_eq!(field.value(), "a\nb");
         assert_eq!(
-            EditField::HeaderValue(1).next(2),
-            EditField::Method,
-            "the last header row's value wraps back to Method"
+            field.cursor_row_col(),
+            (1, 0),
+            "the cursor must now be at the very start of the new second line"
         );
     }
 
     #[test]
-    fn edit_field_next_and_prev_are_exact_inverses() {
-        let header_count = 3;
-        let every_field = [
+    fn backspace_right_after_a_newline_merges_the_two_lines() {
+        let mut field = TextField::new("one\ntwo");
+        field.move_to_row_col(1, 0); // start of "two"
+
+        field.backspace();
+
+        assert_eq!(field.value(), "onetwo");
+        assert_eq!(field.cursor_row_col(), (0, 3));
+    }
+
+    #[test]
+    fn delete_right_before_a_newline_merges_the_two_lines() {
+        let mut field = TextField::new("one\ntwo");
+        field.move_to_row_col(0, 3); // end of "one", right before '\n'
+
+        field.delete();
+
+        assert_eq!(field.value(), "onetwo");
+        assert_eq!(field.cursor_row_col(), (0, 3));
+    }
+
+    #[test]
+    fn cursor_row_col_counts_preceding_newlines_and_the_column_within_the_current_line() {
+        let mut field = TextField::new("ab\ncde\nf");
+        field.move_to_row_col(2, 1); // "f" is the whole third line
+
+        assert_eq!(field.cursor_row_col(), (2, 1));
+    }
+
+    #[test]
+    fn move_up_keeps_the_same_column_when_the_line_above_is_at_least_as_wide() {
+        let mut field = TextField::new("abcd\nxy");
+        field.move_to_row_col(1, 2); // end of "xy"
+
+        field.move_up();
+
+        assert_eq!(field.cursor_row_col(), (0, 2));
+    }
+
+    #[test]
+    fn move_up_clamps_to_the_end_of_a_shorter_line_above() {
+        let mut field = TextField::new("ab\nwxyz");
+        field.move_to_row_col(1, 4); // end of "wxyz"
+
+        field.move_up();
+
+        assert_eq!(
+            field.cursor_row_col(),
+            (0, 2),
+            "the line above is only 2 chars wide, so the cursor clamps to its end"
+        );
+    }
+
+    #[test]
+    fn move_up_on_the_first_line_is_a_no_op() {
+        let mut field = TextField::new("abc");
+        field.move_to_row_col(0, 1);
+
+        field.move_up();
+
+        assert_eq!(field.cursor_row_col(), (0, 1));
+    }
+
+    #[test]
+    fn move_down_keeps_the_same_column_when_the_line_below_is_at_least_as_wide() {
+        let mut field = TextField::new("xy\nabcd");
+        field.move_to_row_col(0, 2);
+
+        field.move_down();
+
+        assert_eq!(field.cursor_row_col(), (1, 2));
+    }
+
+    #[test]
+    fn move_down_clamps_to_the_end_of_a_shorter_line_below() {
+        let mut field = TextField::new("wxyz\nab");
+        field.move_to_row_col(0, 4);
+
+        field.move_down();
+
+        assert_eq!(field.cursor_row_col(), (1, 2));
+    }
+
+    #[test]
+    fn move_down_on_the_last_line_is_a_no_op() {
+        let mut field = TextField::new("abc");
+        field.move_to_row_col(0, 1);
+
+        field.move_down();
+
+        assert_eq!(field.cursor_row_col(), (0, 1));
+    }
+
+    #[test]
+    fn move_up_then_down_returns_to_the_original_column() {
+        let mut field = TextField::new("hello\nworld");
+        field.move_to_row_col(1, 3);
+
+        field.move_up();
+        field.move_down();
+
+        assert_eq!(field.cursor_row_col(), (1, 3));
+    }
+
+    #[test]
+    fn edit_field_next_alternates_between_method_and_url_with_no_headers_or_body() {
+        assert_eq!(EditField::Method.next(0, false), EditField::Url);
+        assert_eq!(EditField::Url.next(0, false), EditField::Method);
+    }
+
+    #[test]
+    fn edit_field_next_walks_through_header_rows_in_order() {
+        assert_eq!(EditField::Url.next(2, false), EditField::HeaderKey(0));
+        assert_eq!(
+            EditField::HeaderKey(0).next(2, false),
+            EditField::HeaderValue(0)
+        );
+        assert_eq!(
+            EditField::HeaderValue(0).next(2, false),
+            EditField::HeaderKey(1)
+        );
+        assert_eq!(
+            EditField::HeaderKey(1).next(2, false),
+            EditField::HeaderValue(1)
+        );
+        assert_eq!(
+            EditField::HeaderValue(1).next(2, false),
             EditField::Method,
-            EditField::Url,
-            EditField::HeaderKey(0),
-            EditField::HeaderValue(0),
-            EditField::HeaderKey(1),
-            EditField::HeaderValue(1),
-            EditField::HeaderKey(2),
-            EditField::HeaderValue(2),
-        ];
-        for field in every_field {
-            assert_eq!(
-                field.next(header_count).prev(header_count),
-                field,
-                "prev must exactly undo next for {field:?}"
-            );
-            assert_eq!(
-                field.prev(header_count).next(header_count),
-                field,
-                "next must exactly undo prev for {field:?}"
-            );
+            "with no body field, the last header row's value wraps back to Method"
+        );
+    }
+
+    #[test]
+    fn edit_field_next_visits_body_last_when_editable() {
+        assert_eq!(EditField::Url.next(0, true), EditField::Body);
+        assert_eq!(
+            EditField::HeaderValue(1).next(2, true),
+            EditField::Body,
+            "the last header row's value must move into Body when the body is editable"
+        );
+        assert_eq!(
+            EditField::Body.next(2, true),
+            EditField::Method,
+            "Body wraps back to Method"
+        );
+    }
+
+    #[test]
+    fn edit_field_next_skips_body_entirely_when_unsupported() {
+        assert_eq!(
+            EditField::Url.next(0, false),
+            EditField::Method,
+            "with no headers and no editable body, Url wraps straight back to Method"
+        );
+        assert_eq!(EditField::HeaderValue(1).next(2, false), EditField::Method);
+    }
+
+    #[test]
+    fn edit_field_next_and_prev_are_exact_inverses_across_every_layout() {
+        for header_count in [0, 1, 3] {
+            for has_body in [false, true] {
+                let mut every_field = vec![EditField::Method, EditField::Url];
+                for index in 0..header_count {
+                    every_field.push(EditField::HeaderKey(index));
+                    every_field.push(EditField::HeaderValue(index));
+                }
+                if has_body {
+                    every_field.push(EditField::Body);
+                }
+                for field in every_field {
+                    assert_eq!(
+                        field
+                            .next(header_count, has_body)
+                            .prev(header_count, has_body),
+                        field,
+                        "prev must exactly undo next for {field:?} \
+                         (header_count={header_count}, has_body={has_body})"
+                    );
+                    assert_eq!(
+                        field
+                            .prev(header_count, has_body)
+                            .next(header_count, has_body),
+                        field,
+                        "next must exactly undo prev for {field:?} \
+                         (header_count={header_count}, has_body={has_body})"
+                    );
+                }
+            }
         }
     }
 
     #[test]
-    fn edit_field_prev_from_method_wraps_to_the_last_header_value_when_headers_exist() {
-        assert_eq!(EditField::Method.prev(2), EditField::HeaderValue(1));
+    fn edit_field_prev_from_method_prefers_body_over_headers_when_both_exist() {
+        assert_eq!(EditField::Method.prev(2, true), EditField::Body);
     }
 
     #[test]
-    fn edit_field_prev_from_method_wraps_to_url_with_no_headers() {
-        assert_eq!(EditField::Method.prev(0), EditField::Url);
+    fn edit_field_prev_from_method_wraps_to_the_last_header_value_with_no_body() {
+        assert_eq!(EditField::Method.prev(2, false), EditField::HeaderValue(1));
+    }
+
+    #[test]
+    fn edit_field_prev_from_method_wraps_to_url_with_no_headers_or_body() {
+        assert_eq!(EditField::Method.prev(0, false), EditField::Url);
     }
 
     // --- EditState: headers -----------------------------------------------
@@ -828,6 +1244,123 @@ mod tests {
             "deleting must only ever act on a focused header row"
         );
         assert_eq!(edit.focus, EditField::Method);
+    }
+
+    // --- BodyEdit --------------------------------------------------------
+
+    fn request_from(body_yaml: &str) -> Request {
+        let yaml = format!("method: POST\nurl: https://example.com\n{body_yaml}");
+        Request::from_yaml_str(&yaml).expect("valid test request")
+    }
+
+    #[test]
+    fn body_edit_new_is_editable_and_empty_for_a_request_with_no_body_at_all() {
+        let request = request_from("");
+
+        let body = BodyEdit::new(&request);
+
+        match body {
+            BodyEdit::Editable { text, is_json } => {
+                assert_eq!(text.value(), "");
+                assert!(!is_json, "no body at all defaults to plain, not JSON, mode");
+            }
+            other => panic!("expected BodyEdit::Editable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_edit_new_is_editable_plain_for_a_raw_body_field() {
+        let request = request_from("body: hello world");
+
+        let body = BodyEdit::new(&request);
+
+        match body {
+            BodyEdit::Editable { text, is_json } => {
+                assert_eq!(text.value(), "hello world");
+                assert!(!is_json);
+            }
+            other => panic!("expected BodyEdit::Editable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_edit_new_is_editable_json_and_pretty_printed_for_a_json_body_field() {
+        let request = request_from("json:\n  name: ada\n  roles: [admin, user]\n");
+
+        let body = BodyEdit::new(&request);
+
+        match body {
+            BodyEdit::Editable { text, is_json } => {
+                assert!(is_json);
+                // Pretty-printed, not the compact form `serde_yaml` would
+                // have produced — real proof it round-trips through
+                // `serde_json::Value` and back, not just carried over as a
+                // YAML string.
+                assert!(
+                    text.value().contains("\n"),
+                    "expected pretty-printed JSON:\n{}",
+                    text.value()
+                );
+                let reparsed: serde_json::Value =
+                    serde_json::from_str(text.value()).expect("must still be valid JSON");
+                assert_eq!(reparsed["name"], "ada");
+                assert_eq!(reparsed["roles"][0], "admin");
+            }
+            other => panic!("expected BodyEdit::Editable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_edit_new_is_unsupported_with_a_visible_path_for_body_file() {
+        let request = request_from("body_file: ./payload.json");
+
+        let body = BodyEdit::new(&request);
+
+        match body {
+            BodyEdit::Unsupported { description } => {
+                assert!(description.contains("./payload.json"));
+                assert!(description.contains("not editable"));
+            }
+            other => panic!("expected BodyEdit::Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_edit_new_is_unsupported_for_a_form_body() {
+        let request = request_from("form:\n  username: ada\n");
+
+        let body = BodyEdit::new(&request);
+
+        match body {
+            BodyEdit::Unsupported { description } => {
+                assert!(description.contains("form"));
+                assert!(description.contains("not editable"));
+            }
+            other => panic!("expected BodyEdit::Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn body_edit_new_is_unsupported_for_a_multipart_body() {
+        let request = request_from("multipart:\n  - name: description\n    value: hi\n");
+
+        let body = BodyEdit::new(&request);
+
+        match body {
+            BodyEdit::Unsupported { description } => {
+                assert!(description.contains("multipart"));
+                assert!(description.contains("not editable"));
+            }
+            other => panic!("expected BodyEdit::Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_state_new_reports_has_editable_body_correctly() {
+        assert!(EditState::new(&request_from("")).has_editable_body());
+        assert!(EditState::new(&request_from("body: x")).has_editable_body());
+        assert!(!EditState::new(&request_from("body_file: ./x.json")).has_editable_body());
+        assert!(!EditState::new(&request_from("form:\n  a: b\n")).has_editable_body());
     }
 
     // --- Method validation ----------------------------------------------------
