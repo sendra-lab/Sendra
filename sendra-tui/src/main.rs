@@ -224,9 +224,20 @@ fn translate_event(event: Event, overlay_open: bool, edit_mode_open: bool) -> Me
     match event {
         Event::Resize(_, _) => Message::Resize,
         Event::Key(key) if key.kind == KeyEventKind::Press => {
-            let is_quit = key.code == KeyCode::Char('q')
-                || (key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL));
+            let is_ctrl_c =
+                key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+            // Bare `q` quits everywhere *except* while editing: issue 17
+            // could make `q` a global quit key because edit mode had no
+            // text fields yet, but issue 18 gives it real ones, and a
+            // method or URL is entirely likely to contain the letter `q`
+            // (`?query=...`) — quitting the whole app on that keystroke
+            // would make such a URL unable to be typed at all. Ctrl+C stays
+            // a quit key everywhere, editing included: it is never a
+            // character a text field would otherwise accept (crossterm
+            // reports it as `Char('c')` plus the control modifier, not
+            // plain text input), and leaving *some* always-on quit key is
+            // what issue 13's clean-exit audit relies on.
+            let is_quit = is_ctrl_c || (key.code == KeyCode::Char('q') && !edit_mode_open);
             if is_quit {
                 return Message::Quit;
             }
@@ -241,10 +252,13 @@ fn translate_event(event: Event, overlay_open: bool, edit_mode_open: bool) -> Me
                 };
             }
 
-            // Edit mode's own, deliberately tiny key set — see
-            // `app::Message::SaveEdit`/`CancelEdit`. Everything else
-            // (including `e`/nav/run) falls through to `Message::Tick`
-            // here exactly the way the overlay branch above already
+            // Edit mode's own key set — see `app::Message::SaveEdit`/
+            // `CancelEdit`/`EditFocusNext`/`EditInsertChar` and friends.
+            // Everything here (including `e`/nav/run, which reach an
+            // ordinary character insert instead — see `Char(ch)` below)
+            // falls through to `Message::Tick` only for a control
+            // combination or a non-character key this issue gives no
+            // meaning to, exactly the way the overlay branch above already
             // discards keys that are not its own, rather than reaching the
             // ordinary browsing keymap below and relying on `update()`'s
             // edit-mode guard alone to refuse it.
@@ -253,6 +267,19 @@ fn translate_event(event: Event, overlay_open: bool, edit_mode_open: bool) -> Me
                     KeyCode::Esc => Message::CancelEdit,
                     KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         Message::SaveEdit
+                    }
+                    KeyCode::Tab => Message::EditFocusNext,
+                    KeyCode::Backspace => Message::EditBackspace,
+                    KeyCode::Delete => Message::EditDelete,
+                    KeyCode::Left => Message::EditCursorLeft,
+                    KeyCode::Right => Message::EditCursorRight,
+                    // Any other control combination (Ctrl+<letter>) is not
+                    // a character this field should insert — crossterm
+                    // still reports the plain letter as `Char`, so this
+                    // guard is what keeps e.g. Ctrl+A from silently typing
+                    // an `a` into the field instead of doing nothing.
+                    KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::EditInsertChar(ch)
                     }
                     _ => Message::Tick,
                 };
@@ -471,10 +498,13 @@ mod tests {
     }
 
     #[test]
-    fn q_and_ctrl_c_quit_even_while_editing() {
-        // Same gap as the overlay case above, checked for edit mode's own
-        // tiny key set — `update`'s edit-mode guard exempts `Quit` for the
-        // identical reason it exempts it from the InFlight guard.
+    fn ctrl_c_quits_while_editing_but_bare_q_types_a_character_instead() {
+        // Issue 17 could make bare `q` a global quit key because edit mode
+        // had no text fields yet; issue 18 gives it real ones (method/URL),
+        // and a URL containing `q` (`?query=...`) must be typeable — so `q`
+        // while editing must insert, not quit. Ctrl+C is unaffected: it is
+        // never a character a text field would otherwise accept, so it
+        // stays the one quit key that works everywhere, editing included.
         let from_q = translate_event(press(KeyCode::Char('q')), false, true);
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -482,7 +512,7 @@ mod tests {
             true,
         );
 
-        assert!(matches!(from_q, Message::Quit));
+        assert!(matches!(from_q, Message::EditInsertChar('q')));
         assert!(matches!(from_ctrl_c, Message::Quit));
     }
 
@@ -537,25 +567,74 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_browsing_keys_do_nothing_while_editing() {
-        // Edit mode's key set is deliberately tiny (see `translate_event`'s
-        // own doc comment) — nav, run and opening the environment overlay
-        // must not leak through it, the same guarantee the overlay branch
-        // already gives its own keys.
-        for code in [
-            KeyCode::Down,
-            KeyCode::Up,
-            KeyCode::Enter,
-            KeyCode::Char('r'),
-            KeyCode::Char('e'),
-            KeyCode::Char('i'),
-        ] {
+    fn non_character_browsing_keys_do_nothing_while_editing() {
+        // Edit mode has real text fields now, so `Char` keys like `r`/`e`/`i`
+        // legitimately insert (see `letters_that_double_as_browsing_keys_
+        // insert_into_the_field_while_editing` below) rather than falling
+        // through to `Tick` — but keys with no text-field meaning at all
+        // (arrow-key navigation not bound to cursor movement, Enter/run)
+        // still must not leak through, the same guarantee the overlay
+        // branch already gives its own keys.
+        for code in [KeyCode::Down, KeyCode::Up, KeyCode::Enter] {
             let message = translate_event(press(code), false, true);
             assert!(
                 matches!(message, Message::Tick),
                 "expected {code:?} to be a no-op while editing, got {message:?}"
             );
         }
+    }
+
+    #[test]
+    fn letters_that_double_as_browsing_keys_insert_into_the_field_while_editing() {
+        // `r`/`e`/`i` are bound to run/env/enter-edit while browsing, but
+        // while editing they are just ordinary letters a method or URL can
+        // contain — the same reasoning `ctrl_c_quits_while_editing_but_
+        // bare_q_types_a_character_instead` applies to `q`.
+        for ch in ['r', 'e', 'i'] {
+            let message = translate_event(press(KeyCode::Char(ch)), false, true);
+            assert!(
+                matches!(message, Message::EditInsertChar(c) if c == ch),
+                "expected {ch:?} to insert while editing, got {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_mode_text_input_keys_translate_correctly() {
+        assert!(matches!(
+            translate_event(press(KeyCode::Tab), false, true),
+            Message::EditFocusNext
+        ));
+        assert!(matches!(
+            translate_event(press(KeyCode::Backspace), false, true),
+            Message::EditBackspace
+        ));
+        assert!(matches!(
+            translate_event(press(KeyCode::Delete), false, true),
+            Message::EditDelete
+        ));
+        assert!(matches!(
+            translate_event(press(KeyCode::Left), false, true),
+            Message::EditCursorLeft
+        ));
+        assert!(matches!(
+            translate_event(press(KeyCode::Right), false, true),
+            Message::EditCursorRight
+        ));
+    }
+
+    #[test]
+    fn control_letter_combinations_other_than_ctrl_s_do_nothing_while_editing() {
+        // Ctrl+A is not a character this field should insert — crossterm
+        // still reports the plain letter as `Char('a')`, so without the
+        // control-modifier guard in `translate_event` this would silently
+        // type an `a` into the field instead of doing nothing.
+        let message = translate_event(
+            press_with(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            false,
+            true,
+        );
+        assert!(matches!(message, Message::Tick));
     }
 
     #[test]

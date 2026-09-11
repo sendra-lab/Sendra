@@ -1945,6 +1945,7 @@ dependencies = [
  "ratatui",
  "sendra-core",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
 ]
