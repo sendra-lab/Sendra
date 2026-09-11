@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -21,6 +22,19 @@ const MAX_BODY_PREVIEW_CHARS: usize = 2000;
 pub struct NamedEnvironment {
     pub name: String,
     pub environment: Environment,
+}
+
+/// The state of an in-progress edit of the selected request. Empty for now —
+/// this issue lays down the enter/save/cancel/dirty scaffolding every real
+/// editable field (method, URL, headers, ...) will hang off of starting at
+/// issue 18, but adds none of them itself. `dirty` is the one thing that
+/// already means something: it starts `false` and, once real editing
+/// messages exist, they will flip it `true` the same way they mutate a
+/// working copy of the field they touch — nothing here yet does, since there
+/// is nothing to touch.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EditState {
+    pub dirty: bool,
 }
 
 #[derive(Debug, Default)]
@@ -70,6 +84,23 @@ pub struct AppState {
     /// never auto-revealed on the next run" means resetting it there too,
     /// not only at process start.
     pub reveal_captures: bool,
+    /// `Some(EditState)` while the request at `selected` (in
+    /// `LoadState::Loaded`) is being edited, `None` while merely browsing —
+    /// V1's only mode. Entering and leaving flows through
+    /// `Message::EnterEditMode`/`Message::SaveEdit`/`Message::CancelEdit`
+    /// like every other state transition (see `update()`), never set
+    /// directly from `main.rs` or anywhere outside this module's own
+    /// `update()` — an Elm-style side-channel flag is exactly what this
+    /// issue's own instructions rule out.
+    pub edit_mode: Option<EditState>,
+    /// Indices into the current document's `requests()` that have unsaved
+    /// edits — inserted by whatever future editing message mutates a
+    /// request's working copy, removed by `Message::SaveEdit` and
+    /// `Message::CancelEdit`. Lives here, not on `Document` itself: nothing
+    /// in `sendra-core` exposes a mutable `Document`, and "which requests
+    /// have unsaved TUI-local edits" is sendra-tui's own bookkeeping, not
+    /// something a collection file format should have to represent.
+    pub dirty_requests: HashSet<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -170,6 +201,24 @@ pub enum Message {
     /// values become masked again — a toggle rather than a one-way reveal,
     /// so hiding them again does not need a second, differently-named key.
     ToggleRevealCaptures,
+    /// Enters edit mode for the currently selected request — see
+    /// `AppState::edit_mode`. A no-op (see [`update`]) unless a request is
+    /// actually selected, the environment overlay is closed, and no run is
+    /// in flight: edit mode is exclusive with those, the same way the
+    /// environment overlay and an in-flight run are already exclusive with
+    /// each other and with browsing.
+    EnterEditMode,
+    /// Ctrl+S while editing: commits the working edit and leaves edit mode.
+    /// Nothing here has a real field to write back yet (see
+    /// `AppState::edit_mode`'s own doc comment) — this issue proves the
+    /// keybinding and the mode transition, not the content being saved.
+    SaveEdit,
+    /// Esc while editing: discards the working edit — whatever it changed —
+    /// and leaves edit mode, restoring the exact state browsing was in
+    /// before `EnterEditMode`. Distinct from `SaveEdit` only in that it
+    /// clears `dirty_requests` for the edited index without ever having
+    /// written anything back.
+    CancelEdit,
     /// A crossterm `Event::Resize` reaching the translation layer in
     /// `main::next_message`. Carries no data and `update` treats it as a
     /// no-op: ratatui's `Terminal::draw` already calls `Terminal::autoresize`
@@ -226,6 +275,29 @@ pub fn update(state: &mut AppState, msg: Message) {
     // regardless, and `RunCompleted` is exactly the message that ends this
     // state, so blocking it would make the block permanent.
     if matches!(state.run_state, RunState::InFlight)
+        && matches!(
+            msg,
+            Message::SelectNext
+                | Message::SelectPrevious
+                | Message::OpenEnvironmentOverlay
+                | Message::CloseEnvironmentOverlay
+                | Message::ConfirmEnvironmentSelection
+                | Message::RunRequested
+                | Message::EnterEditMode
+        )
+    {
+        return;
+    }
+
+    // While the selected request is being edited, browsing/overlay/run
+    // messages are refused the same way the InFlight guard above refuses
+    // them — edit mode is exclusive with every other mode, not a state
+    // layered on top of ordinary browsing (see the doc comment on
+    // `AppState::edit_mode`). `SaveEdit`/`CancelEdit` are exempt: they are
+    // exactly the messages that end this state, the same reason
+    // `RunCompleted` is exempt from the InFlight guard. `Quit`/`Tick` keep
+    // working for the same reason they always do.
+    if state.edit_mode.is_some()
         && matches!(
             msg,
             Message::SelectNext
@@ -309,6 +381,37 @@ pub fn update(state: &mut AppState, msg: Message) {
         // already does.
         Message::ScrollResponseBottom => state.response_scroll = usize::MAX,
         Message::ToggleRevealCaptures => state.reveal_captures = !state.reveal_captures,
+        Message::EnterEditMode => {
+            // Guarded here, not just left to the block above: the block
+            // above only refuses messages while edit mode is *already*
+            // active, so entering it needs its own check against the
+            // overlay and InFlight — the two states issue 17 decided edit
+            // mode is exclusive with (see `AppState::edit_mode`'s doc
+            // comment). `request_is_selected` is the same check
+            // `RunRequested` already uses for "is there anything here to
+            // act on".
+            if state.edit_mode.is_none()
+                && state.environment_overlay.is_none()
+                && !matches!(state.run_state, RunState::InFlight)
+                && request_is_selected(state)
+            {
+                state.edit_mode = Some(EditState::default());
+            }
+        }
+        Message::SaveEdit => {
+            if state.edit_mode.take().is_some() {
+                if let LoadState::Loaded { selected, .. } = &state.load_state {
+                    state.dirty_requests.remove(selected);
+                }
+            }
+        }
+        Message::CancelEdit => {
+            if state.edit_mode.take().is_some() {
+                if let LoadState::Loaded { selected, .. } = &state.load_state {
+                    state.dirty_requests.remove(selected);
+                }
+            }
+        }
         // See the doc comment on `Message::Resize` — the redraw itself
         // comes from `terminal.draw` re-running `view` against the
         // already-resized backend on the loop's next iteration; there is no
@@ -392,7 +495,7 @@ pub fn view(state: &AppState, frame: &mut Frame) {
                 .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
                 .split(rows[0]);
 
-            render_request_list(frame, panes[0], document, *selected);
+            render_request_list(frame, panes[0], document, *selected, &state.dirty_requests);
             render_detail_pane(frame, panes[1], document, *selected, base_dir, state);
         }
     }
@@ -447,13 +550,29 @@ fn render_error(frame: &mut Frame, area: Rect, heading: &str, error: &impl std::
 /// last item back to the first, or the first back to the last, which must
 /// re-scroll the window to the opposite end in one step. Verified, not
 /// assumed — see `collection_browser_scrolls_to_keep_selection_visible`.
-fn render_request_list(frame: &mut Frame, area: Rect, document: &Document, selected: usize) {
+fn render_request_list(
+    frame: &mut Frame,
+    area: Rect,
+    document: &Document,
+    selected: usize,
+    dirty_requests: &HashSet<usize>,
+) {
     let items: Vec<ListItem> = document
         .requests()
         .iter()
-        .map(|request| {
+        .enumerate()
+        .map(|(index, request)| {
             let name = request.name.as_deref().unwrap_or("(unnamed)");
-            ListItem::new(format!("{} {name}", request.method))
+            // `*` for unsaved edits, matching the same marker convention as
+            // an editor's modified-buffer indicator — a leading space in the
+            // ordinary case keeps every row's method column aligned rather
+            // than shifting only dirty rows one character right.
+            let marker = if dirty_requests.contains(&index) {
+                "*"
+            } else {
+                " "
+            };
+            ListItem::new(format!("{marker}{} {name}", request.method))
         })
         .collect();
 
@@ -784,39 +903,53 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 /// keybindings currently live — chosen from exactly the state `update()`
 /// itself branches on, so this can never say a key does something `update()`
 /// would actually refuse, or omit one it would accept. Five contexts, in the
-/// same priority order `update()`'s own InFlight guard and `view()`'s own
-/// overlay-vs-response-panel-vs-preview dispatch already imply:
+/// same priority order `update()`'s own InFlight/edit-mode guards and
+/// `view()`'s own overlay-vs-response-panel-vs-preview dispatch already
+/// imply:
 ///
 /// 1. **The environment overlay is open** (`environment_overlay.is_some()`,
 ///    the same condition `view()` checks to draw it) — only the overlay's
 ///    own keys apply, checked first because the overlay is drawn on top of
 ///    everything else and is what has the user's attention, and because
 ///    nothing about `next_message` stops it opening over a `load_state`
-///    that isn't `Loaded` (see the next context).
-/// 2. **No collection is loaded** (`load_state` is `Loading`,
+///    that isn't `Loaded` (see the next context). Mutually exclusive with
+///    edit mode below — `update()` refuses to open the overlay while
+///    `edit_mode` is set, and refuses to enter edit mode while the overlay
+///    is open — so these two contexts never need to be prioritized against
+///    each other, only checked in some order.
+/// 2. **The selected request is being edited** (`edit_mode.is_some()`) —
+///    `update()`'s own edit-mode guard refuses every navigation/overlay/run
+///    message while this holds, the same way the InFlight guard does for a
+///    run, so only `Ctrl+S`/`Esc`/quit are genuinely live.
+/// 3. **No collection is loaded** (`load_state` is `Loading`,
 ///    `NoPathProvided` or `Failed` — see `view()`'s own match on it): there
 ///    is no request list and nothing to run, so nav/run are not offered;
 ///    the environment overlay and quit are the only two keys that do
 ///    anything, and both keep working, which is the whole point of this
 ///    context existing — a failed collection load must not read as a dead
 ///    end.
-/// 3. **A run is in flight** (`RunState::InFlight`) — `update()`'s own guard
+/// 4. **A run is in flight** (`RunState::InFlight`) — `update()`'s own guard
 ///    at the top of the function refuses every navigation/overlay/run
 ///    message while this holds, so `q` (never blocked — see that guard's own
 ///    comment) is genuinely the only key left to advertise.
-/// 4. **A run has completed** (`RunState::Completed`) — the response panel
+/// 5. **A run has completed** (`RunState::Completed`) — the response panel
 ///    is what `render_detail_pane` is showing (see its own doc comment), so
 ///    this is where the scroll keys and, when there is something to reveal,
 ///    the capture-reveal key belong; nav/run/env/quit are back too, since
 ///    the InFlight guard no longer applies.
-/// 5. **Otherwise** (`RunState::Idle`, a collection is loaded) — the
+/// 6. **Otherwise** (`RunState::Idle`, a collection is loaded) — the
 ///    ordinary collection browser, showing the request preview.
 ///
 /// No key is added here that `update`/`main::next_message` do not already
-/// bind — this only narrates keys issues 1-9 already wired.
+/// bind — this only narrates keys issues 1-9 and 17 already wired.
 fn status_help_text(state: &AppState) -> String {
     if state.environment_overlay.is_some() {
         return "↑/↓ nav  enter confirm  esc cancel  q quit".to_string();
+    }
+
+    if let Some(edit) = &state.edit_mode {
+        let dirty = if edit.dirty { " (unsaved changes)" } else { "" };
+        return format!("Editing{dirty}  |  ctrl+s save  esc cancel  q quit");
     }
 
     if !matches!(state.load_state, LoadState::Loaded { .. }) {
@@ -824,7 +957,7 @@ fn status_help_text(state: &AppState) -> String {
     }
 
     match &state.run_state {
-        RunState::Idle => "↑/↓ nav  enter/r run  e env  q quit".to_string(),
+        RunState::Idle => "↑/↓ nav  enter/r run  i edit  e env  q quit".to_string(),
         RunState::InFlight => {
             let frame_char = SPINNER_FRAMES[state.spinner_tick % SPINNER_FRAMES.len()];
             format!("{frame_char} Running request...  |  q quit")
@@ -851,7 +984,7 @@ fn status_help_text(state: &AppState) -> String {
                 "  c reveal/hide captures"
             };
             format!(
-                "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn/Home/End scroll{reveal}  e env  q quit"
+                "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn/Home/End scroll{reveal}  i edit  e env  q quit"
             )
         }
     }
@@ -1634,6 +1767,277 @@ requests:
         update(&mut state, Message::SelectNext);
 
         assert_eq!(selected(&state), 1);
+    }
+
+    // --- edit mode ----------------------------------------------------------
+
+    #[test]
+    fn enter_edit_mode_is_a_no_op_without_a_selected_request() {
+        let mut state = AppState::default();
+
+        update(&mut state, Message::EnterEditMode);
+
+        assert!(state.edit_mode.is_none());
+    }
+
+    #[test]
+    fn enter_edit_mode_starts_a_clean_edit_state() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+
+        update(&mut state, Message::EnterEditMode);
+
+        assert_eq!(state.edit_mode, Some(EditState::default()));
+        assert!(
+            state.dirty_requests.is_empty(),
+            "entering edit mode alone must not mark anything dirty"
+        );
+    }
+
+    #[test]
+    fn entering_and_cancelling_edit_mode_with_no_changes_is_a_no_op() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        let before_document = match &state.load_state {
+            LoadState::Loaded { document, .. } => (**document).clone(),
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+
+        update(&mut state, Message::EnterEditMode);
+        update(&mut state, Message::CancelEdit);
+
+        assert!(state.edit_mode.is_none());
+        assert!(state.dirty_requests.is_empty());
+        match &state.load_state {
+            LoadState::Loaded {
+                document, selected, ..
+            } => {
+                assert_eq!(**document, before_document);
+                assert_eq!(*selected, 0);
+            }
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_edit_round_trips_state_exactly_after_a_placeholder_mutation() {
+        // Full round-trip proof for issue 17: enter edit mode, mutate
+        // something a real future editing message would mutate (there are
+        // no real editable fields yet — see `AppState::edit_mode`'s own doc
+        // comment — so this stands in for one), cancel, and check every
+        // piece of state a real edit could plausibly have touched is back
+        // to exactly what it was before `EnterEditMode`. Not just
+        // `edit_mode` itself (trivially `None` again either way) but the
+        // dirty bookkeeping and the untouched document/selection too — the
+        // proof this issue's own instructions ask for that cancelling never
+        // leaves `AppState` partially mutated.
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        let before_document = match &state.load_state {
+            LoadState::Loaded { document, .. } => (**document).clone(),
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        let before_selected = selected(&state);
+        let before_active_environment = state.active_environment;
+        let before_environment_overlay = state.environment_overlay;
+        let before_response_scroll = state.response_scroll;
+        let before_reveal_captures = state.reveal_captures;
+
+        update(&mut state, Message::EnterEditMode);
+        assert!(state.edit_mode.is_some());
+
+        // The placeholder/test-only state change: directly flip the one
+        // field `EditState` has, and mark the request dirty, exactly as a
+        // real editing message (issue 18+) would once it exists — proving
+        // the *cancel* mechanism works even when something really did
+        // change, not only in the trivial no-change case above.
+        state.edit_mode.as_mut().expect("just entered").dirty = true;
+        state.dirty_requests.insert(before_selected);
+
+        update(&mut state, Message::CancelEdit);
+
+        assert_eq!(
+            state.edit_mode, None,
+            "cancel must leave edit mode entirely"
+        );
+        assert!(
+            state.dirty_requests.is_empty(),
+            "cancel must clear the dirty marker for the request that was being edited"
+        );
+        match &state.load_state {
+            LoadState::Loaded {
+                document, selected, ..
+            } => {
+                assert_eq!(
+                    **document, before_document,
+                    "cancel must not leave the loaded document changed"
+                );
+                assert_eq!(*selected, before_selected);
+            }
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+        assert_eq!(state.active_environment, before_active_environment);
+        assert_eq!(state.environment_overlay, before_environment_overlay);
+        assert_eq!(state.response_scroll, before_response_scroll);
+        assert_eq!(state.reveal_captures, before_reveal_captures);
+    }
+
+    #[test]
+    fn save_edit_clears_edit_mode_and_the_dirty_marker() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().expect("just entered").dirty = true;
+        state.dirty_requests.insert(selected(&state));
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(state.edit_mode.is_none());
+        assert!(
+            state.dirty_requests.is_empty(),
+            "save must clear the dirty marker for the request just saved"
+        );
+    }
+
+    #[test]
+    fn dirty_marker_appears_in_the_collection_browser_and_disappears_on_cancel() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().expect("just entered").dirty = true;
+        state.dirty_requests.insert(selected(&state));
+
+        assert!(
+            state.dirty_requests.contains(&0),
+            "the request being edited (index 0) must be marked dirty"
+        );
+        assert!(
+            status_help_text(&state).contains("unsaved changes"),
+            "the help bar must surface the dirty edit"
+        );
+
+        update(&mut state, Message::CancelEdit);
+
+        assert!(
+            !state.dirty_requests.contains(&0),
+            "cancel must remove the dirty marker"
+        );
+        assert!(!status_help_text(&state).contains("unsaved changes"));
+    }
+
+    #[test]
+    fn dirty_marker_renders_next_to_the_edited_request_in_the_collection_browser() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let render = |state: &AppState| {
+            let backend = TestBackend::new(60, 10);
+            let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+            terminal
+                .draw(|frame| view(state, frame))
+                .expect("rendering must not panic");
+            buffer_to_string(terminal.backend().buffer())
+        };
+
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        let clean_screen = render(&state);
+        assert!(
+            !clean_screen.contains('*'),
+            "nothing is dirty yet, so no marker should render:\n{clean_screen}"
+        );
+
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().expect("just entered").dirty = true;
+        state.dirty_requests.insert(0);
+        let dirty_screen = render(&state);
+        assert!(
+            dirty_screen.contains("*GET One"),
+            "the dirty request must show a marker in the collection browser:\n{dirty_screen}"
+        );
+
+        update(&mut state, Message::CancelEdit);
+        let cancelled_screen = render(&state);
+        assert!(
+            !cancelled_screen.contains('*'),
+            "cancelling must remove the marker again:\n{cancelled_screen}"
+        );
+    }
+
+    #[test]
+    fn help_bar_shows_editing_state_and_its_own_keys() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+
+        update(&mut state, Message::EnterEditMode);
+
+        let text = status_help_text(&state);
+        assert!(text.contains("Editing"));
+        assert!(text.contains("ctrl+s save"));
+        assert!(text.contains("esc cancel"));
+        assert!(
+            !text.contains("nav"),
+            "browsing keys must not be advertised while editing"
+        );
+    }
+
+    #[test]
+    fn cannot_enter_edit_mode_while_the_environment_overlay_is_open() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenEnvironmentOverlay);
+        assert!(state.environment_overlay.is_some());
+
+        update(&mut state, Message::EnterEditMode);
+
+        assert!(
+            state.edit_mode.is_none(),
+            "edit mode must not open on top of the environment overlay"
+        );
+    }
+
+    #[test]
+    fn cannot_open_the_environment_overlay_while_editing() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+        assert!(state.edit_mode.is_some());
+
+        update(&mut state, Message::OpenEnvironmentOverlay);
+
+        assert!(
+            state.environment_overlay.is_none(),
+            "the environment overlay must not open while editing"
+        );
+    }
+
+    #[test]
+    fn cannot_enter_edit_mode_while_a_run_is_in_flight() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::RunRequested);
+        assert!(matches!(state.run_state, RunState::InFlight));
+
+        update(&mut state, Message::EnterEditMode);
+
+        assert!(
+            state.edit_mode.is_none(),
+            "edit mode must not open while a run is in flight"
+        );
+    }
+
+    #[test]
+    fn navigation_run_and_overlay_are_blocked_while_editing() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        state.environments = ["default", "staging"]
+            .into_iter()
+            .map(|name| named_environment(name, &[]))
+            .collect();
+        update(&mut state, Message::EnterEditMode);
+        assert!(state.edit_mode.is_some());
+
+        update(&mut state, Message::SelectNext);
+        update(&mut state, Message::SelectPrevious);
+        update(&mut state, Message::OpenEnvironmentOverlay);
+        update(&mut state, Message::RunRequested);
+
+        assert_eq!(selected(&state), 0, "selection must not move while editing");
+        assert_eq!(state.environment_overlay, None);
+        assert!(
+            state.edit_mode.is_some(),
+            "editing must still be active — none of the blocked messages should have ended it"
+        );
+        assert!(matches!(state.run_state, RunState::Idle));
     }
 
     #[test]
