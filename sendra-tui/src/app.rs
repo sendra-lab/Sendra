@@ -6,7 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use sendra_core::{
-    AssertionReport, CaptureReport, Document, Environment, Request, Response, SendraError,
+    AssertionReport, CaptureReport, Document, Environment, Method, Request, Response, SendraError,
 };
 
 use crate::run_request::RunOutcome;
@@ -24,17 +24,200 @@ pub struct NamedEnvironment {
     pub environment: Environment,
 }
 
-/// The state of an in-progress edit of the selected request. Empty for now —
-/// this issue lays down the enter/save/cancel/dirty scaffolding every real
-/// editable field (method, URL, headers, ...) will hang off of starting at
-/// issue 18, but adds none of them itself. `dirty` is the one thing that
-/// already means something: it starts `false` and, once real editing
-/// messages exist, they will flip it `true` the same way they mutate a
-/// working copy of the field they touch — nothing here yet does, since there
-/// is nothing to touch.
+/// A single-line, cursor-addressable text buffer — the minimal text-input
+/// primitive every field edit mode touches shares (method and URL today;
+/// headers/auth/body starting in issues 19-23), rather than each hand-rolling
+/// its own insert/delete/cursor-movement logic.
+///
+/// A dependency like `tui-input` was considered and rejected: every field
+/// this crate will ever edit is a single line of plain text with no
+/// undo/redo, no multi-line, no IME composition, and no need for anything
+/// beyond insert/backspace/delete/left/right — exactly what this type
+/// covers in well under a hundred lines including its own tests. Pulling in
+/// an external crate would trade a dependency (plus its own `Input`/event
+/// API to learn and wire into `Message`/`update`, and its own opinions on
+/// things like scrolling a field wider than its viewport, unneeded here)
+/// for something this hand-rolls more simply and keeps fully under this
+/// crate's own tests, the same reasoning `body_for_display`'s doc comment
+/// gives for reimplementing rather than depending across a crate boundary.
+/// Revisit if a later field genuinely needs more than this (multi-line
+/// input, unicode grapheme-aware cursor movement instead of per-`char`,
+/// undo).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextField {
+    value: String,
+    /// Byte offset into `value` — always on a `char` boundary, maintained by
+    /// every method below rather than trusted from outside, since `value` is
+    /// UTF-8 and an arbitrary byte offset could land mid-codepoint and panic
+    /// on the next `insert`/`drain`.
+    cursor: usize,
+}
+
+impl TextField {
+    /// Starts with the cursor at the end — the natural place to resume
+    /// typing a field that already has a value, matching how a browser's
+    /// address bar or an ordinary GUI text field focuses.
+    fn new(value: impl Into<String>) -> Self {
+        let value = value.into();
+        let cursor = value.len();
+        Self { value, cursor }
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// The cursor's position measured in `char`s rather than bytes — what a
+    /// terminal column offset actually needs, since a multi-byte UTF-8
+    /// character is still exactly one terminal cell wide for anything in the
+    /// Basic Multilingual Plane this app is likely to see typed into a
+    /// method or URL field.
+    pub fn cursor_chars(&self) -> usize {
+        self.value[..self.cursor].chars().count()
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.value.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    /// Deletes the character immediately before the cursor ("Backspace") — a
+    /// no-op at the very start of the field.
+    fn backspace(&mut self) {
+        if let Some(prev) = self.prev_char_boundary() {
+            self.value.drain(prev..self.cursor);
+            self.cursor = prev;
+        }
+    }
+
+    /// Deletes the character the cursor sits on ("Delete") — a no-op at the
+    /// very end of the field, where there is no character under the cursor.
+    fn delete(&mut self) {
+        if let Some(next) = self.next_char_boundary() {
+            self.value.drain(self.cursor..next);
+        }
+    }
+
+    fn move_left(&mut self) {
+        if let Some(prev) = self.prev_char_boundary() {
+            self.cursor = prev;
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(next) = self.next_char_boundary() {
+            self.cursor = next;
+        }
+    }
+
+    fn prev_char_boundary(&self) -> Option<usize> {
+        self.value[..self.cursor]
+            .chars()
+            .next_back()
+            .map(|ch| self.cursor - ch.len_utf8())
+    }
+
+    fn next_char_boundary(&self) -> Option<usize> {
+        self.value[self.cursor..]
+            .chars()
+            .next()
+            .map(|ch| self.cursor + ch.len_utf8())
+    }
+}
+
+/// Which of edit mode's fields `Message::EditFocusNext` (`Tab`) is currently
+/// pointed at, and so which one `Message::EditInsertChar`/`EditBackspace`/etc.
+/// act on. Two variants today (method, URL); headers/auth/body add their own
+/// starting issue 19, at which point this and `EditState::focused_field_mut`
+/// are exactly where those new variants slot in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EditField {
+    #[default]
+    Method,
+    Url,
+}
+
+impl EditField {
+    fn next(self) -> Self {
+        match self {
+            EditField::Method => EditField::Url,
+            EditField::Url => EditField::Method,
+        }
+    }
+}
+
+/// The state of an in-progress edit of the selected request. Issue 17 built
+/// the enter/save/cancel/dirty scaffolding with nothing to edit; this issue
+/// adds the first two real fields, `method` and `url`, as working copies
+/// (`TextField`s) separate from the request itself — `Message::SaveEdit`
+/// copies them back into the loaded document (see `update`'s own
+/// `Message::SaveEdit` arm), `Message::CancelEdit` simply drops this whole
+/// struct, which is what makes cancelling a full, provable no-op no matter
+/// what was typed.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EditState {
     pub dirty: bool,
+    pub method: TextField,
+    pub url: TextField,
+    pub focus: EditField,
+    /// `Some(message)` whenever `method`'s current text does not parse as a
+    /// real `sendra_core::Method` — recomputed on every keystroke that
+    /// touches `method` (see `edit_mutate` in `update`), not only at save
+    /// time, so a bad method is never silently accepted *or* silently
+    /// dropped: the field keeps exactly what was typed, and this is the
+    /// message `render_edit_pane` shows alongside it. `Message::SaveEdit`
+    /// refuses to save while this is `Some`, but never clears `edit_mode`
+    /// over it — see that arm's own comment.
+    pub method_error: Option<String>,
+}
+
+impl EditState {
+    fn new(request: &Request) -> Self {
+        let method = TextField::new(request.method.as_str());
+        let method_error = validate_method_text(method.value()).err();
+        Self {
+            dirty: false,
+            method,
+            url: TextField::new(request.url.clone()),
+            focus: EditField::default(),
+            method_error,
+        }
+    }
+
+    fn focused_field_mut(&mut self) -> &mut TextField {
+        match self.focus {
+            EditField::Method => &mut self.method,
+            EditField::Url => &mut self.url,
+        }
+    }
+}
+
+/// Whether `text` parses as a real `sendra_core::Method` — reusing that
+/// enum's own `Deserialize` impl (the exact check a collection YAML file's
+/// `method:` field is already held to, via `serde_yaml`, a workspace
+/// dependency sendra-core itself already uses for the same purpose) rather
+/// than a hand-maintained list of method names living in sendra-tui that
+/// could quietly drift from `Method`'s real, closed variant set.
+///
+/// Input is uppercased before checking: `Method`'s `Deserialize` is
+/// case-sensitive (`#[serde(rename_all = "UPPERCASE")]`), matching the
+/// convention every Sendra YAML file is written in, but a user typing into a
+/// live text field is not writing YAML and has no reason to expect
+/// `get`/`Get`/`GET` to mean three different things. Built as a
+/// `serde_yaml::Value::String` and deserialized from that typed value,
+/// rather than parsed from raw YAML text via `serde_yaml::from_str` — the
+/// latter would run the *whole* YAML scalar grammar over whatever was typed,
+/// which reinterprets some plain words as other types entirely (YAML 1.1
+/// treats `no`/`yes`/`on`/`off` as booleans); going through a `Value`
+/// already tagged as a string skips that grammar and checks only what this
+/// function claims to check: is this string one of `Method`'s variants.
+fn validate_method_text(text: &str) -> Result<Method, String> {
+    let candidate = serde_yaml::Value::String(text.trim().to_ascii_uppercase());
+    serde_yaml::from_value::<Method>(candidate).map_err(|_| {
+        format!(
+            "'{text}' is not a valid HTTP method (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS)"
+        )
+    })
 }
 
 #[derive(Debug, Default)]
@@ -208,10 +391,11 @@ pub enum Message {
     /// environment overlay and an in-flight run are already exclusive with
     /// each other and with browsing.
     EnterEditMode,
-    /// Ctrl+S while editing: commits the working edit and leaves edit mode.
-    /// Nothing here has a real field to write back yet (see
-    /// `AppState::edit_mode`'s own doc comment) — this issue proves the
-    /// keybinding and the mode transition, not the content being saved.
+    /// Ctrl+S while editing: commits `method`/`url` back into the loaded
+    /// document (see `update`'s own arm) and leaves edit mode — a no-op that
+    /// stays in edit mode, rather than one that discards the edit, when
+    /// `method_error` is set: see that arm for why refusing to save invalid
+    /// input is not the same as refusing the keystroke that produced it.
     SaveEdit,
     /// Esc while editing: discards the working edit — whatever it changed —
     /// and leaves edit mode, restoring the exact state browsing was in
@@ -219,6 +403,24 @@ pub enum Message {
     /// clears `dirty_requests` for the edited index without ever having
     /// written anything back.
     CancelEdit,
+    /// `Tab` while editing: moves focus to the other field (see
+    /// `EditField::next`) — the only two exist today, so this simply
+    /// alternates; a third field arriving in issue 19+ still only needs
+    /// `EditField::next` to grow, not this message.
+    EditFocusNext,
+    /// An ordinary printable character typed into whichever field is
+    /// currently focused — inserted at the cursor via `TextField::insert_char`.
+    EditInsertChar(char),
+    /// `Backspace` on the focused field: deletes the character before the
+    /// cursor.
+    EditBackspace,
+    /// `Delete` on the focused field: deletes the character under the
+    /// cursor.
+    EditDelete,
+    /// `Left` on the focused field: moves the cursor back one character.
+    EditCursorLeft,
+    /// `Right` on the focused field: moves the cursor forward one character.
+    EditCursorRight,
     /// A crossterm `Event::Resize` reaching the translation layer in
     /// `main::next_message`. Carries no data and `update` treats it as a
     /// no-op: ratatui's `Terminal::draw` already calls `Terminal::autoresize`
@@ -387,31 +589,76 @@ pub fn update(state: &mut AppState, msg: Message) {
             // active, so entering it needs its own check against the
             // overlay and InFlight — the two states issue 17 decided edit
             // mode is exclusive with (see `AppState::edit_mode`'s doc
-            // comment). `request_is_selected` is the same check
-            // `RunRequested` already uses for "is there anything here to
-            // act on".
+            // comment). `selected_request` both confirms there is something
+            // to act on (the same check `RunRequested` uses) and hands over
+            // the real `method`/`url` `EditState::new` seeds the working
+            // copy from.
             if state.edit_mode.is_none()
                 && state.environment_overlay.is_none()
                 && !matches!(state.run_state, RunState::InFlight)
-                && request_is_selected(state)
             {
-                state.edit_mode = Some(EditState::default());
+                if let Some(request) = selected_request(state) {
+                    state.edit_mode = Some(EditState::new(request));
+                }
             }
         }
         Message::SaveEdit => {
-            if state.edit_mode.take().is_some() {
-                if let LoadState::Loaded { selected, .. } = &state.load_state {
-                    state.dirty_requests.remove(selected);
+            // Refuses to save — but, deliberately, does *not* clear
+            // `edit_mode` — while `method_error` is set: an invalid method
+            // must never reach the loaded document, but the user must not
+            // be locked out of fixing it either, which dropping `edit_mode`
+            // here (as `CancelEdit` does) would do by discarding what they
+            // typed. Leaving edit mode active with the same bad text still
+            // in `method` is what keeps the field "still editable
+            // afterward" rather than stuck.
+            let can_save = state
+                .edit_mode
+                .as_ref()
+                .is_some_and(|edit| edit.method_error.is_none());
+            if can_save {
+                if let Some(edit) = state.edit_mode.take() {
+                    if let LoadState::Loaded {
+                        document, selected, ..
+                    } = &mut state.load_state
+                    {
+                        if let Some(request) = request_mut(document, *selected) {
+                            // `method_error` was already confirmed `None`
+                            // above, so this cannot fail — matched rather
+                            // than trusted blindly, so a bug in that
+                            // invariant leaves the request's method
+                            // untouched instead of panicking.
+                            if let Ok(method) = validate_method_text(edit.method.value()) {
+                                request.method = method;
+                            }
+                            request.url = edit.url.value().to_string();
+                        }
+                        state.dirty_requests.remove(selected);
+                    }
                 }
             }
         }
         Message::CancelEdit => {
+            // Dropping `edit_mode` here is the entire mechanism: `method`
+            // and `url` only ever lived in that working copy (see
+            // `EditState`'s own doc comment), never written into the loaded
+            // document until `SaveEdit`, so there is nothing else to undo —
+            // no snapshot to restore, because nothing real was ever changed.
             if state.edit_mode.take().is_some() {
                 if let LoadState::Loaded { selected, .. } = &state.load_state {
                     state.dirty_requests.remove(selected);
                 }
             }
         }
+        Message::EditFocusNext => {
+            if let Some(edit) = &mut state.edit_mode {
+                edit.focus = edit.focus.next();
+            }
+        }
+        Message::EditInsertChar(ch) => edit_mutate(state, |field| field.insert_char(ch)),
+        Message::EditBackspace => edit_mutate(state, TextField::backspace),
+        Message::EditDelete => edit_mutate(state, TextField::delete),
+        Message::EditCursorLeft => edit_move(state, TextField::move_left),
+        Message::EditCursorRight => edit_move(state, TextField::move_right),
         // See the doc comment on `Message::Resize` — the redraw itself
         // comes from `terminal.draw` re-running `view` against the
         // already-resized backend on the loop's next iteration; there is no
@@ -435,6 +682,65 @@ fn request_is_selected(state: &AppState) -> bool {
         &state.load_state,
         LoadState::Loaded { document, selected, .. } if document.requests().get(*selected).is_some()
     )
+}
+
+/// The currently selected request itself, when there is one — the same
+/// condition `request_is_selected` checks, but handing back the `&Request`
+/// `Message::EnterEditMode` needs to seed `EditState::new` from, instead of
+/// just the bool.
+fn selected_request(state: &AppState) -> Option<&Request> {
+    match &state.load_state {
+        LoadState::Loaded {
+            document, selected, ..
+        } => document.requests().get(*selected),
+        _ => None,
+    }
+}
+
+/// A mutable handle to the request at `index` in `document` — what
+/// `Message::SaveEdit` writes the edited `method`/`url` into.
+///
+/// `sendra_core::Document`/`Collection` expose no `requests_mut()` method,
+/// but every field involved (`Document`'s variants, `Collection.requests`)
+/// is already `pub`, so matching on the variant and indexing its `Vec`
+/// directly is using sendra-core's existing public surface, not extending
+/// it — the thing this issue's own instructions rule out is adding a new
+/// public API to sendra-core, not using the public fields it already has.
+fn request_mut(document: &mut Document, index: usize) -> Option<&mut Request> {
+    match document {
+        Document::Single(request) => (index == 0).then_some(request),
+        Document::Collection(collection) => collection.requests.get_mut(index),
+    }
+}
+
+/// Applies `mutate` to whichever field `EditState::focus` currently points
+/// at, then marks the edit (and the request being edited) dirty and, if the
+/// method field is the one that just changed, recomputes `method_error` —
+/// the one piece of live validation this issue adds. A no-op when edit mode
+/// is not active, so every `Message::EditInsertChar`/`EditBackspace`/
+/// `EditDelete` arm can call this unconditionally rather than each
+/// re-checking `state.edit_mode.is_some()` itself.
+fn edit_mutate(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
+    let Some(edit) = &mut state.edit_mode else {
+        return;
+    };
+    mutate(edit.focused_field_mut());
+    edit.dirty = true;
+    if edit.focus == EditField::Method {
+        edit.method_error = validate_method_text(edit.method.value()).err();
+    }
+    if let LoadState::Loaded { selected, .. } = &state.load_state {
+        state.dirty_requests.insert(*selected);
+    }
+}
+
+/// Like `edit_mutate`, but for cursor movement: moving the cursor is not an
+/// edit, so unlike `edit_mutate` this never sets `dirty` or touches
+/// `dirty_requests`/`method_error`.
+fn edit_move(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
+    if let Some(edit) = &mut state.edit_mode {
+        mutate(edit.focused_field_mut());
+    }
 }
 
 /// Routes `SelectNext`/`SelectPrevious` to the overlay's cursor when it is
@@ -604,6 +910,18 @@ fn render_detail_pane(
         return;
     };
 
+    // Edit mode takes over the whole detail pane — checked first, ahead of
+    // the completed-run response panel below, since editing is allowed
+    // (see `Message::EnterEditMode`'s doc comment) whether or not a run has
+    // completed, and there is no meaningful "preview vs. response" split to
+    // preserve underneath an edit in progress: `method`/`url` in `EditState`
+    // are what is authoritative right now, not whatever the last resolved
+    // preview or response showed.
+    if let Some(edit) = &state.edit_mode {
+        render_edit_pane(frame, area, edit);
+        return;
+    }
+
     if let RunState::Completed(outcome) = &state.run_state {
         render_response_panel(
             frame,
@@ -642,6 +960,63 @@ fn render_detail_pane(
     };
 
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
+}
+
+/// Edit mode's own half of the detail pane: `method` and `url` as live,
+/// cursor-addressable text fields (`▶` marking whichever `EditState::focus`
+/// currently points at), `method_error` shown inline right under the field
+/// it is about, and the keybinding reminder every other pane in this file
+/// puts in its own footer/status text. The real terminal cursor is placed
+/// on the focused field's `TextField::cursor_chars` via
+/// `Frame::set_cursor_position`, not just implied by the `▶` marker — an
+/// ordinary text field shows a real blinking cursor, not merely which line
+/// is active.
+fn render_edit_pane(frame: &mut Frame, area: Rect, edit: &EditState) {
+    let method_marker = if edit.focus == EditField::Method {
+        "▶"
+    } else {
+        " "
+    };
+    let url_marker = if edit.focus == EditField::Url {
+        "▶"
+    } else {
+        " "
+    };
+
+    let mut lines = [
+        format!("{method_marker} Method: {}", edit.method.value()),
+        format!("  ⚠ {}", edit.method_error.as_deref().unwrap_or("")),
+        String::new(),
+        format!("{url_marker} URL:    {}", edit.url.value()),
+        String::new(),
+        "Tab switch field  Ctrl+S save  Esc cancel".to_string(),
+    ];
+    // An empty error line still reserves its row (see the `⚠ {}` line
+    // above) rather than the whole pane shifting up and down every time a
+    // keystroke fixes or breaks validity — the same "always show something,
+    // never let a row silently disappear" posture `render_response_panel`'s
+    // footer already takes. Blank it out here instead: showing a bare `⚠`
+    // marker with nothing after it on a passing method would look like a
+    // rendering bug, not "no error".
+    if edit.method_error.is_none() {
+        lines[1] = String::new();
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines.join("\n")).wrap(Wrap { trim: false }),
+        area,
+    );
+
+    // Column offset: `▶ Method: ` / `▶ URL:    ` are the same width (10
+    // cells) by construction — `"Method: "` and `"URL:    "` are both
+    // 8 characters — so one constant serves both fields' cursor placement.
+    const FIELD_PREFIX_WIDTH: u16 = 2 + 8;
+    let (row, field) = match edit.focus {
+        EditField::Method => (0, &edit.method),
+        EditField::Url => (3, &edit.url),
+    };
+    let column = area.x + FIELD_PREFIX_WIDTH + field.cursor_chars() as u16;
+    frame.set_cursor_position((column, area.y + row));
 }
 
 /// The completed-run half of the detail pane: a real response's status,
@@ -949,7 +1324,14 @@ fn status_help_text(state: &AppState) -> String {
 
     if let Some(edit) = &state.edit_mode {
         let dirty = if edit.dirty { " (unsaved changes)" } else { "" };
-        return format!("Editing{dirty}  |  ctrl+s save  esc cancel  q quit");
+        let invalid = if edit.method_error.is_some() {
+            "  (fix method to save)"
+        } else {
+            ""
+        };
+        return format!(
+            "Editing{dirty}{invalid}  |  tab switch field  ctrl+s save  esc cancel  q quit"
+        );
     }
 
     if !matches!(state.load_state, LoadState::Loaded { .. }) {
@@ -1769,6 +2151,131 @@ requests:
         assert_eq!(selected(&state), 1);
     }
 
+    // --- TextField: the shared text-input primitive --------------------------
+
+    #[test]
+    fn text_field_starts_with_the_cursor_at_the_end() {
+        let field = TextField::new("GET");
+        assert_eq!(field.value(), "GET");
+        assert_eq!(field.cursor_chars(), 3);
+    }
+
+    #[test]
+    fn insert_char_inserts_at_the_cursor_and_advances_it() {
+        let mut field = TextField::new("GT");
+        field.move_left(); // cursor between G and T
+        field.insert_char('E');
+        assert_eq!(field.value(), "GET");
+        assert_eq!(field.cursor_chars(), 2);
+    }
+
+    #[test]
+    fn backspace_removes_the_character_before_the_cursor() {
+        let mut field = TextField::new("GET");
+        field.backspace();
+        assert_eq!(field.value(), "GE");
+        assert_eq!(field.cursor_chars(), 2);
+    }
+
+    #[test]
+    fn backspace_at_the_start_is_a_no_op() {
+        let mut field = TextField::new("GET");
+        field.move_left();
+        field.move_left();
+        field.move_left();
+        assert_eq!(field.cursor_chars(), 0);
+        field.backspace();
+        assert_eq!(field.value(), "GET");
+        assert_eq!(field.cursor_chars(), 0);
+    }
+
+    #[test]
+    fn delete_removes_the_character_under_the_cursor() {
+        let mut field = TextField::new("GET");
+        field.move_left(); // cursor between E and T
+        field.move_left(); // cursor between G and E
+        field.delete();
+        assert_eq!(field.value(), "GT");
+        assert_eq!(field.cursor_chars(), 1);
+    }
+
+    #[test]
+    fn delete_at_the_end_is_a_no_op() {
+        let mut field = TextField::new("GET");
+        field.delete();
+        assert_eq!(field.value(), "GET");
+    }
+
+    #[test]
+    fn cursor_movement_does_not_run_past_either_end() {
+        let mut field = TextField::new("GO");
+        field.move_right();
+        assert_eq!(field.cursor_chars(), 2, "must not run past the end");
+        field.move_left();
+        field.move_left();
+        field.move_left();
+        assert_eq!(field.cursor_chars(), 0, "must not run past the start");
+    }
+
+    #[test]
+    fn multi_byte_characters_are_never_split() {
+        // "é" is two UTF-8 bytes but one `char` — insert/backspace/delete
+        // and cursor movement must all treat it as one unit, or `value`
+        // would stop being valid UTF-8 the moment a byte offset landed
+        // mid-codepoint.
+        let mut field = TextField::new("café");
+        assert_eq!(field.cursor_chars(), 4);
+        field.backspace();
+        assert_eq!(field.value(), "caf");
+        field.insert_char('é');
+        assert_eq!(field.value(), "café");
+        field.move_left();
+        field.delete();
+        assert_eq!(field.value(), "caf");
+    }
+
+    #[test]
+    fn edit_field_next_alternates_between_method_and_url() {
+        assert_eq!(EditField::Method.next(), EditField::Url);
+        assert_eq!(EditField::Url.next(), EditField::Method);
+    }
+
+    // --- Method validation ----------------------------------------------------
+
+    #[test]
+    fn validate_method_text_accepts_every_real_method_case_insensitively() {
+        for (text, expected) in [
+            ("GET", Method::Get),
+            ("post", Method::Post),
+            ("Put", Method::Put),
+            ("PATCH", Method::Patch),
+            ("delete", Method::Delete),
+            ("Head", Method::Head),
+            ("OPTIONS", Method::Options),
+        ] {
+            assert_eq!(validate_method_text(text), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn validate_method_text_rejects_a_made_up_method() {
+        let error = validate_method_text("FOOBAR").expect_err("FOOBAR is not a real method");
+        assert!(error.contains("FOOBAR"));
+        assert!(error.contains("GET"), "the error should list real methods");
+    }
+
+    #[test]
+    fn validate_method_text_does_not_coerce_yaml_boolean_words() {
+        // A raw `serde_yaml::from_str` on "no"/"yes"/"on"/"off" would parse
+        // as a YAML 1.1 boolean before ever reaching `Method`'s own
+        // `Deserialize` — going through a `Value::String` instead (see
+        // `validate_method_text`'s own doc comment) must sidestep that
+        // entirely, and none of these are real methods regardless.
+        for text in ["no", "yes", "on", "off"] {
+            assert!(validate_method_text(text).is_err());
+        }
+    }
+
     // --- edit mode ----------------------------------------------------------
 
     #[test]
@@ -1781,12 +2288,23 @@ requests:
     }
 
     #[test]
-    fn enter_edit_mode_starts_a_clean_edit_state() {
+    fn enter_edit_mode_seeds_the_working_copy_from_the_real_request() {
         let mut state = loaded_state(THREE_REQUEST_COLLECTION);
 
         update(&mut state, Message::EnterEditMode);
 
-        assert_eq!(state.edit_mode, Some(EditState::default()));
+        let edit = state.edit_mode.as_ref().expect("edit mode just entered");
+        assert!(
+            !edit.dirty,
+            "entering edit mode alone must not mark the edit dirty"
+        );
+        assert_eq!(edit.method.value(), "GET");
+        assert_eq!(edit.url.value(), "https://example.com");
+        assert_eq!(edit.focus, EditField::Method);
+        assert_eq!(
+            edit.method_error, None,
+            "the request's own method is always valid"
+        );
         assert!(
             state.dirty_requests.is_empty(),
             "entering edit mode alone must not mark anything dirty"
@@ -1817,18 +2335,35 @@ requests:
         }
     }
 
+    /// Types `text` into whichever field is currently focused, one
+    /// `Message::EditInsertChar` per character — the same path a real
+    /// keystroke takes through `main::translate_event`, not a shortcut that
+    /// pokes `TextField` directly.
+    fn type_into_focused_field(state: &mut AppState, text: &str) {
+        for ch in text.chars() {
+            update(state, Message::EditInsertChar(ch));
+        }
+    }
+
+    /// `Message::EditBackspace` `n` times — enough to clear a field of known
+    /// length before typing a replacement, since there is no "select all"
+    /// message.
+    fn backspace_n(state: &mut AppState, n: usize) {
+        for _ in 0..n {
+            update(state, Message::EditBackspace);
+        }
+    }
+
     #[test]
-    fn cancel_edit_round_trips_state_exactly_after_a_placeholder_mutation() {
-        // Full round-trip proof for issue 17: enter edit mode, mutate
-        // something a real future editing message would mutate (there are
-        // no real editable fields yet — see `AppState::edit_mode`'s own doc
-        // comment — so this stands in for one), cancel, and check every
-        // piece of state a real edit could plausibly have touched is back
-        // to exactly what it was before `EnterEditMode`. Not just
-        // `edit_mode` itself (trivially `None` again either way) but the
-        // dirty bookkeeping and the untouched document/selection too — the
-        // proof this issue's own instructions ask for that cancelling never
-        // leaves `AppState` partially mutated.
+    fn cancel_edit_round_trips_state_exactly_after_editing_method_and_url() {
+        // Full round-trip proof for issue 18, extending issue 17's own
+        // placeholder-only version: enter edit mode, actually change both
+        // real fields through the same messages a keystroke sends, cancel,
+        // and check every piece of state an edit could plausibly have
+        // touched — not just `edit_mode` (trivially `None` again either
+        // way) but the dirty bookkeeping and, this time, the request's real
+        // `method`/`url` inside the loaded document — is back to exactly
+        // what it was before `EnterEditMode`.
         let mut state = loaded_state(THREE_REQUEST_COLLECTION);
         let before_document = match &state.load_state {
             LoadState::Loaded { document, .. } => (**document).clone(),
@@ -1843,13 +2378,15 @@ requests:
         update(&mut state, Message::EnterEditMode);
         assert!(state.edit_mode.is_some());
 
-        // The placeholder/test-only state change: directly flip the one
-        // field `EditState` has, and mark the request dirty, exactly as a
-        // real editing message (issue 18+) would once it exists — proving
-        // the *cancel* mechanism works even when something really did
-        // change, not only in the trivial no-change case above.
-        state.edit_mode.as_mut().expect("just entered").dirty = true;
-        state.dirty_requests.insert(before_selected);
+        backspace_n(&mut state, "GET".len());
+        type_into_focused_field(&mut state, "DELETE");
+        update(&mut state, Message::EditFocusNext);
+        type_into_focused_field(&mut state, "/changed");
+        assert!(
+            state.edit_mode.as_ref().expect("still editing").dirty,
+            "a real edit must have marked the working copy dirty"
+        );
+        assert!(state.dirty_requests.contains(&before_selected));
 
         update(&mut state, Message::CancelEdit);
 
@@ -1867,7 +2404,8 @@ requests:
             } => {
                 assert_eq!(
                     **document, before_document,
-                    "cancel must not leave the loaded document changed"
+                    "cancel must not leave the loaded document's method/url changed, \
+                     even though real edits were typed before cancelling"
                 );
                 assert_eq!(*selected, before_selected);
             }
@@ -1880,18 +2418,122 @@ requests:
     }
 
     #[test]
-    fn save_edit_clears_edit_mode_and_the_dirty_marker() {
+    fn save_edit_writes_the_new_method_and_url_into_the_loaded_document() {
         let mut state = loaded_state(THREE_REQUEST_COLLECTION);
         update(&mut state, Message::EnterEditMode);
-        state.edit_mode.as_mut().expect("just entered").dirty = true;
-        state.dirty_requests.insert(selected(&state));
+
+        backspace_n(&mut state, "GET".len());
+        type_into_focused_field(&mut state, "POST");
+        update(&mut state, Message::EditFocusNext);
+        backspace_n(&mut state, "https://example.com".len());
+        type_into_focused_field(&mut state, "https://example.com/updated");
 
         update(&mut state, Message::SaveEdit);
 
-        assert!(state.edit_mode.is_none());
+        assert!(state.edit_mode.is_none(), "save must leave edit mode");
         assert!(
             state.dirty_requests.is_empty(),
             "save must clear the dirty marker for the request just saved"
+        );
+        // Re-inspect the request the same way re-selecting it in the
+        // collection browser would read it — proving the new values are
+        // really in `AppState`'s in-memory request, not only in the
+        // now-discarded `EditState`.
+        let request = match &state.load_state {
+            LoadState::Loaded {
+                document, selected, ..
+            } => &document.requests()[*selected],
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        assert_eq!(request.method, Method::Post);
+        assert_eq!(request.url, "https://example.com/updated");
+    }
+
+    #[test]
+    fn invalid_method_shows_an_inline_error_blocks_save_and_stays_editable() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+
+        backspace_n(&mut state, "GET".len());
+        type_into_focused_field(&mut state, "FOOBAR");
+
+        let edit = state.edit_mode.as_ref().expect("still editing");
+        assert_eq!(edit.method.value(), "FOOBAR");
+        assert!(
+            edit.method_error.is_some(),
+            "'FOOBAR' is not a real sendra_core::Method and must be flagged"
+        );
+        assert!(status_help_text(&state).contains("fix method to save"));
+
+        // Attempting to save an invalid method must not crash, discard the
+        // edit, or silently write a bogus method into the request — it is a
+        // no-op that leaves the field exactly as typed.
+        update(&mut state, Message::SaveEdit);
+        assert!(
+            state.edit_mode.is_some(),
+            "SaveEdit must refuse to leave edit mode while the method is invalid"
+        );
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().method.value(),
+            "FOOBAR",
+            "the invalid text must still be there — refusing to save must not clear it"
+        );
+        let unchanged_request = match &state.load_state {
+            LoadState::Loaded {
+                document, selected, ..
+            } => &document.requests()[*selected],
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        assert_eq!(
+            unchanged_request.method,
+            Method::Get,
+            "the loaded document's real method must be untouched by a refused save"
+        );
+
+        // The field must still be editable afterward — not stuck — proven
+        // by fixing it and saving again successfully.
+        backspace_n(&mut state, "FOOBAR".len());
+        type_into_focused_field(&mut state, "PUT");
+        assert_eq!(
+            state
+                .edit_mode
+                .as_ref()
+                .expect("still editing")
+                .method_error,
+            None,
+            "PUT is a real method again"
+        );
+
+        update(&mut state, Message::SaveEdit);
+        assert!(
+            state.edit_mode.is_none(),
+            "save must now succeed with a valid method"
+        );
+        let saved_request = match &state.load_state {
+            LoadState::Loaded {
+                document, selected, ..
+            } => &document.requests()[*selected],
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        assert_eq!(saved_request.method, Method::Put);
+    }
+
+    #[test]
+    fn method_validation_is_case_insensitive() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+
+        backspace_n(&mut state, "GET".len());
+        type_into_focused_field(&mut state, "post");
+
+        assert_eq!(
+            state
+                .edit_mode
+                .as_ref()
+                .expect("still editing")
+                .method_error,
+            None,
+            "lowercase 'post' must validate the same as 'POST'"
         );
     }
 
@@ -1899,8 +2541,7 @@ requests:
     fn dirty_marker_appears_in_the_collection_browser_and_disappears_on_cancel() {
         let mut state = loaded_state(THREE_REQUEST_COLLECTION);
         update(&mut state, Message::EnterEditMode);
-        state.edit_mode.as_mut().expect("just entered").dirty = true;
-        state.dirty_requests.insert(selected(&state));
+        type_into_focused_field(&mut state, "X");
 
         assert!(
             state.dirty_requests.contains(&0),
@@ -1942,8 +2583,12 @@ requests:
         );
 
         update(&mut state, Message::EnterEditMode);
-        state.edit_mode.as_mut().expect("just entered").dirty = true;
-        state.dirty_requests.insert(0);
+        type_into_focused_field(&mut state, "X");
+        // The request list is the left pane (`render_request_list`), drawn
+        // unconditionally whenever a collection is loaded — edit mode only
+        // takes over the right-hand detail pane (see `render_detail_pane`'s
+        // own edit-mode branch) — so the marker must already be visible
+        // here, mid-edit, not only after returning to browsing.
         let dirty_screen = render(&state);
         assert!(
             dirty_screen.contains("*GET One"),
@@ -3253,7 +3898,66 @@ requests:
                 },
             );
             draw(&failed, width, height);
+
+            let mut editing = loaded_state(THREE_REQUEST_COLLECTION);
+            update(&mut editing, Message::EnterEditMode);
+            type_into_focused_field(&mut editing, "X");
+            draw(&editing, width, height);
         }
+    }
+
+    /// The edit pane itself: both fields' current text, the `▶` focus
+    /// marker moving with `Message::EditFocusNext`, and the inline
+    /// validation message appearing for an invalid method and disappearing
+    /// once it is fixed — the visual half of the coverage
+    /// `invalid_method_shows_an_inline_error_blocks_save_and_stays_editable`
+    /// already gives the underlying state.
+    #[test]
+    fn edit_pane_renders_both_fields_focus_marker_and_validation_message() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let render = |state: &AppState| {
+            let backend = TestBackend::new(60, 10);
+            let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+            terminal
+                .draw(|frame| view(state, frame))
+                .expect("rendering must not panic");
+            buffer_to_string(terminal.backend().buffer())
+        };
+
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+
+        let initial_screen = render(&state);
+        assert!(initial_screen.contains("Method: GET"));
+        assert!(initial_screen.contains("URL:    https://example.com"));
+        assert!(
+            initial_screen.contains("▶ Method"),
+            "focus starts on the method field:\n{initial_screen}"
+        );
+
+        backspace_n(&mut state, "GET".len());
+        type_into_focused_field(&mut state, "FOOBAR");
+        let invalid_screen = render(&state);
+        assert!(
+            invalid_screen.contains("FOOBAR"),
+            "the invalid text itself must still be shown:\n{invalid_screen}"
+        );
+        assert!(
+            // Line-wrapped across rows at this width, so checked as two
+            // shorter substrings rather than one that could straddle a
+            // wrap point.
+            invalid_screen.contains("not a valid HTTP") && invalid_screen.contains("method"),
+            "the inline validation message must be visible:\n{invalid_screen}"
+        );
+
+        update(&mut state, Message::EditFocusNext);
+        let focus_moved_screen = render(&state);
+        assert!(
+            focus_moved_screen.contains("▶ URL"),
+            "focus must have moved to the URL field:\n{focus_moved_screen}"
+        );
     }
 
     /// The response panel's own scroll clamp (`render_response_panel`),

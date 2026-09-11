@@ -22,6 +22,13 @@ sendra-core = { path = "../sendra-core" }
 # here rather than shared because sendra-tui depends on sendra-core, not on
 # sendra-cli.
 serde_json = { workspace = true }
+# Validates a live-typed method-field string against `sendra_core::Method`'s
+# own `Deserialize` impl (see `app::validate_method_text`) — the same crate
+# sendra-core itself already uses to parse a collection file's `method:`
+# field, not a new dependency to the workspace, just wired into this crate
+# too so edit mode checks against the real type instead of a hand-maintained
+# list of method names.
+serde_yaml = { workspace = true }
 # Drives the request execution pipeline (`sendra_core::send`, which reqwest
 # needs a runtime under). Current-thread only ("rt"): each run spins up its
 # own runtime on its own OS thread (see `run_request::spawn`) rather than
