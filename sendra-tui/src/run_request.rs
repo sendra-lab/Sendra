@@ -71,8 +71,8 @@ pub enum RunError {
     /// `spawn`'s `catch_unwind`, a panic here would unwind the whole thread
     /// before `on_complete` ever ran, and `RunState` would stay
     /// `InFlight` forever with no `RunCompleted` message ever arriving —
-    /// the exact silent-hang shape issue 11 already fixed for other error
-    /// paths. Carrying the panic payload through `RunOutcome` the same way
+    /// the same silent-hang shape any other unhandled run failure would
+    /// have. Carrying the panic payload through `RunOutcome` the same way
     /// any other run failure travels keeps that guarantee: every run ends
     /// in a `RunCompleted`, even this one.
     Panicked(String),
@@ -349,11 +349,10 @@ mod tests {
     }
 
     /// The full `spawn`-shaped scenario end to end: a real OS thread whose
-    /// work panics. This is what issue 13's audit calls for directly — "a
-    /// bug inside run_request.rs" on the run thread — proven not to hang by
-    /// blocking on the very same `mpsc` completion signal `main`'s real loop
-    /// waits on, with a timeout that fails the test outright if it ever
-    /// does hang instead of asserting a negative.
+    /// work panics — a bug inside this module, on the run thread — proven
+    /// not to hang by blocking on the very same `mpsc` completion signal
+    /// `main`'s real loop waits on, with a timeout that fails the test
+    /// outright if it ever does hang instead of asserting a negative.
     #[test]
     fn a_panic_on_the_run_thread_still_completes_instead_of_hanging_forever() {
         let (tx, rx) = mpsc::channel();
