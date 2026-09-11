@@ -176,10 +176,11 @@ fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 
 /// The only place allowed to touch crossterm event types directly — translates
 /// a poll/read result into a `Message`, keeping `update`/`view` crossterm-agnostic.
-/// `overlay_open` is the one piece of context this translation needs: the
-/// same physical keys mean different things depending on whether the
-/// environment overlay is on screen, without leaking that decision into
-/// `update`/`view` as raw key codes.
+/// `overlay_open`/`edit_mode_open` are the pieces of context this translation
+/// needs: the same physical keys mean different things depending on whether
+/// the environment overlay is on screen or the selected request is being
+/// edited, without leaking that decision into `update`/`view` as raw key
+/// codes.
 ///
 /// `Event::Resize` gets its own explicit arm to `Message::Resize` rather than
 /// falling into the catch-all `Message::Tick` below — see that variant's doc
@@ -197,12 +198,16 @@ fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// scroll deliberately lives on a disjoint set of keys (`PageUp`/`PageDown`/
 /// `Home`/`End`) instead of overloading the same arrows based on which pane
 /// currently "has focus".
-fn next_message(overlay_open: bool) -> io::Result<Message> {
+fn next_message(overlay_open: bool, edit_mode_open: bool) -> io::Result<Message> {
     if !event::poll(Duration::from_millis(100))? {
         return Ok(Message::Tick);
     }
 
-    Ok(translate_event(event::read()?, overlay_open))
+    Ok(translate_event(
+        event::read()?,
+        overlay_open,
+        edit_mode_open,
+    ))
 }
 
 /// The pure key/resize-to-`Message` mapping `next_message` reads off the
@@ -215,7 +220,7 @@ fn next_message(overlay_open: bool) -> io::Result<Message> {
 /// `Message::Quit` so that whatever `main::run`/`restore_terminal` do for
 /// one, they provably do for the other — not two independently-written quit
 /// paths that could quietly drift apart.
-fn translate_event(event: Event, overlay_open: bool) -> Message {
+fn translate_event(event: Event, overlay_open: bool, edit_mode_open: bool) -> Message {
     match event {
         Event::Resize(_, _) => Message::Resize,
         Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -236,8 +241,26 @@ fn translate_event(event: Event, overlay_open: bool) -> Message {
                 };
             }
 
+            // Edit mode's own, deliberately tiny key set — see
+            // `app::Message::SaveEdit`/`CancelEdit`. Everything else
+            // (including `e`/nav/run) falls through to `Message::Tick`
+            // here exactly the way the overlay branch above already
+            // discards keys that are not its own, rather than reaching the
+            // ordinary browsing keymap below and relying on `update()`'s
+            // edit-mode guard alone to refuse it.
+            if edit_mode_open {
+                return match key.code {
+                    KeyCode::Esc => Message::CancelEdit,
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::SaveEdit
+                    }
+                    _ => Message::Tick,
+                };
+            }
+
             match key.code {
                 KeyCode::Char('e') => Message::OpenEnvironmentOverlay,
+                KeyCode::Char('i') => Message::EnterEditMode,
                 KeyCode::Down | KeyCode::Char('j') => Message::SelectNext,
                 KeyCode::Up | KeyCode::Char('k') => Message::SelectPrevious,
                 KeyCode::Enter | KeyCode::Char('r') => Message::RunRequested,
@@ -311,7 +334,10 @@ fn run(
             update(&mut state, msg);
         }
 
-        let msg = next_message(state.environment_overlay.is_some())?;
+        let msg = next_message(
+            state.environment_overlay.is_some(),
+            state.edit_mode.is_some(),
+        )?;
         let is_run_request = matches!(msg, Message::RunRequested);
         let was_already_running = matches!(state.run_state, RunState::InFlight);
         update(&mut state, msg);
@@ -417,9 +443,12 @@ mod tests {
 
     #[test]
     fn q_and_ctrl_c_both_translate_to_the_identical_quit_message() {
-        let from_q = translate_event(press(KeyCode::Char('q')), false);
-        let from_ctrl_c =
-            translate_event(press_with(KeyCode::Char('c'), KeyModifiers::CONTROL), false);
+        let from_q = translate_event(press(KeyCode::Char('q')), false, false);
+        let from_ctrl_c = translate_event(
+            press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            false,
+        );
 
         assert!(matches!(from_q, Message::Quit));
         assert!(matches!(from_ctrl_c, Message::Quit));
@@ -430,9 +459,28 @@ mod tests {
         // `update`'s InFlight guard exempts `Quit` specifically so it can
         // never be blocked (see its own doc comment); the overlay must not
         // re-introduce that gap from the translation side.
-        let from_q = translate_event(press(KeyCode::Char('q')), true);
-        let from_ctrl_c =
-            translate_event(press_with(KeyCode::Char('c'), KeyModifiers::CONTROL), true);
+        let from_q = translate_event(press(KeyCode::Char('q')), true, false);
+        let from_ctrl_c = translate_event(
+            press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            true,
+            false,
+        );
+
+        assert!(matches!(from_q, Message::Quit));
+        assert!(matches!(from_ctrl_c, Message::Quit));
+    }
+
+    #[test]
+    fn q_and_ctrl_c_quit_even_while_editing() {
+        // Same gap as the overlay case above, checked for edit mode's own
+        // tiny key set — `update`'s edit-mode guard exempts `Quit` for the
+        // identical reason it exempts it from the InFlight guard.
+        let from_q = translate_event(press(KeyCode::Char('q')), false, true);
+        let from_ctrl_c = translate_event(
+            press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            true,
+        );
 
         assert!(matches!(from_q, Message::Quit));
         assert!(matches!(from_ctrl_c, Message::Quit));
@@ -443,7 +491,7 @@ mod tests {
         // `c` alone is `ToggleRevealCaptures` (outside the overlay) — only
         // `c` *with* the control modifier means quit. A translation that
         // conflated the two would make an ordinary keystroke exit the app.
-        let message = translate_event(press(KeyCode::Char('c')), false);
+        let message = translate_event(press(KeyCode::Char('c')), false, false);
 
         assert!(!matches!(message, Message::Quit));
     }
@@ -457,6 +505,7 @@ mod tests {
                 KeyEventKind::Release,
             )),
             false,
+            false,
         );
 
         assert!(
@@ -467,9 +516,52 @@ mod tests {
 
     #[test]
     fn resize_events_translate_to_the_resize_message() {
-        let message = translate_event(Event::Resize(40, 20), false);
+        let message = translate_event(Event::Resize(40, 20), false, false);
 
         assert!(matches!(message, Message::Resize));
+    }
+
+    // --- edit mode's own key set -------------------------------------------
+
+    #[test]
+    fn esc_cancels_edit_and_ctrl_s_saves_it_while_editing() {
+        let cancel = translate_event(press(KeyCode::Esc), false, true);
+        let save = translate_event(
+            press_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            false,
+            true,
+        );
+
+        assert!(matches!(cancel, Message::CancelEdit));
+        assert!(matches!(save, Message::SaveEdit));
+    }
+
+    #[test]
+    fn ordinary_browsing_keys_do_nothing_while_editing() {
+        // Edit mode's key set is deliberately tiny (see `translate_event`'s
+        // own doc comment) — nav, run and opening the environment overlay
+        // must not leak through it, the same guarantee the overlay branch
+        // already gives its own keys.
+        for code in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Enter,
+            KeyCode::Char('r'),
+            KeyCode::Char('e'),
+            KeyCode::Char('i'),
+        ] {
+            let message = translate_event(press(code), false, true);
+            assert!(
+                matches!(message, Message::Tick),
+                "expected {code:?} to be a no-op while editing, got {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn i_enters_edit_mode_outside_the_overlay_and_outside_edit_mode() {
+        let message = translate_event(press(KeyCode::Char('i')), false, false);
+        assert!(matches!(message, Message::EnterEditMode));
     }
 
     // --- clean-exit audit: panic-hook thread gating -----------------------
