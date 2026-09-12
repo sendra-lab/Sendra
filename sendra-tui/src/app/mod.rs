@@ -4,12 +4,18 @@
 //! - [`update`]: `update()`, the one function allowed to mutate `AppState`.
 //! - [`view`]: `view()` and every `render_*`/`format_*` function under it.
 //!
+//! Plus [`preview`], a small fourth module holding the sendra-core call
+//! sequences (substitution, auth/query/body resolution) `view`'s read-only
+//! browsing preview and auth-masking build on — domain computation `view`
+//! needs but should not itself contain; see that module's own doc comment.
+//!
 //! This is a pure reorganization of what used to be one `app.rs` file along
 //! boundaries the module already had (state/model, reducer, rendering) —
 //! no behavior changed, only where the code lives. `main.rs` is unaffected:
 //! it still reaches everything it needs through `crate::app::{...}`, exactly
 //! the names re-exported below.
 
+mod preview;
 mod state;
 mod update;
 mod view;

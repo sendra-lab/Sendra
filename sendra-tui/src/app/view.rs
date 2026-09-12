@@ -1,8 +1,10 @@
 //! The view half of sendra-tui's Elm-style architecture: `view()` and every
 //! `render_*`/`format_*` function it calls, plus the small pure UI helpers
-//! (`centered_rect`, `inset`, `truncate_body`, `resolve_preview`) those
-//! render functions build on. Nothing here ever mutates `AppState` — see
-//! `super::update` for the one function that does.
+//! (`centered_rect`, `inset`, `truncate_body`) those render functions build
+//! on. Nothing here ever mutates `AppState` — see `super::update` for the
+//! one function that does. The sendra-core resolution pipeline the browsing
+//! preview and its auth-masking need lives in [`super::preview`], not here
+//! — see that module's own doc comment for why.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -13,11 +15,12 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 use sendra_core::{
     ApiKeyLocation, AssertionReport, CaptureReport, Document, Environment, OAuthGrantType, Request,
-    Response, SendraError,
+    Response,
 };
 
 use crate::run_request::RunOutcome;
 
+use super::preview::{self, resolve_browsing_preview};
 use super::state::{
     AppState, AssertionRow, AuthEdit, AuthField, BodyEdit, CaptureKind, CaptureRow,
     CollectionSession, DeleteConfirm, EditField, EditState, EnvVarField, EnvironmentEditState,
@@ -279,11 +282,13 @@ fn render_detail_pane(
         return;
     }
 
-    let text = match resolve_preview(request, base_dir, &environment) {
-        Ok(resolved) => {
-            let (auth_headers, auth_query) = auth_derived_entries(request, &environment);
-            format_resolved_request(&resolved, &auth_headers, &auth_query, state.reveal_captures)
-        }
+    let text = match resolve_browsing_preview(request, base_dir, &environment) {
+        Ok(preview) => format_resolved_request(
+            &preview.request,
+            &preview.auth_headers,
+            &preview.auth_query,
+            state.reveal_captures,
+        ),
         // Honest about what's actually active: with nothing selected yet
         // (the default before any environment is picked), a `{{var}}`
         // request surfaces the same `VariableNotFound` core itself raises
@@ -911,8 +916,9 @@ fn capture_value_prefix(index: usize, name_value: &str, kind: CaptureKind) -> St
 }
 
 /// What `Request::resolve_auth` (via `Environment::apply` first, the same
-/// two-step pipeline `resolve_preview` already runs for the read-only,
-/// not-editing preview) would actually send for this in-progress edit —
+/// two-step pipeline `preview::substitute_and_resolve_auth` runs for the
+/// read-only, not-editing preview) would actually send for this in-progress
+/// edit —
 /// reusing that real sendra-core pipeline rather than reformatting
 /// `AuthEdit` by hand, so this line is provably correct instead of merely a
 /// plausible-looking mirror of it. Built from `edit.to_request(base_request)`,
@@ -948,11 +954,18 @@ fn describe_resolved_auth(
         return "(OAuth token acquired at request time — not shown in this preview)".to_string();
     }
 
-    match environment
-        .apply(&preview)
-        .and_then(|request| request.resolve_auth())
-    {
-        Ok(resolved) => {
+    // Reuses `preview::substitute_and_resolve_auth` for the two sendra-core
+    // calls themselves, but — unlike `resolve_browsing_preview` — diffs the
+    // result against `preview` (this edit's own pre-substitution candidate),
+    // not the substituted request the helper also returns: a request or
+    // environment whose header/query *names* contain `{{var}}` templates
+    // can have those names change during substitution, so diffing against
+    // the wrong "before" could misclassify a header/query entry that only
+    // looks new because its name was just substituted. `preview` is what
+    // this pane's `Auth:` section itself shows, so it is the correct
+    // "before" for what the user just typed.
+    match preview::substitute_and_resolve_auth(&preview, environment) {
+        Ok((_substituted, resolved)) => {
             let mut parts: Vec<String> = resolved
                 .headers
                 .iter()
@@ -1418,12 +1431,25 @@ fn tab_hint(state: &AppState) -> &'static str {
 
 /// The `c reveal/hide auth` hint `status_help_text`'s `RunState::Idle` arm
 /// appends — only when the currently selected request's preview actually
-/// has something auth-derived to mask (see `auth_derived_entries`), the
-/// same "don't advertise a key that would be a no-op right now" rule the
-/// `RunState::Completed` arm already follows for its own `c reveal/hide
-/// captures` hint. Empty for every other reason there might be nothing to
-/// check yet: nothing selected, an empty collection, or a request with no
-/// `auth:` (and no environment-level default) at all.
+/// has something auth-derived to mask (see
+/// `preview::added_by_auth_names`), the same "don't advertise a key that
+/// would be a no-op right now" rule the `RunState::Completed` arm already
+/// follows for its own `c reveal/hide captures` hint. Empty for every other
+/// reason there might be nothing to check yet: nothing selected, an empty
+/// collection, a resolution failure, or a request with no `auth:` (and no
+/// environment-level default) at all.
+///
+/// A second, independent call into `preview::substitute_and_resolve_auth`
+/// on top of the one `render_detail_pane` already makes for the same
+/// request this frame — `status_help_text` (this function's only caller) is
+/// rendered from a separate call in `view()`, with no already-computed
+/// preview in scope to read instead. Threading one through would mean
+/// `status_help_text`/`render_status_bar` taking on a precomputed
+/// dependency neither needs for anything else, purely to save one cheap,
+/// already-cached-nowhere resolution call per frame — not worth losing
+/// their current shape as plain functions of `&AppState` alone, which is
+/// what keeps them directly testable against ~15 hand-built states with no
+/// resolution machinery involved.
 fn idle_reveal_hint(state: &AppState) -> &'static str {
     let LoadState::Loaded {
         document, selected, ..
@@ -1436,7 +1462,12 @@ fn idle_reveal_hint(state: &AppState) -> &'static str {
     };
     let environment = active_environment(state)
         .map_or_else(Environment::default, |named| named.environment.clone());
-    let (headers, query) = auth_derived_entries(request, &environment);
+    let Ok((substituted, auth_resolved)) =
+        preview::substitute_and_resolve_auth(request, &environment)
+    else {
+        return "";
+    };
+    let (headers, query) = preview::added_by_auth_names(&substituted, &auth_resolved);
     if headers.is_empty() && query.is_empty() {
         ""
     } else {
@@ -1456,83 +1487,6 @@ pub fn active_environment(state: &AppState) -> Option<&NamedEnvironment> {
         .and_then(|index| state.environments.get(index))
 }
 
-/// The same substitution + auth/query/body resolution pipeline sendra-cli's
-/// `--dry-run` runs before sending, reused directly rather than
-/// reimplemented. Deliberately narrower than the CLI's full pipeline in two
-/// ways, both because this is a preview, not a run: it skips OAuth token
-/// acquisition (`Request::resolve_oauth`), a real network call with no place
-/// in drawing a frame, and it skips `Config::apply`, since the TUI has no
-/// project `Config` loaded anywhere yet — so the headers shown here are the
-/// request's own, substituted, not the final wire-level set an actual run
-/// would send after config defaults are layered on. `environment` is passed
-/// in as a real, caller-chosen value rather than assumed here — an empty
-/// one when nothing is active, or the one the user picked in the overlay
-/// — so any environment-level default (its own `auth` block
-/// included) resolves exactly as `Environment::apply` already defines it.
-fn resolve_preview(
-    request: &Request,
-    base_dir: &Path,
-    environment: &Environment,
-) -> Result<Request, SendraError> {
-    environment
-        .apply(request)
-        .and_then(|request| request.resolve_auth())
-        .and_then(|request| request.resolve_query())
-        .and_then(|request| request.resolve_body(base_dir))
-}
-
-/// Which header names (lower-cased, matching HTTP's own case-insensitivity)
-/// and query parameter names `Request::resolve_auth` adds on top of
-/// whatever `request`'s own `headers`/`query` already had — i.e., exactly
-/// the entries a resolved preview's `Authorization` header or an
-/// `auth.api_key` header/query param derive from, as opposed to a
-/// header/query entry the request file wrote explicitly. Used only to
-/// decide *which* entries `format_resolved_request` must mask in read-only
-/// mode (see its own doc comment) — this never looks at what those values
-/// *are*, only at whether resolving auth is what put them there.
-///
-/// Recomputes `Environment::apply`/`Request::resolve_auth` independently of
-/// `resolve_preview`'s own pipeline (cheap, and the same two calls
-/// `resolve_preview` already makes) rather than threading a second return
-/// value through that function; a resolution failure here — which
-/// `resolve_preview` would also hit, and already reports on its own error
-/// path — yields no masked entries at all, since there is no resolved
-/// preview for masking to apply to in that case.
-fn auth_derived_entries(
-    request: &Request,
-    environment: &Environment,
-) -> (HashSet<String>, HashSet<String>) {
-    let Ok(substituted) = environment.apply(request) else {
-        return (HashSet::new(), HashSet::new());
-    };
-    let Ok(auth_resolved) = substituted.resolve_auth() else {
-        return (HashSet::new(), HashSet::new());
-    };
-    let header_names = auth_resolved
-        .headers
-        .iter()
-        .filter(|(name, _)| {
-            !substituted
-                .headers
-                .iter()
-                .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
-        })
-        .map(|(name, _)| name.to_ascii_lowercase())
-        .collect();
-    let query_names = auth_resolved
-        .query
-        .iter()
-        .filter(|(name, _)| {
-            !substituted
-                .query
-                .iter()
-                .any(|(existing, _)| existing == name)
-        })
-        .map(|(name, _)| name.clone())
-        .collect();
-    (header_names, query_names)
-}
-
 /// The read-only request preview `render_detail_pane` shows while browsing
 /// (never while editing — see `render_edit_pane`'s own `Auth:` section,
 /// which is unaffected by this and always shows the real values, since
@@ -1548,13 +1502,14 @@ fn auth_derived_entries(
 /// screen-share or a terminal recording should not casually expose while
 /// just browsing a collection, the same reasoning that already masks a
 /// captured token. `auth_derived_headers`/`auth_derived_query` (see
-/// `auth_derived_entries`) name exactly which entries came from resolving
-/// `auth:` rather than from the request's own `headers`/`query`, so an
-/// ordinary, non-secret header (`Accept`, say) is never masked. An
-/// OAuth-authed request never reaches this function with anything to mask
-/// in the first place: `resolve_preview` skips real token acquisition, so
+/// `preview::BrowsingPreview`/`preview::added_by_auth_names`) name exactly
+/// which entries came from resolving `auth:` rather than from the request's
+/// own `headers`/`query`, so an ordinary, non-secret header (`Accept`, say)
+/// is never masked. An OAuth-authed request never reaches this function
+/// with anything to mask in the first place:
+/// `preview::resolve_browsing_preview` skips real token acquisition, so
 /// `resolve_auth` alone returns a typed error for it, shown as that error
-/// instead of a resolved preview — see `resolve_preview`'s own doc comment.
+/// instead of a resolved preview — see that function's own doc comment.
 fn format_resolved_request(
     request: &Request,
     auth_derived_headers: &HashSet<String>,
@@ -2042,10 +1997,10 @@ mod tests {
         .expect("valid single request");
         let request = &document.requests()[0];
 
-        let resolved = resolve_preview(request, Path::new("."), &Environment::default())
+        let preview = resolve_browsing_preview(request, Path::new("."), &Environment::default())
             .expect("no placeholders to fail on");
 
-        assert_eq!(resolved.url, "https://example.com");
+        assert_eq!(preview.request.url, "https://example.com");
     }
 
     #[test]
@@ -2056,9 +2011,10 @@ mod tests {
         .expect("valid single request");
         let request = &document.requests()[0];
 
-        let error = resolve_preview(request, Path::new("."), &Environment::default()).expect_err(
-            "a placeholder with no active environment must surface a real resolution error",
-        );
+        let error = resolve_browsing_preview(request, Path::new("."), &Environment::default())
+            .expect_err(
+                "a placeholder with no active environment must surface a real resolution error",
+            );
 
         assert!(matches!(error, SendraError::VariableNotFound { .. }));
     }
@@ -2075,10 +2031,10 @@ mod tests {
             .variables
             .insert("user_id".to_string(), "42".to_string());
 
-        let resolved = resolve_preview(request, Path::new("."), &environment)
+        let preview = resolve_browsing_preview(request, Path::new("."), &environment)
             .expect("the environment defines the variable the request needs");
 
-        assert_eq!(resolved.url, "https://example.com/42");
+        assert_eq!(preview.request.url, "https://example.com/42");
     }
 
     // --- Auth masking in the read-only preview -------------------------------
@@ -4294,9 +4250,9 @@ requests:
 
     /// A loaded collection whose one request substitutes `{{base_url}}`,
     /// paired with a real environment file on disk that defines it —
-    /// everything `resolve_preview`'s real pipeline needs to resolve a live
-    /// URL, and everything `Message::SaveEnvironmentEdit` needs to persist
-    /// an edit to. Mirrors `super::super::update::tests::
+    /// everything `preview::resolve_browsing_preview`'s real pipeline needs
+    /// to resolve a live URL, and everything `Message::SaveEnvironmentEdit`
+    /// needs to persist an edit to. Mirrors `super::super::update::tests::
     /// state_with_saved_environment` (which has no loaded collection to
     /// preview against) plus `loaded_state` (which has no real environment
     /// file), rather than reusing either alone.
@@ -4325,9 +4281,9 @@ requests:
 
     /// Proof requirement: after editing an environment variable and saving,
     /// the detail pane's resolved-request preview — built through the real
-    /// `resolve_preview`/`resolve_auth` pipeline `render_detail_pane` always
-    /// uses, not a reformatted stand-in — shows the new value live, with no
-    /// further action needed once the overlay closes.
+    /// `preview::resolve_browsing_preview` pipeline `render_detail_pane`
+    /// always uses, not a reformatted stand-in — shows the new value live,
+    /// with no further action needed once the overlay closes.
     #[test]
     fn saved_environment_variable_edits_show_up_live_in_the_resolved_preview() {
         let (mut state, _dir, _path) = loaded_state_with_saved_environment("old-value");
