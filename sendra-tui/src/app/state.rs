@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use sendra_core::{
-    ApiKeyAuth, ApiKeyLocation, Assertions, Auth, BasicAuth, Document, Environment, Method,
-    NotAssertions, OAuthAuth, OAuthGrantType, Request, SendraError,
+    ApiKeyAuth, ApiKeyLocation, Assertions, Auth, BasicAuth, CaptureSource, Captures, Document,
+    Environment, Method, NotAssertions, OAuthAuth, OAuthGrantType, Request, SendraError,
 };
 
 use crate::run_request::RunOutcome;
@@ -248,7 +248,9 @@ pub enum AuthField {
 /// `AssertionPath(i)`/`AssertionOperator(i)`/`AssertionValue(i)`/
 /// `AssertionNegate(i)` index into `EditState::assertions` — see
 /// `EditState::assertion_row_count` and `AssertionRow`'s own doc comment for
-/// what one row covers.
+/// what one row covers. `CaptureName(i)`/`CaptureKind(i)`/`CaptureValue(i)`
+/// index into `EditState::captures` — see `EditState::capture_row_count` and
+/// `CaptureRow`'s own doc comment.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EditField {
     #[default]
@@ -262,6 +264,9 @@ pub enum EditField {
     AssertionOperator(usize),
     AssertionValue(usize),
     AssertionNegate(usize),
+    CaptureName(usize),
+    CaptureKind(usize),
+    CaptureValue(usize),
 }
 
 impl EditField {
@@ -273,18 +278,21 @@ impl EditField {
     /// back to `Method` from, all depend on how many header/assertion rows
     /// currently exist, whether there is an editable body field at all
     /// right now (see `BodyEdit::Unsupported`, which has no field to
-    /// focus), and which auth fields (if any) `EditState::auth` currently
+    /// focus), which auth fields (if any) `EditState::auth` currently
     /// offers (see `AuthEdit::field_order`, empty for a request with no
-    /// `auth:` at all). Order: Method → URL → each header row's key then
-    /// value, in index order → Body (if editable) → each auth field, in
-    /// order → each assertion row's path, operator, value then negate flag,
-    /// in index order → back to Method.
+    /// `auth:` at all), and how many assertion/capture rows currently exist.
+    /// Order: Method → URL → each header row's key then value, in index
+    /// order → Body (if editable) → each auth field, in order → each
+    /// assertion row's path, operator, value then negate flag, in index
+    /// order → each capture row's name, kind then value, in index order →
+    /// back to Method.
     pub(super) fn next(
         self,
         header_count: usize,
         has_body: bool,
         auth_fields: &[AuthField],
         assertion_row_count: usize,
+        capture_row_count: usize,
     ) -> Self {
         match self {
             EditField::Method => EditField::Url,
@@ -292,7 +300,12 @@ impl EditField {
                 if header_count > 0 {
                     EditField::HeaderKey(0)
                 } else {
-                    Self::after_headers(has_body, auth_fields, assertion_row_count)
+                    Self::after_headers(
+                        has_body,
+                        auth_fields,
+                        assertion_row_count,
+                        capture_row_count,
+                    )
                 }
             }
             EditField::HeaderKey(index) => EditField::HeaderValue(index),
@@ -300,15 +313,22 @@ impl EditField {
                 if index + 1 < header_count {
                     EditField::HeaderKey(index + 1)
                 } else {
-                    Self::after_headers(has_body, auth_fields, assertion_row_count)
+                    Self::after_headers(
+                        has_body,
+                        auth_fields,
+                        assertion_row_count,
+                        capture_row_count,
+                    )
                 }
             }
-            EditField::Body => Self::after_body(auth_fields, assertion_row_count),
+            EditField::Body => {
+                Self::after_body(auth_fields, assertion_row_count, capture_row_count)
+            }
             EditField::Auth(field) => {
                 let index = auth_fields.iter().position(|candidate| *candidate == field);
                 match index.and_then(|index| auth_fields.get(index + 1)) {
                     Some(&next_field) => EditField::Auth(next_field),
-                    None => Self::after_auth(assertion_row_count),
+                    None => Self::after_auth(assertion_row_count, capture_row_count),
                 }
             }
             EditField::AssertionPath(index) => EditField::AssertionOperator(index),
@@ -317,6 +337,15 @@ impl EditField {
             EditField::AssertionNegate(index) => {
                 if index + 1 < assertion_row_count {
                     EditField::AssertionPath(index + 1)
+                } else {
+                    Self::after_assertions(capture_row_count)
+                }
+            }
+            EditField::CaptureName(index) => EditField::CaptureKind(index),
+            EditField::CaptureKind(index) => EditField::CaptureValue(index),
+            EditField::CaptureValue(index) => {
+                if index + 1 < capture_row_count {
+                    EditField::CaptureName(index + 1)
                 } else {
                     EditField::Method
                 }
@@ -332,31 +361,48 @@ impl EditField {
         has_body: bool,
         auth_fields: &[AuthField],
         assertion_row_count: usize,
+        capture_row_count: usize,
     ) -> Self {
         if has_body {
             EditField::Body
         } else {
-            Self::after_body(auth_fields, assertion_row_count)
+            Self::after_body(auth_fields, assertion_row_count, capture_row_count)
         }
     }
 
     /// What comes right after `Body` (or straight after headers/`Url`, with
     /// no editable body): the first auth field, if there is one, otherwise
     /// whatever `after_auth` says.
-    fn after_body(auth_fields: &[AuthField], assertion_row_count: usize) -> Self {
+    fn after_body(
+        auth_fields: &[AuthField],
+        assertion_row_count: usize,
+        capture_row_count: usize,
+    ) -> Self {
         match auth_fields.first() {
             Some(&first) => EditField::Auth(first),
-            None => Self::after_auth(assertion_row_count),
+            None => Self::after_auth(assertion_row_count, capture_row_count),
         }
     }
 
     /// What comes right after the last auth field (or straight after
     /// headers/`Url`/`Body`, with no auth fields at all): the first
-    /// assertion row's path, if there is one, otherwise wrapping back to
-    /// `Method`.
-    fn after_auth(assertion_row_count: usize) -> Self {
+    /// assertion row's path, if there is one, otherwise whatever
+    /// `after_assertions` says.
+    fn after_auth(assertion_row_count: usize, capture_row_count: usize) -> Self {
         if assertion_row_count > 0 {
             EditField::AssertionPath(0)
+        } else {
+            Self::after_assertions(capture_row_count)
+        }
+    }
+
+    /// What comes right after the last assertion row (or straight after
+    /// auth/headers/`Url`/`Body`, with no assertion rows at all): the first
+    /// capture row's name, if there is one, otherwise wrapping back to
+    /// `Method`.
+    fn after_assertions(capture_row_count: usize) -> Self {
+        if capture_row_count > 0 {
+            EditField::CaptureName(0)
         } else {
             EditField::Method
         }
@@ -370,11 +416,16 @@ impl EditField {
         has_body: bool,
         auth_fields: &[AuthField],
         assertion_row_count: usize,
+        capture_row_count: usize,
     ) -> Self {
         match self {
-            EditField::Method => {
-                Self::before_method(header_count, has_body, auth_fields, assertion_row_count)
-            }
+            EditField::Method => Self::before_method(
+                header_count,
+                has_body,
+                auth_fields,
+                assertion_row_count,
+                capture_row_count,
+            ),
             EditField::Url => EditField::Method,
             EditField::HeaderKey(0) => EditField::Url,
             EditField::HeaderKey(index) => EditField::HeaderValue(index - 1),
@@ -399,6 +450,12 @@ impl EditField {
             EditField::AssertionOperator(index) => EditField::AssertionPath(index),
             EditField::AssertionValue(index) => EditField::AssertionOperator(index),
             EditField::AssertionNegate(index) => EditField::AssertionValue(index),
+            EditField::CaptureName(0) => {
+                Self::before_captures(header_count, has_body, auth_fields, assertion_row_count)
+            }
+            EditField::CaptureName(index) => EditField::CaptureValue(index - 1),
+            EditField::CaptureKind(index) => EditField::CaptureName(index),
+            EditField::CaptureValue(index) => EditField::CaptureKind(index),
         }
     }
 
@@ -428,13 +485,12 @@ impl EditField {
         }
     }
 
-    /// What comes right before `Method` when the cycle wraps backward: the
-    /// last assertion row's negate flag, if there are any assertion rows;
-    /// otherwise whatever [`Self::before_assertions`] says. The exact
-    /// mirror of how [`Self::after_headers`]/[`Self::after_body`]/
-    /// [`Self::after_auth`] decide what comes *after* those same sections
-    /// going forward.
-    fn before_method(
+    /// What comes right before the first capture row: the last assertion
+    /// row's negate flag, if there are any assertion rows; otherwise
+    /// whatever [`Self::before_assertions`] says. Shared by `CaptureName(0)`'s
+    /// own `prev` arm and by [`Self::before_method`] (when there are no
+    /// capture rows at all).
+    fn before_captures(
         header_count: usize,
         has_body: bool,
         auth_fields: &[AuthField],
@@ -444,6 +500,26 @@ impl EditField {
             EditField::AssertionNegate(assertion_row_count - 1)
         } else {
             Self::before_assertions(header_count, has_body, auth_fields)
+        }
+    }
+
+    /// What comes right before `Method` when the cycle wraps backward: the
+    /// last capture row's value field, if there are any capture rows;
+    /// otherwise whatever [`Self::before_captures`] says. The exact mirror
+    /// of how [`Self::after_headers`]/[`Self::after_body`]/
+    /// [`Self::after_auth`]/[`Self::after_assertions`] decide what comes
+    /// *after* those same sections going forward.
+    fn before_method(
+        header_count: usize,
+        has_body: bool,
+        auth_fields: &[AuthField],
+        assertion_row_count: usize,
+        capture_row_count: usize,
+    ) -> Self {
+        if capture_row_count > 0 {
+            EditField::CaptureValue(capture_row_count - 1)
+        } else {
+            Self::before_captures(header_count, has_body, auth_fields, assertion_row_count)
         }
     }
 }
@@ -1013,6 +1089,110 @@ pub(super) fn validate_assertion_value_text(text: &str) -> Result<serde_json::Va
         .map_err(|err| format!("'{text}' is not valid YAML: {err}"))
 }
 
+/// Which of `sendra_core::CaptureSource`'s three forms one capture row
+/// currently reads from — a real, closed vocabulary, so (like
+/// `ApiKeyLocation`/`JsonOperator` before it) this is cycled through
+/// (`Message::EditCursorLeft`/`EditCursorRight`), never typed as free text.
+/// See `sendra_core::capture`'s module docs for exactly what each one
+/// captures.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CaptureKind {
+    #[default]
+    JsonPath,
+    Header,
+    Status,
+}
+
+impl CaptureKind {
+    const ALL: [CaptureKind; 3] = [
+        CaptureKind::JsonPath,
+        CaptureKind::Header,
+        CaptureKind::Status,
+    ];
+
+    /// Visible to `EditState::toggle_focused`, which calls this for `Right`
+    /// and [`Self::prev`] for `Left` — an ordinary forward/backward cycle
+    /// through [`Self::ALL`], wrapping at either end, the same shape
+    /// `JsonOperator::next` already has.
+    pub(super) fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|kind| *kind == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub(super) fn prev(self) -> Self {
+        let index = Self::ALL.iter().position(|kind| *kind == self).unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// The label shown in the edit pane — `"json path"`, `"header"` or
+    /// `"status"` — next to the `(←/→)` toggle hint, the same convention
+    /// `JsonOperator::label`/`api_key_location_str` already use.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            CaptureKind::JsonPath => "json path",
+            CaptureKind::Header => "header",
+            CaptureKind::Status => "status",
+        }
+    }
+}
+
+/// One entry of a `capture:` block, mid-edit: a variable name, which of
+/// `CaptureSource`'s three forms it reads from, and (for the two forms that
+/// need one) the path or header name it reads. Mirrors `HeaderRow`'s role for
+/// `Request::headers`.
+///
+/// **Unlike `AssertionRow`, this covers `sendra_core::Captures` completely,
+/// not partially.** `Captures` is not seven heterogeneous kinds the way
+/// `Assertions` is — it is `#[serde(transparent)]` over a single
+/// `BTreeMap<String, CaptureSource>` (see that type's own doc comment), and
+/// `CaptureSource` itself is a small, closed, three-variant enum. A row's
+/// `name` and `kind` plus one `value` field (the JSON path for
+/// `CaptureKind::JsonPath`, the header name for `CaptureKind::Header`, unused
+/// for `CaptureKind::Status` — `status: true` has no argument to type) is
+/// therefore not a scoped-down slice of the schema the way `AssertionRow`'s
+/// `json:`-only coverage is; every capture a request file could express is
+/// representable as one of these rows, and `EditState::to_captures` replaces
+/// `Request::capture` wholesale rather than layering onto a `base` the way
+/// `to_assertions` has to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaptureRow {
+    pub name: TextField,
+    pub kind: CaptureKind,
+    pub value: TextField,
+}
+
+impl CaptureRow {
+    /// Visible to `EditState::new`, which seeds one of these per entry in
+    /// the real request's `capture:` block.
+    fn from_existing(name: &str, source: &CaptureSource) -> Self {
+        let (kind, value) = match source {
+            CaptureSource::JsonPath(path) => (CaptureKind::JsonPath, path.clone()),
+            CaptureSource::Header { header } => (CaptureKind::Header, header.clone()),
+            CaptureSource::Status { .. } => (CaptureKind::Status, String::new()),
+        };
+        Self {
+            name: TextField::new(name),
+            kind,
+            value: TextField::new(value),
+        }
+    }
+
+    /// The real `CaptureSource` this row saves as — the exact reverse of
+    /// `from_existing`. `value` is ignored for `CaptureKind::Status`: the
+    /// only value `CaptureSource::Status` can ever hold is `status: true`
+    /// (see that variant's own doc comment on why `status: false` isn't a
+    /// thing this UI could even build).
+    fn to_capture_source(&self) -> CaptureSource {
+        match self.kind {
+            CaptureKind::JsonPath => CaptureSource::JsonPath(self.value.value().to_string()),
+            CaptureKind::Header => CaptureSource::Header {
+                header: self.value.value().to_string(),
+            },
+            CaptureKind::Status => CaptureSource::Status { status: true },
+        }
+    }
+}
+
 /// The state of an in-progress edit of the selected request: `method` and
 /// `url` as working copies (`TextField`s) separate from the request itself.
 /// `Message::SaveEdit` copies them back into the loaded document (see
@@ -1041,6 +1221,11 @@ pub struct EditState {
     /// `AssertionRow`'s own doc comment for exactly what this does and does
     /// not cover of `sendra_core::Assertions`.
     pub assertions: Vec<AssertionRow>,
+    /// Working copies of the request's `capture:` block — see `CaptureRow`'s
+    /// own doc comment for why, unlike `assertions`, this covers
+    /// `sendra_core::Captures` completely rather than a scoped-down slice of
+    /// it.
+    pub captures: Vec<CaptureRow>,
     pub focus: EditField,
     /// `Some(message)` whenever `method`'s current text does not parse as a
     /// real `sendra_core::Method` — recomputed on every keystroke that
@@ -1100,6 +1285,17 @@ impl EditState {
                 rows
             })
             .unwrap_or_default();
+        let captures = request
+            .capture
+            .as_ref()
+            .map(|captures| {
+                captures
+                    .entries()
+                    .iter()
+                    .map(|(name, source)| CaptureRow::from_existing(name, source))
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             dirty: false,
             method,
@@ -1108,6 +1304,7 @@ impl EditState {
             body: BodyEdit::new(request),
             auth: AuthEdit::new(request.auth.as_ref()),
             assertions,
+            captures,
             focus: EditField::default(),
             method_error,
             body_error: None,
@@ -1136,6 +1333,9 @@ impl EditState {
             EditField::AssertionPath(index) => Some(&mut self.assertions[index].path),
             EditField::AssertionValue(index) => Some(&mut self.assertions[index].value),
             EditField::AssertionOperator(_) | EditField::AssertionNegate(_) => None,
+            EditField::CaptureName(index) => Some(&mut self.captures[index].name),
+            EditField::CaptureValue(index) => Some(&mut self.captures[index].value),
+            EditField::CaptureKind(_) => None,
         }
     }
 
@@ -1163,7 +1363,10 @@ impl EditState {
             | EditField::AssertionPath(_)
             | EditField::AssertionOperator(_)
             | EditField::AssertionValue(_)
-            | EditField::AssertionNegate(_) => return,
+            | EditField::AssertionNegate(_)
+            | EditField::CaptureName(_)
+            | EditField::CaptureKind(_)
+            | EditField::CaptureValue(_) => return,
         };
         self.headers.remove(index);
         self.focus = if self.headers.is_empty() {
@@ -1200,7 +1403,10 @@ impl EditState {
             | EditField::HeaderKey(_)
             | EditField::HeaderValue(_)
             | EditField::Body
-            | EditField::Auth(_) => return,
+            | EditField::Auth(_)
+            | EditField::CaptureName(_)
+            | EditField::CaptureKind(_)
+            | EditField::CaptureValue(_) => return,
         };
         self.assertions.remove(index);
         self.focus = if self.assertions.is_empty() {
@@ -1211,6 +1417,51 @@ impl EditState {
             )
         } else {
             EditField::AssertionPath(index.saturating_sub(1).min(self.assertions.len() - 1))
+        };
+    }
+
+    /// Appends a new, empty capture row at the end and moves focus straight
+    /// to its name field — visible to `super::update`'s
+    /// `Message::AddCaptureRow` arm. Mirrors `add_assertion_row` exactly.
+    pub(super) fn add_capture_row(&mut self) {
+        self.captures.push(CaptureRow::default());
+        self.focus = EditField::CaptureName(self.captures.len() - 1);
+    }
+
+    /// Removes whichever capture row `focus` currently points at — a no-op
+    /// when focus is not on a capture row at all. Focus afterward never
+    /// dangles on a removed row: it moves to the previous row's name (or, if
+    /// the deleted row was the first one, the new first row's name), or to
+    /// whatever field would ordinarily precede the captures section if none
+    /// remain (see `EditField::before_captures`). Mirrors
+    /// `delete_focused_assertion_row` exactly. Visible to `super::update`'s
+    /// `Message::DeleteCaptureRow` arm.
+    pub(super) fn delete_focused_capture_row(&mut self) {
+        let index = match self.focus {
+            EditField::CaptureName(index)
+            | EditField::CaptureKind(index)
+            | EditField::CaptureValue(index) => index,
+            EditField::Method
+            | EditField::Url
+            | EditField::HeaderKey(_)
+            | EditField::HeaderValue(_)
+            | EditField::Body
+            | EditField::Auth(_)
+            | EditField::AssertionPath(_)
+            | EditField::AssertionOperator(_)
+            | EditField::AssertionValue(_)
+            | EditField::AssertionNegate(_) => return,
+        };
+        self.captures.remove(index);
+        self.focus = if self.captures.is_empty() {
+            EditField::before_captures(
+                self.headers.len(),
+                self.has_editable_body(),
+                self.auth_field_order(),
+                self.assertion_row_count(),
+            )
+        } else {
+            EditField::CaptureName(index.saturating_sub(1).min(self.captures.len() - 1))
         };
     }
 
@@ -1238,16 +1489,25 @@ impl EditState {
         self.assertions.len()
     }
 
+    /// How many capture rows `EditField::next`/`prev` should cycle through
+    /// right now — visible to `super::update`'s
+    /// `Message::EditFocusNext`/`EditFocusPrev` arms and to
+    /// `render_edit_pane`.
+    pub(super) fn capture_row_count(&self) -> usize {
+        self.captures.len()
+    }
+
     /// Toggles whichever fixed-enum sub-field focus currently points at —
     /// an auth sub-field (`api_key.in`/`oauth.grant_type`, via
-    /// `AuthEdit::toggle`, always a plain flip regardless of `forward`) or
-    /// an assertion row's `operator` (cycled forward/backward through
+    /// `AuthEdit::toggle`, always a plain flip regardless of `forward`), an
+    /// assertion row's `operator` (cycled forward/backward through
     /// [`JsonOperator::next`]/[`JsonOperator::prev`]) or `negate` (a plain
-    /// flip, like the auth sub-fields). A no-op returning `false` whenever
-    /// focus is on none of these — every other field is a `TextField` with
-    /// a real cursor to move instead. Visible to
-    /// `super::update::edit_move_or_toggle`, which calls this before
-    /// falling back to ordinary cursor movement.
+    /// flip, like the auth sub-fields), or a capture row's `kind` (cycled
+    /// forward/backward through [`CaptureKind::next`]/[`CaptureKind::prev`]).
+    /// A no-op returning `false` whenever focus is on none of these — every
+    /// other field is a `TextField` with a real cursor to move instead.
+    /// Visible to `super::update::edit_move_or_toggle`, which calls this
+    /// before falling back to ordinary cursor movement.
     pub(super) fn toggle_focused(&mut self, forward: bool) -> bool {
         match self.focus {
             EditField::Auth(field) => self.auth.toggle(field),
@@ -1262,6 +1522,15 @@ impl EditState {
             }
             EditField::AssertionNegate(index) => {
                 self.assertions[index].negate = !self.assertions[index].negate;
+                true
+            }
+            EditField::CaptureKind(index) => {
+                let row = &mut self.captures[index];
+                row.kind = if forward {
+                    row.kind.next()
+                } else {
+                    row.kind.prev()
+                };
                 true
             }
             _ => false,
@@ -1293,6 +1562,7 @@ impl EditState {
             .collect();
         request.auth = self.auth.to_auth();
         request.assertions = self.to_assertions(base.assertions.as_ref());
+        request.capture = self.to_captures();
         request
     }
 
@@ -1348,6 +1618,30 @@ impl EditState {
             None
         } else {
             Some(assertions)
+        }
+    }
+
+    /// Reassembles `self.captures`'s rows into a real `sendra_core::Captures`
+    /// — unlike `to_assertions`, this takes no `base` to layer onto:
+    /// `Captures` is `entries` and nothing else (see `CaptureRow`'s own doc
+    /// comment), so every row this edit session holds is the *entire*
+    /// `capture:` block, not a slice of it. A later row with the same `name`
+    /// as an earlier one overwrites it, the same last-one-wins rule
+    /// `to_assertions` already follows for a duplicate path.
+    ///
+    /// Returns `None` when the result would capture nothing at all — an edit
+    /// session that deleted every row must not leave behind an empty,
+    /// pointless `capture: {}` block.
+    pub(super) fn to_captures(&self) -> Option<Captures> {
+        let captures: Captures = self
+            .captures
+            .iter()
+            .map(|row| (row.name.value().to_string(), row.to_capture_source()))
+            .collect();
+        if captures.is_empty() {
+            None
+        } else {
+            Some(captures)
         }
     }
 }
@@ -1621,6 +1915,17 @@ pub enum Message {
     /// `EditState::delete_focused_assertion_row` for where focus lands
     /// afterward.
     DeleteAssertionRow,
+    /// A keybinding while editing (`Ctrl+P`, not a plain character): appends
+    /// a new, empty capture row and focuses its name — see
+    /// `EditState::add_capture_row`. A separate binding from `AddHeaderRow`'s
+    /// `Ctrl+N` and `AddAssertionRow`'s `Ctrl+A`, since all three kinds of
+    /// row can be present in the same edit session.
+    AddCaptureRow,
+    /// A keybinding while editing (`Ctrl+K`): removes whichever capture row
+    /// is currently focused, a no-op everywhere else — see
+    /// `EditState::delete_focused_capture_row` for where focus lands
+    /// afterward.
+    DeleteCaptureRow,
     /// An ordinary printable character typed into whichever field is
     /// currently focused — inserted at the cursor via `TextField::insert_char`.
     EditInsertChar(char),
@@ -1891,30 +2196,30 @@ mod tests {
 
     #[test]
     fn edit_field_next_alternates_between_method_and_url_with_no_headers_or_body() {
-        assert_eq!(EditField::Method.next(0, false, &[], 0), EditField::Url);
-        assert_eq!(EditField::Url.next(0, false, &[], 0), EditField::Method);
+        assert_eq!(EditField::Method.next(0, false, &[], 0, 0), EditField::Url);
+        assert_eq!(EditField::Url.next(0, false, &[], 0, 0), EditField::Method);
     }
 
     #[test]
     fn edit_field_next_walks_through_header_rows_in_order() {
         assert_eq!(
-            EditField::Url.next(2, false, &[], 0),
+            EditField::Url.next(2, false, &[], 0, 0),
             EditField::HeaderKey(0)
         );
         assert_eq!(
-            EditField::HeaderKey(0).next(2, false, &[], 0),
+            EditField::HeaderKey(0).next(2, false, &[], 0, 0),
             EditField::HeaderValue(0)
         );
         assert_eq!(
-            EditField::HeaderValue(0).next(2, false, &[], 0),
+            EditField::HeaderValue(0).next(2, false, &[], 0, 0),
             EditField::HeaderKey(1)
         );
         assert_eq!(
-            EditField::HeaderKey(1).next(2, false, &[], 0),
+            EditField::HeaderKey(1).next(2, false, &[], 0, 0),
             EditField::HeaderValue(1)
         );
         assert_eq!(
-            EditField::HeaderValue(1).next(2, false, &[], 0),
+            EditField::HeaderValue(1).next(2, false, &[], 0, 0),
             EditField::Method,
             "with no body, auth or assertion field, the last header row's value wraps back to Method"
         );
@@ -1922,24 +2227,24 @@ mod tests {
 
     #[test]
     fn edit_field_next_visits_body_before_auth_before_assertions() {
-        assert_eq!(EditField::Url.next(0, true, &[], 0), EditField::Body);
+        assert_eq!(EditField::Url.next(0, true, &[], 0, 0), EditField::Body);
         assert_eq!(
-            EditField::HeaderValue(1).next(2, true, &[], 0),
+            EditField::HeaderValue(1).next(2, true, &[], 0, 0),
             EditField::Body,
             "the last header row's value must move into Body when the body is editable"
         );
         assert_eq!(
-            EditField::Body.next(2, true, &[], 0),
+            EditField::Body.next(2, true, &[], 0, 0),
             EditField::Method,
             "Body wraps back to Method when there is no auth or assertion field"
         );
         assert_eq!(
-            EditField::Body.next(2, true, &[AuthField::BearerToken], 0),
+            EditField::Body.next(2, true, &[AuthField::BearerToken], 0, 0),
             EditField::Auth(AuthField::BearerToken),
             "Body moves into Auth when there is one"
         );
         assert_eq!(
-            EditField::Body.next(2, true, &[], 3),
+            EditField::Body.next(2, true, &[], 3, 0),
             EditField::AssertionPath(0),
             "Body moves into the first assertion row when there is no auth but there are \
              assertion rows"
@@ -1949,13 +2254,13 @@ mod tests {
     #[test]
     fn edit_field_next_skips_body_entirely_when_unsupported() {
         assert_eq!(
-            EditField::Url.next(0, false, &[], 0),
+            EditField::Url.next(0, false, &[], 0, 0),
             EditField::Method,
             "with no headers, no editable body, no auth and no assertions, Url wraps straight \
              back to Method"
         );
         assert_eq!(
-            EditField::HeaderValue(1).next(2, false, &[], 0),
+            EditField::HeaderValue(1).next(2, false, &[], 0, 0),
             EditField::Method
         );
     }
@@ -1968,25 +2273,25 @@ mod tests {
             AuthField::ApiKeyLocation,
         ];
         assert_eq!(
-            EditField::Url.next(0, false, &auth_fields, 0),
+            EditField::Url.next(0, false, &auth_fields, 0, 0),
             EditField::Auth(AuthField::ApiKeyName),
             "with no headers/body, Url moves straight into the first auth field"
         );
         assert_eq!(
-            EditField::Auth(AuthField::ApiKeyName).next(0, false, &auth_fields, 0),
+            EditField::Auth(AuthField::ApiKeyName).next(0, false, &auth_fields, 0, 0),
             EditField::Auth(AuthField::ApiKeyValue)
         );
         assert_eq!(
-            EditField::Auth(AuthField::ApiKeyValue).next(0, false, &auth_fields, 0),
+            EditField::Auth(AuthField::ApiKeyValue).next(0, false, &auth_fields, 0, 0),
             EditField::Auth(AuthField::ApiKeyLocation)
         );
         assert_eq!(
-            EditField::Auth(AuthField::ApiKeyLocation).next(0, false, &auth_fields, 0),
+            EditField::Auth(AuthField::ApiKeyLocation).next(0, false, &auth_fields, 0, 0),
             EditField::Method,
             "the last auth field wraps back to Method when there are no assertion rows"
         );
         assert_eq!(
-            EditField::Auth(AuthField::ApiKeyLocation).next(0, false, &auth_fields, 2),
+            EditField::Auth(AuthField::ApiKeyLocation).next(0, false, &auth_fields, 2, 0),
             EditField::AssertionPath(0),
             "the last auth field moves into the first assertion row when there are any"
         );
@@ -1995,19 +2300,19 @@ mod tests {
     #[test]
     fn edit_field_next_walks_through_one_assertion_rows_four_sub_fields_and_wraps_to_method() {
         assert_eq!(
-            EditField::AssertionPath(0).next(0, false, &[], 1),
+            EditField::AssertionPath(0).next(0, false, &[], 1, 0),
             EditField::AssertionOperator(0)
         );
         assert_eq!(
-            EditField::AssertionOperator(0).next(0, false, &[], 1),
+            EditField::AssertionOperator(0).next(0, false, &[], 1, 0),
             EditField::AssertionValue(0)
         );
         assert_eq!(
-            EditField::AssertionValue(0).next(0, false, &[], 1),
+            EditField::AssertionValue(0).next(0, false, &[], 1, 0),
             EditField::AssertionNegate(0)
         );
         assert_eq!(
-            EditField::AssertionNegate(0).next(0, false, &[], 1),
+            EditField::AssertionNegate(0).next(0, false, &[], 1, 0),
             EditField::Method,
             "the only assertion row's negate flag wraps back to Method"
         );
@@ -2016,12 +2321,12 @@ mod tests {
     #[test]
     fn edit_field_next_moves_from_one_assertion_row_into_the_next() {
         assert_eq!(
-            EditField::AssertionNegate(0).next(0, false, &[], 2),
+            EditField::AssertionNegate(0).next(0, false, &[], 2, 0),
             EditField::AssertionPath(1),
             "the first row's negate flag moves into the second row's path"
         );
         assert_eq!(
-            EditField::AssertionNegate(1).next(0, false, &[], 2),
+            EditField::AssertionNegate(1).next(0, false, &[], 2, 0),
             EditField::Method,
             "the last row's negate flag wraps back to Method"
         );
@@ -2043,44 +2348,77 @@ mod tests {
             for has_body in [false, true] {
                 for auth_fields in auth_layouts {
                     for assertion_row_count in [0, 1, 2] {
-                        let mut every_field = vec![EditField::Method, EditField::Url];
-                        for index in 0..header_count {
-                            every_field.push(EditField::HeaderKey(index));
-                            every_field.push(EditField::HeaderValue(index));
-                        }
-                        if has_body {
-                            every_field.push(EditField::Body);
-                        }
-                        for &field in auth_fields {
-                            every_field.push(EditField::Auth(field));
-                        }
-                        for index in 0..assertion_row_count {
-                            every_field.push(EditField::AssertionPath(index));
-                            every_field.push(EditField::AssertionOperator(index));
-                            every_field.push(EditField::AssertionValue(index));
-                            every_field.push(EditField::AssertionNegate(index));
-                        }
-                        for field in every_field {
-                            assert_eq!(
-                                field
-                                    .next(header_count, has_body, auth_fields, assertion_row_count)
-                                    .prev(header_count, has_body, auth_fields, assertion_row_count),
-                                field,
-                                "prev must exactly undo next for {field:?} \
-                                 (header_count={header_count}, has_body={has_body}, \
-                                 auth_fields={auth_fields:?}, \
-                                 assertion_row_count={assertion_row_count})"
-                            );
-                            assert_eq!(
-                                field
-                                    .prev(header_count, has_body, auth_fields, assertion_row_count)
-                                    .next(header_count, has_body, auth_fields, assertion_row_count),
-                                field,
-                                "next must exactly undo prev for {field:?} \
-                                 (header_count={header_count}, has_body={has_body}, \
-                                 auth_fields={auth_fields:?}, \
-                                 assertion_row_count={assertion_row_count})"
-                            );
+                        for capture_row_count in [0, 1, 2] {
+                            let mut every_field = vec![EditField::Method, EditField::Url];
+                            for index in 0..header_count {
+                                every_field.push(EditField::HeaderKey(index));
+                                every_field.push(EditField::HeaderValue(index));
+                            }
+                            if has_body {
+                                every_field.push(EditField::Body);
+                            }
+                            for &field in auth_fields {
+                                every_field.push(EditField::Auth(field));
+                            }
+                            for index in 0..assertion_row_count {
+                                every_field.push(EditField::AssertionPath(index));
+                                every_field.push(EditField::AssertionOperator(index));
+                                every_field.push(EditField::AssertionValue(index));
+                                every_field.push(EditField::AssertionNegate(index));
+                            }
+                            for index in 0..capture_row_count {
+                                every_field.push(EditField::CaptureName(index));
+                                every_field.push(EditField::CaptureKind(index));
+                                every_field.push(EditField::CaptureValue(index));
+                            }
+                            for field in every_field {
+                                assert_eq!(
+                                    field
+                                        .next(
+                                            header_count,
+                                            has_body,
+                                            auth_fields,
+                                            assertion_row_count,
+                                            capture_row_count,
+                                        )
+                                        .prev(
+                                            header_count,
+                                            has_body,
+                                            auth_fields,
+                                            assertion_row_count,
+                                            capture_row_count,
+                                        ),
+                                    field,
+                                    "prev must exactly undo next for {field:?} \
+                                     (header_count={header_count}, has_body={has_body}, \
+                                     auth_fields={auth_fields:?}, \
+                                     assertion_row_count={assertion_row_count}, \
+                                     capture_row_count={capture_row_count})"
+                                );
+                                assert_eq!(
+                                    field
+                                        .prev(
+                                            header_count,
+                                            has_body,
+                                            auth_fields,
+                                            assertion_row_count,
+                                            capture_row_count,
+                                        )
+                                        .next(
+                                            header_count,
+                                            has_body,
+                                            auth_fields,
+                                            assertion_row_count,
+                                            capture_row_count,
+                                        ),
+                                    field,
+                                    "next must exactly undo prev for {field:?} \
+                                     (header_count={header_count}, has_body={has_body}, \
+                                     auth_fields={auth_fields:?}, \
+                                     assertion_row_count={assertion_row_count}, \
+                                     capture_row_count={capture_row_count})"
+                                );
+                            }
                         }
                     }
                 }
@@ -2091,35 +2429,43 @@ mod tests {
     #[test]
     fn edit_field_prev_from_method_prefers_assertions_over_auth_body_and_headers() {
         assert_eq!(
-            EditField::Method.prev(2, true, &[AuthField::BearerToken], 2),
+            EditField::Method.prev(2, true, &[AuthField::BearerToken], 2, 0),
             EditField::AssertionNegate(1)
+        );
+    }
+
+    #[test]
+    fn edit_field_prev_from_method_prefers_captures_over_assertions_auth_body_and_headers() {
+        assert_eq!(
+            EditField::Method.prev(2, true, &[AuthField::BearerToken], 2, 3),
+            EditField::CaptureValue(2)
         );
     }
 
     #[test]
     fn edit_field_prev_from_method_prefers_auth_over_body_and_headers_with_no_assertions() {
         assert_eq!(
-            EditField::Method.prev(2, true, &[AuthField::BearerToken], 0),
+            EditField::Method.prev(2, true, &[AuthField::BearerToken], 0, 0),
             EditField::Auth(AuthField::BearerToken)
         );
     }
 
     #[test]
     fn edit_field_prev_from_method_prefers_body_over_headers_with_no_auth_or_assertions() {
-        assert_eq!(EditField::Method.prev(2, true, &[], 0), EditField::Body);
+        assert_eq!(EditField::Method.prev(2, true, &[], 0, 0), EditField::Body);
     }
 
     #[test]
     fn edit_field_prev_from_method_wraps_to_the_last_header_value_with_nothing_else() {
         assert_eq!(
-            EditField::Method.prev(2, false, &[], 0),
+            EditField::Method.prev(2, false, &[], 0, 0),
             EditField::HeaderValue(1)
         );
     }
 
     #[test]
     fn edit_field_prev_from_method_wraps_to_url_with_nothing_at_all() {
-        assert_eq!(EditField::Method.prev(0, false, &[], 0), EditField::Url);
+        assert_eq!(EditField::Method.prev(0, false, &[], 0, 0), EditField::Url);
     }
 
     // --- EditState: headers -----------------------------------------------

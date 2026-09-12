@@ -301,6 +301,16 @@ fn translate_event(
                     KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         Message::DeleteAssertionRow
                     }
+                    // Ctrl+P/Ctrl+K, the same idea again, for capture rows —
+                    // a third separate pair since header, assertion and
+                    // capture rows can all be present (and being added
+                    // to/deleted from) in the same edit session.
+                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::AddCaptureRow
+                    }
+                    KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::DeleteCaptureRow
+                    }
                     KeyCode::Tab => Message::EditFocusNext,
                     KeyCode::BackTab => Message::EditFocusPrev,
                     KeyCode::Backspace => Message::EditBackspace,
@@ -734,13 +744,32 @@ mod tests {
     }
 
     #[test]
-    fn control_letter_combinations_other_than_ctrl_s_n_d_a_x_do_nothing_while_editing() {
+    fn ctrl_p_and_ctrl_k_add_and_delete_a_capture_row_while_editing() {
+        let add = translate_event(
+            press_with(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            false,
+            true,
+            false,
+        );
+        let delete = translate_event(
+            press_with(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            false,
+            true,
+            false,
+        );
+
+        assert!(matches!(add, Message::AddCaptureRow));
+        assert!(matches!(delete, Message::DeleteCaptureRow));
+    }
+
+    #[test]
+    fn control_letter_combinations_other_than_ctrl_s_n_d_a_x_p_k_do_nothing_while_editing() {
         // Ctrl+B is not a character this field should insert — crossterm
         // still reports the plain letter as `Char('b')`, so without the
         // control-modifier guard in `translate_event` this would silently
         // type a `b` into the field instead of doing nothing. Picked because
-        // it is not one of the six control combinations edit mode actually
-        // binds (`s`/`n`/`d`/`a`/`x`, plus `c` for quit).
+        // it is not one of the eight control combinations edit mode actually
+        // binds (`s`/`n`/`d`/`a`/`x`/`p`/`k`, plus `c` for quit).
         let message = translate_event(
             press_with(KeyCode::Char('b'), KeyModifiers::CONTROL),
             false,

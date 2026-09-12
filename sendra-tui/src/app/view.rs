@@ -19,8 +19,8 @@ use sendra_core::{
 use crate::run_request::RunOutcome;
 
 use super::state::{
-    AppState, AssertionRow, AuthEdit, AuthField, BodyEdit, EditField, EditState, JsonOperator,
-    LoadState, NamedEnvironment, RunState,
+    AppState, AssertionRow, AuthEdit, AuthField, BodyEdit, CaptureKind, CaptureRow, EditField,
+    EditState, JsonOperator, LoadState, NamedEnvironment, RunState,
 };
 
 /// Body preview is capped rather than shown in full — scrolling through a
@@ -374,10 +374,22 @@ fn render_edit_pane(
     }
 
     lines.push(String::new());
+    lines.push("Captures:".to_string());
+    let captures_start_line = lines.len();
+    if edit.captures.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for (index, row) in edit.captures.iter().enumerate() {
+            lines.push(capture_row_line(edit.focus, index, row));
+        }
+    }
+
+    lines.push(String::new());
     lines.push(
         "Tab/Shift+Tab move focus  Ctrl+N add header  Ctrl+D delete header  \
-         Ctrl+A add assertion  Ctrl+X delete assertion  Ctrl+S save  Esc cancel  \
-         (Body: Enter for newline, ↑/↓ move lines; Auth/Assertions: ←/→ toggle option)"
+         Ctrl+A add assertion  Ctrl+X delete assertion  Ctrl+P add capture  \
+         Ctrl+K delete capture  Ctrl+S save  Esc cancel  \
+         (Body: Enter for newline, ↑/↓ move lines; Auth/Assertions/Captures: ←/→ toggle option)"
             .to_string(),
     );
 
@@ -462,6 +474,27 @@ fn render_edit_pane(
                 row.value_error.as_deref(),
             );
             (assertions_start_line + index, prefix.chars().count() as u16)
+        }
+        EditField::CaptureName(index) => {
+            let prefix = capture_name_prefix(index);
+            let cursor = edit.captures[index].name.cursor_chars();
+            (
+                captures_start_line + index,
+                prefix.chars().count() as u16 + cursor as u16,
+            )
+        }
+        EditField::CaptureKind(index) => {
+            let prefix = capture_kind_prefix(index, edit.captures[index].name.value());
+            (captures_start_line + index, prefix.chars().count() as u16)
+        }
+        EditField::CaptureValue(index) => {
+            let row = &edit.captures[index];
+            let prefix = capture_value_prefix(index, row.name.value(), row.kind);
+            let cursor = row.value.cursor_chars();
+            (
+                captures_start_line + index,
+                prefix.chars().count() as u16 + cursor as u16,
+            )
         }
     };
     frame.set_cursor_position((area.x + column, area.y + row as u16));
@@ -705,6 +738,66 @@ fn assertion_negate_prefix(
     format!(
         "{}{value_value}{error}    Negate: ",
         assertion_value_prefix(index, path_value, operator)
+    )
+}
+
+/// One capture row's display line: independent `▶` markers for its three
+/// sub-fields (name, kind, value), since exactly one can be focused at a
+/// time — mirrors `assertion_row_line`'s role for assertion rows. `kind`
+/// shows its real fixed-enum value plus a `(←/→)` toggle hint, the same
+/// convention `assertion_row_line` uses for `operator`/`negate`. `value` is
+/// shown even for `CaptureKind::Status`, whose real save always ignores it
+/// (see `CaptureRow::to_capture_source`) — kept visible rather than hidden
+/// so the row layout, and so every prefix function below it, never has to
+/// change shape depending on which kind is selected.
+///
+/// **The literal gaps here are load-bearing** — see `assertion_row_line`'s
+/// own doc comment for why: this line's prefix functions reconstruct it
+/// character for character to place the real terminal cursor.
+fn capture_row_line(focus: EditField, index: usize, row: &CaptureRow) -> String {
+    let name_marker = if focus == EditField::CaptureName(index) {
+        "▶"
+    } else {
+        " "
+    };
+    let kind_marker = if focus == EditField::CaptureKind(index) {
+        "▶"
+    } else {
+        " "
+    };
+    let value_marker = if focus == EditField::CaptureValue(index) {
+        "▶"
+    } else {
+        " "
+    };
+    format!(
+        "{name_marker}[{index}] Name: {}   {kind_marker}Source: {} (←/→)   {value_marker}Value: {}",
+        row.name.value(),
+        row.kind.label(),
+        row.value.value(),
+    )
+}
+
+/// The prefix of a capture row's line up to (not including) the name field's
+/// own text — see [`capture_row_line`]'s own doc comment on why this must
+/// stay in lockstep with it.
+fn capture_name_prefix(index: usize) -> String {
+    format!(" [{index}] Name: ")
+}
+
+/// Like [`capture_name_prefix`], but up to (not including) the source kind
+/// label's own text.
+fn capture_kind_prefix(index: usize, name_value: &str) -> String {
+    format!("{}{name_value}    Source: ", capture_name_prefix(index))
+}
+
+/// Like [`capture_kind_prefix`], but up to (not including) the value field's
+/// own text.
+fn capture_value_prefix(index: usize, name_value: &str, kind: CaptureKind) -> String {
+    format!(
+        "{}{} (←/→)    Value: ",
+        capture_kind_prefix(index, name_value),
+        kind.label()
     )
 }
 
@@ -2898,6 +2991,107 @@ requests:
         assert!(
             screen.contains('⚠'),
             "a malformed value must show an inline warning:\n{screen}"
+        );
+    }
+
+    // --- Capture editing ------------------------------------------------------
+
+    const REQUEST_WITH_JSON_PATH_CAPTURE: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    capture:
+      id: $.id
+";
+
+    const REQUEST_WITH_NO_CAPTURE: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+";
+
+    #[test]
+    fn edit_pane_shows_no_captures_placeholder_for_a_request_with_none() {
+        let mut state = loaded_state(REQUEST_WITH_NO_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_screen(&state);
+
+        assert!(screen.contains("Captures:"), "{screen}");
+        assert!(screen.contains("(none)"), "{screen}");
+    }
+
+    #[test]
+    fn edit_pane_lists_an_existing_json_path_capture_row() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_screen(&state);
+
+        assert!(screen.contains("Name: id"), "{screen}");
+        assert!(screen.contains("Source: json path"), "{screen}");
+        assert!(screen.contains("Value: $.id"), "{screen}");
+    }
+
+    #[test]
+    fn add_capture_row_key_bind_shows_up_as_a_new_empty_row_on_screen() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+
+        update(&mut state, Message::AddCaptureRow);
+
+        let screen = render_screen(&state);
+        assert!(screen.contains("[1] Name: "), "{screen}");
+    }
+
+    #[test]
+    fn delete_capture_row_key_bind_removes_a_row_from_screen() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::CaptureName(0);
+
+        update(&mut state, Message::DeleteCaptureRow);
+
+        let screen = render_screen(&state);
+        assert!(!screen.contains("Name: id"), "{screen}");
+        assert!(screen.contains("(none)"), "{screen}");
+    }
+
+    #[test]
+    fn edit_pane_marks_whichever_capture_sub_field_has_focus() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::CaptureValue(0);
+
+        let screen = render_screen(&state);
+        let value_line = screen
+            .lines()
+            .find(|line| line.contains("Value: $.id"))
+            .expect("the capture row's line must be on screen");
+        assert!(
+            value_line.contains('▶'),
+            "the focused sub-field's line must carry a focus marker: {value_line}"
+        );
+    }
+
+    #[test]
+    fn tab_reaches_the_capture_section_and_toggling_the_kind_shows_up_live() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::CaptureKind(0);
+
+        let before = render_screen(&state);
+        assert!(before.contains("Source: json path"), "{before}");
+
+        update(&mut state, Message::EditCursorRight);
+        let after = render_screen(&state);
+        assert!(
+            after.contains("Source: header"),
+            "the displayed source kind must reflect the toggle:\n{after}"
         );
     }
 
