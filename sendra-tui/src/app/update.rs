@@ -201,6 +201,7 @@ pub fn update(state: &mut AppState, msg: Message) {
                                 })
                                 .collect();
                             apply_body_edit(request, &edit.body);
+                            request.auth = edit.auth.to_auth();
                         }
                         state.dirty_requests.remove(selected);
                     }
@@ -222,13 +223,17 @@ pub fn update(state: &mut AppState, msg: Message) {
         Message::EditFocusNext => {
             if let Some(edit) = &mut state.edit_mode {
                 let has_body = edit.has_editable_body();
-                edit.focus = edit.focus.next(edit.headers.len(), has_body);
+                edit.focus = edit
+                    .focus
+                    .next(edit.headers.len(), has_body, edit.auth_field_order());
             }
         }
         Message::EditFocusPrev => {
             if let Some(edit) = &mut state.edit_mode {
                 let has_body = edit.has_editable_body();
-                edit.focus = edit.focus.prev(edit.headers.len(), has_body);
+                edit.focus = edit
+                    .focus
+                    .prev(edit.headers.len(), has_body, edit.auth_field_order());
             }
         }
         Message::AddHeaderRow => edit_state_mutate(state, EditState::add_header_row),
@@ -236,8 +241,8 @@ pub fn update(state: &mut AppState, msg: Message) {
         Message::EditInsertChar(ch) => edit_mutate(state, |field| field.insert_char(ch)),
         Message::EditBackspace => edit_mutate(state, TextField::backspace),
         Message::EditDelete => edit_mutate(state, TextField::delete),
-        Message::EditCursorLeft => edit_move(state, TextField::move_left),
-        Message::EditCursorRight => edit_move(state, TextField::move_right),
+        Message::EditCursorLeft => edit_move_or_toggle(state, TextField::move_left),
+        Message::EditCursorRight => edit_move_or_toggle(state, TextField::move_right),
         Message::EditCursorUp => edit_move(state, TextField::move_up),
         Message::EditCursorDown => edit_move(state, TextField::move_down),
         // See the doc comment on `Message::Resize` — the redraw itself
@@ -352,15 +357,21 @@ fn apply_body_edit(request: &mut Request, body: &BodyEdit) {
 /// Applies `mutate` to whichever field `EditState::focus` currently points
 /// at, then marks the edit (and the request being edited) dirty and, if the
 /// method field is the one that just changed, recomputes `method_error` —
-/// live validation on every keystroke. A no-op when edit mode
-/// is not active, so every `Message::EditInsertChar`/`EditBackspace`/
-/// `EditDelete` arm can call this unconditionally rather than each
-/// re-checking `state.edit_mode.is_some()` itself.
+/// live validation on every keystroke. A no-op when edit mode is not active,
+/// so every `Message::EditInsertChar`/`EditBackspace`/`EditDelete` arm can
+/// call this unconditionally rather than each re-checking
+/// `state.edit_mode.is_some()` itself. Also a no-op — nothing to mark dirty —
+/// when focus is on a fixed-enum auth sub-field (`api_key.in`/
+/// `oauth.grant_type`), which has no `TextField` for `focused_field_mut` to
+/// hand back at all; typing/backspacing/deleting has nothing to do there.
 fn edit_mutate(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
     let Some(edit) = &mut state.edit_mode else {
         return;
     };
-    mutate(edit.focused_field_mut());
+    let Some(field) = edit.focused_field_mut() else {
+        return;
+    };
+    mutate(field);
     edit.dirty = true;
     if edit.focus == EditField::Method {
         edit.method_error = validate_method_text(edit.method.value()).err();
@@ -398,10 +409,40 @@ fn edit_state_mutate(state: &mut AppState, mutate: impl FnOnce(&mut EditState)) 
 
 /// Like `edit_mutate`, but for cursor movement: moving the cursor is not an
 /// edit, so unlike `edit_mutate` this never sets `dirty` or touches
-/// `dirty_requests`/`method_error`.
+/// `dirty_requests`/`method_error`. A no-op when focus is on a fixed-enum
+/// auth sub-field, the same as `edit_mutate` — see `edit_move_or_toggle`,
+/// which is what `Left`/`Right` actually call instead of this, for the field
+/// where that would otherwise leave the key doing nothing at all.
 fn edit_move(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
     if let Some(edit) = &mut state.edit_mode {
-        mutate(edit.focused_field_mut());
+        if let Some(field) = edit.focused_field_mut() {
+            mutate(field);
+        }
+    }
+}
+
+/// `Left`/`Right` on the focused field: ordinarily cursor movement, exactly
+/// like `edit_move` — but `api_key.in` and `oauth.grant_type` are fixed
+/// two-value enums with no `TextField`/cursor to move through at all (see
+/// `AuthField::ApiKeyLocation`/`OAuthGrantType`), so while one of those has
+/// focus, these same two keys instead flip its value (see
+/// `AuthEdit::toggle`). Unlike ordinary cursor movement, a toggle really is
+/// an edit — it changes what gets saved — so this marks `dirty`/
+/// `dirty_requests` exactly the way `edit_mutate` does, not the way
+/// `edit_move` deliberately doesn't.
+fn edit_move_or_toggle(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
+    let Some(edit) = &mut state.edit_mode else {
+        return;
+    };
+    if edit.toggle_focused_auth_field() {
+        edit.dirty = true;
+        if let LoadState::Loaded { selected, .. } = &state.load_state {
+            state.dirty_requests.insert(*selected);
+        }
+        return;
+    }
+    if let Some(field) = edit.focused_field_mut() {
+        mutate(field);
     }
 }
 
@@ -437,8 +478,9 @@ fn select(state: &mut AppState, delta: isize) {
 mod tests {
     use std::path::PathBuf;
 
-    use sendra_core::Method;
+    use sendra_core::{ApiKeyLocation, Method};
 
+    use super::super::state::{AuthEdit, AuthField};
     use super::super::test_support::*;
     use super::super::view::status_help_text;
     use super::*;
@@ -1804,5 +1846,317 @@ requests:
 
         update(&mut state, Message::Quit);
         assert!(state.should_quit, "quit must still work after a failed run");
+    }
+
+    // --- Auth editing --------------------------------------------------------
+
+    const REQUEST_WITH_BEARER_AUTH: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    auth:
+      bearer: old-token
+";
+
+    const REQUEST_WITH_API_KEY_AUTH: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    auth:
+      api_key:
+        in: header
+        name: X-Api-Key
+        value: old-value
+";
+
+    const REQUEST_WITH_NO_AUTH: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+";
+
+    #[test]
+    fn enter_edit_mode_seeds_auth_from_the_real_request() {
+        let mut state = loaded_state(REQUEST_WITH_BEARER_AUTH);
+
+        update(&mut state, Message::EnterEditMode);
+
+        let edit = state.edit_mode.as_ref().expect("edit mode just entered");
+        match &edit.auth {
+            AuthEdit::Bearer { token } => assert_eq!(token.value(), "old-token"),
+            other => panic!("expected AuthEdit::Bearer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tab_moves_focus_from_body_into_the_bearer_token_field_and_wraps_to_method() {
+        let mut state = loaded_state(REQUEST_WITH_BEARER_AUTH);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Body;
+
+        update(&mut state, Message::EditFocusNext);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::Auth(AuthField::BearerToken)
+        );
+
+        update(&mut state, Message::EditFocusNext);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::Method,
+            "the last (only) auth field wraps back to Method"
+        );
+    }
+
+    #[test]
+    fn shift_tab_from_method_moves_into_the_last_auth_field() {
+        let mut state = loaded_state(REQUEST_WITH_API_KEY_AUTH);
+        update(&mut state, Message::EnterEditMode);
+
+        update(&mut state, Message::EditFocusPrev);
+
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::Auth(AuthField::ApiKeyLocation),
+            "Shift+Tab from Method must land on the last auth field"
+        );
+    }
+
+    #[test]
+    fn typing_into_the_focused_bearer_token_field_marks_the_edit_dirty() {
+        let mut state = loaded_state(REQUEST_WITH_BEARER_AUTH);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Auth(AuthField::BearerToken);
+        backspace_n(&mut state, "old-token".len());
+
+        type_into_focused_field(&mut state, "new-token");
+
+        let edit = state.edit_mode.as_ref().unwrap();
+        match &edit.auth {
+            AuthEdit::Bearer { token } => assert_eq!(token.value(), "new-token"),
+            other => panic!("expected AuthEdit::Bearer, got {other:?}"),
+        }
+        assert!(edit.dirty);
+        assert!(state.dirty_requests.contains(&0));
+    }
+
+    #[test]
+    fn save_edit_writes_the_edited_bearer_token_into_the_loaded_document() {
+        let mut state = loaded_state(REQUEST_WITH_BEARER_AUTH);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Auth(AuthField::BearerToken);
+        backspace_n(&mut state, "old-token".len());
+        type_into_focused_field(&mut state, "new-token");
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(state.edit_mode.is_none());
+        let request = saved_request(&state);
+        let auth = request.auth.as_ref().expect("auth must still be set");
+        assert_eq!(auth.bearer.as_deref(), Some("new-token"));
+    }
+
+    #[test]
+    fn cancel_edit_discards_auth_changes() {
+        let mut state = loaded_state(REQUEST_WITH_BEARER_AUTH);
+        let before_document = match &state.load_state {
+            LoadState::Loaded { document, .. } => (**document).clone(),
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Auth(AuthField::BearerToken);
+        backspace_n(&mut state, "old-token".len());
+        type_into_focused_field(&mut state, "changed");
+
+        update(&mut state, Message::CancelEdit);
+
+        assert!(state.edit_mode.is_none());
+        match &state.load_state {
+            LoadState::Loaded { document, .. } => {
+                assert_eq!(
+                    **document, before_document,
+                    "cancel must leave the real request's auth completely untouched"
+                );
+            }
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn left_right_toggle_the_api_key_location_instead_of_moving_a_cursor() {
+        let mut state = loaded_state(REQUEST_WITH_API_KEY_AUTH);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Auth(AuthField::ApiKeyLocation);
+
+        update(&mut state, Message::EditCursorRight);
+
+        let edit = state.edit_mode.as_ref().unwrap();
+        match &edit.auth {
+            AuthEdit::ApiKey { location, .. } => assert_eq!(*location, ApiKeyLocation::Query),
+            other => panic!("expected AuthEdit::ApiKey, got {other:?}"),
+        }
+        assert!(edit.dirty, "toggling the location is a real edit");
+        assert!(state.dirty_requests.contains(&0));
+
+        update(&mut state, Message::EditCursorLeft);
+        match &state.edit_mode.as_ref().unwrap().auth {
+            AuthEdit::ApiKey { location, .. } => assert_eq!(*location, ApiKeyLocation::Header),
+            other => panic!("expected AuthEdit::ApiKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_edit_writes_the_toggled_api_key_location_into_the_loaded_document() {
+        let mut state = loaded_state(REQUEST_WITH_API_KEY_AUTH);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Auth(AuthField::ApiKeyLocation);
+        update(&mut state, Message::EditCursorRight);
+
+        update(&mut state, Message::SaveEdit);
+
+        let request = saved_request(&state);
+        let api_key = request
+            .auth
+            .as_ref()
+            .expect("auth must still be set")
+            .api_key
+            .as_ref()
+            .expect("api_key must still be set");
+        assert_eq!(api_key.r#in, ApiKeyLocation::Query);
+        assert_eq!(api_key.name, "X-Api-Key");
+        assert_eq!(api_key.value, "old-value");
+    }
+
+    #[test]
+    fn typing_and_left_right_are_no_ops_when_the_request_has_no_auth() {
+        let mut state = loaded_state(REQUEST_WITH_NO_AUTH);
+        update(&mut state, Message::EnterEditMode);
+        assert!(
+            state
+                .edit_mode
+                .as_ref()
+                .unwrap()
+                .auth_field_order()
+                .is_empty(),
+            "a request with no auth: block has no auth fields to focus"
+        );
+
+        // Tab all the way around the whole focus cycle — Auth must never be
+        // reachable, since there is nothing to focus.
+        for _ in 0..6 {
+            update(&mut state, Message::EditFocusNext);
+            assert!(!matches!(
+                state.edit_mode.as_ref().unwrap().focus,
+                EditField::Auth(_)
+            ));
+        }
+
+        update(&mut state, Message::SaveEdit);
+        assert_eq!(saved_request(&state).auth, None);
+    }
+
+    /// Proof requirement: editing a request's own auth must be verified
+    /// against `Request::resolve_auth`'s *actual* output, not just that the
+    /// working-copy struct fields changed. This exercises the exact
+    /// `EditState::to_request` + `Environment::apply`/`resolve_auth`
+    /// pipeline `render_edit_pane`'s live preview reuses, proving a bearer
+    /// token typed into the edit pane resolves to the real `Authorization`
+    /// header sendra-core would actually send.
+    #[test]
+    fn edited_bearer_token_resolves_to_the_real_authorization_header() {
+        let mut state = loaded_state(REQUEST_WITH_BEARER_AUTH);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Auth(AuthField::BearerToken);
+        backspace_n(&mut state, "old-token".len());
+        type_into_focused_field(&mut state, "brand-new-token");
+
+        let base_request = saved_request(&state).clone();
+        let edit = state.edit_mode.as_ref().unwrap();
+        let candidate = edit.to_request(&base_request);
+
+        let resolved = candidate
+            .resolve_auth()
+            .expect("a bearer token always resolves");
+        assert_eq!(
+            resolved
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+            Some(&(
+                "Authorization".to_string(),
+                "Bearer brand-new-token".to_string()
+            )),
+            "resolve_auth's real output must reflect the edited token, not just the struct field"
+        );
+    }
+
+    /// Proof requirement: an environment-level `auth:` default must still
+    /// only apply when the request's own auth is genuinely absent — editing
+    /// (or clearing) a request's own auth must not change that precedence,
+    /// verified through the same real `Environment::apply`/`resolve_auth`
+    /// sendra-core itself uses to decide, not a TUI-side reimplementation of
+    /// that rule.
+    #[test]
+    fn environment_default_auth_only_applies_when_the_edited_request_has_none() {
+        use sendra_core::{Auth, Environment};
+
+        let mut environment = Environment::default();
+        environment.auth = Some(Auth {
+            bearer: Some("env-default-token".to_string()),
+            basic: None,
+            api_key: None,
+            oauth: None,
+        });
+
+        // The request's own bearer auth must win — the environment default
+        // must never be applied on top of it.
+        let mut state = loaded_state(REQUEST_WITH_BEARER_AUTH);
+        update(&mut state, Message::EnterEditMode);
+        let base_request = saved_request(&state).clone();
+        let edit = state.edit_mode.as_ref().unwrap();
+        let candidate = edit.to_request(&base_request);
+        let resolved = environment
+            .apply(&candidate)
+            .and_then(|request| request.resolve_auth())
+            .expect("resolves");
+        assert_eq!(
+            resolved
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+            Some(&("Authorization".to_string(), "Bearer old-token".to_string())),
+            "the request's own auth must win over the environment default"
+        );
+
+        // With no auth of its own (the request's auth: block removed), the
+        // environment default must apply.
+        let mut state = loaded_state(REQUEST_WITH_NO_AUTH);
+        update(&mut state, Message::EnterEditMode);
+        let base_request = saved_request(&state).clone();
+        let edit = state.edit_mode.as_ref().unwrap();
+        assert!(edit.auth_field_order().is_empty());
+        let candidate = edit.to_request(&base_request);
+        assert_eq!(candidate.auth, None);
+        let resolved = environment
+            .apply(&candidate)
+            .and_then(|request| request.resolve_auth())
+            .expect("resolves");
+        assert_eq!(
+            resolved
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization")),
+            Some(&(
+                "Authorization".to_string(),
+                "Bearer env-default-token".to_string()
+            )),
+            "with no auth of its own, the environment default must apply"
+        );
     }
 }

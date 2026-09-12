@@ -8,7 +8,10 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use sendra_core::{Document, Environment, Method, Request, SendraError};
+use sendra_core::{
+    ApiKeyAuth, ApiKeyLocation, Auth, BasicAuth, Document, Environment, Method, OAuthAuth,
+    OAuthGrantType, Request, SendraError,
+};
 
 use crate::run_request::RunOutcome;
 
@@ -211,14 +214,37 @@ impl HeaderRow {
     }
 }
 
+/// Which auth sub-field currently has focus, when the selected request's
+/// `auth:` block is one this edit session can reach. Which of these are ever
+/// reachable at once depends entirely on which of `bearer`/`basic`/
+/// `api_key`/`oauth` the request actually has — see `AuthEdit::field_order`,
+/// which is the only thing that decides that; a bearer-only request never
+/// makes `BasicUser` reachable, for instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthField {
+    BearerToken,
+    BasicUser,
+    BasicPass,
+    ApiKeyName,
+    ApiKeyValue,
+    ApiKeyLocation,
+    OAuthGrantType,
+    OAuthTokenUrl,
+    OAuthClientId,
+    OAuthClientSecret,
+    OAuthScope,
+    OAuthUsername,
+    OAuthPassword,
+}
+
 /// Which of edit mode's fields `Message::EditFocusNext`/`EditFocusPrev`
 /// (`Tab`/`Shift+Tab`) is currently pointed at, and so which one
 /// `Message::EditInsertChar`/`EditBackspace`/etc. act on. `HeaderKey(i)`/
 /// `HeaderValue(i)` index into `EditState::headers`; `Body` is the raw body
 /// text area (see `BodyEdit`) and only ever appears in the focus cycle when
 /// `EditState::body` is actually editable — see `next`/`prev`'s own
-/// `has_body` parameter. If auth ever gains its own field, this and
-/// `EditState::focused_field_mut` are exactly where that would slot in.
+/// `has_body` parameter. `Auth(field)` is the same idea for `EditState::auth`
+/// — see `next`/`prev`'s `auth_fields` parameter and `AuthEdit::field_order`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EditField {
     #[default]
@@ -227,57 +253,88 @@ pub enum EditField {
     HeaderKey(usize),
     HeaderValue(usize),
     Body,
+    Auth(AuthField),
 }
 
 impl EditField {
     /// Visible to `super::update`'s `Message::EditFocusNext` arm. Takes
-    /// `header_count` and `has_body` (rather than being a pure function of
-    /// `self` alone) since whether `Url` steps straight into the first
-    /// header row or into `Body`, and where the cycle wraps back to
-    /// `Method` from, both depend on how many header rows currently exist
-    /// and whether there is an editable body field at all right now (see
-    /// `BodyEdit::Unsupported`, which has no field to focus). Order: Method
-    /// → URL → each header row's key then value, in index order → Body (if
-    /// editable) → back to Method.
-    pub(super) fn next(self, header_count: usize, has_body: bool) -> Self {
+    /// `header_count`, `has_body` and `auth_fields` (rather than being a
+    /// pure function of `self` alone) since whether `Url` steps straight
+    /// into the first header row, `Body`, or the first auth field, and
+    /// where the cycle wraps back to `Method` from, all depend on how many
+    /// header rows currently exist, whether there is an editable body field
+    /// at all right now (see `BodyEdit::Unsupported`, which has no field to
+    /// focus), and which auth fields (if any) `EditState::auth` currently
+    /// offers (see `AuthEdit::field_order`, empty for a request with no
+    /// `auth:` at all). Order: Method → URL → each header row's key then
+    /// value, in index order → Body (if editable) → each auth field, in
+    /// order → back to Method.
+    pub(super) fn next(
+        self,
+        header_count: usize,
+        has_body: bool,
+        auth_fields: &[AuthField],
+    ) -> Self {
         match self {
             EditField::Method => EditField::Url,
             EditField::Url => {
                 if header_count > 0 {
                     EditField::HeaderKey(0)
-                } else if has_body {
-                    EditField::Body
                 } else {
-                    EditField::Method
+                    Self::after_headers(has_body, auth_fields)
                 }
             }
             EditField::HeaderKey(index) => EditField::HeaderValue(index),
             EditField::HeaderValue(index) => {
                 if index + 1 < header_count {
                     EditField::HeaderKey(index + 1)
-                } else if has_body {
-                    EditField::Body
                 } else {
-                    EditField::Method
+                    Self::after_headers(has_body, auth_fields)
                 }
             }
-            EditField::Body => EditField::Method,
+            EditField::Body => Self::after_body(auth_fields),
+            EditField::Auth(field) => {
+                let index = auth_fields.iter().position(|candidate| *candidate == field);
+                match index.and_then(|index| auth_fields.get(index + 1)) {
+                    Some(&next_field) => EditField::Auth(next_field),
+                    None => EditField::Method,
+                }
+            }
+        }
+    }
+
+    /// What comes right after the last header row (or straight after `Url`,
+    /// with no headers at all): `Body` if it's editable, otherwise whatever
+    /// `after_body` says — shared by the `Url` and `HeaderValue` arms of
+    /// [`Self::next`], which both reach this exact same decision.
+    fn after_headers(has_body: bool, auth_fields: &[AuthField]) -> Self {
+        if has_body {
+            EditField::Body
+        } else {
+            Self::after_body(auth_fields)
+        }
+    }
+
+    /// What comes right after `Body` (or straight after headers/`Url`, with
+    /// no editable body): the first auth field, if there is one, otherwise
+    /// wrapping back to `Method`.
+    fn after_body(auth_fields: &[AuthField]) -> Self {
+        match auth_fields.first() {
+            Some(&first) => EditField::Auth(first),
+            None => EditField::Method,
         }
     }
 
     /// The exact reverse of [`Self::next`] — visible to `super::update`'s
     /// `Message::EditFocusPrev` arm (`Shift+Tab`).
-    pub(super) fn prev(self, header_count: usize, has_body: bool) -> Self {
+    pub(super) fn prev(
+        self,
+        header_count: usize,
+        has_body: bool,
+        auth_fields: &[AuthField],
+    ) -> Self {
         match self {
-            EditField::Method => {
-                if has_body {
-                    EditField::Body
-                } else if header_count > 0 {
-                    EditField::HeaderValue(header_count - 1)
-                } else {
-                    EditField::Url
-                }
-            }
+            EditField::Method => Self::before_method(header_count, has_body, auth_fields),
             EditField::Url => EditField::Method,
             EditField::HeaderKey(0) => EditField::Url,
             EditField::HeaderKey(index) => EditField::HeaderValue(index - 1),
@@ -289,6 +346,38 @@ impl EditField {
                     EditField::Url
                 }
             }
+            EditField::Auth(field) => {
+                match auth_fields.iter().position(|candidate| *candidate == field) {
+                    Some(0) | None => {
+                        if has_body {
+                            EditField::Body
+                        } else if header_count > 0 {
+                            EditField::HeaderValue(header_count - 1)
+                        } else {
+                            EditField::Url
+                        }
+                    }
+                    Some(index) => EditField::Auth(auth_fields[index - 1]),
+                }
+            }
+        }
+    }
+
+    /// What comes right before `Method` when the cycle wraps backward: the
+    /// last auth field, if there is one; otherwise `Body`, if it's editable;
+    /// otherwise the last header row's value, if there are any headers;
+    /// otherwise `Url`. The exact mirror of how [`Self::after_headers`]/
+    /// [`Self::after_body`] decide what comes *after* those same sections
+    /// going forward.
+    fn before_method(header_count: usize, has_body: bool, auth_fields: &[AuthField]) -> Self {
+        if let Some(&last) = auth_fields.last() {
+            EditField::Auth(last)
+        } else if has_body {
+            EditField::Body
+        } else if header_count > 0 {
+            EditField::HeaderValue(header_count - 1)
+        } else {
+            EditField::Url
         }
     }
 }
@@ -400,6 +489,246 @@ impl BodyEdit {
     }
 }
 
+/// The state of an in-progress edit of `Request::auth` — a working copy
+/// shaped by whichever of `bearer`/`basic`/`api_key`/`oauth` the request
+/// actually has. `None` covers a request with no `auth:` block at all; this
+/// edit session never introduces one where there wasn't one already (no
+/// "pick an auth type" step exists here — see this issue's own scoping
+/// notes). Seeded once by `AuthEdit::new` and converted back by `to_auth` —
+/// the same round-trip `BodyEdit`/`HeaderRow` already go through for their
+/// own fields.
+///
+/// **OAuth scoping decision.** `grant_type`/`token_url`/`client_id`/
+/// `client_secret`/`scope`/`username`/`password` are edited here as plain
+/// fields, the same as bearer/basic/api_key — they are static configuration
+/// sendra-core sends *to* the token endpoint, not the token-acquisition flow
+/// itself (`Request::resolve_oauth`, a real network call this never
+/// triggers). What this deliberately does not do: fetch a token to preview
+/// it, or validate these credentials against the real endpoint — editing
+/// only changes what the next real run would send there. See
+/// `render_edit_pane`'s own note on why the live "resolved auth" preview
+/// skips OAuth specifically, the one place this scoping decision is visible
+/// in the UI itself.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum AuthEdit {
+    #[default]
+    None,
+    Bearer {
+        token: TextField,
+    },
+    Basic {
+        user: TextField,
+        pass: TextField,
+    },
+    ApiKey {
+        name: TextField,
+        value: TextField,
+        location: ApiKeyLocation,
+    },
+    OAuth {
+        grant_type: OAuthGrantType,
+        token_url: TextField,
+        client_id: TextField,
+        client_secret: TextField,
+        scope: TextField,
+        username: TextField,
+        password: TextField,
+    },
+}
+
+impl AuthEdit {
+    /// Visible to `super::update`'s `Message::EnterEditMode` arm via
+    /// `EditState::new`. `Auth::validate_exclusivity` guarantees at most one
+    /// of `bearer`/`basic`/`api_key`/`oauth` is set on any `Auth` that made
+    /// it into a loaded `Request`, so checking them in a fixed order finds
+    /// whichever one it is without needing to know which in advance.
+    fn new(auth: Option<&Auth>) -> Self {
+        let Some(auth) = auth else {
+            return AuthEdit::None;
+        };
+        if let Some(token) = &auth.bearer {
+            return AuthEdit::Bearer {
+                token: TextField::new(token.clone()),
+            };
+        }
+        if let Some(basic) = &auth.basic {
+            return AuthEdit::Basic {
+                user: TextField::new(basic.user.clone()),
+                pass: TextField::new(basic.pass.clone()),
+            };
+        }
+        if let Some(api_key) = &auth.api_key {
+            return AuthEdit::ApiKey {
+                name: TextField::new(api_key.name.clone()),
+                value: TextField::new(api_key.value.clone()),
+                location: api_key.r#in,
+            };
+        }
+        if let Some(oauth) = &auth.oauth {
+            return AuthEdit::OAuth {
+                grant_type: oauth.grant_type,
+                token_url: TextField::new(oauth.token_url.clone()),
+                client_id: TextField::new(oauth.client_id.clone()),
+                client_secret: TextField::new(oauth.client_secret.clone()),
+                scope: TextField::new(oauth.scope.clone().unwrap_or_default()),
+                username: TextField::new(oauth.username.clone().unwrap_or_default()),
+                password: TextField::new(oauth.password.clone().unwrap_or_default()),
+            };
+        }
+        AuthEdit::None
+    }
+
+    /// The exact reverse of `new` — visible to `super::update::EditState::to_request`,
+    /// which `Message::SaveEdit` and `render_edit_pane`'s live auth preview
+    /// both build on. `scope`/`username`/`password` round-trip to `None`
+    /// when left blank, matching how `OAuthAuth`'s own fields are optional.
+    pub(super) fn to_auth(&self) -> Option<Auth> {
+        match self {
+            AuthEdit::None => None,
+            AuthEdit::Bearer { token } => Some(Auth {
+                bearer: Some(token.value().to_string()),
+                basic: None,
+                api_key: None,
+                oauth: None,
+            }),
+            AuthEdit::Basic { user, pass } => Some(Auth {
+                bearer: None,
+                basic: Some(BasicAuth {
+                    user: user.value().to_string(),
+                    pass: pass.value().to_string(),
+                }),
+                api_key: None,
+                oauth: None,
+            }),
+            AuthEdit::ApiKey {
+                name,
+                value,
+                location,
+            } => Some(Auth {
+                bearer: None,
+                basic: None,
+                api_key: Some(ApiKeyAuth {
+                    r#in: *location,
+                    name: name.value().to_string(),
+                    value: value.value().to_string(),
+                }),
+                oauth: None,
+            }),
+            AuthEdit::OAuth {
+                grant_type,
+                token_url,
+                client_id,
+                client_secret,
+                scope,
+                username,
+                password,
+            } => Some(Auth {
+                bearer: None,
+                basic: None,
+                api_key: None,
+                oauth: Some(OAuthAuth {
+                    grant_type: *grant_type,
+                    token_url: token_url.value().to_string(),
+                    client_id: client_id.value().to_string(),
+                    client_secret: client_secret.value().to_string(),
+                    scope: non_empty(scope.value()),
+                    username: non_empty(username.value()),
+                    password: non_empty(password.value()),
+                }),
+            }),
+        }
+    }
+
+    /// Which `AuthField`s are reachable right now, in focus-cycle order —
+    /// empty for `AuthEdit::None`, since there is nothing to focus. What
+    /// `EditField::next`/`prev` and `EditState::has_auth` build on,
+    /// mirroring `BodyEdit::has_editable_body`'s role for the body field.
+    pub(super) fn field_order(&self) -> &'static [AuthField] {
+        match self {
+            AuthEdit::None => &[],
+            AuthEdit::Bearer { .. } => &[AuthField::BearerToken],
+            AuthEdit::Basic { .. } => &[AuthField::BasicUser, AuthField::BasicPass],
+            AuthEdit::ApiKey { .. } => &[
+                AuthField::ApiKeyName,
+                AuthField::ApiKeyValue,
+                AuthField::ApiKeyLocation,
+            ],
+            AuthEdit::OAuth { .. } => &[
+                AuthField::OAuthGrantType,
+                AuthField::OAuthTokenUrl,
+                AuthField::OAuthClientId,
+                AuthField::OAuthClientSecret,
+                AuthField::OAuthScope,
+                AuthField::OAuthUsername,
+                AuthField::OAuthPassword,
+            ],
+        }
+    }
+
+    /// The focused `TextField` for `field`, or `None` when `field` names a
+    /// fixed-enum sub-field (`ApiKeyLocation`/`OAuthGrantType`) that has no
+    /// `TextField` at all — see `AuthEdit::toggle` for how those are
+    /// changed instead. Visible to `EditState::focused_field_mut`.
+    pub(super) fn text_field_mut(&mut self, field: AuthField) -> Option<&mut TextField> {
+        match (self, field) {
+            (AuthEdit::Bearer { token }, AuthField::BearerToken) => Some(token),
+            (AuthEdit::Basic { user, .. }, AuthField::BasicUser) => Some(user),
+            (AuthEdit::Basic { pass, .. }, AuthField::BasicPass) => Some(pass),
+            (AuthEdit::ApiKey { name, .. }, AuthField::ApiKeyName) => Some(name),
+            (AuthEdit::ApiKey { value, .. }, AuthField::ApiKeyValue) => Some(value),
+            (AuthEdit::ApiKey { .. }, AuthField::ApiKeyLocation) => None,
+            (AuthEdit::OAuth { .. }, AuthField::OAuthGrantType) => None,
+            (AuthEdit::OAuth { token_url, .. }, AuthField::OAuthTokenUrl) => Some(token_url),
+            (AuthEdit::OAuth { client_id, .. }, AuthField::OAuthClientId) => Some(client_id),
+            (AuthEdit::OAuth { client_secret, .. }, AuthField::OAuthClientSecret) => {
+                Some(client_secret)
+            }
+            (AuthEdit::OAuth { scope, .. }, AuthField::OAuthScope) => Some(scope),
+            (AuthEdit::OAuth { username, .. }, AuthField::OAuthUsername) => Some(username),
+            (AuthEdit::OAuth { password, .. }, AuthField::OAuthPassword) => Some(password),
+            _ => unreachable!(
+                "focus is never Auth(field) for a field outside this AuthEdit's own \
+                 field_order — see EditField::next/prev"
+            ),
+        }
+    }
+
+    /// Toggles whichever fixed-enum sub-field `field` names
+    /// (`api_key.in`/`oauth.grant_type`) — a no-op (returning `false`) for
+    /// any text field, or if `field` doesn't belong to this `AuthEdit`'s own
+    /// variant. `Message::EditCursorLeft`/`EditCursorRight` (`Left`/`Right`)
+    /// call this before falling back to ordinary cursor movement, since
+    /// these two fields have no `TextField`/cursor to move through at all —
+    /// see `super::update::edit_move_or_toggle`.
+    pub(super) fn toggle(&mut self, field: AuthField) -> bool {
+        match (self, field) {
+            (AuthEdit::ApiKey { location, .. }, AuthField::ApiKeyLocation) => {
+                *location = match location {
+                    ApiKeyLocation::Header => ApiKeyLocation::Query,
+                    ApiKeyLocation::Query => ApiKeyLocation::Header,
+                };
+                true
+            }
+            (AuthEdit::OAuth { grant_type, .. }, AuthField::OAuthGrantType) => {
+                *grant_type = match grant_type {
+                    OAuthGrantType::ClientCredentials => OAuthGrantType::Password,
+                    OAuthGrantType::Password => OAuthGrantType::ClientCredentials,
+                };
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// `Some(text)` unless `text` is empty — what `AuthEdit::to_auth` uses for
+/// `OAuthAuth`'s optional `scope`/`username`/`password`, so clearing one of
+/// these fields back to blank saves as the field being genuinely absent
+/// again, not present-but-empty.
+fn non_empty(text: &str) -> Option<String> {
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// The state of an in-progress edit of the selected request: `method` and
 /// `url` as working copies (`TextField`s) separate from the request itself.
 /// `Message::SaveEdit` copies them back into the loaded document (see
@@ -419,6 +748,10 @@ pub struct EditState {
     /// The selected request's body, however it participates in this edit —
     /// see `BodyEdit`'s own doc comment for what is and isn't editable.
     pub body: BodyEdit,
+    /// The selected request's `auth:` block, however it participates in this
+    /// edit — see `AuthEdit`'s own doc comment for what is and isn't
+    /// editable.
+    pub auth: AuthEdit,
     pub focus: EditField,
     /// `Some(message)` whenever `method`'s current text does not parse as a
     /// real `sendra_core::Method` — recomputed on every keystroke that
@@ -461,27 +794,32 @@ impl EditState {
             url: TextField::new(request.url.clone()),
             headers,
             body: BodyEdit::new(request),
+            auth: AuthEdit::new(request.auth.as_ref()),
             focus: EditField::default(),
             method_error,
             body_error: None,
         }
     }
 
-    /// Visible to `super::update`'s `edit_mutate`/`edit_move` helpers.
-    pub(super) fn focused_field_mut(&mut self) -> &mut TextField {
+    /// The focused field's `TextField`, or `None` when focus is on a
+    /// fixed-enum auth sub-field with no `TextField` behind it at all (see
+    /// `AuthEdit::text_field_mut`). Visible to `super::update`'s
+    /// `edit_mutate`/`edit_move`/`edit_move_or_toggle` helpers.
+    pub(super) fn focused_field_mut(&mut self) -> Option<&mut TextField> {
         match self.focus {
-            EditField::Method => &mut self.method,
-            EditField::Url => &mut self.url,
-            EditField::HeaderKey(index) => &mut self.headers[index].key,
-            EditField::HeaderValue(index) => &mut self.headers[index].value,
+            EditField::Method => Some(&mut self.method),
+            EditField::Url => Some(&mut self.url),
+            EditField::HeaderKey(index) => Some(&mut self.headers[index].key),
+            EditField::HeaderValue(index) => Some(&mut self.headers[index].value),
             EditField::Body => match &mut self.body {
-                BodyEdit::Editable { text, .. } => text,
+                BodyEdit::Editable { text, .. } => Some(text),
                 BodyEdit::Unsupported { .. } => unreachable!(
                     "focus is never Body while the body is Unsupported — see \
                      EditField::next/prev, which only ever move focus onto Body \
                      when has_body is true"
                 ),
             },
+            EditField::Auth(field) => self.auth.text_field_mut(field),
         }
     }
 
@@ -502,7 +840,7 @@ impl EditState {
     pub(super) fn delete_focused_header_row(&mut self) {
         let index = match self.focus {
             EditField::HeaderKey(index) | EditField::HeaderValue(index) => index,
-            EditField::Method | EditField::Url | EditField::Body => return,
+            EditField::Method | EditField::Url | EditField::Body | EditField::Auth(_) => return,
         };
         self.headers.remove(index);
         self.focus = if self.headers.is_empty() {
@@ -518,6 +856,52 @@ impl EditState {
     /// `BodyEdit::Unsupported`.
     pub(super) fn has_editable_body(&self) -> bool {
         matches!(self.body, BodyEdit::Editable { .. })
+    }
+
+    /// Which `AuthField`s `EditField::next`/`prev` should cycle through right
+    /// now — empty for a request with no `auth:` at all. Visible to
+    /// `super::update`'s `Message::EditFocusNext`/`EditFocusPrev` arms and to
+    /// `render_edit_pane`.
+    pub(super) fn auth_field_order(&self) -> &'static [AuthField] {
+        self.auth.field_order()
+    }
+
+    /// Toggles the fixed-enum auth sub-field focus currently points at
+    /// (`api_key.in`/`oauth.grant_type`), if any — a no-op returning `false`
+    /// whenever focus is not on one of those two fields. Visible to
+    /// `super::update::edit_move_or_toggle`.
+    pub(super) fn toggle_focused_auth_field(&mut self) -> bool {
+        match self.focus {
+            EditField::Auth(field) => self.auth.toggle(field),
+            _ => false,
+        }
+    }
+
+    /// Builds a full candidate `Request` reflecting every field this edit
+    /// session might change (`method`/`url`/`headers`/`auth`), layered onto
+    /// `base`'s other fields verbatim. This is what `render_edit_pane`'s live
+    /// "resolved auth" preview resolves against, via the exact same
+    /// `Environment::apply`/`Request::resolve_auth` pipeline
+    /// `Message::SaveEdit` and the read-only (non-editing) preview already
+    /// use — so a mid-edit preview of "what auth would actually be sent" is
+    /// provably correct, reusing sendra-core's own resolution, rather than a
+    /// second, hand-rolled formatting of `AuthEdit`. An invalid `method`
+    /// leaves `base`'s own method in the candidate, the same "don't guess"
+    /// rule `Message::SaveEdit` already follows for a method it refuses to
+    /// save.
+    pub(super) fn to_request(&self, base: &Request) -> Request {
+        let mut request = base.clone();
+        if let Ok(method) = validate_method_text(self.method.value()) {
+            request.method = method;
+        }
+        request.url = self.url.value().to_string();
+        request.headers = self
+            .headers
+            .iter()
+            .map(|row| (row.key.value().to_string(), row.value.value().to_string()))
+            .collect();
+        request.auth = self.auth.to_auth();
+        request
     }
 }
 
@@ -1032,104 +1416,171 @@ mod tests {
 
     #[test]
     fn edit_field_next_alternates_between_method_and_url_with_no_headers_or_body() {
-        assert_eq!(EditField::Method.next(0, false), EditField::Url);
-        assert_eq!(EditField::Url.next(0, false), EditField::Method);
+        assert_eq!(EditField::Method.next(0, false, &[]), EditField::Url);
+        assert_eq!(EditField::Url.next(0, false, &[]), EditField::Method);
     }
 
     #[test]
     fn edit_field_next_walks_through_header_rows_in_order() {
-        assert_eq!(EditField::Url.next(2, false), EditField::HeaderKey(0));
+        assert_eq!(EditField::Url.next(2, false, &[]), EditField::HeaderKey(0));
         assert_eq!(
-            EditField::HeaderKey(0).next(2, false),
+            EditField::HeaderKey(0).next(2, false, &[]),
             EditField::HeaderValue(0)
         );
         assert_eq!(
-            EditField::HeaderValue(0).next(2, false),
+            EditField::HeaderValue(0).next(2, false, &[]),
             EditField::HeaderKey(1)
         );
         assert_eq!(
-            EditField::HeaderKey(1).next(2, false),
+            EditField::HeaderKey(1).next(2, false, &[]),
             EditField::HeaderValue(1)
         );
         assert_eq!(
-            EditField::HeaderValue(1).next(2, false),
+            EditField::HeaderValue(1).next(2, false, &[]),
             EditField::Method,
-            "with no body field, the last header row's value wraps back to Method"
+            "with no body or auth field, the last header row's value wraps back to Method"
         );
     }
 
     #[test]
-    fn edit_field_next_visits_body_last_when_editable() {
-        assert_eq!(EditField::Url.next(0, true), EditField::Body);
+    fn edit_field_next_visits_body_before_auth() {
+        assert_eq!(EditField::Url.next(0, true, &[]), EditField::Body);
         assert_eq!(
-            EditField::HeaderValue(1).next(2, true),
+            EditField::HeaderValue(1).next(2, true, &[]),
             EditField::Body,
             "the last header row's value must move into Body when the body is editable"
         );
         assert_eq!(
-            EditField::Body.next(2, true),
+            EditField::Body.next(2, true, &[]),
             EditField::Method,
-            "Body wraps back to Method"
+            "Body wraps back to Method when there is no auth field"
+        );
+        assert_eq!(
+            EditField::Body.next(2, true, &[AuthField::BearerToken]),
+            EditField::Auth(AuthField::BearerToken),
+            "Body moves into Auth when there is one"
         );
     }
 
     #[test]
     fn edit_field_next_skips_body_entirely_when_unsupported() {
         assert_eq!(
-            EditField::Url.next(0, false),
+            EditField::Url.next(0, false, &[]),
             EditField::Method,
-            "with no headers and no editable body, Url wraps straight back to Method"
+            "with no headers, no editable body and no auth, Url wraps straight back to Method"
         );
-        assert_eq!(EditField::HeaderValue(1).next(2, false), EditField::Method);
+        assert_eq!(
+            EditField::HeaderValue(1).next(2, false, &[]),
+            EditField::Method
+        );
+    }
+
+    #[test]
+    fn edit_field_next_walks_through_auth_fields_and_wraps_to_method() {
+        let auth_fields = [
+            AuthField::ApiKeyName,
+            AuthField::ApiKeyValue,
+            AuthField::ApiKeyLocation,
+        ];
+        assert_eq!(
+            EditField::Url.next(0, false, &auth_fields),
+            EditField::Auth(AuthField::ApiKeyName),
+            "with no headers/body, Url moves straight into the first auth field"
+        );
+        assert_eq!(
+            EditField::Auth(AuthField::ApiKeyName).next(0, false, &auth_fields),
+            EditField::Auth(AuthField::ApiKeyValue)
+        );
+        assert_eq!(
+            EditField::Auth(AuthField::ApiKeyValue).next(0, false, &auth_fields),
+            EditField::Auth(AuthField::ApiKeyLocation)
+        );
+        assert_eq!(
+            EditField::Auth(AuthField::ApiKeyLocation).next(0, false, &auth_fields),
+            EditField::Method,
+            "the last auth field wraps back to Method"
+        );
     }
 
     #[test]
     fn edit_field_next_and_prev_are_exact_inverses_across_every_layout() {
+        let auth_layouts: [&[AuthField]; 4] = [
+            &[],
+            &[AuthField::BearerToken],
+            &[AuthField::BasicUser, AuthField::BasicPass],
+            &[
+                AuthField::ApiKeyName,
+                AuthField::ApiKeyValue,
+                AuthField::ApiKeyLocation,
+            ],
+        ];
         for header_count in [0, 1, 3] {
             for has_body in [false, true] {
-                let mut every_field = vec![EditField::Method, EditField::Url];
-                for index in 0..header_count {
-                    every_field.push(EditField::HeaderKey(index));
-                    every_field.push(EditField::HeaderValue(index));
-                }
-                if has_body {
-                    every_field.push(EditField::Body);
-                }
-                for field in every_field {
-                    assert_eq!(
-                        field
-                            .next(header_count, has_body)
-                            .prev(header_count, has_body),
-                        field,
-                        "prev must exactly undo next for {field:?} \
-                         (header_count={header_count}, has_body={has_body})"
-                    );
-                    assert_eq!(
-                        field
-                            .prev(header_count, has_body)
-                            .next(header_count, has_body),
-                        field,
-                        "next must exactly undo prev for {field:?} \
-                         (header_count={header_count}, has_body={has_body})"
-                    );
+                for auth_fields in auth_layouts {
+                    let mut every_field = vec![EditField::Method, EditField::Url];
+                    for index in 0..header_count {
+                        every_field.push(EditField::HeaderKey(index));
+                        every_field.push(EditField::HeaderValue(index));
+                    }
+                    if has_body {
+                        every_field.push(EditField::Body);
+                    }
+                    for &field in auth_fields {
+                        every_field.push(EditField::Auth(field));
+                    }
+                    for field in every_field {
+                        assert_eq!(
+                            field.next(header_count, has_body, auth_fields).prev(
+                                header_count,
+                                has_body,
+                                auth_fields
+                            ),
+                            field,
+                            "prev must exactly undo next for {field:?} \
+                             (header_count={header_count}, has_body={has_body}, \
+                             auth_fields={auth_fields:?})"
+                        );
+                        assert_eq!(
+                            field.prev(header_count, has_body, auth_fields).next(
+                                header_count,
+                                has_body,
+                                auth_fields
+                            ),
+                            field,
+                            "next must exactly undo prev for {field:?} \
+                             (header_count={header_count}, has_body={has_body}, \
+                             auth_fields={auth_fields:?})"
+                        );
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn edit_field_prev_from_method_prefers_body_over_headers_when_both_exist() {
-        assert_eq!(EditField::Method.prev(2, true), EditField::Body);
+    fn edit_field_prev_from_method_prefers_auth_over_body_and_headers() {
+        assert_eq!(
+            EditField::Method.prev(2, true, &[AuthField::BearerToken]),
+            EditField::Auth(AuthField::BearerToken)
+        );
     }
 
     #[test]
-    fn edit_field_prev_from_method_wraps_to_the_last_header_value_with_no_body() {
-        assert_eq!(EditField::Method.prev(2, false), EditField::HeaderValue(1));
+    fn edit_field_prev_from_method_prefers_body_over_headers_with_no_auth() {
+        assert_eq!(EditField::Method.prev(2, true, &[]), EditField::Body);
     }
 
     #[test]
-    fn edit_field_prev_from_method_wraps_to_url_with_no_headers_or_body() {
-        assert_eq!(EditField::Method.prev(0, false), EditField::Url);
+    fn edit_field_prev_from_method_wraps_to_the_last_header_value_with_no_body_or_auth() {
+        assert_eq!(
+            EditField::Method.prev(2, false, &[]),
+            EditField::HeaderValue(1)
+        );
+    }
+
+    #[test]
+    fn edit_field_prev_from_method_wraps_to_url_with_no_headers_body_or_auth() {
+        assert_eq!(EditField::Method.prev(0, false, &[]), EditField::Url);
     }
 
     // --- EditState: headers -----------------------------------------------
@@ -1361,6 +1812,263 @@ mod tests {
         assert!(EditState::new(&request_from("body: x")).has_editable_body());
         assert!(!EditState::new(&request_from("body_file: ./x.json")).has_editable_body());
         assert!(!EditState::new(&request_from("form:\n  a: b\n")).has_editable_body());
+    }
+
+    // --- Auth editing ------------------------------------------------------
+
+    fn request_with_auth(auth_yaml: &str) -> Request {
+        let yaml = format!("method: GET\nurl: https://example.com\nauth:\n{auth_yaml}");
+        Request::from_yaml_str(&yaml).expect("valid test request")
+    }
+
+    #[test]
+    fn auth_edit_new_is_none_for_a_request_with_no_auth_block() {
+        let edit = EditState::new(&request_from(""));
+        assert_eq!(edit.auth, AuthEdit::None);
+        assert!(edit.auth_field_order().is_empty());
+    }
+
+    #[test]
+    fn auth_edit_new_seeds_a_bearer_token_from_the_real_request() {
+        let request = request_with_auth("  bearer: secret-token\n");
+
+        let edit = EditState::new(&request);
+
+        match &edit.auth {
+            AuthEdit::Bearer { token } => assert_eq!(token.value(), "secret-token"),
+            other => panic!("expected AuthEdit::Bearer, got {other:?}"),
+        }
+        assert_eq!(edit.auth_field_order(), &[AuthField::BearerToken]);
+    }
+
+    #[test]
+    fn auth_edit_new_seeds_basic_user_and_pass_from_the_real_request() {
+        let request = request_with_auth("  basic:\n    user: ada\n    pass: hunter2\n");
+
+        let edit = EditState::new(&request);
+
+        match &edit.auth {
+            AuthEdit::Basic { user, pass } => {
+                assert_eq!(user.value(), "ada");
+                assert_eq!(pass.value(), "hunter2");
+            }
+            other => panic!("expected AuthEdit::Basic, got {other:?}"),
+        }
+        assert_eq!(
+            edit.auth_field_order(),
+            &[AuthField::BasicUser, AuthField::BasicPass]
+        );
+    }
+
+    #[test]
+    fn auth_edit_new_seeds_api_key_name_value_and_location() {
+        let request = request_with_auth(
+            "  api_key:\n    in: header\n    name: X-Api-Key\n    value: abc123\n",
+        );
+
+        let edit = EditState::new(&request);
+
+        match &edit.auth {
+            AuthEdit::ApiKey {
+                name,
+                value,
+                location,
+            } => {
+                assert_eq!(name.value(), "X-Api-Key");
+                assert_eq!(value.value(), "abc123");
+                assert_eq!(*location, ApiKeyLocation::Header);
+            }
+            other => panic!("expected AuthEdit::ApiKey, got {other:?}"),
+        }
+        assert_eq!(
+            edit.auth_field_order(),
+            &[
+                AuthField::ApiKeyName,
+                AuthField::ApiKeyValue,
+                AuthField::ApiKeyLocation
+            ]
+        );
+    }
+
+    #[test]
+    fn auth_edit_new_seeds_oauth_fields_including_optional_ones() {
+        let request = request_with_auth(
+            "  oauth:\n    grant_type: password\n    token_url: https://auth.example.com/token\n    \
+             client_id: my-client\n    client_secret: my-secret\n    scope: read write\n    \
+             username: ada\n    password: hunter2\n",
+        );
+
+        let edit = EditState::new(&request);
+
+        match &edit.auth {
+            AuthEdit::OAuth {
+                grant_type,
+                token_url,
+                client_id,
+                client_secret,
+                scope,
+                username,
+                password,
+            } => {
+                assert_eq!(*grant_type, OAuthGrantType::Password);
+                assert_eq!(token_url.value(), "https://auth.example.com/token");
+                assert_eq!(client_id.value(), "my-client");
+                assert_eq!(client_secret.value(), "my-secret");
+                assert_eq!(scope.value(), "read write");
+                assert_eq!(username.value(), "ada");
+                assert_eq!(password.value(), "hunter2");
+            }
+            other => panic!("expected AuthEdit::OAuth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_edit_to_auth_round_trips_a_bearer_token() {
+        let request = request_with_auth("  bearer: secret-token\n");
+        let edit = EditState::new(&request);
+
+        let auth = edit.auth.to_auth().expect("bearer auth must round-trip");
+
+        assert_eq!(auth.bearer.as_deref(), Some("secret-token"));
+        assert_eq!(auth.basic, None);
+        assert_eq!(auth.api_key, None);
+        assert_eq!(auth.oauth, None);
+    }
+
+    #[test]
+    fn auth_edit_to_auth_round_trips_api_key_after_toggling_location() {
+        let request = request_with_auth(
+            "  api_key:\n    in: header\n    name: X-Api-Key\n    value: abc123\n",
+        );
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::Auth(AuthField::ApiKeyLocation);
+
+        assert!(edit.toggle_focused_auth_field());
+
+        let auth = edit.auth.to_auth().expect("api_key auth must round-trip");
+        let api_key = auth.api_key.expect("api_key must still be set");
+        assert_eq!(
+            api_key.r#in,
+            ApiKeyLocation::Query,
+            "toggling must have flipped header -> query"
+        );
+        assert_eq!(api_key.name, "X-Api-Key");
+        assert_eq!(api_key.value, "abc123");
+    }
+
+    #[test]
+    fn auth_edit_to_auth_clears_optional_oauth_fields_left_blank() {
+        let request = request_with_auth(
+            "  oauth:\n    grant_type: client_credentials\n    \
+             token_url: https://auth.example.com/token\n    client_id: my-client\n    \
+             client_secret: my-secret\n",
+        );
+        let edit = EditState::new(&request);
+
+        let auth = edit.auth.to_auth().expect("oauth auth must round-trip");
+        let oauth = auth.oauth.expect("oauth must still be set");
+        assert_eq!(oauth.scope, None);
+        assert_eq!(oauth.username, None);
+        assert_eq!(oauth.password, None);
+    }
+
+    #[test]
+    fn toggling_oauth_grant_type_flips_between_the_two_grants() {
+        let request = request_with_auth(
+            "  oauth:\n    grant_type: client_credentials\n    \
+             token_url: https://auth.example.com/token\n    client_id: my-client\n    \
+             client_secret: my-secret\n",
+        );
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::Auth(AuthField::OAuthGrantType);
+
+        assert!(edit.toggle_focused_auth_field());
+        let auth = edit.auth.to_auth().unwrap();
+        assert_eq!(
+            auth.oauth.as_ref().unwrap().grant_type,
+            OAuthGrantType::Password
+        );
+
+        assert!(edit.toggle_focused_auth_field());
+        let auth = edit.auth.to_auth().unwrap();
+        assert_eq!(
+            auth.oauth.as_ref().unwrap().grant_type,
+            OAuthGrantType::ClientCredentials
+        );
+    }
+
+    #[test]
+    fn toggle_focused_auth_field_is_a_no_op_off_a_toggle_field() {
+        let request = request_with_auth("  bearer: secret-token\n");
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::Auth(AuthField::BearerToken);
+
+        assert!(
+            !edit.toggle_focused_auth_field(),
+            "a plain text auth field has nothing to toggle"
+        );
+    }
+
+    #[test]
+    fn typing_into_the_focused_bearer_token_field_edits_the_working_copy() {
+        let request = request_with_auth("  bearer: old-token\n");
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::Auth(AuthField::BearerToken);
+
+        let field = edit
+            .focused_field_mut()
+            .expect("bearer token is a real text field");
+        for _ in 0.."old-token".len() {
+            field.backspace();
+        }
+        field.insert_char('x');
+
+        match &edit.auth {
+            AuthEdit::Bearer { token } => assert_eq!(token.value(), "x"),
+            other => panic!("expected AuthEdit::Bearer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn focused_field_mut_is_none_for_a_fixed_enum_auth_sub_field() {
+        let request = request_with_auth(
+            "  api_key:\n    in: header\n    name: X-Api-Key\n    value: abc123\n",
+        );
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::Auth(AuthField::ApiKeyLocation);
+
+        assert!(
+            edit.focused_field_mut().is_none(),
+            "the location field has no TextField behind it"
+        );
+    }
+
+    #[test]
+    fn to_request_carries_the_edited_auth_into_a_candidate_request() {
+        let request = request_with_auth("  bearer: old-token\n");
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::Auth(AuthField::BearerToken);
+        let field = edit.focused_field_mut().unwrap();
+        for _ in 0.."old-token".len() {
+            field.backspace();
+        }
+        field.insert_char('n');
+        field.insert_char('e');
+        field.insert_char('w');
+
+        let candidate = edit.to_request(&request);
+
+        assert_eq!(candidate.auth.unwrap().bearer.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn to_request_reflects_no_auth_when_the_request_has_none() {
+        let request = request_from("");
+        let edit = EditState::new(&request);
+
+        let candidate = edit.to_request(&request);
+
+        assert_eq!(candidate.auth, None);
     }
 
     // --- Method validation ----------------------------------------------------
