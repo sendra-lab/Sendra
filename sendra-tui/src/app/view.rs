@@ -19,8 +19,8 @@ use sendra_core::{
 use crate::run_request::RunOutcome;
 
 use super::state::{
-    AppState, AuthEdit, AuthField, BodyEdit, EditField, EditState, LoadState, NamedEnvironment,
-    RunState,
+    AppState, AssertionRow, AuthEdit, AuthField, BodyEdit, EditField, EditState, JsonOperator,
+    LoadState, NamedEnvironment, RunState,
 };
 
 /// Body preview is capped rather than shown in full — scrolling through a
@@ -195,7 +195,10 @@ fn render_detail_pane(
     }
 
     let text = match resolve_preview(request, base_dir, &environment) {
-        Ok(resolved) => format_resolved_request(&resolved),
+        Ok(resolved) => {
+            let (auth_headers, auth_query) = auth_derived_entries(request, &environment);
+            format_resolved_request(&resolved, &auth_headers, &auth_query, state.reveal_captures)
+        }
         // Honest about what's actually active: with nothing selected yet
         // (the default before any environment is picked), a `{{var}}`
         // request surfaces the same `VariableNotFound` core itself raises
@@ -360,10 +363,21 @@ fn render_edit_pane(
     ));
 
     lines.push(String::new());
+    lines.push("Assertions (json path):".to_string());
+    let assertions_start_line = lines.len();
+    if edit.assertions.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for (index, row) in edit.assertions.iter().enumerate() {
+            lines.push(assertion_row_line(edit.focus, index, row));
+        }
+    }
+
+    lines.push(String::new());
     lines.push(
         "Tab/Shift+Tab move focus  Ctrl+N add header  Ctrl+D delete header  \
-         Ctrl+S save  Esc cancel  (Body: Enter for newline, ↑/↓ move lines; \
-         Auth: ←/→ toggle option)"
+         Ctrl+A add assertion  Ctrl+X delete assertion  Ctrl+S save  Esc cancel  \
+         (Body: Enter for newline, ↑/↓ move lines; Auth/Assertions: ←/→ toggle option)"
             .to_string(),
     );
 
@@ -416,6 +430,38 @@ fn render_edit_pane(
                 auth_start_line + index,
                 1 + label.chars().count() as u16 + cursor as u16,
             )
+        }
+        EditField::AssertionPath(index) => {
+            let prefix = assertion_path_prefix(index);
+            let cursor = edit.assertions[index].path.cursor_chars();
+            (
+                assertions_start_line + index,
+                prefix.chars().count() as u16 + cursor as u16,
+            )
+        }
+        EditField::AssertionOperator(index) => {
+            let prefix = assertion_operator_prefix(index, edit.assertions[index].path.value());
+            (assertions_start_line + index, prefix.chars().count() as u16)
+        }
+        EditField::AssertionValue(index) => {
+            let row = &edit.assertions[index];
+            let prefix = assertion_value_prefix(index, row.path.value(), row.operator);
+            let cursor = row.value.cursor_chars();
+            (
+                assertions_start_line + index,
+                prefix.chars().count() as u16 + cursor as u16,
+            )
+        }
+        EditField::AssertionNegate(index) => {
+            let row = &edit.assertions[index];
+            let prefix = assertion_negate_prefix(
+                index,
+                row.path.value(),
+                row.operator,
+                row.value.value(),
+                row.value_error.as_deref(),
+            );
+            (assertions_start_line + index, prefix.chars().count() as u16)
         }
     };
     frame.set_cursor_position((area.x + column, area.y + row as u16));
@@ -559,6 +605,107 @@ fn oauth_grant_type_str(grant_type: OAuthGrantType) -> &'static str {
         OAuthGrantType::ClientCredentials => "client_credentials",
         OAuthGrantType::Password => "password",
     }
+}
+
+/// One assertion row's display line: independent `▶` markers for its four
+/// sub-fields (path, operator, value, negate), since exactly one can be
+/// focused at a time — mirrors `header_row_line`'s role for header rows,
+/// just with two more sub-fields. The operator and negate flag show their
+/// real fixed-enum value plus a `(←/→)` toggle hint, the same convention
+/// `auth_field_display` uses for `ApiKeyLocation`/`OAuthGrantType`. A value
+/// parse error (see `AssertionRow::value_error`) is shown inline right after
+/// the value, on the same line — unlike `method_error`/`body_error`, this
+/// does not reserve a blank row when absent, since a list of rows already
+/// grows and shrinks as they're added/removed, and reserving a whole extra
+/// line under every single row "just in case" would waste far more space
+/// than the one field it protects.
+///
+/// **The literal gaps here are load-bearing.** Each sub-field's prefix
+/// function below (`assertion_operator_prefix`, etc.) reconstructs this same
+/// line up to that field, character for character, to compute the real
+/// terminal cursor's column — so a change to the spacing here must be
+/// mirrored there, the same coupling `header_value_prefix` already has with
+/// `header_row_line`.
+fn assertion_row_line(focus: EditField, index: usize, row: &AssertionRow) -> String {
+    let path_marker = if focus == EditField::AssertionPath(index) {
+        "▶"
+    } else {
+        " "
+    };
+    let operator_marker = if focus == EditField::AssertionOperator(index) {
+        "▶"
+    } else {
+        " "
+    };
+    let value_marker = if focus == EditField::AssertionValue(index) {
+        "▶"
+    } else {
+        " "
+    };
+    let negate_marker = if focus == EditField::AssertionNegate(index) {
+        "▶"
+    } else {
+        " "
+    };
+    let error = row
+        .value_error
+        .as_deref()
+        .map(|message| format!("  ⚠ {message}"))
+        .unwrap_or_default();
+    format!(
+        "{path_marker}[{index}] Path: {}   {operator_marker}Op: {} (←/→)   \
+         {value_marker}Value: {}{error}   {negate_marker}Negate: {} (←/→)",
+        row.path.value(),
+        row.operator.label(),
+        row.value.value(),
+        if row.negate { "yes" } else { "no" },
+    )
+}
+
+/// The prefix of an assertion row's line up to (not including) the path
+/// field's own text — see [`assertion_row_line`]'s own doc comment on why
+/// this must stay in lockstep with it. The marker character itself is not
+/// part of what varies the width — `▶` and `" "` are both exactly one
+/// `char` wide — so a plain space stands in for whichever one is actually
+/// showing, the same convention `header_key_prefix` uses.
+fn assertion_path_prefix(index: usize) -> String {
+    format!(" [{index}] Path: ")
+}
+
+/// Like [`assertion_path_prefix`], but up to (not including) the operator
+/// label's own text.
+fn assertion_operator_prefix(index: usize, path_value: &str) -> String {
+    format!("{}{path_value}    Op: ", assertion_path_prefix(index))
+}
+
+/// Like [`assertion_operator_prefix`], but up to (not including) the value
+/// field's own text.
+fn assertion_value_prefix(index: usize, path_value: &str, operator: JsonOperator) -> String {
+    format!(
+        "{}{} (←/→)    Value: ",
+        assertion_operator_prefix(index, path_value),
+        operator.label()
+    )
+}
+
+/// Like [`assertion_value_prefix`], but up to (not including) the negate
+/// flag's own text. Needs `value_error` since a shown error shifts the
+/// negate field's real column, the same reason `header_value_prefix` needs
+/// the key's value.
+fn assertion_negate_prefix(
+    index: usize,
+    path_value: &str,
+    operator: JsonOperator,
+    value_value: &str,
+    value_error: Option<&str>,
+) -> String {
+    let error = value_error
+        .map(|message| format!("  ⚠ {message}"))
+        .unwrap_or_default();
+    format!(
+        "{}{value_value}{error}    Negate: ",
+        assertion_value_prefix(index, path_value, operator)
+    )
 }
 
 /// What `Request::resolve_auth` (via `Environment::apply` first, the same
@@ -958,7 +1105,12 @@ pub(super) fn status_help_text(state: &AppState) -> String {
     }
 
     match &state.run_state {
-        RunState::Idle => "↑/↓ nav  enter/r run  i edit  e env  q quit".to_string(),
+        RunState::Idle => {
+            format!(
+                "↑/↓ nav  enter/r run  i edit  e env{}  q quit",
+                idle_reveal_hint(state)
+            )
+        }
         RunState::InFlight => {
             let frame_char = SPINNER_FRAMES[state.spinner_tick % SPINNER_FRAMES.len()];
             format!("{frame_char} Running request...  |  q quit")
@@ -988,6 +1140,34 @@ pub(super) fn status_help_text(state: &AppState) -> String {
                 "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn/Home/End scroll{reveal}  i edit  e env  q quit"
             )
         }
+    }
+}
+
+/// The `c reveal/hide auth` hint `status_help_text`'s `RunState::Idle` arm
+/// appends — only when the currently selected request's preview actually
+/// has something auth-derived to mask (see `auth_derived_entries`), the
+/// same "don't advertise a key that would be a no-op right now" rule the
+/// `RunState::Completed` arm already follows for its own `c reveal/hide
+/// captures` hint. Empty for every other reason there might be nothing to
+/// check yet: nothing selected, an empty collection, or a request with no
+/// `auth:` (and no environment-level default) at all.
+fn idle_reveal_hint(state: &AppState) -> &'static str {
+    let LoadState::Loaded {
+        document, selected, ..
+    } = &state.load_state
+    else {
+        return "";
+    };
+    let Some(request) = document.requests().get(*selected) else {
+        return "";
+    };
+    let environment = active_environment(state)
+        .map_or_else(Environment::default, |named| named.environment.clone());
+    let (headers, query) = auth_derived_entries(request, &environment);
+    if headers.is_empty() && query.is_empty() {
+        ""
+    } else {
+        "  c reveal/hide auth"
     }
 }
 
@@ -1028,10 +1208,92 @@ fn resolve_preview(
         .and_then(|request| request.resolve_body(base_dir))
 }
 
-fn format_resolved_request(request: &Request) -> String {
+/// Which header names (lower-cased, matching HTTP's own case-insensitivity)
+/// and query parameter names `Request::resolve_auth` adds on top of
+/// whatever `request`'s own `headers`/`query` already had — i.e., exactly
+/// the entries a resolved preview's `Authorization` header or an
+/// `auth.api_key` header/query param derive from, as opposed to a
+/// header/query entry the request file wrote explicitly. Used only to
+/// decide *which* entries `format_resolved_request` must mask in read-only
+/// mode (see its own doc comment) — this never looks at what those values
+/// *are*, only at whether resolving auth is what put them there.
+///
+/// Recomputes `Environment::apply`/`Request::resolve_auth` independently of
+/// `resolve_preview`'s own pipeline (cheap, and the same two calls
+/// `resolve_preview` already makes) rather than threading a second return
+/// value through that function; a resolution failure here — which
+/// `resolve_preview` would also hit, and already reports on its own error
+/// path — yields no masked entries at all, since there is no resolved
+/// preview for masking to apply to in that case.
+fn auth_derived_entries(
+    request: &Request,
+    environment: &Environment,
+) -> (HashSet<String>, HashSet<String>) {
+    let Ok(substituted) = environment.apply(request) else {
+        return (HashSet::new(), HashSet::new());
+    };
+    let Ok(auth_resolved) = substituted.resolve_auth() else {
+        return (HashSet::new(), HashSet::new());
+    };
+    let header_names = auth_resolved
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            !substituted
+                .headers
+                .iter()
+                .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
+        })
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect();
+    let query_names = auth_resolved
+        .query
+        .iter()
+        .filter(|(name, _)| {
+            !substituted
+                .query
+                .iter()
+                .any(|(existing, _)| existing == name)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    (header_names, query_names)
+}
+
+/// The read-only request preview `render_detail_pane` shows while browsing
+/// (never while editing — see `render_edit_pane`'s own `Auth:` section,
+/// which is unaffected by this and always shows the real values, since
+/// editing them is the whole point there).
+///
+/// **Auth values are masked by default**, the same posture and the same
+/// `<redacted>` placeholder `format_capture_section` already uses for
+/// captured values, toggled by the same `c` keybinding
+/// (`AppState::reveal_captures`) — a bearer token, a Basic password
+/// (base64-encoded into the whole `Authorization` header, which is why the
+/// entire header value is masked rather than trying to decode and mask
+/// only the password half), or an API key are exactly the kind of secret a
+/// screen-share or a terminal recording should not casually expose while
+/// just browsing a collection, the same reasoning that already masks a
+/// captured token. `auth_derived_headers`/`auth_derived_query` (see
+/// `auth_derived_entries`) name exactly which entries came from resolving
+/// `auth:` rather than from the request's own `headers`/`query`, so an
+/// ordinary, non-secret header (`Accept`, say) is never masked. An
+/// OAuth-authed request never reaches this function with anything to mask
+/// in the first place: `resolve_preview` skips real token acquisition, so
+/// `resolve_auth` alone returns a typed error for it, shown as that error
+/// instead of a resolved preview — see `resolve_preview`'s own doc comment.
+fn format_resolved_request(
+    request: &Request,
+    auth_derived_headers: &HashSet<String>,
+    auth_derived_query: &HashSet<String>,
+    reveal: bool,
+) -> String {
     let mut lines = vec![
         format!("Method: {}", request.method),
-        format!("URL:    {}", request.url),
+        format!(
+            "URL:    {}",
+            mask_auth_derived_query_params(&request.url, auth_derived_query, reveal)
+        ),
         String::new(),
         "Headers:".to_string(),
     ];
@@ -1040,7 +1302,13 @@ fn format_resolved_request(request: &Request) -> String {
         lines.push("  (none)".to_string());
     } else {
         for (name, value) in &request.headers {
-            lines.push(format!("  {name}: {value}"));
+            let masked = !reveal && auth_derived_headers.contains(&name.to_ascii_lowercase());
+            let shown = if masked {
+                REDACTED_CAPTURE_VALUE
+            } else {
+                value
+            };
+            lines.push(format!("  {name}: {shown}"));
         }
     }
 
@@ -1060,6 +1328,35 @@ fn format_resolved_request(request: &Request) -> String {
     }
 
     lines.join("\n")
+}
+
+/// Masks the value of every query parameter in `url` whose name is in
+/// `names` — what an `auth.api_key` placed `in: query` needs, since
+/// `Request::resolve_query` merges it straight into the URL string rather
+/// than leaving it as a separate, maskable `(name, value)` pair (see
+/// `Request::resolve_query`'s own doc comment). Matches on the parameter
+/// *name* only, never the value, so this works regardless of how the real
+/// value was percent-encoded — there is no encoded form of a redaction
+/// placeholder to get wrong. A no-op when `reveal` is true, `names` is
+/// empty, or `url` has no query string at all.
+fn mask_auth_derived_query_params(url: &str, names: &HashSet<String>, reveal: bool) -> String {
+    if reveal || names.is_empty() {
+        return url.to_string();
+    }
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let masked = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _value)) if names.contains(key) => {
+                format!("{key}={REDACTED_CAPTURE_VALUE}")
+            }
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{masked}")
 }
 
 fn truncate_body(body: &str) -> (String, bool) {
@@ -1339,6 +1636,177 @@ mod tests {
             .expect("the environment defines the variable the request needs");
 
         assert_eq!(resolved.url, "https://example.com/42");
+    }
+
+    // --- Auth masking in the read-only preview -------------------------------
+    //
+    // `REQUEST_WITH_BEARER_AUTH` is defined further down, in the auth-editing
+    // test section, and reused here too.
+
+    const REQUEST_WITH_BASIC_AUTH_PREVIEW: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    auth:
+      basic:
+        user: ada
+        pass: hunter2
+";
+
+    const REQUEST_WITH_API_KEY_HEADER_AUTH: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    headers:
+      Accept: application/json
+    auth:
+      api_key:
+        in: header
+        name: X-Api-Key
+        value: secret-key-value
+";
+
+    const REQUEST_WITH_API_KEY_QUERY_AUTH: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    auth:
+      api_key:
+        in: query
+        name: api_key
+        value: secret-key-value
+";
+
+    #[test]
+    fn browsing_preview_masks_a_bearer_token_by_default() {
+        let state = loaded_state(REQUEST_WITH_BEARER_AUTH);
+
+        let screen = render_screen(&state);
+
+        assert!(
+            !screen.contains("secret-token"),
+            "the real bearer token must not appear while merely browsing:\n{screen}"
+        );
+        assert!(
+            screen.contains(REDACTED_CAPTURE_VALUE),
+            "the resolved Authorization header must show the redaction placeholder:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn browsing_preview_masks_a_basic_auth_password_by_masking_the_whole_header() {
+        let state = loaded_state(REQUEST_WITH_BASIC_AUTH_PREVIEW);
+
+        let screen = render_screen(&state);
+
+        // Basic auth base64-encodes `user:pass` into one opaque header value
+        // — trivially reversible, so the whole header must be masked, not
+        // just checked for the literal password substring.
+        assert!(
+            !screen.contains("aunter2") && !screen.contains("hunter2"),
+            "the real password must not be recoverable from the screen:\n{screen}"
+        );
+        assert!(screen.contains(REDACTED_CAPTURE_VALUE), "{screen}");
+    }
+
+    #[test]
+    fn browsing_preview_masks_an_api_key_placed_in_a_header_but_not_an_ordinary_header() {
+        let state = loaded_state(REQUEST_WITH_API_KEY_HEADER_AUTH);
+
+        let screen = render_screen(&state);
+
+        assert!(
+            !screen.contains("secret-key-value"),
+            "the real api key value must not appear while merely browsing:\n{screen}"
+        );
+        assert!(
+            screen.contains("X-Api-Key") && screen.contains(REDACTED_CAPTURE_VALUE),
+            "the api key header must still be listed by name, with its value masked:\n{screen}"
+        );
+        assert!(
+            screen.contains("Accept: application/json"),
+            "an ordinary, non-auth header must never be masked:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn browsing_preview_masks_an_api_key_placed_in_the_query_string() {
+        let state = loaded_state(REQUEST_WITH_API_KEY_QUERY_AUTH);
+
+        let screen = render_screen(&state);
+
+        assert!(
+            !screen.contains("secret-key-value"),
+            "the real api key value must not appear in the URL while merely browsing:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("api_key={REDACTED_CAPTURE_VALUE}")),
+            "the query parameter's name must stay visible, only its value masked:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn pressing_c_reveals_auth_in_the_browsing_preview_and_hides_it_again() {
+        let mut state = loaded_state(REQUEST_WITH_BEARER_AUTH);
+
+        let masked = render_screen(&state);
+        assert!(!masked.contains("secret-token"), "{masked}");
+
+        update(&mut state, Message::ToggleRevealCaptures);
+        let revealed = render_screen(&state);
+        assert!(
+            revealed.contains("Bearer secret-token"),
+            "the same key that reveals captures must reveal auth too:\n{revealed}"
+        );
+
+        update(&mut state, Message::ToggleRevealCaptures);
+        let masked_again = render_screen(&state);
+        assert!(!masked_again.contains("secret-token"), "{masked_again}");
+    }
+
+    #[test]
+    fn editing_the_request_always_shows_the_real_auth_value_regardless_of_reveal_state() {
+        // The one place this masking must never apply: edit mode, where
+        // seeing (and changing) the real value is the entire point — see
+        // `render_edit_pane`'s own `Auth:` section and its "Resolved auth"
+        // preview line, both untouched by this feature.
+        let mut state = loaded_state(REQUEST_WITH_BEARER_AUTH);
+        assert!(
+            !state.reveal_captures,
+            "masked by default, same as browsing"
+        );
+
+        update(&mut state, Message::EnterEditMode);
+        let screen = render_screen(&state);
+
+        assert!(
+            screen.contains("secret-token"),
+            "edit mode must always show the real value, never masked:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn a_request_with_no_auth_shows_nothing_masked_and_advertises_no_reveal_key() {
+        let state = loaded_state(THREE_REQUEST_COLLECTION);
+
+        let screen = render_screen(&state);
+        let help = status_help_text(&state);
+
+        assert!(
+            !screen.contains(REDACTED_CAPTURE_VALUE),
+            "nothing to mask means nothing should show the placeholder:\n{screen}"
+        );
+        assert!(
+            !help.contains("reveal"),
+            "advertising the reveal key for a request with nothing to reveal would be \
+             misleading: {help}"
+        );
     }
 
     #[test]
@@ -2298,6 +2766,138 @@ requests:
         assert!(
             after.contains("query X-Api-Key=abc123"),
             "the resolved preview must move the api key into the query string too:\n{after}"
+        );
+    }
+
+    // --- Assertion editing --------------------------------------------------
+
+    const REQUEST_WITH_JSON_ASSERTION: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    assertions:
+      json:
+        $.status: ok
+";
+
+    const REQUEST_WITH_NO_ASSERTIONS: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+";
+
+    #[test]
+    fn edit_pane_shows_no_assertions_placeholder_for_a_request_with_none() {
+        let mut state = loaded_state(REQUEST_WITH_NO_ASSERTIONS);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_screen(&state);
+
+        assert!(screen.contains("Assertions (json path):"), "{screen}");
+        assert!(screen.contains("(none)"), "{screen}");
+    }
+
+    #[test]
+    fn edit_pane_lists_an_existing_json_assertion_row() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_screen(&state);
+
+        assert!(screen.contains("Path: $.status"), "{screen}");
+        assert!(screen.contains("Op: equals"), "{screen}");
+        assert!(screen.contains("Value: ok"), "{screen}");
+        assert!(screen.contains("Negate: no"), "{screen}");
+    }
+
+    #[test]
+    fn add_assertion_row_key_bind_shows_up_as_a_new_empty_row_on_screen() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+
+        update(&mut state, Message::AddAssertionRow);
+
+        let screen = render_screen(&state);
+        assert!(screen.contains("[1] Path: "), "{screen}");
+    }
+
+    #[test]
+    fn delete_assertion_row_key_bind_removes_a_row_from_screen() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionPath(0);
+
+        update(&mut state, Message::DeleteAssertionRow);
+
+        let screen = render_screen(&state);
+        assert!(!screen.contains("$.status"), "{screen}");
+        assert!(screen.contains("(none)"), "{screen}");
+    }
+
+    #[test]
+    fn edit_pane_marks_whichever_assertion_sub_field_has_focus() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionValue(0);
+
+        let screen = render_screen(&state);
+        let value_line = screen
+            .lines()
+            .find(|line| line.contains("Value: ok"))
+            .expect("the assertion row's line must be on screen");
+        assert!(
+            value_line.contains('▶'),
+            "the focused sub-field's line must carry a focus marker: {value_line}"
+        );
+    }
+
+    #[test]
+    fn tab_reaches_the_assertion_section_and_toggling_the_operator_shows_up_live() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionOperator(0);
+
+        let before = render_screen(&state);
+        assert!(before.contains("Op: equals"), "{before}");
+
+        update(&mut state, Message::EditCursorRight);
+        let after = render_screen(&state);
+        assert!(
+            after.contains("Op: greater_than"),
+            "the displayed operator must reflect the toggle:\n{after}"
+        );
+    }
+
+    #[test]
+    fn tab_reaches_the_assertion_section_and_toggling_negate_shows_up_live() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionNegate(0);
+
+        update(&mut state, Message::EditCursorRight);
+        let after = render_screen(&state);
+        assert!(
+            after.contains("Negate: yes"),
+            "the displayed negate flag must reflect the toggle:\n{after}"
+        );
+    }
+
+    #[test]
+    fn edit_pane_shows_a_value_parse_error_inline_on_the_assertion_row() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionValue(0);
+        backspace_n(&mut state, "ok".len());
+        type_into_focused_field(&mut state, "[a, b");
+
+        let screen = render_screen(&state);
+        assert!(
+            screen.contains('⚠'),
+            "a malformed value must show an inline warning:\n{screen}"
         );
     }
 

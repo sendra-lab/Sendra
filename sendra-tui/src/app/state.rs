@@ -5,12 +5,12 @@
 //! `super::update` for `update()` itself — this module only defines what the
 //! state *is*.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
 use sendra_core::{
-    ApiKeyAuth, ApiKeyLocation, Auth, BasicAuth, Document, Environment, Method, OAuthAuth,
-    OAuthGrantType, Request, SendraError,
+    ApiKeyAuth, ApiKeyLocation, Assertions, Auth, BasicAuth, Document, Environment, Method,
+    NotAssertions, OAuthAuth, OAuthGrantType, Request, SendraError,
 };
 
 use crate::run_request::RunOutcome;
@@ -245,6 +245,10 @@ pub enum AuthField {
 /// `EditState::body` is actually editable — see `next`/`prev`'s own
 /// `has_body` parameter. `Auth(field)` is the same idea for `EditState::auth`
 /// — see `next`/`prev`'s `auth_fields` parameter and `AuthEdit::field_order`.
+/// `AssertionPath(i)`/`AssertionOperator(i)`/`AssertionValue(i)`/
+/// `AssertionNegate(i)` index into `EditState::assertions` — see
+/// `EditState::assertion_row_count` and `AssertionRow`'s own doc comment for
+/// what one row covers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EditField {
     #[default]
@@ -254,26 +258,33 @@ pub enum EditField {
     HeaderValue(usize),
     Body,
     Auth(AuthField),
+    AssertionPath(usize),
+    AssertionOperator(usize),
+    AssertionValue(usize),
+    AssertionNegate(usize),
 }
 
 impl EditField {
     /// Visible to `super::update`'s `Message::EditFocusNext` arm. Takes
-    /// `header_count`, `has_body` and `auth_fields` (rather than being a
-    /// pure function of `self` alone) since whether `Url` steps straight
-    /// into the first header row, `Body`, or the first auth field, and
-    /// where the cycle wraps back to `Method` from, all depend on how many
-    /// header rows currently exist, whether there is an editable body field
-    /// at all right now (see `BodyEdit::Unsupported`, which has no field to
+    /// `header_count`, `has_body`, `auth_fields` and `assertion_row_count`
+    /// (rather than being a pure function of `self` alone) since whether
+    /// `Url` steps straight into the first header row, `Body`, the first
+    /// auth field, or the first assertion row, and where the cycle wraps
+    /// back to `Method` from, all depend on how many header/assertion rows
+    /// currently exist, whether there is an editable body field at all
+    /// right now (see `BodyEdit::Unsupported`, which has no field to
     /// focus), and which auth fields (if any) `EditState::auth` currently
     /// offers (see `AuthEdit::field_order`, empty for a request with no
     /// `auth:` at all). Order: Method → URL → each header row's key then
     /// value, in index order → Body (if editable) → each auth field, in
-    /// order → back to Method.
+    /// order → each assertion row's path, operator, value then negate flag,
+    /// in index order → back to Method.
     pub(super) fn next(
         self,
         header_count: usize,
         has_body: bool,
         auth_fields: &[AuthField],
+        assertion_row_count: usize,
     ) -> Self {
         match self {
             EditField::Method => EditField::Url,
@@ -281,7 +292,7 @@ impl EditField {
                 if header_count > 0 {
                     EditField::HeaderKey(0)
                 } else {
-                    Self::after_headers(has_body, auth_fields)
+                    Self::after_headers(has_body, auth_fields, assertion_row_count)
                 }
             }
             EditField::HeaderKey(index) => EditField::HeaderValue(index),
@@ -289,15 +300,25 @@ impl EditField {
                 if index + 1 < header_count {
                     EditField::HeaderKey(index + 1)
                 } else {
-                    Self::after_headers(has_body, auth_fields)
+                    Self::after_headers(has_body, auth_fields, assertion_row_count)
                 }
             }
-            EditField::Body => Self::after_body(auth_fields),
+            EditField::Body => Self::after_body(auth_fields, assertion_row_count),
             EditField::Auth(field) => {
                 let index = auth_fields.iter().position(|candidate| *candidate == field);
                 match index.and_then(|index| auth_fields.get(index + 1)) {
                     Some(&next_field) => EditField::Auth(next_field),
-                    None => EditField::Method,
+                    None => Self::after_auth(assertion_row_count),
+                }
+            }
+            EditField::AssertionPath(index) => EditField::AssertionOperator(index),
+            EditField::AssertionOperator(index) => EditField::AssertionValue(index),
+            EditField::AssertionValue(index) => EditField::AssertionNegate(index),
+            EditField::AssertionNegate(index) => {
+                if index + 1 < assertion_row_count {
+                    EditField::AssertionPath(index + 1)
+                } else {
+                    EditField::Method
                 }
             }
         }
@@ -307,21 +328,37 @@ impl EditField {
     /// with no headers at all): `Body` if it's editable, otherwise whatever
     /// `after_body` says — shared by the `Url` and `HeaderValue` arms of
     /// [`Self::next`], which both reach this exact same decision.
-    fn after_headers(has_body: bool, auth_fields: &[AuthField]) -> Self {
+    fn after_headers(
+        has_body: bool,
+        auth_fields: &[AuthField],
+        assertion_row_count: usize,
+    ) -> Self {
         if has_body {
             EditField::Body
         } else {
-            Self::after_body(auth_fields)
+            Self::after_body(auth_fields, assertion_row_count)
         }
     }
 
     /// What comes right after `Body` (or straight after headers/`Url`, with
     /// no editable body): the first auth field, if there is one, otherwise
-    /// wrapping back to `Method`.
-    fn after_body(auth_fields: &[AuthField]) -> Self {
+    /// whatever `after_auth` says.
+    fn after_body(auth_fields: &[AuthField], assertion_row_count: usize) -> Self {
         match auth_fields.first() {
             Some(&first) => EditField::Auth(first),
-            None => EditField::Method,
+            None => Self::after_auth(assertion_row_count),
+        }
+    }
+
+    /// What comes right after the last auth field (or straight after
+    /// headers/`Url`/`Body`, with no auth fields at all): the first
+    /// assertion row's path, if there is one, otherwise wrapping back to
+    /// `Method`.
+    fn after_auth(assertion_row_count: usize) -> Self {
+        if assertion_row_count > 0 {
+            EditField::AssertionPath(0)
+        } else {
+            EditField::Method
         }
     }
 
@@ -332,9 +369,12 @@ impl EditField {
         header_count: usize,
         has_body: bool,
         auth_fields: &[AuthField],
+        assertion_row_count: usize,
     ) -> Self {
         match self {
-            EditField::Method => Self::before_method(header_count, has_body, auth_fields),
+            EditField::Method => {
+                Self::before_method(header_count, has_body, auth_fields, assertion_row_count)
+            }
             EditField::Url => EditField::Method,
             EditField::HeaderKey(0) => EditField::Url,
             EditField::HeaderKey(index) => EditField::HeaderValue(index - 1),
@@ -348,36 +388,62 @@ impl EditField {
             }
             EditField::Auth(field) => {
                 match auth_fields.iter().position(|candidate| *candidate == field) {
-                    Some(0) | None => {
-                        if has_body {
-                            EditField::Body
-                        } else if header_count > 0 {
-                            EditField::HeaderValue(header_count - 1)
-                        } else {
-                            EditField::Url
-                        }
-                    }
+                    Some(0) | None => Self::before_auth(header_count, has_body),
                     Some(index) => EditField::Auth(auth_fields[index - 1]),
                 }
             }
+            EditField::AssertionPath(0) => {
+                Self::before_assertions(header_count, has_body, auth_fields)
+            }
+            EditField::AssertionPath(index) => EditField::AssertionNegate(index - 1),
+            EditField::AssertionOperator(index) => EditField::AssertionPath(index),
+            EditField::AssertionValue(index) => EditField::AssertionOperator(index),
+            EditField::AssertionNegate(index) => EditField::AssertionValue(index),
         }
     }
 
-    /// What comes right before `Method` when the cycle wraps backward: the
-    /// last auth field, if there is one; otherwise `Body`, if it's editable;
-    /// otherwise the last header row's value, if there are any headers;
-    /// otherwise `Url`. The exact mirror of how [`Self::after_headers`]/
-    /// [`Self::after_body`] decide what comes *after* those same sections
-    /// going forward.
-    fn before_method(header_count: usize, has_body: bool, auth_fields: &[AuthField]) -> Self {
-        if let Some(&last) = auth_fields.last() {
-            EditField::Auth(last)
-        } else if has_body {
+    /// What comes right before the first auth field: `Body`, if it's
+    /// editable; otherwise the last header row's value, if there are any
+    /// headers; otherwise `Url`. Shared by `Auth(field)`'s own `prev` arm
+    /// (when `field` is the first auth field) and by
+    /// [`Self::before_assertions`] (when there is no auth field at all).
+    fn before_auth(header_count: usize, has_body: bool) -> Self {
+        if has_body {
             EditField::Body
         } else if header_count > 0 {
             EditField::HeaderValue(header_count - 1)
         } else {
             EditField::Url
+        }
+    }
+
+    /// What comes right before the first assertion row: the last auth
+    /// field, if there is one; otherwise whatever [`Self::before_auth`]
+    /// says. Shared by `AssertionPath(0)`'s own `prev` arm and by
+    /// [`Self::before_method`] (when there are no assertion rows at all).
+    fn before_assertions(header_count: usize, has_body: bool, auth_fields: &[AuthField]) -> Self {
+        match auth_fields.last() {
+            Some(&last) => EditField::Auth(last),
+            None => Self::before_auth(header_count, has_body),
+        }
+    }
+
+    /// What comes right before `Method` when the cycle wraps backward: the
+    /// last assertion row's negate flag, if there are any assertion rows;
+    /// otherwise whatever [`Self::before_assertions`] says. The exact
+    /// mirror of how [`Self::after_headers`]/[`Self::after_body`]/
+    /// [`Self::after_auth`] decide what comes *after* those same sections
+    /// going forward.
+    fn before_method(
+        header_count: usize,
+        has_body: bool,
+        auth_fields: &[AuthField],
+        assertion_row_count: usize,
+    ) -> Self {
+        if assertion_row_count > 0 {
+            EditField::AssertionNegate(assertion_row_count - 1)
+        } else {
+            Self::before_assertions(header_count, has_body, auth_fields)
         }
     }
 }
@@ -729,6 +795,224 @@ fn non_empty(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
+/// Which operator a `json:` path assertion compares with — the fixed, closed
+/// set sendra-core's own (private) `JsonSpec::parse` recognises as a
+/// single-key operator object, plus bare equality. A real, closed
+/// vocabulary, so — like `ApiKeyLocation`/`OAuthGrantType` before it — this
+/// is cycled through (`Message::EditCursorLeft`/`EditCursorRight`), never
+/// typed as free text. See `sendra_core::assertions::json`'s module docs for
+/// exactly what each one checks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JsonOperator {
+    #[default]
+    Equals,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+    Contains,
+    Length,
+    Matches,
+}
+
+impl JsonOperator {
+    const ALL: [JsonOperator; 8] = [
+        JsonOperator::Equals,
+        JsonOperator::GreaterThan,
+        JsonOperator::GreaterThanOrEqual,
+        JsonOperator::LessThan,
+        JsonOperator::LessThanOrEqual,
+        JsonOperator::Contains,
+        JsonOperator::Length,
+        JsonOperator::Matches,
+    ];
+
+    /// Visible to `EditState::toggle_focused`, which calls this for `Right`
+    /// and [`Self::prev`] for `Left` — an ordinary forward/backward cycle
+    /// through [`Self::ALL`], wrapping at either end.
+    pub(super) fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|op| *op == self).unwrap_or(0);
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub(super) fn prev(self) -> Self {
+        let index = Self::ALL.iter().position(|op| *op == self).unwrap_or(0);
+        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    /// The one-key operator name sendra-core's real YAML schema uses
+    /// (`greater_than`, `matches`, ...) — shown in the edit pane so what is
+    /// on screen matches what the file would say, and what
+    /// [`Self::wrap`]/[`Self::detect`] build and read back.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            JsonOperator::Equals => "equals",
+            JsonOperator::GreaterThan => "greater_than",
+            JsonOperator::GreaterThanOrEqual => "greater_than_or_equal",
+            JsonOperator::LessThan => "less_than",
+            JsonOperator::LessThanOrEqual => "less_than_or_equal",
+            JsonOperator::Contains => "contains",
+            JsonOperator::Length => "length",
+            JsonOperator::Matches => "matches",
+        }
+    }
+
+    /// Builds the real `json:` value sendra-core's own `JsonSpec::parse`
+    /// (`sendra_core::assertions::json`, private to that crate) would read
+    /// back as this operator: `arg` unwrapped for `Equals`, or a one-key
+    /// object (`{greater_than: arg}`, ...) for every named operator. This is
+    /// the only place sendra-tui encodes the operator convention — it never
+    /// reimplements what a value *means*, only how to spell it, and
+    /// `Assertions::evaluate` is what actually interprets it afterward.
+    pub(super) fn wrap(self, arg: serde_json::Value) -> serde_json::Value {
+        match self {
+            JsonOperator::Equals => arg,
+            JsonOperator::GreaterThan => serde_json::json!({ "greater_than": arg }),
+            JsonOperator::GreaterThanOrEqual => {
+                serde_json::json!({ "greater_than_or_equal": arg })
+            }
+            JsonOperator::LessThan => serde_json::json!({ "less_than": arg }),
+            JsonOperator::LessThanOrEqual => serde_json::json!({ "less_than_or_equal": arg }),
+            JsonOperator::Contains => serde_json::json!({ "contains": arg }),
+            JsonOperator::Length => serde_json::json!({ "length": arg }),
+            JsonOperator::Matches => serde_json::json!({ "matches": arg }),
+        }
+    }
+
+    /// The exact reverse of [`Self::wrap`] — a best-effort *display* guess at
+    /// which operator an already-parsed `json:` value was written with, so
+    /// `EditState::new` can preload the edit UI from a real request. Mirrors
+    /// (but does not call — that function is private to sendra-core) the
+    /// same single-key-object shape `JsonSpec::parse` recognises; whichever
+    /// operator this guesses, `Self::wrap` is what actually gets saved, and
+    /// `Assertions::evaluate` — never this function — is what decides what
+    /// the saved value means once the request runs.
+    pub(super) fn detect(value: &serde_json::Value) -> (Self, serde_json::Value) {
+        if let serde_json::Value::Object(map) = value {
+            if map.len() == 1 {
+                for (operator, key) in [
+                    (JsonOperator::GreaterThan, "greater_than"),
+                    (JsonOperator::GreaterThanOrEqual, "greater_than_or_equal"),
+                    (JsonOperator::LessThan, "less_than"),
+                    (JsonOperator::LessThanOrEqual, "less_than_or_equal"),
+                    (JsonOperator::Contains, "contains"),
+                    (JsonOperator::Length, "length"),
+                    (JsonOperator::Matches, "matches"),
+                ] {
+                    if let Some(arg) = map.get(key) {
+                        return (operator, arg.clone());
+                    }
+                }
+            }
+        }
+        (JsonOperator::Equals, value.clone())
+    }
+}
+
+/// One row of a `json:` path assertion: a JSON path, an operator (see
+/// [`JsonOperator`]), the operator's argument as typed, and whether this row
+/// is asserted plain or negated. Mirrors [`HeaderRow`]'s role for
+/// `Request::headers` — a working copy of one entry in a real map, seeded
+/// from it and converted back to it — except the destination is
+/// `Assertions::json`/`NotAssertions::json` rather than a single map, since
+/// a row's `negate` flag decides which of the two it belongs in (see
+/// `EditState::to_assertions`).
+///
+/// **Scoping decision for this issue.** `sendra_core::Assertions` is not one
+/// homogeneous list — it is seven different kinds of check (`status`,
+/// `status_in`, `headers`, `body_contains`, `body_matches`,
+/// `elapsed_ms_under`, `json`), each its own field, plus a `not:` wrapper
+/// duplicating the same seven for negation. Only `json:` (JSON-path +
+/// operator + expected value) is genuinely list-shaped the way
+/// `Request::headers` is — the other six are singular optional values, each
+/// of which would need its own single-field editor in the shape of
+/// `AuthEdit`'s Bearer/Basic fields, and `not:` would double every one of
+/// them again. This issue's row-based add/edit/delete UI covers `json:`
+/// (and, through each row's `negate` flag, `not: {json: {...}}`) end to
+/// end; `status`/`status_in`/`headers`/`body_contains`/`body_matches`/
+/// `elapsed_ms_under`, and every other kind under `not:`, are left
+/// completely untouched by this editor (see `EditState::to_assertions`,
+/// which round-trips them from the original request verbatim) — an honest
+/// gap to revisit as its own issue, not a silent one: nothing here claims to
+/// offer editing for them, the same "say what isn't covered, in the pane
+/// itself" bar `BodyEdit`'s `body_file`/`form`/`multipart` note and
+/// `AuthEdit`'s OAuth note already set.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AssertionRow {
+    pub path: TextField,
+    pub operator: JsonOperator,
+    pub value: TextField,
+    pub negate: bool,
+    /// `Some(message)` whenever `value`'s current text does not parse as
+    /// YAML (and so has no `serde_json::Value` equivalent) — recomputed on
+    /// every keystroke that touches `value`, the same live-validation
+    /// `method_error` already gets (see `update::edit_mutate`). This is the
+    /// same thing `Assertions::json`'s own `Deserialize` would reject a file
+    /// for — a value with no JSON equivalent is a parse error there too, not
+    /// a new, stricter rule invented here — so `Message::SaveEdit` refuses
+    /// to save while any row has this set, the same way it refuses over a
+    /// bad `method`. Unlike a `json:` value's *operator-argument* type (a
+    /// `greater_than` against a string, say), which sendra-core only checks
+    /// once the response actually arrives and so is never rejected here —
+    /// see `AssertionRow::to_json_value`.
+    pub value_error: Option<String>,
+}
+
+impl AssertionRow {
+    /// Visible to `EditState::new`, which seeds one of these per entry in
+    /// the real request's `assertions.json`/`assertions.not.json`.
+    /// `negate` says which of the two `value` came from — `false` for
+    /// `assertions.json`, `true` for `assertions.not.json`.
+    fn from_existing(path: &str, value: &serde_json::Value, negate: bool) -> Self {
+        let (operator, arg) = JsonOperator::detect(value);
+        let text = match &arg {
+            // Displayed without the surrounding quotes a `to_string` would
+            // add, so re-editing a string value shows the same plain text a
+            // person would have typed in the file (`ada`, not `"ada"`) —
+            // still exactly what `to_json_value` parses back out, since bare
+            // YAML text is a string.
+            serde_json::Value::String(s) => s.clone(),
+            other => serde_json::to_string(other).unwrap_or_default(),
+        };
+        Self {
+            path: TextField::new(path),
+            operator,
+            value: TextField::new(text),
+            negate,
+            // Built from a value that already parsed successfully out of a
+            // real, loaded request — there is nothing to reject.
+            value_error: None,
+        }
+    }
+
+    /// This row's `value`, parsed as YAML (the same JSON-value grammar
+    /// `Assertions::json`'s own `Deserialize` holds every expected value to
+    /// — see `Self::value_error`), wrapped in whichever operator shape
+    /// [`JsonOperator::wrap`] builds. `Err` is exactly
+    /// [`Self::value_error`]'s own message; recomputing it here rather than
+    /// trusting a possibly-stale field is what lets `EditState::to_assertions`
+    /// call this directly without also having to check `value_error` first.
+    fn to_json_value(&self) -> Result<serde_json::Value, String> {
+        let arg = validate_assertion_value_text(self.value.value())?;
+        Ok(self.operator.wrap(arg))
+    }
+}
+
+/// Whether `text` parses as YAML — and so has a `serde_json::Value`
+/// equivalent — the same grammar `Assertions::json`'s own `Deserialize`
+/// holds every expected value to when a request file is loaded (see the
+/// module docs on `sendra_core::assertions`). Reused here, not
+/// reimplemented more strictly or more loosely, so a value this UI accepts
+/// is exactly one a hand-written YAML file would also have accepted.
+///
+/// Visible to `super::update`, which calls this on every keystroke that
+/// touches an assertion row's value field and again at save time — the same
+/// two call sites `validate_method_text` already has.
+pub(super) fn validate_assertion_value_text(text: &str) -> Result<serde_json::Value, String> {
+    serde_yaml::from_str::<serde_json::Value>(text)
+        .map_err(|err| format!("'{text}' is not valid YAML: {err}"))
+}
+
 /// The state of an in-progress edit of the selected request: `method` and
 /// `url` as working copies (`TextField`s) separate from the request itself.
 /// `Message::SaveEdit` copies them back into the loaded document (see
@@ -752,6 +1036,11 @@ pub struct EditState {
     /// edit — see `AuthEdit`'s own doc comment for what is and isn't
     /// editable.
     pub auth: AuthEdit,
+    /// Working copies of the request's `json:` path assertions (and, via
+    /// each row's `negate` flag, its `not: {json: {...}}` ones) — see
+    /// `AssertionRow`'s own doc comment for exactly what this does and does
+    /// not cover of `sendra_core::Assertions`.
+    pub assertions: Vec<AssertionRow>,
     pub focus: EditField,
     /// `Some(message)` whenever `method`'s current text does not parse as a
     /// real `sendra_core::Method` — recomputed on every keystroke that
@@ -788,6 +1077,29 @@ impl EditState {
             .iter()
             .map(|(name, value)| HeaderRow::new(name.clone(), value.clone()))
             .collect();
+        let assertions = request
+            .assertions
+            .as_ref()
+            .map(|assertions| {
+                // `json:` rows first, in path order (a `BTreeMap`'s own
+                // iteration order), then `not: {json: {...}}` rows the same
+                // way — a fixed, deterministic order rather than one that
+                // depends on how the map happened to be built.
+                let mut rows: Vec<AssertionRow> = assertions
+                    .json
+                    .iter()
+                    .map(|(path, value)| AssertionRow::from_existing(path, value, false))
+                    .collect();
+                if let Some(not) = &assertions.not {
+                    rows.extend(
+                        not.json
+                            .iter()
+                            .map(|(path, value)| AssertionRow::from_existing(path, value, true)),
+                    );
+                }
+                rows
+            })
+            .unwrap_or_default();
         Self {
             dirty: false,
             method,
@@ -795,6 +1107,7 @@ impl EditState {
             headers,
             body: BodyEdit::new(request),
             auth: AuthEdit::new(request.auth.as_ref()),
+            assertions,
             focus: EditField::default(),
             method_error,
             body_error: None,
@@ -820,6 +1133,9 @@ impl EditState {
                 ),
             },
             EditField::Auth(field) => self.auth.text_field_mut(field),
+            EditField::AssertionPath(index) => Some(&mut self.assertions[index].path),
+            EditField::AssertionValue(index) => Some(&mut self.assertions[index].value),
+            EditField::AssertionOperator(_) | EditField::AssertionNegate(_) => None,
         }
     }
 
@@ -840,13 +1156,61 @@ impl EditState {
     pub(super) fn delete_focused_header_row(&mut self) {
         let index = match self.focus {
             EditField::HeaderKey(index) | EditField::HeaderValue(index) => index,
-            EditField::Method | EditField::Url | EditField::Body | EditField::Auth(_) => return,
+            EditField::Method
+            | EditField::Url
+            | EditField::Body
+            | EditField::Auth(_)
+            | EditField::AssertionPath(_)
+            | EditField::AssertionOperator(_)
+            | EditField::AssertionValue(_)
+            | EditField::AssertionNegate(_) => return,
         };
         self.headers.remove(index);
         self.focus = if self.headers.is_empty() {
             EditField::Url
         } else {
             EditField::HeaderKey(index.saturating_sub(1).min(self.headers.len() - 1))
+        };
+    }
+
+    /// Appends a new, empty assertion row at the end and moves focus
+    /// straight to its path field — visible to `super::update`'s
+    /// `Message::AddAssertionRow` arm. Mirrors `add_header_row` exactly.
+    pub(super) fn add_assertion_row(&mut self) {
+        self.assertions.push(AssertionRow::default());
+        self.focus = EditField::AssertionPath(self.assertions.len() - 1);
+    }
+
+    /// Removes whichever assertion row `focus` currently points at — a
+    /// no-op when focus is not on an assertion row at all. Focus afterward
+    /// never dangles on a removed row: it moves to the previous row's path
+    /// (or, if the deleted row was the first one, the new first row's
+    /// path), or to whatever field would ordinarily precede the assertions
+    /// section if none remain (see `EditField::before_assertions`). Mirrors
+    /// `delete_focused_header_row` exactly. Visible to `super::update`'s
+    /// `Message::DeleteAssertionRow` arm.
+    pub(super) fn delete_focused_assertion_row(&mut self) {
+        let index = match self.focus {
+            EditField::AssertionPath(index)
+            | EditField::AssertionOperator(index)
+            | EditField::AssertionValue(index)
+            | EditField::AssertionNegate(index) => index,
+            EditField::Method
+            | EditField::Url
+            | EditField::HeaderKey(_)
+            | EditField::HeaderValue(_)
+            | EditField::Body
+            | EditField::Auth(_) => return,
+        };
+        self.assertions.remove(index);
+        self.focus = if self.assertions.is_empty() {
+            EditField::before_assertions(
+                self.headers.len(),
+                self.has_editable_body(),
+                self.auth_field_order(),
+            )
+        } else {
+            EditField::AssertionPath(index.saturating_sub(1).min(self.assertions.len() - 1))
         };
     }
 
@@ -866,29 +1230,56 @@ impl EditState {
         self.auth.field_order()
     }
 
-    /// Toggles the fixed-enum auth sub-field focus currently points at
-    /// (`api_key.in`/`oauth.grant_type`), if any — a no-op returning `false`
-    /// whenever focus is not on one of those two fields. Visible to
-    /// `super::update::edit_move_or_toggle`.
-    pub(super) fn toggle_focused_auth_field(&mut self) -> bool {
+    /// How many assertion rows `EditField::next`/`prev` should cycle
+    /// through right now — visible to `super::update`'s
+    /// `Message::EditFocusNext`/`EditFocusPrev` arms and to
+    /// `render_edit_pane`.
+    pub(super) fn assertion_row_count(&self) -> usize {
+        self.assertions.len()
+    }
+
+    /// Toggles whichever fixed-enum sub-field focus currently points at —
+    /// an auth sub-field (`api_key.in`/`oauth.grant_type`, via
+    /// `AuthEdit::toggle`, always a plain flip regardless of `forward`) or
+    /// an assertion row's `operator` (cycled forward/backward through
+    /// [`JsonOperator::next`]/[`JsonOperator::prev`]) or `negate` (a plain
+    /// flip, like the auth sub-fields). A no-op returning `false` whenever
+    /// focus is on none of these — every other field is a `TextField` with
+    /// a real cursor to move instead. Visible to
+    /// `super::update::edit_move_or_toggle`, which calls this before
+    /// falling back to ordinary cursor movement.
+    pub(super) fn toggle_focused(&mut self, forward: bool) -> bool {
         match self.focus {
             EditField::Auth(field) => self.auth.toggle(field),
+            EditField::AssertionOperator(index) => {
+                let row = &mut self.assertions[index];
+                row.operator = if forward {
+                    row.operator.next()
+                } else {
+                    row.operator.prev()
+                };
+                true
+            }
+            EditField::AssertionNegate(index) => {
+                self.assertions[index].negate = !self.assertions[index].negate;
+                true
+            }
             _ => false,
         }
     }
 
     /// Builds a full candidate `Request` reflecting every field this edit
-    /// session might change (`method`/`url`/`headers`/`auth`), layered onto
-    /// `base`'s other fields verbatim. This is what `render_edit_pane`'s live
-    /// "resolved auth" preview resolves against, via the exact same
-    /// `Environment::apply`/`Request::resolve_auth` pipeline
-    /// `Message::SaveEdit` and the read-only (non-editing) preview already
-    /// use — so a mid-edit preview of "what auth would actually be sent" is
-    /// provably correct, reusing sendra-core's own resolution, rather than a
-    /// second, hand-rolled formatting of `AuthEdit`. An invalid `method`
-    /// leaves `base`'s own method in the candidate, the same "don't guess"
-    /// rule `Message::SaveEdit` already follows for a method it refuses to
-    /// save.
+    /// session might change (`method`/`url`/`headers`/`auth`/`assertions`),
+    /// layered onto `base`'s other fields verbatim. This is what
+    /// `render_edit_pane`'s live "resolved auth" preview resolves against,
+    /// via the exact same `Environment::apply`/`Request::resolve_auth`
+    /// pipeline `Message::SaveEdit` and the read-only (non-editing) preview
+    /// already use — so a mid-edit preview of "what auth would actually be
+    /// sent" is provably correct, reusing sendra-core's own resolution,
+    /// rather than a second, hand-rolled formatting of `AuthEdit`. An
+    /// invalid `method` leaves `base`'s own method in the candidate, the
+    /// same "don't guess" rule `Message::SaveEdit` already follows for a
+    /// method it refuses to save.
     pub(super) fn to_request(&self, base: &Request) -> Request {
         let mut request = base.clone();
         if let Ok(method) = validate_method_text(self.method.value()) {
@@ -901,7 +1292,63 @@ impl EditState {
             .map(|row| (row.key.value().to_string(), row.value.value().to_string()))
             .collect();
         request.auth = self.auth.to_auth();
+        request.assertions = self.to_assertions(base.assertions.as_ref());
         request
+    }
+
+    /// Reassembles `self.assertions`'s rows back into a real
+    /// `sendra_core::Assertions`, layered onto `base` (the request's
+    /// original assertions block, before this edit session) the same way
+    /// `to_request` layers `method`/`url`/`headers`/`auth` onto a real
+    /// `Request`: every field this editor does not offer —
+    /// `status`/`status_in`/`headers`/`body_contains`/`body_matches`/
+    /// `elapsed_ms_under`, and the same six again under `not:` — is carried
+    /// over from `base` completely untouched (see `AssertionRow`'s own doc
+    /// comment for why those are out of scope here). Only `json` and
+    /// `not.json` are replaced, built fresh from the rows: a row whose
+    /// `negate` is `false` goes into `json`, `true` goes into `not.json`,
+    /// keyed by its `path` — a later row with the same path as an earlier
+    /// one overwrites it, the same last-one-wins rule a hand-written YAML
+    /// file with a duplicate mapping key would already get from `serde_yaml`.
+    /// A row whose `value` fails to parse (see `AssertionRow::value_error`)
+    /// is skipped rather than saved malformed; `Message::SaveEdit` already
+    /// refuses to reach this at all while any row has one, so this is a
+    /// last-resort guard against a stale invariant, not the primary check.
+    ///
+    /// Returns `None` when the result would assert nothing at all — an
+    /// edit session that deleted every row from a request that had no other
+    /// assertion kind set either must not leave behind an empty, pointless
+    /// `assertions: {}` block.
+    pub(super) fn to_assertions(&self, base: Option<&Assertions>) -> Option<Assertions> {
+        let mut assertions = base.cloned().unwrap_or_default();
+        let mut positive = BTreeMap::new();
+        let mut negated = BTreeMap::new();
+        for row in &self.assertions {
+            if let Ok(value) = row.to_json_value() {
+                let path = row.path.value().to_string();
+                if row.negate {
+                    negated.insert(path, value);
+                } else {
+                    positive.insert(path, value);
+                }
+            }
+        }
+        assertions.json = positive;
+        match &mut assertions.not {
+            Some(not) => not.json = negated,
+            None if !negated.is_empty() => {
+                assertions.not = Some(NotAssertions {
+                    json: negated,
+                    ..NotAssertions::default()
+                });
+            }
+            None => {}
+        }
+        if assertions.is_empty() {
+            None
+        } else {
+            Some(assertions)
+        }
     }
 }
 
@@ -976,14 +1423,24 @@ pub struct AppState {
     /// changed request-list selection both reset it, in `update` and
     /// `select` respectively.
     pub response_scroll: usize,
-    /// Whether captured values are shown in the clear rather than masked —
-    /// `Message::ToggleRevealCaptures`, bound to `c`. Starts `false` (masked)
-    /// every time, is never written anywhere but this in-memory field, and is
-    /// reset back to `false` on the same two events that reset `run_state`
-    /// (a fresh `RunRequested`, a changed request-list selection) — see the
-    /// doc comment on `render_capture_section` for why "never persisted,
-    /// never auto-revealed on the next run" means resetting it there too,
-    /// not only at process start.
+    /// Whether captured values, and (see `view::format_resolved_request`)
+    /// auth-derived header/query values in the read-only request preview,
+    /// are shown in the clear rather than masked — `Message::
+    /// ToggleRevealCaptures`, bound to `c`. One flag for both, not a second
+    /// toggle: both are the same "sensitive value a screen-share or a
+    /// terminal recording shouldn't casually expose while just browsing"
+    /// concern, and a user who has already asked to see one kind of secret
+    /// this session is not asking to keep the other hidden. Never affects
+    /// edit mode, where auth values are always shown in the clear regardless
+    /// — editing them is the whole point there, and there is nothing to
+    /// browse-and-forget about a value you are actively typing. Starts
+    /// `false` (masked) every time, is never written anywhere but this
+    /// in-memory field, and is reset back to `false` on the same two events
+    /// that reset `run_state` (a fresh `RunRequested`, a changed
+    /// request-list selection) — see the doc comment on
+    /// `format_capture_section` for why "never persisted, never
+    /// auto-revealed on the next run" means resetting it there too, not only
+    /// at process start.
     pub reveal_captures: bool,
     /// `Some(EditState)` while the request at `selected` (in
     /// `LoadState::Loaded`) is being edited, `None` while merely browsing.
@@ -1112,9 +1569,11 @@ pub enum Message {
     /// clamp every other scroll value already goes through, so this needs
     /// no separate "what's the last valid position" calculation here.
     ScrollResponseBottom,
-    /// `c`: flips `reveal_captures`. Masked values become visible, visible
-    /// values become masked again — a toggle rather than a one-way reveal,
-    /// so hiding them again does not need a second, differently-named key.
+    /// `c`: flips `reveal_captures`. Masked values — captured values and,
+    /// while merely browsing, auth-derived header/query values in the
+    /// request preview — become visible, visible values become masked
+    /// again — a toggle rather than a one-way reveal, so hiding them again
+    /// does not need a second, differently-named key.
     ToggleRevealCaptures,
     /// Enters edit mode for the currently selected request — see
     /// `AppState::edit_mode`. A no-op (see [`super::update::update`]) unless a request is
@@ -1151,6 +1610,17 @@ pub enum Message {
     /// `EditState::delete_focused_header_row` for where focus lands
     /// afterward.
     DeleteHeaderRow,
+    /// A keybinding while editing (`Ctrl+A`, not a plain character): appends
+    /// a new, empty assertion row and focuses its path — see
+    /// `EditState::add_assertion_row`. A separate binding from
+    /// `AddHeaderRow`'s `Ctrl+N`, since both can be reachable in the same
+    /// edit session.
+    AddAssertionRow,
+    /// A keybinding while editing (`Ctrl+X`): removes whichever assertion
+    /// row is currently focused, a no-op everywhere else — see
+    /// `EditState::delete_focused_assertion_row` for where focus lands
+    /// afterward.
+    DeleteAssertionRow,
     /// An ordinary printable character typed into whichever field is
     /// currently focused — inserted at the cursor via `TextField::insert_char`.
     EditInsertChar(char),
@@ -1160,9 +1630,14 @@ pub enum Message {
     /// `Delete` on the focused field: deletes the character under the
     /// cursor.
     EditDelete,
-    /// `Left` on the focused field: moves the cursor back one character.
+    /// `Left` on the focused field: ordinarily moves the cursor back one
+    /// character, but on a fixed-enum sub-field (an auth sub-field, or an
+    /// assertion row's operator/negate flag) toggles it backward instead —
+    /// see `EditState::toggle_focused`/`super::update::edit_move_or_toggle`.
     EditCursorLeft,
-    /// `Right` on the focused field: moves the cursor forward one character.
+    /// `Right` on the focused field: the mirror of `EditCursorLeft` — moves
+    /// the cursor forward one character, or toggles a fixed-enum sub-field
+    /// forward.
     EditCursorRight,
     /// `Up`, only bound while the body field is focused (see
     /// `main::translate_event`) — every other field is single-line, where
@@ -1416,89 +1891,139 @@ mod tests {
 
     #[test]
     fn edit_field_next_alternates_between_method_and_url_with_no_headers_or_body() {
-        assert_eq!(EditField::Method.next(0, false, &[]), EditField::Url);
-        assert_eq!(EditField::Url.next(0, false, &[]), EditField::Method);
+        assert_eq!(EditField::Method.next(0, false, &[], 0), EditField::Url);
+        assert_eq!(EditField::Url.next(0, false, &[], 0), EditField::Method);
     }
 
     #[test]
     fn edit_field_next_walks_through_header_rows_in_order() {
-        assert_eq!(EditField::Url.next(2, false, &[]), EditField::HeaderKey(0));
         assert_eq!(
-            EditField::HeaderKey(0).next(2, false, &[]),
+            EditField::Url.next(2, false, &[], 0),
+            EditField::HeaderKey(0)
+        );
+        assert_eq!(
+            EditField::HeaderKey(0).next(2, false, &[], 0),
             EditField::HeaderValue(0)
         );
         assert_eq!(
-            EditField::HeaderValue(0).next(2, false, &[]),
+            EditField::HeaderValue(0).next(2, false, &[], 0),
             EditField::HeaderKey(1)
         );
         assert_eq!(
-            EditField::HeaderKey(1).next(2, false, &[]),
+            EditField::HeaderKey(1).next(2, false, &[], 0),
             EditField::HeaderValue(1)
         );
         assert_eq!(
-            EditField::HeaderValue(1).next(2, false, &[]),
+            EditField::HeaderValue(1).next(2, false, &[], 0),
             EditField::Method,
-            "with no body or auth field, the last header row's value wraps back to Method"
+            "with no body, auth or assertion field, the last header row's value wraps back to Method"
         );
     }
 
     #[test]
-    fn edit_field_next_visits_body_before_auth() {
-        assert_eq!(EditField::Url.next(0, true, &[]), EditField::Body);
+    fn edit_field_next_visits_body_before_auth_before_assertions() {
+        assert_eq!(EditField::Url.next(0, true, &[], 0), EditField::Body);
         assert_eq!(
-            EditField::HeaderValue(1).next(2, true, &[]),
+            EditField::HeaderValue(1).next(2, true, &[], 0),
             EditField::Body,
             "the last header row's value must move into Body when the body is editable"
         );
         assert_eq!(
-            EditField::Body.next(2, true, &[]),
+            EditField::Body.next(2, true, &[], 0),
             EditField::Method,
-            "Body wraps back to Method when there is no auth field"
+            "Body wraps back to Method when there is no auth or assertion field"
         );
         assert_eq!(
-            EditField::Body.next(2, true, &[AuthField::BearerToken]),
+            EditField::Body.next(2, true, &[AuthField::BearerToken], 0),
             EditField::Auth(AuthField::BearerToken),
             "Body moves into Auth when there is one"
+        );
+        assert_eq!(
+            EditField::Body.next(2, true, &[], 3),
+            EditField::AssertionPath(0),
+            "Body moves into the first assertion row when there is no auth but there are \
+             assertion rows"
         );
     }
 
     #[test]
     fn edit_field_next_skips_body_entirely_when_unsupported() {
         assert_eq!(
-            EditField::Url.next(0, false, &[]),
+            EditField::Url.next(0, false, &[], 0),
             EditField::Method,
-            "with no headers, no editable body and no auth, Url wraps straight back to Method"
+            "with no headers, no editable body, no auth and no assertions, Url wraps straight \
+             back to Method"
         );
         assert_eq!(
-            EditField::HeaderValue(1).next(2, false, &[]),
+            EditField::HeaderValue(1).next(2, false, &[], 0),
             EditField::Method
         );
     }
 
     #[test]
-    fn edit_field_next_walks_through_auth_fields_and_wraps_to_method() {
+    fn edit_field_next_walks_through_auth_fields_then_into_assertions() {
         let auth_fields = [
             AuthField::ApiKeyName,
             AuthField::ApiKeyValue,
             AuthField::ApiKeyLocation,
         ];
         assert_eq!(
-            EditField::Url.next(0, false, &auth_fields),
+            EditField::Url.next(0, false, &auth_fields, 0),
             EditField::Auth(AuthField::ApiKeyName),
             "with no headers/body, Url moves straight into the first auth field"
         );
         assert_eq!(
-            EditField::Auth(AuthField::ApiKeyName).next(0, false, &auth_fields),
+            EditField::Auth(AuthField::ApiKeyName).next(0, false, &auth_fields, 0),
             EditField::Auth(AuthField::ApiKeyValue)
         );
         assert_eq!(
-            EditField::Auth(AuthField::ApiKeyValue).next(0, false, &auth_fields),
+            EditField::Auth(AuthField::ApiKeyValue).next(0, false, &auth_fields, 0),
             EditField::Auth(AuthField::ApiKeyLocation)
         );
         assert_eq!(
-            EditField::Auth(AuthField::ApiKeyLocation).next(0, false, &auth_fields),
+            EditField::Auth(AuthField::ApiKeyLocation).next(0, false, &auth_fields, 0),
             EditField::Method,
-            "the last auth field wraps back to Method"
+            "the last auth field wraps back to Method when there are no assertion rows"
+        );
+        assert_eq!(
+            EditField::Auth(AuthField::ApiKeyLocation).next(0, false, &auth_fields, 2),
+            EditField::AssertionPath(0),
+            "the last auth field moves into the first assertion row when there are any"
+        );
+    }
+
+    #[test]
+    fn edit_field_next_walks_through_one_assertion_rows_four_sub_fields_and_wraps_to_method() {
+        assert_eq!(
+            EditField::AssertionPath(0).next(0, false, &[], 1),
+            EditField::AssertionOperator(0)
+        );
+        assert_eq!(
+            EditField::AssertionOperator(0).next(0, false, &[], 1),
+            EditField::AssertionValue(0)
+        );
+        assert_eq!(
+            EditField::AssertionValue(0).next(0, false, &[], 1),
+            EditField::AssertionNegate(0)
+        );
+        assert_eq!(
+            EditField::AssertionNegate(0).next(0, false, &[], 1),
+            EditField::Method,
+            "the only assertion row's negate flag wraps back to Method"
+        );
+    }
+
+    #[test]
+    fn edit_field_next_moves_from_one_assertion_row_into_the_next() {
+        assert_eq!(
+            EditField::AssertionNegate(0).next(0, false, &[], 2),
+            EditField::AssertionPath(1),
+            "the first row's negate flag moves into the second row's path"
+        );
+        assert_eq!(
+            EditField::AssertionNegate(1).next(0, false, &[], 2),
+            EditField::Method,
+            "the last row's negate flag wraps back to Method"
         );
     }
 
@@ -1517,40 +2042,46 @@ mod tests {
         for header_count in [0, 1, 3] {
             for has_body in [false, true] {
                 for auth_fields in auth_layouts {
-                    let mut every_field = vec![EditField::Method, EditField::Url];
-                    for index in 0..header_count {
-                        every_field.push(EditField::HeaderKey(index));
-                        every_field.push(EditField::HeaderValue(index));
-                    }
-                    if has_body {
-                        every_field.push(EditField::Body);
-                    }
-                    for &field in auth_fields {
-                        every_field.push(EditField::Auth(field));
-                    }
-                    for field in every_field {
-                        assert_eq!(
-                            field.next(header_count, has_body, auth_fields).prev(
-                                header_count,
-                                has_body,
-                                auth_fields
-                            ),
-                            field,
-                            "prev must exactly undo next for {field:?} \
-                             (header_count={header_count}, has_body={has_body}, \
-                             auth_fields={auth_fields:?})"
-                        );
-                        assert_eq!(
-                            field.prev(header_count, has_body, auth_fields).next(
-                                header_count,
-                                has_body,
-                                auth_fields
-                            ),
-                            field,
-                            "next must exactly undo prev for {field:?} \
-                             (header_count={header_count}, has_body={has_body}, \
-                             auth_fields={auth_fields:?})"
-                        );
+                    for assertion_row_count in [0, 1, 2] {
+                        let mut every_field = vec![EditField::Method, EditField::Url];
+                        for index in 0..header_count {
+                            every_field.push(EditField::HeaderKey(index));
+                            every_field.push(EditField::HeaderValue(index));
+                        }
+                        if has_body {
+                            every_field.push(EditField::Body);
+                        }
+                        for &field in auth_fields {
+                            every_field.push(EditField::Auth(field));
+                        }
+                        for index in 0..assertion_row_count {
+                            every_field.push(EditField::AssertionPath(index));
+                            every_field.push(EditField::AssertionOperator(index));
+                            every_field.push(EditField::AssertionValue(index));
+                            every_field.push(EditField::AssertionNegate(index));
+                        }
+                        for field in every_field {
+                            assert_eq!(
+                                field
+                                    .next(header_count, has_body, auth_fields, assertion_row_count)
+                                    .prev(header_count, has_body, auth_fields, assertion_row_count),
+                                field,
+                                "prev must exactly undo next for {field:?} \
+                                 (header_count={header_count}, has_body={has_body}, \
+                                 auth_fields={auth_fields:?}, \
+                                 assertion_row_count={assertion_row_count})"
+                            );
+                            assert_eq!(
+                                field
+                                    .prev(header_count, has_body, auth_fields, assertion_row_count)
+                                    .next(header_count, has_body, auth_fields, assertion_row_count),
+                                field,
+                                "next must exactly undo prev for {field:?} \
+                                 (header_count={header_count}, has_body={has_body}, \
+                                 auth_fields={auth_fields:?}, \
+                                 assertion_row_count={assertion_row_count})"
+                            );
+                        }
                     }
                 }
             }
@@ -1558,29 +2089,37 @@ mod tests {
     }
 
     #[test]
-    fn edit_field_prev_from_method_prefers_auth_over_body_and_headers() {
+    fn edit_field_prev_from_method_prefers_assertions_over_auth_body_and_headers() {
         assert_eq!(
-            EditField::Method.prev(2, true, &[AuthField::BearerToken]),
+            EditField::Method.prev(2, true, &[AuthField::BearerToken], 2),
+            EditField::AssertionNegate(1)
+        );
+    }
+
+    #[test]
+    fn edit_field_prev_from_method_prefers_auth_over_body_and_headers_with_no_assertions() {
+        assert_eq!(
+            EditField::Method.prev(2, true, &[AuthField::BearerToken], 0),
             EditField::Auth(AuthField::BearerToken)
         );
     }
 
     #[test]
-    fn edit_field_prev_from_method_prefers_body_over_headers_with_no_auth() {
-        assert_eq!(EditField::Method.prev(2, true, &[]), EditField::Body);
+    fn edit_field_prev_from_method_prefers_body_over_headers_with_no_auth_or_assertions() {
+        assert_eq!(EditField::Method.prev(2, true, &[], 0), EditField::Body);
     }
 
     #[test]
-    fn edit_field_prev_from_method_wraps_to_the_last_header_value_with_no_body_or_auth() {
+    fn edit_field_prev_from_method_wraps_to_the_last_header_value_with_nothing_else() {
         assert_eq!(
-            EditField::Method.prev(2, false, &[]),
+            EditField::Method.prev(2, false, &[], 0),
             EditField::HeaderValue(1)
         );
     }
 
     #[test]
-    fn edit_field_prev_from_method_wraps_to_url_with_no_headers_body_or_auth() {
-        assert_eq!(EditField::Method.prev(0, false, &[]), EditField::Url);
+    fn edit_field_prev_from_method_wraps_to_url_with_nothing_at_all() {
+        assert_eq!(EditField::Method.prev(0, false, &[], 0), EditField::Url);
     }
 
     // --- EditState: headers -----------------------------------------------
@@ -1943,7 +2482,7 @@ mod tests {
         let mut edit = EditState::new(&request);
         edit.focus = EditField::Auth(AuthField::ApiKeyLocation);
 
-        assert!(edit.toggle_focused_auth_field());
+        assert!(edit.toggle_focused(true));
 
         let auth = edit.auth.to_auth().expect("api_key auth must round-trip");
         let api_key = auth.api_key.expect("api_key must still be set");
@@ -1982,14 +2521,14 @@ mod tests {
         let mut edit = EditState::new(&request);
         edit.focus = EditField::Auth(AuthField::OAuthGrantType);
 
-        assert!(edit.toggle_focused_auth_field());
+        assert!(edit.toggle_focused(true));
         let auth = edit.auth.to_auth().unwrap();
         assert_eq!(
             auth.oauth.as_ref().unwrap().grant_type,
             OAuthGrantType::Password
         );
 
-        assert!(edit.toggle_focused_auth_field());
+        assert!(edit.toggle_focused(true));
         let auth = edit.auth.to_auth().unwrap();
         assert_eq!(
             auth.oauth.as_ref().unwrap().grant_type,
@@ -1998,13 +2537,13 @@ mod tests {
     }
 
     #[test]
-    fn toggle_focused_auth_field_is_a_no_op_off_a_toggle_field() {
+    fn toggle_focused_is_a_no_op_off_a_toggle_field() {
         let request = request_with_auth("  bearer: secret-token\n");
         let mut edit = EditState::new(&request);
         edit.focus = EditField::Auth(AuthField::BearerToken);
 
         assert!(
-            !edit.toggle_focused_auth_field(),
+            !edit.toggle_focused(true),
             "a plain text auth field has nothing to toggle"
         );
     }
@@ -2069,6 +2608,358 @@ mod tests {
         let candidate = edit.to_request(&request);
 
         assert_eq!(candidate.auth, None);
+    }
+
+    // --- Assertion editing --------------------------------------------------
+
+    fn request_with_assertions(assertions_yaml: &str) -> Request {
+        let yaml = format!("method: GET\nurl: https://example.com\nassertions:\n{assertions_yaml}");
+        Request::from_yaml_str(&yaml).expect("valid test request")
+    }
+
+    // --- JsonOperator ---
+
+    #[test]
+    fn json_operator_next_cycles_through_every_variant_and_wraps() {
+        let mut op = JsonOperator::Equals;
+        let mut seen = vec![op];
+        for _ in 0..7 {
+            op = op.next();
+            seen.push(op);
+        }
+        assert_eq!(op.next(), JsonOperator::Equals, "must wrap back to Equals");
+        assert_eq!(
+            seen,
+            vec![
+                JsonOperator::Equals,
+                JsonOperator::GreaterThan,
+                JsonOperator::GreaterThanOrEqual,
+                JsonOperator::LessThan,
+                JsonOperator::LessThanOrEqual,
+                JsonOperator::Contains,
+                JsonOperator::Length,
+                JsonOperator::Matches,
+            ]
+        );
+    }
+
+    #[test]
+    fn json_operator_prev_is_the_exact_inverse_of_next() {
+        for op in JsonOperator::ALL {
+            assert_eq!(op.next().prev(), op);
+            assert_eq!(op.prev().next(), op);
+        }
+    }
+
+    #[test]
+    fn json_operator_wrap_and_detect_round_trip_every_operator() {
+        let arg = serde_json::json!(5);
+        for op in JsonOperator::ALL {
+            let wrapped = op.wrap(arg.clone());
+            let (detected, detected_arg) = JsonOperator::detect(&wrapped);
+            assert_eq!(detected, op, "wrap/detect must round-trip for {op:?}");
+            assert_eq!(detected_arg, arg);
+        }
+    }
+
+    #[test]
+    fn json_operator_detect_reads_a_multi_key_object_as_equals() {
+        // The documented disambiguation rule: only a single-key mapping with
+        // a recognised key is an operator; anything else, including a
+        // two-key object that happens to use an operator name, is equality.
+        let value = serde_json::json!({"greater_than": 5, "less_than": 1});
+        let (operator, arg) = JsonOperator::detect(&value);
+        assert_eq!(operator, JsonOperator::Equals);
+        assert_eq!(arg, value);
+    }
+
+    // --- AssertionRow / EditState::new seeding ---
+
+    #[test]
+    fn edit_state_new_is_empty_for_a_request_with_no_assertions() {
+        let edit = EditState::new(&request_from(""));
+        assert!(edit.assertions.is_empty());
+        assert_eq!(edit.assertion_row_count(), 0);
+    }
+
+    #[test]
+    fn edit_state_new_seeds_a_bare_equality_json_assertion() {
+        let request = request_with_assertions("  json:\n    $.user.id: 42\n");
+        let edit = EditState::new(&request);
+
+        assert_eq!(edit.assertions.len(), 1);
+        let row = &edit.assertions[0];
+        assert_eq!(row.path.value(), "$.user.id");
+        assert_eq!(row.operator, JsonOperator::Equals);
+        assert_eq!(row.value.value(), "42");
+        assert!(!row.negate);
+        assert_eq!(row.value_error, None);
+    }
+
+    #[test]
+    fn edit_state_new_seeds_a_string_equality_value_without_quotes() {
+        let request = request_with_assertions("  json:\n    $.user.name: ada\n");
+        let edit = EditState::new(&request);
+        assert_eq!(edit.assertions[0].value.value(), "ada");
+    }
+
+    #[test]
+    fn edit_state_new_seeds_an_operator_assertion_with_its_argument() {
+        let request = request_with_assertions("  json:\n    $.count: {greater_than: 5}\n");
+        let edit = EditState::new(&request);
+
+        let row = &edit.assertions[0];
+        assert_eq!(row.path.value(), "$.count");
+        assert_eq!(row.operator, JsonOperator::GreaterThan);
+        assert_eq!(row.value.value(), "5");
+    }
+
+    #[test]
+    fn edit_state_new_seeds_both_json_and_not_json_rows_json_first() {
+        let request =
+            request_with_assertions("  json:\n    $.a: 1\n  not:\n    json:\n      $.b: 2\n");
+        let edit = EditState::new(&request);
+
+        assert_eq!(edit.assertions.len(), 2);
+        assert_eq!(edit.assertions[0].path.value(), "$.a");
+        assert!(!edit.assertions[0].negate);
+        assert_eq!(edit.assertions[1].path.value(), "$.b");
+        assert!(
+            edit.assertions[1].negate,
+            "the not: json entry must be marked negated"
+        );
+    }
+
+    // --- add / delete rows ---
+
+    #[test]
+    fn add_assertion_row_appends_an_empty_row_and_focuses_its_path() {
+        let mut edit = EditState::new(&request_from(""));
+
+        edit.add_assertion_row();
+
+        assert_eq!(edit.assertions.len(), 1);
+        assert_eq!(edit.assertions[0].path.value(), "");
+        assert_eq!(edit.assertions[0].operator, JsonOperator::Equals);
+        assert_eq!(edit.focus, EditField::AssertionPath(0));
+    }
+
+    #[test]
+    fn delete_focused_assertion_row_removes_it_and_focuses_the_previous_rows_path() {
+        let request = request_with_assertions("  json:\n    $.a: 1\n    $.b: 2\n    $.c: 3\n");
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::AssertionValue(1); // $.b
+
+        edit.delete_focused_assertion_row();
+
+        assert_eq!(edit.assertions.len(), 2);
+        assert_eq!(edit.assertions[0].path.value(), "$.a");
+        assert_eq!(edit.assertions[1].path.value(), "$.c");
+        assert_eq!(edit.focus, EditField::AssertionPath(0));
+    }
+
+    #[test]
+    fn delete_focused_assertion_row_with_only_one_row_left_falls_back_before_assertions() {
+        let request = request_with_assertions("  json:\n    $.a: 1\n");
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::AssertionPath(0);
+
+        edit.delete_focused_assertion_row();
+
+        assert!(edit.assertions.is_empty());
+        assert_eq!(
+            edit.focus,
+            EditField::Body,
+            "a request with no body: at all still gets an empty editable Body field, so focus \
+             lands there rather than on Url"
+        );
+    }
+
+    #[test]
+    fn delete_focused_assertion_row_is_a_no_op_when_focus_is_elsewhere() {
+        let request = request_with_assertions("  json:\n    $.a: 1\n");
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::Method;
+
+        edit.delete_focused_assertion_row();
+
+        assert_eq!(edit.assertions.len(), 1, "nothing should be deleted");
+        assert_eq!(edit.focus, EditField::Method);
+    }
+
+    // --- value validation ---
+
+    #[test]
+    fn validate_assertion_value_text_accepts_ordinary_yaml_scalars_and_collections() {
+        assert!(validate_assertion_value_text("42").is_ok());
+        assert!(validate_assertion_value_text("ada").is_ok());
+        assert!(validate_assertion_value_text("[a, b]").is_ok());
+        assert!(
+            validate_assertion_value_text("").is_ok(),
+            "blank parses as null"
+        );
+    }
+
+    #[test]
+    fn validate_assertion_value_text_rejects_malformed_yaml() {
+        assert!(validate_assertion_value_text("[a, b").is_err());
+    }
+
+    #[test]
+    fn toggling_the_operator_recomputes_nothing_but_the_row_and_cycles_both_directions() {
+        let mut edit = EditState::new(&request_with_assertions("  json:\n    $.a: 1\n"));
+        edit.focus = EditField::AssertionOperator(0);
+
+        assert!(edit.toggle_focused(true));
+        assert_eq!(edit.assertions[0].operator, JsonOperator::GreaterThan);
+
+        assert!(edit.toggle_focused(false));
+        assert_eq!(edit.assertions[0].operator, JsonOperator::Equals);
+    }
+
+    #[test]
+    fn toggling_negate_flips_the_flag_regardless_of_direction() {
+        let mut edit = EditState::new(&request_with_assertions("  json:\n    $.a: 1\n"));
+        edit.focus = EditField::AssertionNegate(0);
+
+        assert!(edit.toggle_focused(true));
+        assert!(edit.assertions[0].negate);
+
+        assert!(edit.toggle_focused(false));
+        assert!(!edit.assertions[0].negate);
+    }
+
+    // --- to_assertions round-trip ---
+
+    #[test]
+    fn to_assertions_saves_an_added_row_into_json() {
+        let request = request_from("");
+        let mut edit = EditState::new(&request);
+        edit.add_assertion_row();
+        edit.assertions[0].path = TextField::new("$.status");
+        edit.assertions[0].value = TextField::new("ok");
+
+        let assertions = edit
+            .to_assertions(request.assertions.as_ref())
+            .expect("a real assertion was added");
+
+        assert_eq!(
+            assertions.json.get("$.status"),
+            Some(&serde_json::json!("ok"))
+        );
+        assert!(assertions.not.is_none());
+    }
+
+    #[test]
+    fn to_assertions_saves_a_negated_row_into_not_json() {
+        let request = request_from("");
+        let mut edit = EditState::new(&request);
+        edit.add_assertion_row();
+        edit.assertions[0].path = TextField::new("$.status");
+        edit.assertions[0].value = TextField::new("error");
+        edit.assertions[0].negate = true;
+
+        let assertions = edit
+            .to_assertions(request.assertions.as_ref())
+            .expect("a real assertion was added");
+
+        assert!(assertions.json.is_empty());
+        assert_eq!(
+            assertions.not.unwrap().json.get("$.status"),
+            Some(&serde_json::json!("error"))
+        );
+    }
+
+    #[test]
+    fn to_assertions_saves_an_operator_row_in_the_real_one_key_object_shape() {
+        let request = request_from("");
+        let mut edit = EditState::new(&request);
+        edit.add_assertion_row();
+        edit.assertions[0].path = TextField::new("$.count");
+        edit.assertions[0].operator = JsonOperator::GreaterThanOrEqual;
+        edit.assertions[0].value = TextField::new("10");
+
+        let assertions = edit.to_assertions(request.assertions.as_ref()).unwrap();
+
+        assert_eq!(
+            assertions.json.get("$.count"),
+            Some(&serde_json::json!({"greater_than_or_equal": 10}))
+        );
+    }
+
+    #[test]
+    fn to_assertions_editing_an_existing_row_replaces_its_value() {
+        let request = request_with_assertions("  json:\n    $.a: 1\n");
+        let mut edit = EditState::new(&request);
+        edit.assertions[0].value = TextField::new("2");
+
+        let assertions = edit.to_assertions(request.assertions.as_ref()).unwrap();
+
+        assert_eq!(assertions.json.get("$.a"), Some(&serde_json::json!(2)));
+    }
+
+    #[test]
+    fn to_assertions_deleting_the_only_row_returns_none_when_nothing_else_is_set() {
+        let request = request_with_assertions("  json:\n    $.a: 1\n");
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::AssertionPath(0);
+        edit.delete_focused_assertion_row();
+
+        let assertions = edit.to_assertions(request.assertions.as_ref());
+
+        assert_eq!(
+            assertions, None,
+            "an assertions: {{}} block must not be invented"
+        );
+    }
+
+    #[test]
+    fn to_assertions_preserves_every_other_assertion_kind_untouched() {
+        // The scoping contract: status/status_in/headers/body_contains/
+        // body_matches/elapsed_ms_under, and everything under `not:` besides
+        // `json`, are not offered by this editor and must round-trip
+        // completely unchanged.
+        let request = request_with_assertions(
+            "  status: 200\n  status_in: [200, 201]\n  headers:\n    accept: text/plain\n  \
+             body_contains: ok\n  body_matches: 'ok$'\n  elapsed_ms_under: 500\n  json:\n    \
+             $.a: 1\n  not:\n    status: 404\n    body_contains: error\n    json:\n      $.b: 2\n",
+        );
+        let mut edit = EditState::new(&request);
+        // Edit the one thing this editor does offer, to prove the rest
+        // survives a real save, not just an untouched no-op.
+        edit.assertions[0].value = TextField::new("2");
+
+        let assertions = edit
+            .to_assertions(request.assertions.as_ref())
+            .expect("still has plenty set");
+
+        let original = request.assertions.as_ref().unwrap();
+        assert_eq!(assertions.status, original.status);
+        assert_eq!(assertions.status_in, original.status_in);
+        assert_eq!(assertions.headers, original.headers);
+        assert_eq!(assertions.body_contains, original.body_contains);
+        assert_eq!(assertions.body_matches, original.body_matches);
+        assert_eq!(assertions.elapsed_ms_under, original.elapsed_ms_under);
+        let not = assertions.not.as_ref().unwrap();
+        let original_not = original.not.as_ref().unwrap();
+        assert_eq!(not.status, original_not.status);
+        assert_eq!(not.body_contains, original_not.body_contains);
+        // Only this one changed.
+        assert_eq!(assertions.json.get("$.a"), Some(&serde_json::json!(2)));
+    }
+
+    #[test]
+    fn to_request_carries_edited_assertions_into_a_candidate_request() {
+        let request = request_with_assertions("  json:\n    $.a: 1\n");
+        let mut edit = EditState::new(&request);
+        edit.assertions[0].value = TextField::new("2");
+
+        let candidate = edit.to_request(&request);
+
+        assert_eq!(
+            candidate.assertions.unwrap().json.get("$.a"),
+            Some(&serde_json::json!(2))
+        );
     }
 
     // --- Method validation ----------------------------------------------------
