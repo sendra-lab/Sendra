@@ -202,7 +202,19 @@ fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// line" only while the body field specifically has focus (see
 /// `app::EditField::Body`) — every other edit-mode field is single-line, so
 /// those keys stay meaningless there exactly as they always have been.
+// One independent boolean per modal this crate can have open, in priority
+// order — deliberately flat rather than bundled into a struct: every one of
+// these is read straight off `AppState` right before the call (see `run`'s
+// own call site) and this function's whole reason to exist is being a pure,
+// unit-testable mapping with no `AppState` of its own to read from (see this
+// function's own doc comment on `translate_event`'s testability). Bundling
+// them would trade this lint for a second, parallel definition of "which
+// modal is open" that every call site would have to keep in sync with
+// `AppState` by hand instead of just reading the fields directly.
+#[allow(clippy::too_many_arguments)]
 fn next_message(
+    open_collection_prompt_open: bool,
+    close_confirm_open: bool,
     overlay_open: bool,
     environment_edit_open: bool,
     env_var_delete_pending: bool,
@@ -216,6 +228,8 @@ fn next_message(
 
     Ok(translate_event(
         event::read()?,
+        open_collection_prompt_open,
+        close_confirm_open,
         overlay_open,
         environment_edit_open,
         env_var_delete_pending,
@@ -235,8 +249,11 @@ fn next_message(
 /// `Message::Quit` so that whatever `main::run`/`restore_terminal` do for
 /// one, they provably do for the other — not two independently-written quit
 /// paths that could quietly drift apart.
+#[allow(clippy::too_many_arguments)]
 fn translate_event(
     event: Event,
+    open_collection_prompt_open: bool,
+    close_confirm_open: bool,
     overlay_open: bool,
     environment_edit_open: bool,
     env_var_delete_pending: bool,
@@ -250,20 +267,54 @@ fn translate_event(
             let is_ctrl_c =
                 key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
             // Bare `q` quits everywhere *except* while editing: edit mode's
-            // text fields (a request's own, or an environment's variable
-            // name/value rows) can hold a method, URL or value that is
-            // entirely likely to contain the letter `q` (`?query=...`) —
-            // quitting the whole app on that keystroke would make such a
-            // value unable to be typed at all. Ctrl+C stays a quit key
-            // everywhere, editing included: it is never a character a text
-            // field would otherwise accept (crossterm reports it as
-            // `Char('c')` plus the control modifier, not plain text input),
-            // and leaving *some* always-on quit key matters for a clean
-            // exit.
+            // text fields (a request's own, an environment's variable
+            // name/value rows, or the open-collection prompt's own path) can
+            // hold a method, URL, value or path that is entirely likely to
+            // contain the letter `q` (`?query=...`, a directory literally
+            // named `q`) — quitting the whole app on that keystroke would
+            // make such a value unable to be typed at all. Ctrl+C stays a
+            // quit key everywhere, editing included: it is never a
+            // character a text field would otherwise accept (crossterm
+            // reports it as `Char('c')` plus the control modifier, not
+            // plain text input), and leaving *some* always-on quit key
+            // matters for a clean exit.
             let is_quit = is_ctrl_c
-                || (key.code == KeyCode::Char('q') && !edit_mode_open && !environment_edit_open);
+                || (key.code == KeyCode::Char('q')
+                    && !edit_mode_open
+                    && !environment_edit_open
+                    && !open_collection_prompt_open);
             if is_quit {
                 return Message::Quit;
+            }
+
+            // The two process-wide modals — the open-collection prompt and a
+            // pending tab-close confirmation — take over the whole screen,
+            // so their own keys are checked before anything else, including
+            // the environment overlay's own nested modals below: whichever
+            // one is open is unconditionally what has the user's attention.
+            // `update()`'s own guard already refuses to open one while the
+            // other (or any session-scoped modal) is active, so at most one
+            // of these two branches is ever live at a time in practice.
+            if close_confirm_open {
+                return match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') => Message::CancelCloseCollection,
+                    KeyCode::Enter | KeyCode::Char('y') => Message::ConfirmCloseCollection,
+                    _ => Message::Tick,
+                };
+            }
+            if open_collection_prompt_open {
+                return match key.code {
+                    KeyCode::Esc => Message::CancelOpenCollectionPrompt,
+                    KeyCode::Enter => Message::ConfirmOpenCollectionPath,
+                    KeyCode::Backspace => Message::EditBackspace,
+                    KeyCode::Delete => Message::EditDelete,
+                    KeyCode::Left => Message::EditCursorLeft,
+                    KeyCode::Right => Message::EditCursorRight,
+                    KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::EditInsertChar(ch)
+                    }
+                    _ => Message::Tick,
+                };
             }
 
             // The pending-row-delete confirmation inside an environment-
@@ -421,6 +472,12 @@ fn translate_event(
                 KeyCode::Char('i') => Message::EnterEditMode,
                 KeyCode::Char('n') => Message::AddRequest,
                 KeyCode::Char('d') => Message::RequestDelete,
+                KeyCode::Char('o') => Message::OpenCollectionPrompt,
+                KeyCode::Char(']') => Message::NextCollection,
+                KeyCode::Char('[') => Message::PreviousCollection,
+                KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Message::CloseCollectionRequested
+                }
                 KeyCode::Down | KeyCode::Char('j') => Message::SelectNext,
                 KeyCode::Up | KeyCode::Char('k') => Message::SelectPrevious,
                 KeyCode::Enter | KeyCode::Char('r') => Message::RunRequested,
@@ -496,6 +553,8 @@ fn run(
         }
 
         let msg = next_message(
+            state.open_collection_prompt.is_some(),
+            state.close_confirm.is_some(),
             state.environment_overlay.is_some(),
             state.environment_edit.is_some(),
             state
@@ -506,6 +565,34 @@ fn run(
             state.edit_mode.is_some(),
             state.body_focused(),
         )?;
+        // `Message::ConfirmOpenCollectionPath` is never handed to `update()`
+        // as-is — see that variant's own doc comment on why the reducer
+        // itself must stay free of file I/O. Here, right before the message
+        // would otherwise flow into `update()`, the typed path is read back
+        // out of `state.open_collection_prompt` and resolved through the
+        // exact same `Document::from_path` + `base_dir` + `load_environments`
+        // calls `main()` already uses for the very first collection — reused,
+        // not duplicated — and the *result* replaces the message.
+        let msg = if matches!(msg, Message::ConfirmOpenCollectionPath) {
+            match &state.open_collection_prompt {
+                Some(prompt) => {
+                    let path = PathBuf::from(prompt.path.value());
+                    let base_dir = base_dir(&path).to_path_buf();
+                    let result = Document::from_path(&path);
+                    let (environments, environment_errors) = load_environments(&base_dir);
+                    Message::CollectionOpened {
+                        base_dir,
+                        path,
+                        result: Box::new(result),
+                        environments,
+                        environment_errors,
+                    }
+                }
+                None => msg,
+            }
+        } else {
+            msg
+        };
         let is_run_request = matches!(msg, Message::RunRequested);
         let was_already_running = matches!(state.run_state, RunState::InFlight);
         update(&mut state, msg);
@@ -519,9 +606,21 @@ fn run(
             if let (RunState::InFlight, Some((request, environment, base_dir))) =
                 (&state.run_state, selected_run(&state))
             {
+                // Captured now, not read back out of `state` when the result
+                // arrives: by then the user may have switched, opened, or
+                // closed tabs, so `state.active_collection` could name a
+                // completely different session. Tagging the outgoing
+                // `RunCompleted` with the id of the session that actually
+                // requested this run is what lets `update()` route the
+                // result back to the right tab regardless — see that
+                // variant's own doc comment.
+                let collection_id = state.active().id;
                 let tx = run_tx.clone();
                 run_request::spawn(request, environment, base_dir, move |result| {
-                    let _ = tx.send(Message::RunCompleted(result));
+                    let _ = tx.send(Message::RunCompleted {
+                        collection_id,
+                        outcome: result,
+                    });
                 });
             }
         }
@@ -620,9 +719,13 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             false,
@@ -642,6 +745,8 @@ mod tests {
         // re-introduce that gap from the translation side.
         let from_q = translate_event(
             press(KeyCode::Char('q')),
+            false,
+            false,
             true,
             false,
             false,
@@ -651,6 +756,8 @@ mod tests {
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            false,
             true,
             false,
             false,
@@ -672,6 +779,8 @@ mod tests {
         let from_q = translate_event(
             press(KeyCode::Char('q')),
             false,
+            false,
+            false,
             true,
             false,
             false,
@@ -680,6 +789,8 @@ mod tests {
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             true,
             false,
@@ -702,12 +813,16 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
             true,
             false,
             false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             false,
@@ -733,11 +848,15 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
             true,
             false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             false,
@@ -763,6 +882,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
 
         assert!(!matches!(message, Message::Quit));
@@ -776,6 +897,8 @@ mod tests {
                 KeyModifiers::NONE,
                 KeyEventKind::Release,
             )),
+            false,
+            false,
             false,
             false,
             false,
@@ -800,6 +923,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
 
         assert!(matches!(message, Message::Resize));
@@ -809,9 +934,21 @@ mod tests {
 
     #[test]
     fn esc_cancels_edit_and_ctrl_s_saves_it_while_editing() {
-        let cancel = translate_event(press(KeyCode::Esc), false, false, false, false, true, false);
+        let cancel = translate_event(
+            press(KeyCode::Esc),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
         let save = translate_event(
             press_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             false,
@@ -836,7 +973,17 @@ mod tests {
         // this is exactly the case where those keys must stay meaningless,
         // covered separately (with `body_focused: true`) below.
         for code in [KeyCode::Down, KeyCode::Up, KeyCode::Enter] {
-            let message = translate_event(press(code), false, false, false, false, true, false);
+            let message = translate_event(
+                press(code),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+            );
             assert!(
                 matches!(message, Message::Tick),
                 "expected {code:?} to be a no-op while editing outside the body field, \
@@ -858,6 +1005,8 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
+                false,
                 true,
                 false,
             );
@@ -871,12 +1020,24 @@ mod tests {
     #[test]
     fn edit_mode_text_input_keys_translate_correctly() {
         assert!(matches!(
-            translate_event(press(KeyCode::Tab), false, false, false, false, true, false),
+            translate_event(
+                press(KeyCode::Tab),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false
+            ),
             Message::EditFocusNext
         ));
         assert!(matches!(
             translate_event(
                 press(KeyCode::BackTab),
+                false,
+                false,
                 false,
                 false,
                 false,
@@ -893,6 +1054,8 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
+                false,
                 true,
                 false
             ),
@@ -901,6 +1064,8 @@ mod tests {
         assert!(matches!(
             translate_event(
                 press(KeyCode::Delete),
+                false,
+                false,
                 false,
                 false,
                 false,
@@ -917,6 +1082,8 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
+                false,
                 true,
                 false
             ),
@@ -925,6 +1092,8 @@ mod tests {
         assert!(matches!(
             translate_event(
                 press(KeyCode::Right),
+                false,
+                false,
                 false,
                 false,
                 false,
@@ -945,17 +1114,39 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
+                false,
                 true,
                 true
             ),
             Message::EditInsertChar('\n')
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::Up), false, false, false, false, true, true),
+            translate_event(
+                press(KeyCode::Up),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true
+            ),
             Message::EditCursorUp
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::Down), false, false, false, false, true, true),
+            translate_event(
+                press(KeyCode::Down),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true
+            ),
             Message::EditCursorDown
         ));
     }
@@ -968,11 +1159,15 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
             true,
             false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             false,
@@ -993,11 +1188,15 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
             true,
             false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             false,
@@ -1018,11 +1217,15 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
             true,
             false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             false,
@@ -1049,6 +1252,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
             true,
             false,
         );
@@ -1059,6 +1264,8 @@ mod tests {
     fn i_enters_edit_mode_outside_the_overlay_and_outside_edit_mode() {
         let message = translate_event(
             press(KeyCode::Char('i')),
+            false,
+            false,
             false,
             false,
             false,
@@ -1079,6 +1286,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         assert!(matches!(message, Message::AddRequest));
     }
@@ -1087,6 +1296,8 @@ mod tests {
     fn d_requests_delete_outside_the_overlay_and_outside_edit_mode() {
         let message = translate_event(
             press(KeyCode::Char('d')),
+            false,
+            false,
             false,
             false,
             false,
@@ -1102,14 +1313,34 @@ mod tests {
     #[test]
     fn delete_confirm_prompt_confirms_on_y_or_enter_and_cancels_on_n_or_esc() {
         for code in [KeyCode::Char('y'), KeyCode::Enter] {
-            let message = translate_event(press(code), false, false, false, true, false, false);
+            let message = translate_event(
+                press(code),
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+            );
             assert!(
                 matches!(message, Message::ConfirmDelete),
                 "expected {code:?} to confirm the pending delete, got {message:?}"
             );
         }
         for code in [KeyCode::Char('n'), KeyCode::Esc] {
-            let message = translate_event(press(code), false, false, false, true, false, false);
+            let message = translate_event(
+                press(code),
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+            );
             assert!(
                 matches!(message, Message::CancelDelete),
                 "expected {code:?} to cancel the pending delete, got {message:?}"
@@ -1120,7 +1351,17 @@ mod tests {
     #[test]
     fn other_keys_do_nothing_while_the_delete_confirm_prompt_is_open() {
         for code in [KeyCode::Down, KeyCode::Up, KeyCode::Char('r')] {
-            let message = translate_event(press(code), false, false, false, true, false, false);
+            let message = translate_event(
+                press(code),
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+            );
             assert!(
                 matches!(message, Message::Tick),
                 "expected {code:?} to be a no-op while the delete confirm prompt is open, \
@@ -1135,6 +1376,8 @@ mod tests {
     fn i_opens_an_environment_variable_edit_session_from_the_overlay() {
         let message = translate_event(
             press(KeyCode::Char('i')),
+            false,
+            false,
             true,
             false,
             false,
@@ -1147,9 +1390,21 @@ mod tests {
 
     #[test]
     fn esc_cancels_and_ctrl_s_saves_an_environment_variable_edit_session() {
-        let cancel = translate_event(press(KeyCode::Esc), false, true, false, false, false, false);
+        let cancel = translate_event(
+            press(KeyCode::Esc),
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
         let save = translate_event(
             press_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             true,
             false,
@@ -1167,6 +1422,8 @@ mod tests {
         let add = translate_event(
             press_with(KeyCode::Char('n'), KeyModifiers::CONTROL),
             false,
+            false,
+            false,
             true,
             false,
             false,
@@ -1175,6 +1432,8 @@ mod tests {
         );
         let delete = translate_event(
             press_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             true,
             false,
@@ -1190,12 +1449,24 @@ mod tests {
     #[test]
     fn text_input_keys_translate_correctly_while_editing_environment_variables() {
         assert!(matches!(
-            translate_event(press(KeyCode::Tab), false, true, false, false, false, false),
+            translate_event(
+                press(KeyCode::Tab),
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false
+            ),
             Message::EditFocusNext
         ));
         assert!(matches!(
             translate_event(
                 press(KeyCode::BackTab),
+                false,
+                false,
                 false,
                 true,
                 false,
@@ -1209,6 +1480,8 @@ mod tests {
             translate_event(
                 press(KeyCode::Backspace),
                 false,
+                false,
+                false,
                 true,
                 false,
                 false,
@@ -1221,6 +1494,8 @@ mod tests {
             translate_event(
                 press(KeyCode::Delete),
                 false,
+                false,
+                false,
                 true,
                 false,
                 false,
@@ -1232,6 +1507,8 @@ mod tests {
         assert!(matches!(
             translate_event(
                 press(KeyCode::Char('x')),
+                false,
+                false,
                 false,
                 true,
                 false,
@@ -1248,6 +1525,8 @@ mod tests {
         let from_q = translate_event(
             press(KeyCode::Char('q')),
             false,
+            false,
+            false,
             true,
             false,
             false,
@@ -1256,6 +1535,8 @@ mod tests {
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             true,
             false,
@@ -1270,14 +1551,34 @@ mod tests {
     #[test]
     fn env_var_delete_confirm_confirms_on_y_or_enter_and_cancels_on_n_or_esc() {
         for code in [KeyCode::Char('y'), KeyCode::Enter] {
-            let message = translate_event(press(code), false, true, true, false, false, false);
+            let message = translate_event(
+                press(code),
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            );
             assert!(
                 matches!(message, Message::ConfirmDeleteEnvVarRow),
                 "expected {code:?} to confirm the pending row delete, got {message:?}"
             );
         }
         for code in [KeyCode::Char('n'), KeyCode::Esc] {
-            let message = translate_event(press(code), false, true, true, false, false, false);
+            let message = translate_event(
+                press(code),
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            );
             assert!(
                 matches!(message, Message::CancelDeleteEnvVarRow),
                 "expected {code:?} to cancel the pending row delete, got {message:?}"
@@ -1291,7 +1592,17 @@ mod tests {
         // typed into the still-focused row's field once the confirmation
         // has already claimed those keys.
         for code in [KeyCode::Down, KeyCode::Char('x')] {
-            let message = translate_event(press(code), false, true, true, false, false, false);
+            let message = translate_event(
+                press(code),
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+            );
             assert!(
                 matches!(message, Message::Tick),
                 "expected {code:?} to be a no-op while the row-delete confirm is open, \
