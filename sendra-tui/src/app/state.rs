@@ -214,6 +214,193 @@ impl HeaderRow {
     }
 }
 
+/// Which half of which row currently has focus while editing an
+/// environment's variables — the same "row index plus which side" shape
+/// `EditField::HeaderKey`/`HeaderValue` already have for a request's
+/// headers, pulled out on its own rather than folded into `EditField`
+/// itself: an environment-variable edit session is a sibling of a request
+/// edit session (see [`EnvironmentEditState`]'s own doc comment), not a mode
+/// layered inside the same one, so it needs no other field of `EditField`'s
+/// and gains nothing from sharing that type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvVarField {
+    Name(usize),
+    Value(usize),
+}
+
+/// The state of an in-progress edit of one environment's variables, opened
+/// from the environment overlay (`Message::EnterEnvironmentEdit`) rather
+/// than from the collection browser. A sibling of [`EditState`], not a
+/// variant of it: a request's fields and an environment's variables are
+/// edited through disjoint UI (the detail pane vs. the overlay), opened and
+/// closed by entirely disjoint messages, and `update()`'s own guards already
+/// keep the environment overlay and edit mode mutually exclusive (opening
+/// one is refused while the other is active) — so the two states can never
+/// even coexist, let alone need to share a representation.
+///
+/// Like [`EditState`], nothing here touches `AppState::environments` until
+/// `Message::SaveEnvironmentEdit` actually writes it back — `rows` is a
+/// working copy, seeded once by `new` from the real
+/// `Environment::variables`, so `Message::CancelEnvironmentEdit` dropping
+/// this whole struct is a full, provable no-op no matter what was typed, the
+/// exact same guarantee `EditState`'s own doc comment makes for
+/// `Message::CancelEdit`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvironmentEditState {
+    /// Index into `AppState::environments` this session is editing — fixed
+    /// for the life of the session. `Message::SaveEnvironmentEdit` writes
+    /// back into `AppState::environments[index]`, never a different one, no
+    /// matter what `AppState::environment_overlay`'s own cursor does in the
+    /// meantime (it cannot move at all while this session is open — see
+    /// `update()`'s own guard).
+    pub index: usize,
+    /// Working copies of the environment's variables, seeded in the same
+    /// order `Environment::variables` (a `BTreeMap`) already iterates —
+    /// sorted by name. Reuses [`HeaderRow`] rather than a second hand-rolled
+    /// name/value row type: a variable row is exactly the same shape a
+    /// request's header row already is.
+    pub rows: Vec<HeaderRow>,
+    /// Which row (and which half of it) has focus — `None` only when `rows`
+    /// is empty, since there is then nothing to focus at all. This is the
+    /// zero-variables case this issue's own investigation covers: an
+    /// environment can genuinely have no variables (see this module's own
+    /// `Environment` doc comment on why that is not an error), and this
+    /// type has to represent "editing an environment with nothing in it yet"
+    /// cleanly rather than pretend a row exists to focus.
+    pub focus: Option<EnvVarField>,
+    /// `Some(index)` into `rows` while a delete confirmation is pending for
+    /// that row — the actual removal happens only on
+    /// `Message::ConfirmDeleteEnvVarRow`; `Message::CancelDeleteEnvVarRow`
+    /// (or starting any other row action) drops this without touching
+    /// `rows` at all. A minimal, single-purpose confirmation, the same scope
+    /// note `AppState::delete_confirm` already makes for deleting a whole
+    /// request: a unified confirmation shared by every destructive action in
+    /// this batch is a later, separate concern.
+    pub pending_delete: Option<usize>,
+    /// `Some(message)` right after `Message::SaveEnvironmentEdit` refused to
+    /// save — either live validation (an empty or duplicated variable name —
+    /// see `update::validate_env_var_rows`) or a real failure writing to
+    /// disk. Mirrors `EditState::save_error` exactly: the session stays open
+    /// with this set so the typed changes are never lost, only blocked.
+    pub save_error: Option<String>,
+}
+
+impl EnvironmentEditState {
+    /// Visible to `super::update`'s `Message::EnterEnvironmentEdit` arm,
+    /// the only place outside this module allowed to start one of these.
+    pub(super) fn new(index: usize, environment: &Environment) -> Self {
+        let rows: Vec<HeaderRow> = environment
+            .variables
+            .iter()
+            .map(|(name, value)| HeaderRow::new(name.clone(), value.clone()))
+            .collect();
+        let focus = if rows.is_empty() {
+            None
+        } else {
+            Some(EnvVarField::Name(0))
+        };
+        Self {
+            index,
+            rows,
+            focus,
+            pending_delete: None,
+            save_error: None,
+        }
+    }
+
+    /// The focused `TextField`, or `None` when nothing is focused (`rows` is
+    /// empty). Visible to `super::update`'s dispatch for
+    /// `Message::EditInsertChar`/`EditBackspace`/`EditDelete`/
+    /// `EditCursorLeft`/`EditCursorRight` — the exact same generic
+    /// text-field messages a request edit session's own fields already use,
+    /// routed here instead of to `AppState::edit_mode` whenever that one is
+    /// `None` and this one is `Some` (the two are mutually exclusive — see
+    /// this type's own doc comment).
+    pub(super) fn focused_field_mut(&mut self) -> Option<&mut TextField> {
+        let row = match self.focus? {
+            EnvVarField::Name(index) => return self.rows.get_mut(index).map(|row| &mut row.key),
+            EnvVarField::Value(index) => index,
+        };
+        self.rows.get_mut(row).map(|row| &mut row.value)
+    }
+
+    /// `Tab`: name → value → next row's name, wrapping from the last row's
+    /// value back to the first row's name. A no-op when `rows` is empty.
+    pub(super) fn focus_next(&mut self) {
+        self.focus = match self.focus {
+            None => None,
+            Some(EnvVarField::Name(index)) => Some(EnvVarField::Value(index)),
+            Some(EnvVarField::Value(index)) => {
+                let next = index + 1;
+                Some(EnvVarField::Name(if next < self.rows.len() {
+                    next
+                } else {
+                    0
+                }))
+            }
+        };
+    }
+
+    /// The exact reverse of [`Self::focus_next`] — `Shift+Tab`.
+    pub(super) fn focus_prev(&mut self) {
+        self.focus = match self.focus {
+            None => None,
+            Some(EnvVarField::Name(0)) => {
+                Some(EnvVarField::Value(self.rows.len().saturating_sub(1)))
+            }
+            Some(EnvVarField::Name(index)) => Some(EnvVarField::Value(index - 1)),
+            Some(EnvVarField::Value(index)) => Some(EnvVarField::Name(index)),
+        };
+    }
+
+    /// Appends a new, empty row at the end and moves focus straight to its
+    /// name field — mirrors `EditState::add_header_row` exactly. Visible to
+    /// `super::update`'s `Message::AddEnvVarRow` arm.
+    pub(super) fn add_row(&mut self) {
+        self.rows.push(HeaderRow::default());
+        self.focus = Some(EnvVarField::Name(self.rows.len() - 1));
+    }
+
+    /// Marks whichever row `focus` currently points at pending deletion — a
+    /// no-op when nothing is focused. The actual removal is
+    /// [`Self::confirm_pending_delete`]; this only opens the confirmation.
+    /// Visible to `super::update`'s `Message::RequestDeleteEnvVarRow` arm.
+    pub(super) fn request_delete_focused(&mut self) {
+        let index = match self.focus {
+            Some(EnvVarField::Name(index) | EnvVarField::Value(index)) => index,
+            None => return,
+        };
+        self.pending_delete = Some(index);
+    }
+
+    /// Drops a pending deletion without removing anything — visible to
+    /// `super::update`'s `Message::CancelDeleteEnvVarRow` arm.
+    pub(super) fn cancel_pending_delete(&mut self) {
+        self.pending_delete = None;
+    }
+
+    /// Actually removes the row named by `pending_delete`, if any — visible
+    /// to `super::update`'s `Message::ConfirmDeleteEnvVarRow` arm. Focus
+    /// afterward never dangles on a removed row: it moves to the row that
+    /// slid into its place (or the new last row, if the deleted one was
+    /// last), or to `None` if no rows remain — the zero-variables state this
+    /// type's own `focus` doc comment describes.
+    pub(super) fn confirm_pending_delete(&mut self) {
+        let Some(index) = self.pending_delete.take() else {
+            return;
+        };
+        if index >= self.rows.len() {
+            return;
+        }
+        self.rows.remove(index);
+        self.focus = if self.rows.is_empty() {
+            None
+        } else {
+            Some(EnvVarField::Name(index.min(self.rows.len() - 1)))
+        };
+    }
+}
+
 /// Which auth sub-field currently has focus, when the selected request's
 /// `auth:` block is one this edit session can reach. Which of these are ever
 /// reachable at once depends entirely on which of `bearer`/`basic`/
@@ -1826,6 +2013,14 @@ pub struct AppState {
     /// confirmation used by every destructive action in this batch is a
     /// later, separate concern.
     pub delete_confirm: Option<DeleteConfirm>,
+    /// `Some(EnvironmentEditState)` while the environment overlay is showing
+    /// an in-progress edit of one environment's variables, `None` while the
+    /// overlay is merely browsing (or closed). See that type's own doc
+    /// comment for why it is a sibling of `edit_mode`, not layered inside
+    /// it. Entering and leaving flows through `Message::EnterEnvironmentEdit`/
+    /// `Message::SaveEnvironmentEdit`/`Message::CancelEnvironmentEdit`, the
+    /// same pattern every other editable state in this crate follows.
+    pub environment_edit: Option<EnvironmentEditState>,
 }
 
 /// What `Message::RequestDelete` opens and `Message::ConfirmDelete`/
@@ -2049,6 +2244,45 @@ pub enum Message {
     /// no-op" guarantee `Message::CancelEdit` already has for a pre-existing
     /// request's edit.
     CancelDelete,
+    /// `i` while the environment overlay is open: opens an edit session
+    /// (`AppState::environment_edit`) for whichever environment the
+    /// overlay's own cursor is currently pointed at. A no-op if an edit
+    /// session is already open or nothing is highlighted (no environments
+    /// found at all).
+    EnterEnvironmentEdit,
+    /// Ctrl+S while editing an environment's variables: validates the
+    /// working rows (see `update::validate_env_var_rows` — an empty or
+    /// duplicated name refuses the save the same way an invalid `method`
+    /// already does for a request), then writes them back to the
+    /// environment's own file via `Environment::save_to_path` and leaves the
+    /// edit session. A failed validation or a failed write leaves the
+    /// session open with `EnvironmentEditState::save_error` set, the same
+    /// "no-op that keeps you where you can retry" shape `Message::SaveEdit`
+    /// already has.
+    SaveEnvironmentEdit,
+    /// Esc while editing an environment's variables: discards the working
+    /// copy — nothing was ever written into `AppState::environments` before
+    /// this point, so there is nothing else to undo, the same as
+    /// `Message::CancelEdit` for a pre-existing request's edit.
+    CancelEnvironmentEdit,
+    /// Ctrl+N while editing an environment's variables: appends a new, empty
+    /// row and focuses its name field. Mirrors `Message::AddHeaderRow`, kept
+    /// as its own message rather than reused for both: the two operate on
+    /// entirely different working copies (`EditState::headers` vs.
+    /// `EnvironmentEditState::rows`), and conflating them would make one
+    /// physical key's meaning depend on which of two mutually-exclusive
+    /// modes happens to be open.
+    AddEnvVarRow,
+    /// Ctrl+D while editing an environment's variables: opens a minimal
+    /// confirmation (`EnvironmentEditState::pending_delete`) for whichever
+    /// row currently has focus — the actual removal is
+    /// `Message::ConfirmDeleteEnvVarRow`. A no-op when nothing is focused.
+    RequestDeleteEnvVarRow,
+    /// `y`/Enter on the pending-row-delete confirmation: removes the row.
+    ConfirmDeleteEnvVarRow,
+    /// `n`/Esc on the pending-row-delete confirmation: leaves the row
+    /// completely untouched.
+    CancelDeleteEnvVarRow,
     /// `Tab` while editing: moves focus to the next field in order (see
     /// `EditField::next`) — method, URL, then each header row's key and
     /// value in turn, wrapping back to method.

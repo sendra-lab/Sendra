@@ -204,6 +204,8 @@ fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// those keys stay meaningless there exactly as they always have been.
 fn next_message(
     overlay_open: bool,
+    environment_edit_open: bool,
+    env_var_delete_pending: bool,
     delete_confirm_open: bool,
     edit_mode_open: bool,
     body_focused: bool,
@@ -215,6 +217,8 @@ fn next_message(
     Ok(translate_event(
         event::read()?,
         overlay_open,
+        environment_edit_open,
+        env_var_delete_pending,
         delete_confirm_open,
         edit_mode_open,
         body_focused,
@@ -234,6 +238,8 @@ fn next_message(
 fn translate_event(
     event: Event,
     overlay_open: bool,
+    environment_edit_open: bool,
+    env_var_delete_pending: bool,
     delete_confirm_open: bool,
     edit_mode_open: bool,
     body_focused: bool,
@@ -244,17 +250,70 @@ fn translate_event(
             let is_ctrl_c =
                 key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
             // Bare `q` quits everywhere *except* while editing: edit mode's
-            // text fields can hold a method or URL that is entirely likely
-            // to contain the letter `q` (`?query=...`) — quitting the whole
-            // app on that keystroke would make such a URL unable to be
-            // typed at all. Ctrl+C stays a quit key everywhere, editing
-            // included: it is never a character a text field would
-            // otherwise accept (crossterm reports it as `Char('c')` plus
-            // the control modifier, not plain text input), and leaving
-            // *some* always-on quit key matters for a clean exit.
-            let is_quit = is_ctrl_c || (key.code == KeyCode::Char('q') && !edit_mode_open);
+            // text fields (a request's own, or an environment's variable
+            // name/value rows) can hold a method, URL or value that is
+            // entirely likely to contain the letter `q` (`?query=...`) —
+            // quitting the whole app on that keystroke would make such a
+            // value unable to be typed at all. Ctrl+C stays a quit key
+            // everywhere, editing included: it is never a character a text
+            // field would otherwise accept (crossterm reports it as
+            // `Char('c')` plus the control modifier, not plain text input),
+            // and leaving *some* always-on quit key matters for a clean
+            // exit.
+            let is_quit = is_ctrl_c
+                || (key.code == KeyCode::Char('q') && !edit_mode_open && !environment_edit_open);
             if is_quit {
                 return Message::Quit;
+            }
+
+            // The pending-row-delete confirmation inside an environment-
+            // variable edit session — the innermost of the three nested
+            // modal states an environment can be in (overlay → edit session
+            // → this), checked first for the same reason `delete_confirm_
+            // open` below is checked ahead of ordinary edit-mode keys: it is
+            // modal and drawn on top of everything else, including the
+            // variable-editing keymap it is nested inside.
+            if env_var_delete_pending {
+                return match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') => Message::CancelDeleteEnvVarRow,
+                    KeyCode::Enter | KeyCode::Char('y') => Message::ConfirmDeleteEnvVarRow,
+                    _ => Message::Tick,
+                };
+            }
+
+            // An environment-variable edit session's own key set — checked
+            // ahead of `overlay_open` below since this session only ever
+            // opens *from* the overlay (see `Message::EnterEnvironmentEdit`)
+            // and needs a completely different keymap (typing into a
+            // name/value field, row add/delete) than the overlay's own
+            // picker keys (`Enter`/arrows) mean while merely browsing.
+            if environment_edit_open {
+                return match key.code {
+                    KeyCode::Esc => Message::CancelEnvironmentEdit,
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::SaveEnvironmentEdit
+                    }
+                    KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::AddEnvVarRow
+                    }
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::RequestDeleteEnvVarRow
+                    }
+                    KeyCode::Tab => Message::EditFocusNext,
+                    KeyCode::BackTab => Message::EditFocusPrev,
+                    KeyCode::Backspace => Message::EditBackspace,
+                    KeyCode::Delete => Message::EditDelete,
+                    KeyCode::Left => Message::EditCursorLeft,
+                    KeyCode::Right => Message::EditCursorRight,
+                    // Any other control combination is not a character this
+                    // field should insert — the same guard edit mode's own
+                    // keymap uses for the same reason (see its own comment
+                    // below).
+                    KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::EditInsertChar(ch)
+                    }
+                    _ => Message::Tick,
+                };
             }
 
             if overlay_open {
@@ -263,6 +322,7 @@ fn translate_event(
                     KeyCode::Enter => Message::ConfirmEnvironmentSelection,
                     KeyCode::Down | KeyCode::Char('j') => Message::SelectNext,
                     KeyCode::Up | KeyCode::Char('k') => Message::SelectPrevious,
+                    KeyCode::Char('i') => Message::EnterEnvironmentEdit,
                     _ => Message::Tick,
                 };
             }
@@ -437,6 +497,11 @@ fn run(
 
         let msg = next_message(
             state.environment_overlay.is_some(),
+            state.environment_edit.is_some(),
+            state
+                .environment_edit
+                .as_ref()
+                .is_some_and(|env_edit| env_edit.pending_delete.is_some()),
             state.delete_confirm.is_some(),
             state.edit_mode.is_some(),
             state.body_focused(),
@@ -547,9 +612,19 @@ mod tests {
 
     #[test]
     fn q_and_ctrl_c_both_translate_to_the_identical_quit_message() {
-        let from_q = translate_event(press(KeyCode::Char('q')), false, false, false, false);
+        let from_q = translate_event(
+            press(KeyCode::Char('q')),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             false,
@@ -565,10 +640,20 @@ mod tests {
         // `update`'s InFlight guard exempts `Quit` specifically so it can
         // never be blocked (see its own doc comment); the overlay must not
         // re-introduce that gap from the translation side.
-        let from_q = translate_event(press(KeyCode::Char('q')), true, false, false, false);
+        let from_q = translate_event(
+            press(KeyCode::Char('q')),
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
             true,
+            false,
+            false,
             false,
             false,
             false,
@@ -579,13 +664,52 @@ mod tests {
     }
 
     #[test]
+    fn q_and_ctrl_c_quit_even_while_editing_an_environments_variables() {
+        // The same clean-exit guarantee as the environment overlay above,
+        // checked for the environment-variable edit session's own
+        // `environment_edit_open` branch — its text fields can just as
+        // easily hold a `q` as a request's method/URL can.
+        let from_q = translate_event(
+            press(KeyCode::Char('q')),
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        let from_ctrl_c = translate_event(
+            press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(matches!(from_q, Message::EditInsertChar('q')));
+        assert!(matches!(from_ctrl_c, Message::Quit));
+    }
+
+    #[test]
     fn q_and_ctrl_c_quit_even_while_the_delete_confirm_prompt_is_open() {
         // The same clean-exit guarantee as the environment overlay above,
         // checked for the delete confirmation prompt's own `delete_confirm_
         // open` branch.
-        let from_q = translate_event(press(KeyCode::Char('q')), false, true, false, false);
+        let from_q = translate_event(
+            press(KeyCode::Char('q')),
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             true,
             false,
@@ -603,9 +727,19 @@ mod tests {
         // must insert, not quit. Ctrl+C is unaffected: it is never a
         // character a text field would otherwise accept, so it stays the
         // one quit key that works everywhere, editing included.
-        let from_q = translate_event(press(KeyCode::Char('q')), false, false, true, false);
+        let from_q = translate_event(
+            press(KeyCode::Char('q')),
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             true,
@@ -621,7 +755,15 @@ mod tests {
         // `c` alone is `ToggleRevealCaptures` (outside the overlay) — only
         // `c` *with* the control modifier means quit. A translation that
         // conflated the two would make an ordinary keystroke exit the app.
-        let message = translate_event(press(KeyCode::Char('c')), false, false, false, false);
+        let message = translate_event(
+            press(KeyCode::Char('c')),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
 
         assert!(!matches!(message, Message::Quit));
     }
@@ -638,6 +780,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
 
         assert!(
@@ -648,7 +792,15 @@ mod tests {
 
     #[test]
     fn resize_events_translate_to_the_resize_message() {
-        let message = translate_event(Event::Resize(40, 20), false, false, false, false);
+        let message = translate_event(
+            Event::Resize(40, 20),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
 
         assert!(matches!(message, Message::Resize));
     }
@@ -657,9 +809,11 @@ mod tests {
 
     #[test]
     fn esc_cancels_edit_and_ctrl_s_saves_it_while_editing() {
-        let cancel = translate_event(press(KeyCode::Esc), false, false, true, false);
+        let cancel = translate_event(press(KeyCode::Esc), false, false, false, false, true, false);
         let save = translate_event(
             press_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             true,
@@ -682,7 +836,7 @@ mod tests {
         // this is exactly the case where those keys must stay meaningless,
         // covered separately (with `body_focused: true`) below.
         for code in [KeyCode::Down, KeyCode::Up, KeyCode::Enter] {
-            let message = translate_event(press(code), false, false, true, false);
+            let message = translate_event(press(code), false, false, false, false, true, false);
             assert!(
                 matches!(message, Message::Tick),
                 "expected {code:?} to be a no-op while editing outside the body field, \
@@ -698,7 +852,15 @@ mod tests {
         // method or URL can contain — the same reasoning `ctrl_c_quits_
         // while_editing_but_bare_q_types_a_character_instead` applies to `q`.
         for ch in ['r', 'e', 'i', 'n'] {
-            let message = translate_event(press(KeyCode::Char(ch)), false, false, true, false);
+            let message = translate_event(
+                press(KeyCode::Char(ch)),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+            );
             assert!(
                 matches!(message, Message::EditInsertChar(c) if c == ch),
                 "expected {ch:?} to insert while editing, got {message:?}"
@@ -709,27 +871,67 @@ mod tests {
     #[test]
     fn edit_mode_text_input_keys_translate_correctly() {
         assert!(matches!(
-            translate_event(press(KeyCode::Tab), false, false, true, false),
+            translate_event(press(KeyCode::Tab), false, false, false, false, true, false),
             Message::EditFocusNext
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::BackTab), false, false, true, false),
+            translate_event(
+                press(KeyCode::BackTab),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false
+            ),
             Message::EditFocusPrev
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::Backspace), false, false, true, false),
+            translate_event(
+                press(KeyCode::Backspace),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false
+            ),
             Message::EditBackspace
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::Delete), false, false, true, false),
+            translate_event(
+                press(KeyCode::Delete),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false
+            ),
             Message::EditDelete
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::Left), false, false, true, false),
+            translate_event(
+                press(KeyCode::Left),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false
+            ),
             Message::EditCursorLeft
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::Right), false, false, true, false),
+            translate_event(
+                press(KeyCode::Right),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false
+            ),
             Message::EditCursorRight
         ));
     }
@@ -737,15 +939,23 @@ mod tests {
     #[test]
     fn body_focused_enter_up_down_edit_the_multiline_body_instead_of_doing_nothing() {
         assert!(matches!(
-            translate_event(press(KeyCode::Enter), false, false, true, true),
+            translate_event(
+                press(KeyCode::Enter),
+                false,
+                false,
+                false,
+                false,
+                true,
+                true
+            ),
             Message::EditInsertChar('\n')
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::Up), false, false, true, true),
+            translate_event(press(KeyCode::Up), false, false, false, false, true, true),
             Message::EditCursorUp
         ));
         assert!(matches!(
-            translate_event(press(KeyCode::Down), false, false, true, true),
+            translate_event(press(KeyCode::Down), false, false, false, false, true, true),
             Message::EditCursorDown
         ));
     }
@@ -756,11 +966,15 @@ mod tests {
             press_with(KeyCode::Char('n'), KeyModifiers::CONTROL),
             false,
             false,
+            false,
+            false,
             true,
             false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             true,
@@ -777,11 +991,15 @@ mod tests {
             press_with(KeyCode::Char('a'), KeyModifiers::CONTROL),
             false,
             false,
+            false,
+            false,
             true,
             false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             true,
@@ -798,11 +1016,15 @@ mod tests {
             press_with(KeyCode::Char('p'), KeyModifiers::CONTROL),
             false,
             false,
+            false,
+            false,
             true,
             false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             true,
@@ -825,6 +1047,8 @@ mod tests {
             press_with(KeyCode::Char('b'), KeyModifiers::CONTROL),
             false,
             false,
+            false,
+            false,
             true,
             false,
         );
@@ -833,19 +1057,43 @@ mod tests {
 
     #[test]
     fn i_enters_edit_mode_outside_the_overlay_and_outside_edit_mode() {
-        let message = translate_event(press(KeyCode::Char('i')), false, false, false, false);
+        let message = translate_event(
+            press(KeyCode::Char('i')),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(matches!(message, Message::EnterEditMode));
     }
 
     #[test]
     fn n_adds_a_request_outside_the_overlay_and_outside_edit_mode() {
-        let message = translate_event(press(KeyCode::Char('n')), false, false, false, false);
+        let message = translate_event(
+            press(KeyCode::Char('n')),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(matches!(message, Message::AddRequest));
     }
 
     #[test]
     fn d_requests_delete_outside_the_overlay_and_outside_edit_mode() {
-        let message = translate_event(press(KeyCode::Char('d')), false, false, false, false);
+        let message = translate_event(
+            press(KeyCode::Char('d')),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
         assert!(matches!(message, Message::RequestDelete));
     }
 
@@ -854,14 +1102,14 @@ mod tests {
     #[test]
     fn delete_confirm_prompt_confirms_on_y_or_enter_and_cancels_on_n_or_esc() {
         for code in [KeyCode::Char('y'), KeyCode::Enter] {
-            let message = translate_event(press(code), false, true, false, false);
+            let message = translate_event(press(code), false, false, false, true, false, false);
             assert!(
                 matches!(message, Message::ConfirmDelete),
                 "expected {code:?} to confirm the pending delete, got {message:?}"
             );
         }
         for code in [KeyCode::Char('n'), KeyCode::Esc] {
-            let message = translate_event(press(code), false, true, false, false);
+            let message = translate_event(press(code), false, false, false, true, false, false);
             assert!(
                 matches!(message, Message::CancelDelete),
                 "expected {code:?} to cancel the pending delete, got {message:?}"
@@ -872,10 +1120,181 @@ mod tests {
     #[test]
     fn other_keys_do_nothing_while_the_delete_confirm_prompt_is_open() {
         for code in [KeyCode::Down, KeyCode::Up, KeyCode::Char('r')] {
-            let message = translate_event(press(code), false, true, false, false);
+            let message = translate_event(press(code), false, false, false, true, false, false);
             assert!(
                 matches!(message, Message::Tick),
                 "expected {code:?} to be a no-op while the delete confirm prompt is open, \
+                 got {message:?}"
+            );
+        }
+    }
+
+    // --- environment-variable edit session's own key set --------------------
+
+    #[test]
+    fn i_opens_an_environment_variable_edit_session_from_the_overlay() {
+        let message = translate_event(
+            press(KeyCode::Char('i')),
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(matches!(message, Message::EnterEnvironmentEdit));
+    }
+
+    #[test]
+    fn esc_cancels_and_ctrl_s_saves_an_environment_variable_edit_session() {
+        let cancel = translate_event(press(KeyCode::Esc), false, true, false, false, false, false);
+        let save = translate_event(
+            press_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(matches!(cancel, Message::CancelEnvironmentEdit));
+        assert!(matches!(save, Message::SaveEnvironmentEdit));
+    }
+
+    #[test]
+    fn ctrl_n_and_ctrl_d_add_and_request_delete_a_row_while_editing_environment_variables() {
+        let add = translate_event(
+            press_with(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        let delete = translate_event(
+            press_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(matches!(add, Message::AddEnvVarRow));
+        assert!(matches!(delete, Message::RequestDeleteEnvVarRow));
+    }
+
+    #[test]
+    fn text_input_keys_translate_correctly_while_editing_environment_variables() {
+        assert!(matches!(
+            translate_event(press(KeyCode::Tab), false, true, false, false, false, false),
+            Message::EditFocusNext
+        ));
+        assert!(matches!(
+            translate_event(
+                press(KeyCode::BackTab),
+                false,
+                true,
+                false,
+                false,
+                false,
+                false
+            ),
+            Message::EditFocusPrev
+        ));
+        assert!(matches!(
+            translate_event(
+                press(KeyCode::Backspace),
+                false,
+                true,
+                false,
+                false,
+                false,
+                false
+            ),
+            Message::EditBackspace
+        ));
+        assert!(matches!(
+            translate_event(
+                press(KeyCode::Delete),
+                false,
+                true,
+                false,
+                false,
+                false,
+                false
+            ),
+            Message::EditDelete
+        ));
+        assert!(matches!(
+            translate_event(
+                press(KeyCode::Char('x')),
+                false,
+                true,
+                false,
+                false,
+                false,
+                false
+            ),
+            Message::EditInsertChar('x')
+        ));
+    }
+
+    #[test]
+    fn bare_q_types_a_character_while_editing_environment_variables_but_ctrl_c_still_quits() {
+        let from_q = translate_event(
+            press(KeyCode::Char('q')),
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        let from_ctrl_c = translate_event(
+            press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(matches!(from_q, Message::EditInsertChar('q')));
+        assert!(matches!(from_ctrl_c, Message::Quit));
+    }
+
+    #[test]
+    fn env_var_delete_confirm_confirms_on_y_or_enter_and_cancels_on_n_or_esc() {
+        for code in [KeyCode::Char('y'), KeyCode::Enter] {
+            let message = translate_event(press(code), false, true, true, false, false, false);
+            assert!(
+                matches!(message, Message::ConfirmDeleteEnvVarRow),
+                "expected {code:?} to confirm the pending row delete, got {message:?}"
+            );
+        }
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            let message = translate_event(press(code), false, true, true, false, false, false);
+            assert!(
+                matches!(message, Message::CancelDeleteEnvVarRow),
+                "expected {code:?} to cancel the pending row delete, got {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_keys_do_nothing_while_the_env_var_delete_confirm_is_open() {
+        // In particular, a plain `y`/`n` must not fall through and be
+        // typed into the still-focused row's field once the confirmation
+        // has already claimed those keys.
+        for code in [KeyCode::Down, KeyCode::Char('x')] {
+            let message = translate_event(press(code), false, true, true, false, false, false);
+            assert!(
+                matches!(message, Message::Tick),
+                "expected {code:?} to be a no-op while the row-delete confirm is open, \
                  got {message:?}"
             );
         }
