@@ -133,9 +133,9 @@ pub fn spawn(
                 Ok(runtime) => runtime.block_on(execute(request, environment, base_dir)),
                 // See `RunError::RuntimeUnavailable`: reported through the
                 // same `RunOutcome` a network failure would be, not
-                // panicked — the run ends up in `RunState::Completed(Err(_))`,
-                // exactly as reachable and exactly as recoverable as any
-                // other failed run.
+                // panicked — the run ends up as a failed history entry
+                // (`RunOutcome { result: Err(_), .. }`), exactly as reachable
+                // and exactly as recoverable as any other failed run.
                 Err(error) => RunOutcome {
                     result: Err(RunError::RuntimeUnavailable(error)),
                     assertions: AssertionReport::default(),

@@ -5,8 +5,9 @@
 //! `super::update` for `update()` itself — this module only defines what the
 //! state *is*.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use sendra_core::{
     ApiKeyAuth, ApiKeyLocation, Assertions, Auth, BasicAuth, CaptureSource, Captures, Document,
@@ -2088,6 +2089,101 @@ pub struct CollectionSession {
     /// `Message::SaveEnvironmentEdit`/`Message::CancelEnvironmentEdit`, the
     /// same pattern every other editable state in this crate follows.
     pub environment_edit: Option<EnvironmentEditState>,
+    /// Every past run of each request in this session, most recent entry
+    /// first, keyed by that request's index into `document.requests()` —
+    /// scoped to this one session exactly like every other field here, so
+    /// history from a run in one tab can never appear while browsing another
+    /// (see this struct's own doc comment on tab isolation).
+    ///
+    /// **In-memory only.** Never written to disk: gone the moment this
+    /// process exits or this tab closes, by design — a run's response can
+    /// hold arbitrary (and possibly sensitive) response bodies that were
+    /// never asked to be persisted, unlike a request's own definition.
+    ///
+    /// **Capped per request at [`RUN_HISTORY_CAP`] entries**, oldest dropped
+    /// first — see that constant's own doc comment for why. Written to only
+    /// by `update::push_history_entry`, the one place `Message::RunCompleted`
+    /// records a finished run.
+    ///
+    /// **Reindexed on delete, exactly like `dirty_requests`.** A request's
+    /// index can shift when an earlier one is deleted
+    /// (`Message::ConfirmDelete`), so this map is rewritten the same way
+    /// `dirty_requests` already is — see `update::reindex_dirty_after_delete`
+    /// and its history counterpart, `update::reindex_history_after_delete`.
+    /// The deleted request's own history is dropped outright: there is no
+    /// longer a request left for it to be about.
+    pub run_history: HashMap<usize, Vec<RunHistoryEntry>>,
+    /// `Some(...)` while the run-history browser is open for the currently
+    /// selected request — a sibling of `environment_overlay`: opened and
+    /// closed by `Message::OpenHistoryOverlay`/`Message::CloseHistoryOverlay`,
+    /// and mutually exclusive with edit mode, the delete confirmation, the
+    /// environment overlay/edit session, and an in-flight run, the same way
+    /// every other modal in this crate is kept exclusive with every other
+    /// (see `update()`'s own guards).
+    pub history_overlay: Option<HistoryOverlay>,
+}
+
+/// Cap on how many past runs [`CollectionSession::run_history`] keeps per
+/// request. Chosen generously for what browsing actually needs — nobody
+/// scrolls back through more than a handful of past runs while debugging a
+/// single request — while still bounding the real memory cost this issue was
+/// asked to consider: nothing in sendra-core caps a response body's size, and
+/// a long session that re-sends the same request many times would otherwise
+/// let those bodies accumulate in memory without limit. Once a request's
+/// history grows past this, its oldest entry is dropped to make room for the
+/// newest — see `update::push_history_entry`.
+pub const RUN_HISTORY_CAP: usize = 20;
+
+/// One past run of a request, kept in [`CollectionSession::run_history`] for
+/// browsing after `RunState` has moved on to whatever the *next* run said.
+/// Holds the exact same real [`RunOutcome`] `RunState::Completed` is backed
+/// by for the current run, not a TUI-invented summary — see
+/// `CollectionSession::current_run`'s own doc comment for why there is only
+/// ever this one copy of it, not a second one duplicated onto `RunState`
+/// itself. A historical entry renders through the exact same
+/// `view::render_response_panel` a live one does, for the same reason: the
+/// data is identical in shape, only "how long ago" differs.
+#[derive(Debug)]
+pub struct RunHistoryEntry {
+    /// When this run's `Message::RunCompleted` was handled — wall-clock, so
+    /// the history list can show how long ago a run happened, which the
+    /// list's own position (most recent first) does not by itself convey.
+    pub completed_at: SystemTime,
+    pub outcome: RunOutcome,
+}
+
+/// The run-history browser's own state, opened by `Message::OpenHistoryOverlay`
+/// for whichever request is currently selected: a list of that request's past
+/// runs (`CollectionSession::run_history`, read fresh each render rather than
+/// copied in here), with `cursor` pointing at one of them, plus — once
+/// `Message::ViewHistoryEntry` picks one — the full response-panel view of
+/// that entry.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistoryOverlay {
+    /// Index into the selected request's history entries (`0` = most recent)
+    /// the list's own selection currently points at. Reset to `0` whenever
+    /// the overlay opens; kept in bounds by `update::select`, the same way
+    /// the collection browser's own `selected` already is.
+    pub cursor: usize,
+    /// `Some(index)` while showing that entry's full result instead of the
+    /// list — a "replace, not a toggle" relationship one level in from the
+    /// one `render_detail_pane`'s own doc comment describes between the
+    /// request preview and a live run's response panel: the list is only
+    /// ever a stand-in for "what did this past run actually show".
+    pub viewing: Option<usize>,
+    /// Scroll position for the entry named by `viewing`'s own response
+    /// panel — a field of its own, not `CollectionSession::response_scroll`,
+    /// since that field belongs to the *live* run and must not be disturbed
+    /// by scrolling back through a past one. Reset to `0` whenever `viewing`
+    /// changes.
+    pub view_scroll: usize,
+    /// Whether the viewed entry's captures are shown in the clear — a flag
+    /// of its own for the same reason `view_scroll` is: independent of
+    /// `CollectionSession::reveal_captures`, which is about the live run.
+    /// Starts (and resets to) `false` whenever `viewing` changes, the same
+    /// "never auto-revealed" rule `CollectionSession::reveal_captures` itself
+    /// follows for a fresh run.
+    pub view_reveal_captures: bool,
 }
 
 /// What `Message::RequestDelete` opens and `Message::ConfirmDelete`/
@@ -2163,6 +2259,44 @@ impl CollectionSession {
             || self.delete_confirm.is_some()
             || self.environment_edit.is_some()
             || matches!(self.run_state, RunState::InFlight)
+    }
+
+    /// The selected request's history entries, most recent first — empty
+    /// when nothing is loaded/selected or nothing has ever been run for it.
+    /// Visible to `update`'s history-overlay message handling and `view`'s
+    /// history overlay rendering, so both read the exact same slice rather
+    /// than each re-deriving "which request, which entries" independently.
+    pub fn selected_history(&self) -> &[RunHistoryEntry] {
+        let LoadState::Loaded { selected, .. } = &self.load_state else {
+            return &[];
+        };
+        self.run_history
+            .get(selected)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// The current run's outcome — always the selected request's own most
+    /// recent history entry, since finishing a run and recording it as that
+    /// request's newest history entry happen together, in
+    /// `update::push_history_entry` (see `Message::RunCompleted`'s own
+    /// handling). `RunState::Completed` deliberately carries no `RunOutcome`
+    /// of its own for this reason: `run_history` is the one place a run's
+    /// data lives, not two copies (`RunState`'s own and a history entry)
+    /// that could quietly drift apart — and `RunOutcome` holding a
+    /// `Result<Response, RunError>` (in turn wrapping `SendraError`, which is
+    /// not `Clone`) rules out a second copy even if one were wanted.
+    ///
+    /// `None` while `run_state` isn't `Completed`. Also `None`, unreachable
+    /// in ordinary operation, if a `Completed` run state ever outlived the
+    /// history entry it should name — nothing else in this crate clears
+    /// `run_history`, so this can only happen if that invariant is broken
+    /// elsewhere.
+    pub fn current_run(&self) -> Option<&RunOutcome> {
+        if !matches!(self.run_state, RunState::Completed) {
+            return None;
+        }
+        self.selected_history().first().map(|entry| &entry.outcome)
     }
 }
 
@@ -2428,6 +2562,32 @@ pub enum Message {
         collection_id: u64,
         outcome: RunOutcome,
     },
+    /// `h` while browsing: opens the run-history browser
+    /// (`CollectionSession::history_overlay`) for the currently selected
+    /// request. A no-op while it's already open, or while any other modal
+    /// (edit mode, an overlay, a confirmation, an in-flight run) is already
+    /// active — see `update()`'s own guards — consistent with every other
+    /// mode-entry message in this crate. Opens even when the selected
+    /// request has no history yet: the overlay itself says so, the same
+    /// "say what isn't there yet, in the pane itself" rule the environment
+    /// overlay already follows for zero discovered environments.
+    OpenHistoryOverlay,
+    /// Esc while the history browser's list has focus: closes it. While
+    /// instead viewing one entry's full result (`HistoryOverlay::viewing` is
+    /// `Some`), Esc means `CloseHistoryEntryView` (back to the list) —
+    /// `main::translate_event` is what tells these two apart, the same way
+    /// it already tells the environment overlay's own Esc apart from edit
+    /// mode's.
+    CloseHistoryOverlay,
+    /// Enter on the history browser's list: shows the entry at
+    /// `HistoryOverlay::cursor`'s full result in place of the list —
+    /// `HistoryOverlay::viewing`'s own doc comment on why this is a
+    /// replace, not a toggle.
+    ViewHistoryEntry,
+    /// Esc while viewing one entry's full result: back to the list,
+    /// `HistoryOverlay::viewing` cleared. The exact reverse of
+    /// `ViewHistoryEntry`.
+    CloseHistoryEntryView,
     /// `o` while browsing: opens the "open another collection" path-input
     /// prompt (`AppState::open_collection_prompt`). A no-op while any other
     /// modal (edit mode, an overlay, a confirmation) is already open,
@@ -2723,12 +2883,23 @@ pub enum Message {
 /// back to `Idle` the moment the request-list selection actually moves, so
 /// `Completed` can never be misread as an answer for a request other than
 /// the one it was sent for.
-#[derive(Debug, Default)]
+///
+/// **`Completed` carries no data of its own.** Earlier this held the run's
+/// own `RunOutcome` directly (`Completed(RunOutcome)`); now that outcome
+/// lives in `CollectionSession::run_history` instead — the request's newest
+/// history entry — and `Completed` is only a marker that such an entry
+/// exists. See `CollectionSession::current_run`'s own doc comment for the
+/// full reasoning: chiefly that `RunOutcome` has no `Clone` to make a second
+/// copy from (it holds a `Result<_, RunError>` wrapping `SendraError`), so
+/// keeping the real value in exactly one place — history — rather than
+/// duplicating it onto `RunState` too is both the simpler design and the
+/// only one `RunOutcome`'s own type allows.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     #[default]
     Idle,
     InFlight,
-    Completed(RunOutcome),
+    Completed,
 }
 
 #[cfg(test)]

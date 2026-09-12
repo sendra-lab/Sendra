@@ -24,7 +24,7 @@ use super::preview::{self, resolve_browsing_preview};
 use super::state::{
     AppState, AssertionRow, AuthEdit, AuthField, BodyEdit, CaptureKind, CaptureRow,
     CollectionSession, DeleteConfirm, EditField, EditState, EnvVarField, EnvironmentEditState,
-    JsonOperator, LoadState, NamedEnvironment, OpenCollectionPromptState, RunState,
+    HistoryOverlay, JsonOperator, LoadState, NamedEnvironment, OpenCollectionPromptState, RunState,
 };
 
 /// Body preview is capped rather than shown in full — scrolling through a
@@ -95,6 +95,10 @@ pub fn view(state: &AppState, frame: &mut Frame) {
 
     if let Some(cursor) = state.environment_overlay {
         render_environment_overlay(frame, state, cursor);
+    }
+
+    if let Some(overlay) = &state.history_overlay {
+        render_history_overlay(frame, state, overlay);
     }
 
     if let Some(confirm) = &state.delete_confirm {
@@ -271,7 +275,7 @@ fn render_detail_pane(
         return;
     }
 
-    if let RunState::Completed(outcome) = &state.run_state {
+    if let Some(outcome) = state.current_run() {
         render_response_panel(
             frame,
             area,
@@ -1257,7 +1261,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 /// The bottom bar's full text — status where there is one, then the
 /// keybindings currently live — chosen from exactly the state `update()`
 /// itself branches on, so this can never say a key does something `update()`
-/// would actually refuse, or omit one it would accept. Five contexts, in the
+/// would actually refuse, or omit one it would accept. Eight contexts, in the
 /// same priority order `update()`'s own InFlight/edit-mode guards and
 /// `view()`'s own overlay-vs-response-panel-vs-preview dispatch already
 /// imply:
@@ -1281,27 +1285,34 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 ///    `edit_mode` is set, and refuses to enter edit mode while the overlay
 ///    is open — so these two contexts never need to be prioritized against
 ///    each other, only checked in some order.
-/// 2. **The selected request is being edited** (`edit_mode.is_some()`) —
+/// 2. **The run-history browser is open** (`history_overlay.is_some()`) — a
+///    sibling of the environment overlay one level up: only its own keys
+///    apply (the list's while merely browsing, `PgUp`/`PgDn`/`Home`/`End`/`c`
+///    once `HistoryOverlay::viewing` picks an entry), and it is likewise
+///    mutually exclusive with edit mode and the environment overlay (see
+///    `update()`'s own guards).
+/// 3. **The selected request is being edited** (`edit_mode.is_some()`) —
 ///    `update()`'s own edit-mode guard refuses every navigation/overlay/run
 ///    message while this holds, the same way the InFlight guard does for a
 ///    run, so only `Ctrl+S`/`Esc`/quit are genuinely live.
-/// 3. **No collection is loaded** (`load_state` is `Loading`,
+/// 4. **No collection is loaded** (`load_state` is `Loading`,
 ///    `NoPathProvided` or `Failed` — see `view()`'s own match on it): there
 ///    is no request list and nothing to run, so nav/run are not offered;
 ///    the environment overlay and quit are the only two keys that do
 ///    anything, and both keep working, which is the whole point of this
 ///    context existing — a failed collection load must not read as a dead
 ///    end.
-/// 4. **A run is in flight** (`RunState::InFlight`) — `update()`'s own guard
+/// 5. **A run is in flight** (`RunState::InFlight`) — `update()`'s own guard
 ///    at the top of the function refuses every navigation/overlay/run
 ///    message while this holds, so `q` (never blocked — see that guard's own
 ///    comment) is genuinely the only key left to advertise.
-/// 5. **A run has completed** (`RunState::Completed`) — the response panel
+/// 6. **A run has completed** (`RunState::Completed`) — the response panel
 ///    is what `render_detail_pane` is showing (see its own doc comment), so
 ///    this is where the scroll keys and, when there is something to reveal,
 ///    the capture-reveal key belong; nav/run/env/quit are back too, since
-///    the InFlight guard no longer applies.
-/// 6. **Otherwise** (`RunState::Idle`, a collection is loaded) — the
+///    the InFlight guard no longer applies. `h` for the history browser is
+///    offered too, once there is any history yet to browse.
+/// 7. **Otherwise** (`RunState::Idle`, a collection is loaded) — the
 ///    ordinary collection browser, showing the request preview.
 ///
 /// No key is added here that `update`/`main::next_message` do not already
@@ -1359,6 +1370,23 @@ pub(super) fn status_help_text(state: &AppState) -> String {
         return "↑/↓ nav  enter confirm  i edit variables  esc cancel  q quit".to_string();
     }
 
+    if let Some(overlay) = &state.history_overlay {
+        return if overlay.viewing.is_some() {
+            let reveal = if state
+                .selected_history()
+                .get(overlay.viewing.unwrap_or(0))
+                .is_some_and(|entry| !entry.outcome.capture.is_empty())
+            {
+                "  c reveal/hide captures"
+            } else {
+                ""
+            };
+            format!("PgUp/PgDn/Home/End scroll{reveal}  esc back  q quit")
+        } else {
+            "↑/↓ nav  enter view  esc close  q quit".to_string()
+        };
+    }
+
     if let Some(edit) = &state.edit_mode {
         let dirty = if edit.dirty { " (unsaved changes)" } else { "" };
         let invalid = if edit.method_error.is_some() {
@@ -1388,7 +1416,14 @@ pub(super) fn status_help_text(state: &AppState) -> String {
             let frame_char = SPINNER_FRAMES[state.spinner_tick % SPINNER_FRAMES.len()];
             format!("{frame_char} Running request...  |  q quit")
         }
-        RunState::Completed(outcome) => {
+        RunState::Completed => {
+            // `state.current_run()` is `Some` here by construction — see
+            // that method's own doc comment: `run_state` only ever becomes
+            // `Completed` in the same step `Message::RunCompleted` records
+            // the history entry it names.
+            let outcome = state
+                .current_run()
+                .expect("RunState::Completed implies a history entry exists");
             let status = match &outcome.result {
                 Ok(response) => {
                     let assertions = if outcome.assertions.is_empty() {
@@ -1409,8 +1444,13 @@ pub(super) fn status_help_text(state: &AppState) -> String {
             } else {
                 "  c reveal/hide captures"
             };
+            let history_hint = if state.selected_history().is_empty() {
+                ""
+            } else {
+                "  h history"
+            };
             format!(
-                "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn/Home/End scroll{reveal}  i edit  n new request  d delete  e env  o open{}  q quit",
+                "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn/Home/End scroll{reveal}  i edit  n new request  d delete  e env  o open{history_hint}{}  q quit",
                 tab_hint(state)
             )
         }
@@ -1752,6 +1792,103 @@ fn render_environment_overlay(frame: &mut Frame, state: &AppState, cursor: usize
         Paragraph::new(lines.join("\n")).wrap(Wrap { trim: false }),
         panes[1],
     );
+}
+
+/// The run-history browser (`CollectionSession::history_overlay`) — a list
+/// of the selected request's past runs, or (once `Message::ViewHistoryEntry`
+/// picks one) that entry's full result through the exact same
+/// `render_response_panel` a live run's own response uses, so a historical
+/// entry is never shown through a second, differently-formatted rendering
+/// path — see `RunHistoryEntry`'s own doc comment.
+fn render_history_overlay(frame: &mut Frame, state: &AppState, overlay: &HistoryOverlay) {
+    let entries = state.selected_history();
+
+    if let Some(index) = overlay.viewing {
+        let title = match entries.get(index) {
+            Some(entry) => format!(
+                "Run history — {} ago (esc back)",
+                format_elapsed(entry.completed_at)
+            ),
+            None => "Run history (esc back)".to_string(),
+        };
+        let inner = modal_frame(frame, 85, 85, title);
+        match entries.get(index) {
+            Some(entry) => render_response_panel(
+                frame,
+                inner,
+                &entry.outcome,
+                overlay.view_scroll,
+                overlay.view_reveal_captures,
+            ),
+            None => {
+                frame.render_widget(Paragraph::new("This run is no longer available."), inner);
+            }
+        }
+        return;
+    }
+
+    let inner = modal_frame(frame, 70, 70, "Run history — Enter to view, Esc to close");
+
+    if entries.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No runs yet for this request. Press enter/r to run it."),
+            inner,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = entries
+        .iter()
+        .map(|entry| {
+            let summary = match &entry.outcome.result {
+                Ok(response) => {
+                    let assertions = if entry.outcome.assertions.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " — {} passed, {} failed",
+                            entry.outcome.assertions.passed_count(),
+                            entry.outcome.assertions.failed_count()
+                        )
+                    };
+                    format!("{}{assertions}", response.status)
+                }
+                Err(error) => format!("failed — {error}"),
+            };
+            ListItem::new(format!(
+                "{} ago  —  {summary}",
+                format_elapsed(entry.completed_at)
+            ))
+        })
+        .collect();
+    let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut list_state = ListState::default()
+        .with_selected(Some(overlay.cursor.min(entries.len().saturating_sub(1))));
+    frame.render_stateful_widget(list, inner, &mut list_state);
+}
+
+/// A short, human "N ago" rendering of `when` relative to now — `"just now"`
+/// under a second, otherwise whole seconds/minutes/hours, coarsest unit
+/// only (`"2h"`, never `"2h 3m"`): enough to place a run in time relative to
+/// the others in the list without pulling in a date/time-formatting
+/// dependency this crate has no other use for. `when` in the future (a clock
+/// adjustment mid-session, the only realistic cause) reads as `"just now"`
+/// rather than a nonsensical negative duration.
+fn format_elapsed(when: std::time::SystemTime) -> String {
+    let elapsed = match when.elapsed() {
+        Ok(elapsed) => elapsed,
+        Err(_) => return "just now".to_string(),
+    };
+    let secs = elapsed.as_secs();
+    if secs == 0 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
 }
 
 /// The environment-variable edit session — what `render_environment_overlay`
