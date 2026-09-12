@@ -1814,6 +1814,38 @@ pub struct AppState {
     /// whole `Document` wholesale rather than trying to reverse the
     /// insertion in place.
     pub pending_new_request: Option<PendingNewRequest>,
+    /// `Some(...)` while a delete confirmation prompt is open for the
+    /// request at `DeleteConfirm::index` in the loaded document, `None`
+    /// while merely browsing. Entering and leaving flows through
+    /// `Message::RequestDelete`/`Message::ConfirmDelete`/`Message::CancelDelete`
+    /// like every other state transition — see `update()`'s own guards,
+    /// which treat this as exclusive with edit mode, the environment
+    /// overlay and an in-flight run, the same way those are already
+    /// exclusive with each other. Deliberately a minimal, single-purpose
+    /// confirmation rather than a shared overlay component: a unified
+    /// confirmation used by every destructive action in this batch is a
+    /// later, separate concern.
+    pub delete_confirm: Option<DeleteConfirm>,
+}
+
+/// What `Message::RequestDelete` opens and `Message::ConfirmDelete`/
+/// `Message::CancelDelete` close — which request is pending deletion, and
+/// (once a confirmed deletion has actually been attempted) whatever went
+/// wrong writing it back to disk.
+#[derive(Debug, Clone)]
+pub struct DeleteConfirm {
+    /// Index into the loaded document's `requests()` — fixed for the life of
+    /// this prompt; nothing else can change the selection while it is open
+    /// (see `update()`'s browsing-message guard for `delete_confirm`).
+    pub index: usize,
+    /// `Some(message)` right after `Message::ConfirmDelete` attempted to
+    /// write the deletion to disk (via `sendra_core::Document::save_to_path`)
+    /// and that write failed — a full disk, a permissions error, anything
+    /// `save_to_path`'s own doc comment covers. The prompt stays open with
+    /// this set so the failure is visible and the user can retry or cancel,
+    /// the same way `EditState::save_error` keeps edit mode open on a failed
+    /// `SaveEdit` rather than silently discarding the pending change.
+    pub error: Option<String>,
 }
 
 /// What `Message::CancelEdit` restores after `Message::AddRequest` is
@@ -1993,6 +2025,30 @@ pub enum Message {
     /// clears `dirty_requests` for the edited index without ever having
     /// written anything back.
     CancelEdit,
+    /// `d` while browsing: opens a confirmation prompt (`AppState::
+    /// delete_confirm`) to delete the currently selected request. A no-op
+    /// under the same conditions `EnterEditMode`/`AddRequest` are (nothing
+    /// loaded, the environment overlay open, edit mode active, a run in
+    /// flight), plus one more that is specific to deletion: refused outright
+    /// when deleting would leave the document with zero requests — see
+    /// `update::can_delete`'s own doc comment for why that's never reachable
+    /// rather than handled after the fact.
+    RequestDelete,
+    /// `y`/Enter on the delete confirmation prompt: removes the request
+    /// `AppState::delete_confirm` names, persists the result via
+    /// `Document::save_to_path`, and closes the prompt — unless the write
+    /// fails, in which case the prompt stays open with
+    /// `DeleteConfirm::error` set, the same "no-op that keeps you where you
+    /// can retry or cancel" shape `Message::SaveEdit` already has for its own
+    /// `save_error`.
+    ConfirmDelete,
+    /// `n`/Esc on the delete confirmation prompt: closes it without touching
+    /// the loaded document at all — nothing was ever mutated before this
+    /// point (see `update`'s own `Message::RequestDelete`/`ConfirmDelete`
+    /// arms), so there is nothing to undo, the same "cancelling is a provable
+    /// no-op" guarantee `Message::CancelEdit` already has for a pre-existing
+    /// request's edit.
+    CancelDelete,
     /// `Tab` while editing: moves focus to the next field in order (see
     /// `EditField::next`) — method, URL, then each header row's key and
     /// value in turn, wrapping back to method.

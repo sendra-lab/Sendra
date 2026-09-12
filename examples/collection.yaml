@@ -15,7 +15,7 @@ requests:
       Accept: application/json
       User-Agent: sendra/0.1.0
 
-  - name: Post JSON
+  - name: post json
     method: POST
     url: https://httpbin.org/post
     headers:
