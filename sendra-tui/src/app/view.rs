@@ -12,13 +12,15 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use sendra_core::{
-    AssertionReport, CaptureReport, Document, Environment, Request, Response, SendraError,
+    ApiKeyLocation, AssertionReport, CaptureReport, Document, Environment, OAuthGrantType, Request,
+    Response, SendraError,
 };
 
 use crate::run_request::RunOutcome;
 
 use super::state::{
-    AppState, BodyEdit, EditField, EditState, LoadState, NamedEnvironment, RunState,
+    AppState, AuthEdit, AuthField, BodyEdit, EditField, EditState, LoadState, NamedEnvironment,
+    RunState,
 };
 
 /// Body preview is capped rather than shown in full — scrolling through a
@@ -166,6 +168,9 @@ fn render_detail_pane(
         return;
     };
 
+    let active = active_environment(state);
+    let environment = active.map_or_else(Environment::default, |named| named.environment.clone());
+
     // Edit mode takes over the whole detail pane — checked first, ahead of
     // the completed-run response panel below, since editing is allowed
     // (see `Message::EnterEditMode`'s doc comment) whether or not a run has
@@ -174,7 +179,7 @@ fn render_detail_pane(
     // are what is authoritative right now, not whatever the last resolved
     // preview or response showed.
     if let Some(edit) = &state.edit_mode {
-        render_edit_pane(frame, area, edit);
+        render_edit_pane(frame, area, edit, request, &environment);
         return;
     }
 
@@ -188,9 +193,6 @@ fn render_detail_pane(
         );
         return;
     }
-
-    let active = active_environment(state);
-    let environment = active.map_or_else(Environment::default, |named| named.environment.clone());
 
     let text = match resolve_preview(request, base_dir, &environment) {
         Ok(resolved) => format_resolved_request(&resolved),
@@ -225,13 +227,15 @@ fn render_detail_pane(
 /// currently points at, independently for a row's key and its value), then
 /// a `Body` section — either the raw/JSON text area (see
 /// `BodyEdit::Editable`) or a read-only line naming what isn't editable
-/// here (see `BodyEdit::Unsupported`) — `method_error`/`body_error` shown
-/// inline right under the field each is about, and the keybinding reminder
-/// every other pane in this file puts in its own footer/status text. The
-/// real terminal cursor is placed on the focused field's real position via
-/// `Frame::set_cursor_position`, not just implied by the `▶` marker — an
-/// ordinary text field shows a real blinking cursor, not merely which line
-/// is active.
+/// here (see `BodyEdit::Unsupported`) — then an `Auth:` section (see
+/// `AuthEdit`'s own doc comment for exactly what is and isn't editable
+/// there) and, right under it, a live "Resolved auth" line — `method_error`/
+/// `body_error` shown inline right under the field each is about, and the
+/// keybinding reminder every other pane in this file puts in its own
+/// footer/status text. The real terminal cursor is placed on the focused
+/// field's real position via `Frame::set_cursor_position`, not just implied
+/// by the `▶` marker — an ordinary text field shows a real blinking cursor,
+/// not merely which line is active.
 ///
 /// **A caveat shared with every field in this pane, not new here**: the
 /// whole pane wraps (`Wrap { trim: false }`), so a line wider than the pane
@@ -241,7 +245,18 @@ fn render_detail_pane(
 /// mean switching to unwrapped rendering with horizontal scroll for every
 /// field, a change orthogonal to what this issue asked for; not attempted
 /// here.
-fn render_edit_pane(frame: &mut Frame, area: Rect, edit: &EditState) {
+///
+/// `base_request`/`environment` are only needed for the "Resolved auth"
+/// line — see `describe_resolved_auth`, which is the one place this
+/// function looks past `edit` itself at what the rest of the request and
+/// the active environment actually are.
+fn render_edit_pane(
+    frame: &mut Frame,
+    area: Rect,
+    edit: &EditState,
+    base_request: &Request,
+    environment: &Environment,
+) {
     let method_marker = if edit.focus == EditField::Method {
         "▶"
     } else {
@@ -318,9 +333,37 @@ fn render_edit_pane(frame: &mut Frame, area: Rect, edit: &EditState) {
     }
 
     lines.push(String::new());
+    lines.push("Auth:".to_string());
+    let auth_fields = edit.auth_field_order();
+    let auth_start_line = lines.len();
+    if auth_fields.is_empty() {
+        lines.push("  (no auth configured on this request)".to_string());
+    } else {
+        for &field in auth_fields {
+            let marker = if edit.focus == EditField::Auth(field) {
+                "▶"
+            } else {
+                " "
+            };
+            lines.push(format!(
+                "{marker}{}{}",
+                auth_field_label(field),
+                auth_field_display(&edit.auth, field)
+            ));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(format!(
+        "Resolved auth → {}",
+        describe_resolved_auth(base_request, edit, environment)
+    ));
+
+    lines.push(String::new());
     lines.push(
         "Tab/Shift+Tab move focus  Ctrl+N add header  Ctrl+D delete header  \
-         Ctrl+S save  Esc cancel  (in Body: Enter for newline, ↑/↓ move lines)"
+         Ctrl+S save  Esc cancel  (Body: Enter for newline, ↑/↓ move lines; \
+         Auth: ←/→ toggle option)"
             .to_string(),
     );
 
@@ -361,6 +404,18 @@ fn render_edit_pane(frame: &mut Frame, area: Rect, edit: &EditState) {
             };
             let (line_offset, column) = text.cursor_row_col();
             (body_start_line + line_offset, column as u16)
+        }
+        EditField::Auth(field) => {
+            let index = auth_fields
+                .iter()
+                .position(|candidate| *candidate == field)
+                .unwrap_or(0);
+            let label = auth_field_label(field);
+            let cursor = auth_field_cursor_chars(&edit.auth, field);
+            (
+                auth_start_line + index,
+                1 + label.chars().count() as u16 + cursor as u16,
+            )
         }
     };
     frame.set_cursor_position((area.x + column, area.y + row as u16));
@@ -404,6 +459,177 @@ fn header_row_line(focus: EditField, index: usize, row: &super::state::HeaderRow
         row.key.value(),
         row.value.value()
     )
+}
+
+/// One auth field's fixed label — e.g. `"Bearer token: "` — used both to
+/// render its row and, like `header_key_prefix`, to measure the real
+/// cursor's column.
+fn auth_field_label(field: AuthField) -> &'static str {
+    match field {
+        AuthField::BearerToken => "Bearer token: ",
+        AuthField::BasicUser => "User: ",
+        AuthField::BasicPass => "Password: ",
+        AuthField::ApiKeyName => "Name: ",
+        AuthField::ApiKeyValue => "Value: ",
+        AuthField::ApiKeyLocation => "Location: ",
+        AuthField::OAuthGrantType => "Grant type: ",
+        AuthField::OAuthTokenUrl => "Token URL: ",
+        AuthField::OAuthClientId => "Client ID: ",
+        AuthField::OAuthClientSecret => "Client secret: ",
+        AuthField::OAuthScope => "Scope: ",
+        AuthField::OAuthUsername => "Username: ",
+        AuthField::OAuthPassword => "Password: ",
+    }
+}
+
+/// The current display text for one auth field's row: a live `TextField`'s
+/// value for every text field, or the fixed enum's own value plus a toggle
+/// hint for `ApiKeyLocation`/`OAuthGrantType`, which have no `TextField`
+/// behind them at all (see `AuthEdit::toggle`).
+fn auth_field_display(auth: &AuthEdit, field: AuthField) -> String {
+    match (auth, field) {
+        (AuthEdit::Bearer { token }, AuthField::BearerToken) => token.value().to_string(),
+        (AuthEdit::Basic { user, .. }, AuthField::BasicUser) => user.value().to_string(),
+        (AuthEdit::Basic { pass, .. }, AuthField::BasicPass) => pass.value().to_string(),
+        (AuthEdit::ApiKey { name, .. }, AuthField::ApiKeyName) => name.value().to_string(),
+        (AuthEdit::ApiKey { value, .. }, AuthField::ApiKeyValue) => value.value().to_string(),
+        (AuthEdit::ApiKey { location, .. }, AuthField::ApiKeyLocation) => {
+            format!("{} (←/→ to change)", api_key_location_str(*location))
+        }
+        (AuthEdit::OAuth { grant_type, .. }, AuthField::OAuthGrantType) => {
+            format!("{} (←/→ to change)", oauth_grant_type_str(*grant_type))
+        }
+        (AuthEdit::OAuth { token_url, .. }, AuthField::OAuthTokenUrl) => {
+            token_url.value().to_string()
+        }
+        (AuthEdit::OAuth { client_id, .. }, AuthField::OAuthClientId) => {
+            client_id.value().to_string()
+        }
+        (AuthEdit::OAuth { client_secret, .. }, AuthField::OAuthClientSecret) => {
+            client_secret.value().to_string()
+        }
+        (AuthEdit::OAuth { scope, .. }, AuthField::OAuthScope) => scope.value().to_string(),
+        (AuthEdit::OAuth { username, .. }, AuthField::OAuthUsername) => {
+            username.value().to_string()
+        }
+        (AuthEdit::OAuth { password, .. }, AuthField::OAuthPassword) => {
+            password.value().to_string()
+        }
+        _ => unreachable!(
+            "auth_field_display is only ever called for a field in this AuthEdit's own \
+             field_order — see EditState::auth_field_order"
+        ),
+    }
+}
+
+/// The focused auth field's cursor column, in `char`s — `0` for
+/// `ApiKeyLocation`/`OAuthGrantType`, which have no `TextField`/cursor at
+/// all, placing the real terminal cursor right at the start of the
+/// displayed value instead. Mirrors `auth_field_display`'s own match, but
+/// immutable — this runs after `render_edit_pane` has already rendered the
+/// text, only to place the cursor.
+fn auth_field_cursor_chars(auth: &AuthEdit, field: AuthField) -> usize {
+    match (auth, field) {
+        (AuthEdit::Bearer { token }, AuthField::BearerToken) => token.cursor_chars(),
+        (AuthEdit::Basic { user, .. }, AuthField::BasicUser) => user.cursor_chars(),
+        (AuthEdit::Basic { pass, .. }, AuthField::BasicPass) => pass.cursor_chars(),
+        (AuthEdit::ApiKey { name, .. }, AuthField::ApiKeyName) => name.cursor_chars(),
+        (AuthEdit::ApiKey { value, .. }, AuthField::ApiKeyValue) => value.cursor_chars(),
+        (AuthEdit::OAuth { token_url, .. }, AuthField::OAuthTokenUrl) => token_url.cursor_chars(),
+        (AuthEdit::OAuth { client_id, .. }, AuthField::OAuthClientId) => client_id.cursor_chars(),
+        (AuthEdit::OAuth { client_secret, .. }, AuthField::OAuthClientSecret) => {
+            client_secret.cursor_chars()
+        }
+        (AuthEdit::OAuth { scope, .. }, AuthField::OAuthScope) => scope.cursor_chars(),
+        (AuthEdit::OAuth { username, .. }, AuthField::OAuthUsername) => username.cursor_chars(),
+        (AuthEdit::OAuth { password, .. }, AuthField::OAuthPassword) => password.cursor_chars(),
+        _ => 0,
+    }
+}
+
+fn api_key_location_str(location: ApiKeyLocation) -> &'static str {
+    match location {
+        ApiKeyLocation::Header => "header",
+        ApiKeyLocation::Query => "query",
+    }
+}
+
+fn oauth_grant_type_str(grant_type: OAuthGrantType) -> &'static str {
+    match grant_type {
+        OAuthGrantType::ClientCredentials => "client_credentials",
+        OAuthGrantType::Password => "password",
+    }
+}
+
+/// What `Request::resolve_auth` (via `Environment::apply` first, the same
+/// two-step pipeline `resolve_preview` already runs for the read-only,
+/// not-editing preview) would actually send for this in-progress edit —
+/// reusing that real sendra-core pipeline rather than reformatting
+/// `AuthEdit` by hand, so this line is provably correct instead of merely a
+/// plausible-looking mirror of it. Built from `edit.to_request(base_request)`,
+/// which folds in every field this edit session could have changed
+/// (method/url/headers/auth) — so an explicit `Authorization` header typed
+/// into the Headers section alongside `auth.bearer`, say, shows the same
+/// collision this pipeline would raise for a real run, not a preview that
+/// only ever looks at auth in isolation.
+///
+/// **Reused across both directions of the environment-auth precedence
+/// rule**: `environment.apply` is what decides whether the environment's own
+/// default `auth:` applies at all (only when `preview.auth` is `None`) —
+/// see `Environment::auth`'s own doc comment — so clearing a request's auth
+/// down to nothing in this edit session and saving genuinely lets the
+/// environment default take over, and this preview shows that happening
+/// live, not just asserted.
+///
+/// **OAuth is skipped here deliberately** — the one place this issue's OAuth
+/// scoping decision (see `AuthEdit`'s own doc comment) is visible in the UI
+/// itself: acquiring a real token means a real network call
+/// (`Request::resolve_oauth`), which has no place in drawing a frame, and
+/// `resolve_auth` alone returns a typed error for an unresolved
+/// `auth.oauth` — correct, but would read as if something were wrong with
+/// what was typed rather than as the deliberate limitation it is.
+fn describe_resolved_auth(
+    base_request: &Request,
+    edit: &EditState,
+    environment: &Environment,
+) -> String {
+    let preview = edit.to_request(base_request);
+
+    if matches!(edit.auth, AuthEdit::OAuth { .. }) {
+        return "(OAuth token acquired at request time — not shown in this preview)".to_string();
+    }
+
+    match environment
+        .apply(&preview)
+        .and_then(|request| request.resolve_auth())
+    {
+        Ok(resolved) => {
+            let mut parts: Vec<String> = resolved
+                .headers
+                .iter()
+                .filter(|(name, _)| {
+                    !preview
+                        .headers
+                        .iter()
+                        .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
+                })
+                .map(|(name, value)| format!("header {name}: {value}"))
+                .collect();
+            parts.extend(
+                resolved
+                    .query
+                    .iter()
+                    .filter(|(name, _)| !preview.query.iter().any(|(existing, _)| existing == name))
+                    .map(|(name, value)| format!("query {name}={value}")),
+            );
+            if parts.is_empty() {
+                "(no auth resolved)".to_string()
+            } else {
+                parts.join(", ")
+            }
+        }
+        Err(error) => format!("could not resolve — {error}"),
+    }
 }
 
 /// The completed-run half of the detail pane: a real response's status,
@@ -1876,6 +2102,202 @@ mod tests {
         assert!(
             !text.contains("nav"),
             "browsing keys must not be advertised while editing"
+        );
+    }
+
+    // --- Auth editing -------------------------------------------------------
+
+    const REQUEST_WITH_BEARER_AUTH: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    auth:
+      bearer: secret-token
+";
+
+    const REQUEST_WITH_BASIC_AUTH: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    auth:
+      basic:
+        user: ada
+        pass: hunter2
+";
+
+    const REQUEST_WITH_API_KEY_AUTH: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    auth:
+      api_key:
+        in: header
+        name: X-Api-Key
+        value: abc123
+";
+
+    const REQUEST_WITH_OAUTH_AUTH: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    auth:
+      oauth:
+        grant_type: client_credentials
+        token_url: https://auth.example.com/token
+        client_id: my-client
+        client_secret: my-secret
+";
+
+    fn render_screen(state: &AppState) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        // Tall enough that the edit pane's auth section and its "Resolved
+        // auth" preview line are never clipped by the pane's own height —
+        // the pane has no scrolling of its own (see `render_edit_pane`'s
+        // doc comment), so a too-short terminal would silently cut off
+        // exactly what these tests assert on.
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+        terminal
+            .draw(|frame| view(state, frame))
+            .expect("rendering must not panic");
+        buffer_to_string(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn edit_pane_shows_the_bearer_token_and_its_resolved_authorization_header() {
+        let mut state = loaded_state(REQUEST_WITH_BEARER_AUTH);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_screen(&state);
+
+        assert!(
+            screen.contains("Bearer token: secret-token"),
+            "the bearer token field must be shown:\n{screen}"
+        );
+        assert!(
+            screen.contains("Resolved auth"),
+            "the live resolved-auth preview must be shown:\n{screen}"
+        );
+        assert!(
+            screen.contains("Authorization: Bearer secret-token"),
+            "the resolved preview must show the real Authorization header \
+             resolve_auth would send:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn edit_pane_shows_basic_auth_user_and_password_fields() {
+        let mut state = loaded_state(REQUEST_WITH_BASIC_AUTH);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_screen(&state);
+
+        assert!(screen.contains("User: ada"), "{screen}");
+        assert!(screen.contains("Password: hunter2"), "{screen}");
+    }
+
+    #[test]
+    fn edit_pane_shows_api_key_fields_and_its_fixed_location_enum() {
+        let mut state = loaded_state(REQUEST_WITH_API_KEY_AUTH);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_screen(&state);
+
+        assert!(screen.contains("Name: X-Api-Key"), "{screen}");
+        assert!(screen.contains("Value: abc123"), "{screen}");
+        assert!(
+            screen.contains("Location: header"),
+            "the location must show its real fixed-enum value, not free text:\n{screen}"
+        );
+        assert!(
+            screen.contains("←/→ to change"),
+            "a toggle hint must be shown for the fixed-enum location field:\n{screen}"
+        );
+        assert!(
+            screen.contains("X-Api-Key: abc123"),
+            "the resolved preview must show the real header resolve_auth would add:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn edit_pane_shows_oauth_config_fields_as_editable_plain_text() {
+        let mut state = loaded_state(REQUEST_WITH_OAUTH_AUTH);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_screen(&state);
+
+        assert!(
+            screen.contains("Grant type: client_credentials"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Token URL: https://auth.example.com/token"),
+            "{screen}"
+        );
+        assert!(screen.contains("Client ID: my-client"), "{screen}");
+        assert!(screen.contains("Client secret: my-secret"), "{screen}");
+    }
+
+    #[test]
+    fn edit_pane_marks_oauth_as_read_only_in_the_resolved_auth_preview() {
+        // This is the one place this issue's OAuth scoping decision is
+        // visible in the UI itself: the config fields above are editable,
+        // but the live "Resolved auth" preview must say plainly that no
+        // token was actually acquired here, rather than silently showing
+        // nothing or a fabricated bearer value.
+        let mut state = loaded_state(REQUEST_WITH_OAUTH_AUTH);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_screen(&state);
+
+        assert!(
+            screen.contains("OAuth token acquired at request time"),
+            "the resolved-auth preview must name the OAuth limitation, not just be blank:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn edit_pane_shows_no_auth_configured_for_a_request_with_no_auth_block() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_screen(&state);
+
+        assert!(
+            screen.contains("no auth configured on this request"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn tab_reaches_the_auth_section_and_toggling_the_api_key_location_shows_up_live() {
+        let mut state = loaded_state(REQUEST_WITH_API_KEY_AUTH);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Auth(AuthField::ApiKeyLocation);
+
+        let before = render_screen(&state);
+        assert!(before.contains("X-Api-Key: abc123"), "{before}");
+        assert!(!before.contains("query X-Api-Key=abc123"), "{before}");
+
+        update(&mut state, Message::EditCursorRight);
+        let after = render_screen(&state);
+        assert!(
+            after.contains("Location: query"),
+            "the displayed location must reflect the toggle:\n{after}"
+        );
+        assert!(
+            after.contains("query X-Api-Key=abc123"),
+            "the resolved preview must move the api key into the query string too:\n{after}"
         );
     }
 
