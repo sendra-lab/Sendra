@@ -19,8 +19,8 @@ use sendra_core::{
 use crate::run_request::RunOutcome;
 
 use super::state::{
-    AppState, AuthEdit, AuthField, BodyEdit, EditField, EditState, LoadState, NamedEnvironment,
-    RunState,
+    AppState, AssertionRow, AuthEdit, AuthField, BodyEdit, EditField, EditState, JsonOperator,
+    LoadState, NamedEnvironment, RunState,
 };
 
 /// Body preview is capped rather than shown in full — scrolling through a
@@ -360,10 +360,21 @@ fn render_edit_pane(
     ));
 
     lines.push(String::new());
+    lines.push("Assertions (json path):".to_string());
+    let assertions_start_line = lines.len();
+    if edit.assertions.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for (index, row) in edit.assertions.iter().enumerate() {
+            lines.push(assertion_row_line(edit.focus, index, row));
+        }
+    }
+
+    lines.push(String::new());
     lines.push(
         "Tab/Shift+Tab move focus  Ctrl+N add header  Ctrl+D delete header  \
-         Ctrl+S save  Esc cancel  (Body: Enter for newline, ↑/↓ move lines; \
-         Auth: ←/→ toggle option)"
+         Ctrl+A add assertion  Ctrl+X delete assertion  Ctrl+S save  Esc cancel  \
+         (Body: Enter for newline, ↑/↓ move lines; Auth/Assertions: ←/→ toggle option)"
             .to_string(),
     );
 
@@ -416,6 +427,38 @@ fn render_edit_pane(
                 auth_start_line + index,
                 1 + label.chars().count() as u16 + cursor as u16,
             )
+        }
+        EditField::AssertionPath(index) => {
+            let prefix = assertion_path_prefix(index);
+            let cursor = edit.assertions[index].path.cursor_chars();
+            (
+                assertions_start_line + index,
+                prefix.chars().count() as u16 + cursor as u16,
+            )
+        }
+        EditField::AssertionOperator(index) => {
+            let prefix = assertion_operator_prefix(index, edit.assertions[index].path.value());
+            (assertions_start_line + index, prefix.chars().count() as u16)
+        }
+        EditField::AssertionValue(index) => {
+            let row = &edit.assertions[index];
+            let prefix = assertion_value_prefix(index, row.path.value(), row.operator);
+            let cursor = row.value.cursor_chars();
+            (
+                assertions_start_line + index,
+                prefix.chars().count() as u16 + cursor as u16,
+            )
+        }
+        EditField::AssertionNegate(index) => {
+            let row = &edit.assertions[index];
+            let prefix = assertion_negate_prefix(
+                index,
+                row.path.value(),
+                row.operator,
+                row.value.value(),
+                row.value_error.as_deref(),
+            );
+            (assertions_start_line + index, prefix.chars().count() as u16)
         }
     };
     frame.set_cursor_position((area.x + column, area.y + row as u16));
@@ -559,6 +602,107 @@ fn oauth_grant_type_str(grant_type: OAuthGrantType) -> &'static str {
         OAuthGrantType::ClientCredentials => "client_credentials",
         OAuthGrantType::Password => "password",
     }
+}
+
+/// One assertion row's display line: independent `▶` markers for its four
+/// sub-fields (path, operator, value, negate), since exactly one can be
+/// focused at a time — mirrors `header_row_line`'s role for header rows,
+/// just with two more sub-fields. The operator and negate flag show their
+/// real fixed-enum value plus a `(←/→)` toggle hint, the same convention
+/// `auth_field_display` uses for `ApiKeyLocation`/`OAuthGrantType`. A value
+/// parse error (see `AssertionRow::value_error`) is shown inline right after
+/// the value, on the same line — unlike `method_error`/`body_error`, this
+/// does not reserve a blank row when absent, since a list of rows already
+/// grows and shrinks as they're added/removed, and reserving a whole extra
+/// line under every single row "just in case" would waste far more space
+/// than the one field it protects.
+///
+/// **The literal gaps here are load-bearing.** Each sub-field's prefix
+/// function below (`assertion_operator_prefix`, etc.) reconstructs this same
+/// line up to that field, character for character, to compute the real
+/// terminal cursor's column — so a change to the spacing here must be
+/// mirrored there, the same coupling `header_value_prefix` already has with
+/// `header_row_line`.
+fn assertion_row_line(focus: EditField, index: usize, row: &AssertionRow) -> String {
+    let path_marker = if focus == EditField::AssertionPath(index) {
+        "▶"
+    } else {
+        " "
+    };
+    let operator_marker = if focus == EditField::AssertionOperator(index) {
+        "▶"
+    } else {
+        " "
+    };
+    let value_marker = if focus == EditField::AssertionValue(index) {
+        "▶"
+    } else {
+        " "
+    };
+    let negate_marker = if focus == EditField::AssertionNegate(index) {
+        "▶"
+    } else {
+        " "
+    };
+    let error = row
+        .value_error
+        .as_deref()
+        .map(|message| format!("  ⚠ {message}"))
+        .unwrap_or_default();
+    format!(
+        "{path_marker}[{index}] Path: {}   {operator_marker}Op: {} (←/→)   \
+         {value_marker}Value: {}{error}   {negate_marker}Negate: {} (←/→)",
+        row.path.value(),
+        row.operator.label(),
+        row.value.value(),
+        if row.negate { "yes" } else { "no" },
+    )
+}
+
+/// The prefix of an assertion row's line up to (not including) the path
+/// field's own text — see [`assertion_row_line`]'s own doc comment on why
+/// this must stay in lockstep with it. The marker character itself is not
+/// part of what varies the width — `▶` and `" "` are both exactly one
+/// `char` wide — so a plain space stands in for whichever one is actually
+/// showing, the same convention `header_key_prefix` uses.
+fn assertion_path_prefix(index: usize) -> String {
+    format!(" [{index}] Path: ")
+}
+
+/// Like [`assertion_path_prefix`], but up to (not including) the operator
+/// label's own text.
+fn assertion_operator_prefix(index: usize, path_value: &str) -> String {
+    format!("{}{path_value}    Op: ", assertion_path_prefix(index))
+}
+
+/// Like [`assertion_operator_prefix`], but up to (not including) the value
+/// field's own text.
+fn assertion_value_prefix(index: usize, path_value: &str, operator: JsonOperator) -> String {
+    format!(
+        "{}{} (←/→)    Value: ",
+        assertion_operator_prefix(index, path_value),
+        operator.label()
+    )
+}
+
+/// Like [`assertion_value_prefix`], but up to (not including) the negate
+/// flag's own text. Needs `value_error` since a shown error shifts the
+/// negate field's real column, the same reason `header_value_prefix` needs
+/// the key's value.
+fn assertion_negate_prefix(
+    index: usize,
+    path_value: &str,
+    operator: JsonOperator,
+    value_value: &str,
+    value_error: Option<&str>,
+) -> String {
+    let error = value_error
+        .map(|message| format!("  ⚠ {message}"))
+        .unwrap_or_default();
+    format!(
+        "{}{value_value}{error}    Negate: ",
+        assertion_value_prefix(index, path_value, operator)
+    )
 }
 
 /// What `Request::resolve_auth` (via `Environment::apply` first, the same
@@ -2298,6 +2442,138 @@ requests:
         assert!(
             after.contains("query X-Api-Key=abc123"),
             "the resolved preview must move the api key into the query string too:\n{after}"
+        );
+    }
+
+    // --- Assertion editing --------------------------------------------------
+
+    const REQUEST_WITH_JSON_ASSERTION: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    assertions:
+      json:
+        $.status: ok
+";
+
+    const REQUEST_WITH_NO_ASSERTIONS: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+";
+
+    #[test]
+    fn edit_pane_shows_no_assertions_placeholder_for_a_request_with_none() {
+        let mut state = loaded_state(REQUEST_WITH_NO_ASSERTIONS);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_screen(&state);
+
+        assert!(screen.contains("Assertions (json path):"), "{screen}");
+        assert!(screen.contains("(none)"), "{screen}");
+    }
+
+    #[test]
+    fn edit_pane_lists_an_existing_json_assertion_row() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+
+        let screen = render_screen(&state);
+
+        assert!(screen.contains("Path: $.status"), "{screen}");
+        assert!(screen.contains("Op: equals"), "{screen}");
+        assert!(screen.contains("Value: ok"), "{screen}");
+        assert!(screen.contains("Negate: no"), "{screen}");
+    }
+
+    #[test]
+    fn add_assertion_row_key_bind_shows_up_as_a_new_empty_row_on_screen() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+
+        update(&mut state, Message::AddAssertionRow);
+
+        let screen = render_screen(&state);
+        assert!(screen.contains("[1] Path: "), "{screen}");
+    }
+
+    #[test]
+    fn delete_assertion_row_key_bind_removes_a_row_from_screen() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionPath(0);
+
+        update(&mut state, Message::DeleteAssertionRow);
+
+        let screen = render_screen(&state);
+        assert!(!screen.contains("$.status"), "{screen}");
+        assert!(screen.contains("(none)"), "{screen}");
+    }
+
+    #[test]
+    fn edit_pane_marks_whichever_assertion_sub_field_has_focus() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionValue(0);
+
+        let screen = render_screen(&state);
+        let value_line = screen
+            .lines()
+            .find(|line| line.contains("Value: ok"))
+            .expect("the assertion row's line must be on screen");
+        assert!(
+            value_line.contains('▶'),
+            "the focused sub-field's line must carry a focus marker: {value_line}"
+        );
+    }
+
+    #[test]
+    fn tab_reaches_the_assertion_section_and_toggling_the_operator_shows_up_live() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionOperator(0);
+
+        let before = render_screen(&state);
+        assert!(before.contains("Op: equals"), "{before}");
+
+        update(&mut state, Message::EditCursorRight);
+        let after = render_screen(&state);
+        assert!(
+            after.contains("Op: greater_than"),
+            "the displayed operator must reflect the toggle:\n{after}"
+        );
+    }
+
+    #[test]
+    fn tab_reaches_the_assertion_section_and_toggling_negate_shows_up_live() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionNegate(0);
+
+        update(&mut state, Message::EditCursorRight);
+        let after = render_screen(&state);
+        assert!(
+            after.contains("Negate: yes"),
+            "the displayed negate flag must reflect the toggle:\n{after}"
+        );
+    }
+
+    #[test]
+    fn edit_pane_shows_a_value_parse_error_inline_on_the_assertion_row() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionValue(0);
+        backspace_n(&mut state, "ok".len());
+        type_into_focused_field(&mut state, "[a, b");
+
+        let screen = render_screen(&state);
+        assert!(
+            screen.contains('⚠'),
+            "a malformed value must show an inline warning:\n{screen}"
         );
     }
 

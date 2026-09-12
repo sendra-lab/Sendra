@@ -7,8 +7,8 @@
 use sendra_core::{Document, Request};
 
 use super::state::{
-    validate_method_text, AppState, BodyEdit, EditField, EditState, LoadState, Message, RunState,
-    TextField,
+    validate_assertion_value_text, validate_method_text, AppState, BodyEdit, EditField, EditState,
+    LoadState, Message, RunState, TextField,
 };
 
 /// Moves `selected` by `delta` (`1` or `-1`) through `len` items, wrapping at
@@ -165,18 +165,19 @@ pub fn update(state: &mut AppState, msg: Message) {
                 edit.body_error = validate_body_for_save(&edit.body);
             }
             // Refuses to save — but, deliberately, does *not* clear
-            // `edit_mode` — while `method_error` or `body_error` is set: an
-            // invalid method or an invalid JSON body must never reach the
-            // loaded document, but the user must not be locked out of
-            // fixing either one, which dropping `edit_mode` here (as
+            // `edit_mode` — while `method_error`, `body_error`, or any
+            // assertion row's `value_error` is set: invalid input must
+            // never reach the loaded document, but the user must not be
+            // locked out of fixing it, which dropping `edit_mode` here (as
             // `CancelEdit` does) would do by discarding what they typed.
             // Leaving edit mode active with the same bad text still in
             // place is what keeps the field "still editable afterward"
             // rather than stuck.
-            let can_save = state
-                .edit_mode
-                .as_ref()
-                .is_some_and(|edit| edit.method_error.is_none() && edit.body_error.is_none());
+            let can_save = state.edit_mode.as_ref().is_some_and(|edit| {
+                edit.method_error.is_none()
+                    && edit.body_error.is_none()
+                    && edit.assertions.iter().all(|row| row.value_error.is_none())
+            });
             if can_save {
                 if let Some(edit) = state.edit_mode.take() {
                     if let LoadState::Loaded {
@@ -202,6 +203,7 @@ pub fn update(state: &mut AppState, msg: Message) {
                                 .collect();
                             apply_body_edit(request, &edit.body);
                             request.auth = edit.auth.to_auth();
+                            request.assertions = edit.to_assertions(request.assertions.as_ref());
                         }
                         state.dirty_requests.remove(selected);
                     }
@@ -223,26 +225,36 @@ pub fn update(state: &mut AppState, msg: Message) {
         Message::EditFocusNext => {
             if let Some(edit) = &mut state.edit_mode {
                 let has_body = edit.has_editable_body();
-                edit.focus = edit
-                    .focus
-                    .next(edit.headers.len(), has_body, edit.auth_field_order());
+                edit.focus = edit.focus.next(
+                    edit.headers.len(),
+                    has_body,
+                    edit.auth_field_order(),
+                    edit.assertion_row_count(),
+                );
             }
         }
         Message::EditFocusPrev => {
             if let Some(edit) = &mut state.edit_mode {
                 let has_body = edit.has_editable_body();
-                edit.focus = edit
-                    .focus
-                    .prev(edit.headers.len(), has_body, edit.auth_field_order());
+                edit.focus = edit.focus.prev(
+                    edit.headers.len(),
+                    has_body,
+                    edit.auth_field_order(),
+                    edit.assertion_row_count(),
+                );
             }
         }
         Message::AddHeaderRow => edit_state_mutate(state, EditState::add_header_row),
         Message::DeleteHeaderRow => edit_state_mutate(state, EditState::delete_focused_header_row),
+        Message::AddAssertionRow => edit_state_mutate(state, EditState::add_assertion_row),
+        Message::DeleteAssertionRow => {
+            edit_state_mutate(state, EditState::delete_focused_assertion_row)
+        }
         Message::EditInsertChar(ch) => edit_mutate(state, |field| field.insert_char(ch)),
         Message::EditBackspace => edit_mutate(state, TextField::backspace),
         Message::EditDelete => edit_mutate(state, TextField::delete),
-        Message::EditCursorLeft => edit_move_or_toggle(state, TextField::move_left),
-        Message::EditCursorRight => edit_move_or_toggle(state, TextField::move_right),
+        Message::EditCursorLeft => edit_move_or_toggle(state, false, TextField::move_left),
+        Message::EditCursorRight => edit_move_or_toggle(state, true, TextField::move_right),
         Message::EditCursorUp => edit_move(state, TextField::move_up),
         Message::EditCursorDown => edit_move(state, TextField::move_down),
         // See the doc comment on `Message::Resize` — the redraw itself
@@ -385,6 +397,16 @@ fn edit_mutate(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
     if edit.focus == EditField::Body {
         edit.body_error = None;
     }
+    // Unlike `body_error`, an assertion row's `value_error` *is* recomputed
+    // on every keystroke, the same as `method_error` — see
+    // `AssertionRow::value_error`'s own doc comment for why: it is the same
+    // "does this even parse as YAML" check a file load already enforces at
+    // parse time, not the looser, evaluate-time operator-argument check a
+    // mid-edit body deliberately defers.
+    if let EditField::AssertionValue(index) = edit.focus {
+        edit.assertions[index].value_error =
+            validate_assertion_value_text(edit.assertions[index].value.value()).err();
+    }
     if let LoadState::Loaded { selected, .. } = &state.load_state {
         state.dirty_requests.insert(*selected);
     }
@@ -422,19 +444,24 @@ fn edit_move(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
 }
 
 /// `Left`/`Right` on the focused field: ordinarily cursor movement, exactly
-/// like `edit_move` — but `api_key.in` and `oauth.grant_type` are fixed
-/// two-value enums with no `TextField`/cursor to move through at all (see
-/// `AuthField::ApiKeyLocation`/`OAuthGrantType`), so while one of those has
-/// focus, these same two keys instead flip its value (see
-/// `AuthEdit::toggle`). Unlike ordinary cursor movement, a toggle really is
-/// an edit — it changes what gets saved — so this marks `dirty`/
+/// like `edit_move` — but a handful of fields are fixed enums with no
+/// `TextField`/cursor to move through at all (`api_key.in`/
+/// `oauth.grant_type`, and an assertion row's `operator`/`negate` — see
+/// `AuthField::ApiKeyLocation`/`OAuthGrantType` and `EditField::
+/// AssertionOperator`/`AssertionNegate`), so while one of those has focus,
+/// these same two keys instead toggle its value (see
+/// `EditState::toggle_focused`) — `forward` is `true` for `Right`, `false`
+/// for `Left`, which only actually changes anything for `operator` (an
+/// 8-way cycle); every other toggle here is a plain two-value flip, where
+/// direction makes no difference. Unlike ordinary cursor movement, a toggle
+/// really is an edit — it changes what gets saved — so this marks `dirty`/
 /// `dirty_requests` exactly the way `edit_mutate` does, not the way
 /// `edit_move` deliberately doesn't.
-fn edit_move_or_toggle(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
+fn edit_move_or_toggle(state: &mut AppState, forward: bool, mutate: impl FnOnce(&mut TextField)) {
     let Some(edit) = &mut state.edit_mode else {
         return;
     };
-    if edit.toggle_focused_auth_field() {
+    if edit.toggle_focused(forward) {
         edit.dirty = true;
         if let LoadState::Loaded { selected, .. } = &state.load_state {
             state.dirty_requests.insert(*selected);
@@ -478,9 +505,9 @@ fn select(state: &mut AppState, delta: isize) {
 mod tests {
     use std::path::PathBuf;
 
-    use sendra_core::{ApiKeyLocation, Method};
+    use sendra_core::{ApiKeyLocation, Assertions, Method, Response};
 
-    use super::super::state::{AuthEdit, AuthField};
+    use super::super::state::{AuthEdit, AuthField, JsonOperator};
     use super::super::test_support::*;
     use super::super::view::status_help_text;
     use super::*;
@@ -2157,6 +2184,378 @@ requests:
                 "Bearer env-default-token".to_string()
             )),
             "with no auth of its own, the environment default must apply"
+        );
+    }
+
+    // --- Assertion editing --------------------------------------------------
+
+    const REQUEST_WITH_JSON_ASSERTION: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    assertions:
+      json:
+        $.status: ok
+";
+
+    const REQUEST_WITH_NO_ASSERTIONS: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+";
+
+    fn synthetic_response(status: u16, body: &str) -> Response {
+        Response {
+            status,
+            status_text: String::new(),
+            headers: Vec::new(),
+            body: body.to_string(),
+            elapsed: std::time::Duration::from_millis(1),
+            redirects: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn enter_edit_mode_seeds_assertion_rows_from_the_real_request() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+
+        update(&mut state, Message::EnterEditMode);
+
+        let edit = state.edit_mode.as_ref().expect("edit mode just entered");
+        assert_eq!(edit.assertions.len(), 1);
+        assert_eq!(edit.assertions[0].path.value(), "$.status");
+        assert_eq!(edit.assertions[0].value.value(), "ok");
+    }
+
+    #[test]
+    fn add_assertion_row_appends_a_new_row_and_focuses_its_path() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+
+        update(&mut state, Message::AddAssertionRow);
+
+        let edit = state.edit_mode.as_ref().unwrap();
+        assert_eq!(edit.assertions.len(), 2);
+        assert_eq!(edit.assertions[1].path.value(), "");
+        assert_eq!(edit.focus, EditField::AssertionPath(1));
+        assert!(edit.dirty);
+        assert!(state.dirty_requests.contains(&0));
+    }
+
+    #[test]
+    fn delete_assertion_row_removes_the_focused_one() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionValue(0);
+
+        update(&mut state, Message::DeleteAssertionRow);
+
+        let edit = state.edit_mode.as_ref().unwrap();
+        assert!(edit.assertions.is_empty());
+        assert!(edit.dirty);
+    }
+
+    #[test]
+    fn delete_assertion_row_is_a_no_op_while_focus_is_elsewhere() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Method);
+
+        update(&mut state, Message::DeleteAssertionRow);
+
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().assertions.len(),
+            1,
+            "nothing should be deleted while focus is on method"
+        );
+    }
+
+    #[test]
+    fn tab_reaches_the_assertion_section_after_the_body_field() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Body;
+
+        update(&mut state, Message::EditFocusNext);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::AssertionPath(0)
+        );
+        update(&mut state, Message::EditFocusNext);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::AssertionOperator(0)
+        );
+        update(&mut state, Message::EditFocusNext);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::AssertionValue(0)
+        );
+        update(&mut state, Message::EditFocusNext);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::AssertionNegate(0)
+        );
+        update(&mut state, Message::EditFocusNext);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::Method,
+            "the last assertion row's negate flag wraps back to Method"
+        );
+    }
+
+    #[test]
+    fn typing_into_the_focused_path_field_edits_the_working_copy_and_marks_dirty() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionPath(0);
+        type_into_focused_field(&mut state, "x");
+
+        let edit = state.edit_mode.as_ref().unwrap();
+        assert_eq!(edit.assertions[0].path.value(), "$.statusx");
+        assert!(edit.dirty);
+        assert!(state.dirty_requests.contains(&0));
+    }
+
+    #[test]
+    fn typing_a_malformed_value_sets_a_live_error_that_blocks_save() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionValue(0);
+        backspace_n(&mut state, "ok".len());
+        type_into_focused_field(&mut state, "[a, b");
+
+        assert!(
+            state.edit_mode.as_ref().unwrap().assertions[0]
+                .value_error
+                .is_some(),
+            "an unbalanced bracket is not valid YAML"
+        );
+
+        update(&mut state, Message::SaveEdit);
+        assert!(
+            state.edit_mode.is_some(),
+            "SaveEdit must refuse to leave edit mode with a malformed assertion value"
+        );
+
+        // Still editable afterward — fix it and save again successfully.
+        backspace_n(&mut state, "[a, b".len());
+        type_into_focused_field(&mut state, "fixed");
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().assertions[0].value_error,
+            None
+        );
+        update(&mut state, Message::SaveEdit);
+        assert!(state.edit_mode.is_none(), "save must now succeed");
+    }
+
+    #[test]
+    fn left_right_toggle_the_operator_and_the_negate_flag() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionOperator(0);
+
+        update(&mut state, Message::EditCursorRight);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().assertions[0].operator,
+            JsonOperator::GreaterThan
+        );
+        update(&mut state, Message::EditCursorLeft);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().assertions[0].operator,
+            JsonOperator::Equals
+        );
+
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionNegate(0);
+        update(&mut state, Message::EditCursorRight);
+        assert!(state.edit_mode.as_ref().unwrap().assertions[0].negate);
+    }
+
+    #[test]
+    fn save_edit_writes_added_edited_and_deleted_assertion_rows_into_the_loaded_document() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+
+        // Edit the existing row's value.
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionValue(0);
+        backspace_n(&mut state, "ok".len());
+        type_into_focused_field(&mut state, "ready");
+
+        // Add a brand-new, negated row.
+        update(&mut state, Message::AddAssertionRow);
+        type_into_focused_field(&mut state, "$.count");
+        update(&mut state, Message::EditFocusNext); // -> operator
+        update(&mut state, Message::EditCursorRight); // -> GreaterThan
+        update(&mut state, Message::EditFocusNext); // -> value
+        type_into_focused_field(&mut state, "5");
+        update(&mut state, Message::EditFocusNext); // -> negate
+        update(&mut state, Message::EditCursorRight); // -> true
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(state.edit_mode.is_none());
+        let request = saved_request(&state);
+        let assertions = request
+            .assertions
+            .as_ref()
+            .expect("assertions must remain set");
+        assert_eq!(
+            assertions.json.get("$.status"),
+            Some(&serde_json::json!("ready")),
+            "the edited row's new value must be saved"
+        );
+        assert_eq!(
+            assertions.not.as_ref().unwrap().json.get("$.count"),
+            Some(&serde_json::json!({"greater_than": 5})),
+            "the added negated row must be saved under not.json in its real operator shape"
+        );
+    }
+
+    #[test]
+    fn cancel_edit_discards_every_assertion_change() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        let before_document = match &state.load_state {
+            LoadState::Loaded { document, .. } => (**document).clone(),
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        update(&mut state, Message::EnterEditMode);
+        update(&mut state, Message::AddAssertionRow);
+        type_into_focused_field(&mut state, "$.new");
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionPath(0);
+        update(&mut state, Message::DeleteAssertionRow);
+
+        update(&mut state, Message::CancelEdit);
+
+        assert!(state.edit_mode.is_none());
+        match &state.load_state {
+            LoadState::Loaded { document, .. } => {
+                assert_eq!(
+                    **document, before_document,
+                    "cancel must leave the real request's assertions completely untouched"
+                );
+            }
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_request_with_no_assertions_offers_none_to_edit_and_save_adds_none() {
+        let mut state = loaded_state(REQUEST_WITH_NO_ASSERTIONS);
+        update(&mut state, Message::EnterEditMode);
+        assert!(state.edit_mode.as_ref().unwrap().assertions.is_empty());
+
+        update(&mut state, Message::SaveEdit);
+
+        assert_eq!(saved_request(&state).assertions, None);
+    }
+
+    /// Proof requirement: adding, editing and deleting assertions must be
+    /// verified against `Assertions::evaluate`'s *actual* output — a real
+    /// pass/fail against a real response — not just that the working-copy
+    /// struct fields changed. `run_request.rs` never gets touched: this
+    /// calls `Assertions::evaluate` directly, as a plain library function,
+    /// the same way `run_request::execute` itself does, without spawning a
+    /// run or wiring the editor into it.
+    #[test]
+    fn edited_assertions_actually_change_what_assertions_evaluate_reports() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+
+        // Before editing: `$.status` must equal "ok" — passes against a
+        // response whose body says so, fails otherwise.
+        let request = saved_request(&state).clone();
+        let original_assertions = request.assertions.clone().unwrap();
+        let ok_response = synthetic_response(200, r#"{"status": "ok"}"#);
+        let error_response = synthetic_response(200, r#"{"status": "error"}"#);
+        assert!(original_assertions.evaluate(&ok_response).passed());
+        assert!(!original_assertions.evaluate(&error_response).passed());
+
+        // Edit it to expect "error" instead — a real, in-progress edit, run
+        // through the exact same `to_assertions` `Message::SaveEdit` uses.
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionValue(0);
+        backspace_n(&mut state, "ok".len());
+        type_into_focused_field(&mut state, "error");
+        let edit = state.edit_mode.as_ref().unwrap();
+        let edited_assertions = edit.to_assertions(request.assertions.as_ref()).unwrap();
+
+        // The real report must have flipped: what used to fail now passes,
+        // and vice versa — proof the edit takes effect in evaluation, not
+        // only in the struct.
+        assert!(
+            !edited_assertions.evaluate(&ok_response).passed(),
+            "the old expectation must no longer hold"
+        );
+        assert!(
+            edited_assertions.evaluate(&error_response).passed(),
+            "the edited expectation must now hold"
+        );
+
+        // Now actually save it, and prove the exact same thing against the
+        // request sitting in the loaded document afterward.
+        update(&mut state, Message::SaveEdit);
+        let saved_assertions = saved_request(&state).assertions.clone().unwrap();
+        assert!(!saved_assertions.evaluate(&ok_response).passed());
+        assert!(saved_assertions.evaluate(&error_response).passed());
+    }
+
+    /// The same proof, for deleting a row: once removed, `evaluate` must
+    /// report nothing at all rather than a lingering pass — an empty report
+    /// is a different, real outcome (`AssertionReport::is_empty`), not the
+    /// same "passed" a check that still exists but happens to hold would
+    /// report.
+    #[test]
+    fn deleting_an_assertion_row_and_saving_removes_it_from_what_evaluate_checks() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::AssertionPath(0);
+
+        update(&mut state, Message::DeleteAssertionRow);
+        update(&mut state, Message::SaveEdit);
+
+        assert_eq!(
+            saved_request(&state).assertions,
+            None,
+            "deleting the only assertion must leave nothing behind"
+        );
+        // Confirmed the same way through evaluation itself, not only the
+        // struct: an absent `assertions:` block is `Assertions::default()`,
+        // which evaluates to an empty, vacuously-passing report.
+        let report = Assertions::default().evaluate(&synthetic_response(200, "anything"));
+        assert!(report.is_empty());
+        assert!(report.passed());
+    }
+
+    /// The same proof, for adding a brand-new operator assertion: a real
+    /// `greater_than` check that genuinely distinguishes a passing response
+    /// from a failing one once evaluated for real.
+    #[test]
+    fn adding_a_greater_than_assertion_and_saving_actually_enforces_it() {
+        let mut state = loaded_state(REQUEST_WITH_NO_ASSERTIONS);
+        update(&mut state, Message::EnterEditMode);
+
+        update(&mut state, Message::AddAssertionRow);
+        type_into_focused_field(&mut state, "$.count");
+        update(&mut state, Message::EditFocusNext); // -> operator
+        update(&mut state, Message::EditCursorRight); // Equals -> GreaterThan
+        update(&mut state, Message::EditFocusNext); // -> value
+        type_into_focused_field(&mut state, "10");
+
+        update(&mut state, Message::SaveEdit);
+
+        let assertions = saved_request(&state).assertions.clone().unwrap();
+        let passing = synthetic_response(200, r#"{"count": 20}"#);
+        let failing = synthetic_response(200, r#"{"count": 5}"#);
+        assert!(
+            assertions.evaluate(&passing).passed(),
+            "20 is genuinely greater than 10"
+        );
+        assert!(
+            !assertions.evaluate(&failing).passed(),
+            "5 is genuinely not greater than 10"
         );
     }
 }

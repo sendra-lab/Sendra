@@ -290,6 +290,17 @@ fn translate_event(
                     KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         Message::DeleteHeaderRow
                     }
+                    // Ctrl+A/Ctrl+X, the same idea as Ctrl+N/Ctrl+D above,
+                    // for assertion rows instead of header rows — a separate
+                    // pair of keys since both kinds of row can be present
+                    // (and being added to/deleted from) in the same edit
+                    // session.
+                    KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::AddAssertionRow
+                    }
+                    KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::DeleteAssertionRow
+                    }
                     KeyCode::Tab => Message::EditFocusNext,
                     KeyCode::BackTab => Message::EditFocusPrev,
                     KeyCode::Backspace => Message::EditBackspace,
@@ -704,13 +715,34 @@ mod tests {
     }
 
     #[test]
-    fn control_letter_combinations_other_than_ctrl_s_n_d_do_nothing_while_editing() {
-        // Ctrl+A is not a character this field should insert — crossterm
-        // still reports the plain letter as `Char('a')`, so without the
-        // control-modifier guard in `translate_event` this would silently
-        // type an `a` into the field instead of doing nothing.
-        let message = translate_event(
+    fn ctrl_a_and_ctrl_x_add_and_delete_an_assertion_row_while_editing() {
+        let add = translate_event(
             press_with(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            false,
+            true,
+            false,
+        );
+        let delete = translate_event(
+            press_with(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            false,
+            true,
+            false,
+        );
+
+        assert!(matches!(add, Message::AddAssertionRow));
+        assert!(matches!(delete, Message::DeleteAssertionRow));
+    }
+
+    #[test]
+    fn control_letter_combinations_other_than_ctrl_s_n_d_a_x_do_nothing_while_editing() {
+        // Ctrl+B is not a character this field should insert — crossterm
+        // still reports the plain letter as `Char('b')`, so without the
+        // control-modifier guard in `translate_event` this would silently
+        // type a `b` into the field instead of doing nothing. Picked because
+        // it is not one of the six control combinations edit mode actually
+        // binds (`s`/`n`/`d`/`a`/`x`, plus `c` for quit).
+        let message = translate_event(
+            press_with(KeyCode::Char('b'), KeyModifiers::CONTROL),
             false,
             true,
             false,
