@@ -5,8 +5,9 @@
 //! invariant matters.
 
 use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 
-use sendra_core::{Collection, Document, Request};
+use sendra_core::{Collection, Document, Environment, Request, SendraError};
 
 use super::state::{
     non_empty, validate_assertion_value_text, validate_method_text, AppState, BodyEdit,
@@ -496,69 +497,49 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                     && edit.assertions.iter().all(|row| row.value_error.is_none())
             });
             if can_save {
-                // Everything the save needs, copied out of `state.load_state`
-                // as owned values rather than matched by reference: the
-                // candidate document built below has to be a full, separate
-                // clone (see the comment on it) attempted against disk
-                // *before* anything in `state` changes, so a failed write
-                // leaves both the loaded document and `edit_mode` completely
-                // untouched — the same "nothing happens until it's known to
-                // work" guarantee `CancelEdit` already relies on for its own
-                // "there is nothing to undo" claim.
-                let loaded = match &state.load_state {
-                    LoadState::Loaded {
-                        document,
-                        selected,
-                        base_dir,
-                        path,
-                    } => Some((
-                        (**document).clone(),
-                        *selected,
-                        base_dir.clone(),
-                        path.clone(),
-                    )),
-                    LoadState::Loading | LoadState::NoPathProvided | LoadState::Failed(_) => None,
-                };
-                if let Some((mut candidate, selected, base_dir, path)) = loaded {
-                    if let Some(request) = request_mut(&mut candidate, selected) {
-                        // `edit_mode` is guaranteed `Some` here: `can_save`
-                        // above is itself `Option::is_some_and`, so it can
-                        // only be `true` when there is an edit to apply.
-                        if let Some(edit) = &state.edit_mode {
-                            apply_edit_to_request(request, edit);
+                // `try_save_edit` attempts the write against a clone before
+                // anything in `state` changes, so a failed write leaves both
+                // the loaded document and `edit_mode` completely untouched —
+                // the same "nothing happens until it's known to work"
+                // guarantee `CancelEdit` already relies on for its own
+                // "there is nothing to undo" claim. `edit_mode` is
+                // guaranteed `Some` here: `can_save` above is itself
+                // `Option::is_some_and`, so it can only be `true` when there
+                // is an edit to apply.
+                let attempt = state
+                    .edit_mode
+                    .as_ref()
+                    .and_then(|edit| try_save_edit(&state.load_state, edit));
+                match attempt {
+                    Some(Ok(saved)) => {
+                        state.load_state = LoadState::Loaded {
+                            document: Box::new(saved.document),
+                            selected: saved.selected,
+                            base_dir: saved.base_dir,
+                            path: saved.path,
+                        };
+                        state.dirty_requests.remove(&saved.selected);
+                        state.edit_mode = None;
+                        // Whatever `Message::AddRequest` might have staged
+                        // for `CancelEdit` to undo no longer applies — the
+                        // request (new or not) is now genuinely saved, so
+                        // there is nothing left to roll back.
+                        state.pending_new_request = None;
+                    }
+                    Some(Err(error)) => {
+                        // The loaded document is still the pre-edit one —
+                        // `try_save_edit`'s candidate was a clone, never
+                        // written back — and `dirty_requests` still names
+                        // this request, exactly as it should: the edit is
+                        // neither lost nor silently marked clean over a save
+                        // that never actually reached disk. `edit_mode`
+                        // stays `Some` so the same typed changes are still
+                        // there to retry, or to `CancelEdit` away.
+                        if let Some(edit) = &mut state.edit_mode {
+                            edit.save_error = Some(error.to_string());
                         }
                     }
-                    match candidate.save_to_path(&path) {
-                        Ok(()) => {
-                            state.load_state = LoadState::Loaded {
-                                document: Box::new(candidate),
-                                selected,
-                                base_dir,
-                                path,
-                            };
-                            state.dirty_requests.remove(&selected);
-                            state.edit_mode = None;
-                            // Whatever `Message::AddRequest` might have
-                            // staged for `CancelEdit` to undo no longer
-                            // applies — the request (new or not) is now
-                            // genuinely saved, so there is nothing left to
-                            // roll back.
-                            state.pending_new_request = None;
-                        }
-                        Err(error) => {
-                            // The loaded document is still the pre-edit one —
-                            // `candidate` was a clone, never written back —
-                            // and `dirty_requests` still names this request,
-                            // exactly as it should: the edit is neither lost
-                            // nor silently marked clean over a save that
-                            // never actually reached disk. `edit_mode` stays
-                            // `Some` so the same typed changes are still
-                            // there to retry, or to `CancelEdit` away.
-                            if let Some(edit) = &mut state.edit_mode {
-                                edit.save_error = Some(error.to_string());
-                            }
-                        }
-                    }
+                    None => {}
                 }
             }
         }
@@ -627,56 +608,38 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
         Message::ConfirmDelete => {
             if let Some(confirm) = &state.delete_confirm {
                 let index = confirm.index;
-                // Everything the delete needs, copied out of
-                // `state.load_state` as owned values — the same
-                // "attempt the write against a clone before anything in
-                // `state` changes" shape `Message::SaveEdit` already uses,
-                // so a failed write leaves the loaded document, `selected`
-                // and `dirty_requests` completely untouched.
-                let loaded = match &state.load_state {
-                    LoadState::Loaded {
-                        document,
-                        base_dir,
-                        path,
-                        ..
-                    } if can_delete(document, index) => {
-                        Some(((**document).clone(), base_dir.clone(), path.clone()))
+                // `try_delete_request` attempts the write against a clone
+                // before anything in `state` changes — the same
+                // "nothing happens until it's known to work" shape
+                // `try_save_edit` uses — so a failed write leaves the loaded
+                // document, `selected` and `dirty_requests` completely
+                // untouched.
+                match try_delete_request(&state.load_state, index) {
+                    Some(Ok(saved)) => {
+                        state.load_state = LoadState::Loaded {
+                            document: Box::new(saved.document),
+                            selected: saved.selected,
+                            base_dir: saved.base_dir,
+                            path: saved.path,
+                        };
+                        state.dirty_requests =
+                            reindex_dirty_after_delete(&state.dirty_requests, index);
+                        state.delete_confirm = None;
+                        // A different (or no longer any) request is now
+                        // selected, the same reset `select()` already
+                        // applies when the selection moves.
+                        state.run_state = RunState::Idle;
+                        state.response_scroll = 0;
+                        state.reveal_captures = false;
                     }
-                    _ => None,
-                };
-                match loaded {
-                    Some((mut candidate, base_dir, path)) => {
-                        remove_request(&mut candidate, index);
-                        match candidate.save_to_path(&path) {
-                            Ok(()) => {
-                                let new_selected =
-                                    new_selection_after_delete(index, candidate.requests().len());
-                                state.load_state = LoadState::Loaded {
-                                    document: Box::new(candidate),
-                                    selected: new_selected,
-                                    base_dir,
-                                    path,
-                                };
-                                state.dirty_requests =
-                                    reindex_dirty_after_delete(&state.dirty_requests, index);
-                                state.delete_confirm = None;
-                                // A different (or no longer any) request is
-                                // now selected, the same reset `select()`
-                                // already applies when the selection moves.
-                                state.run_state = RunState::Idle;
-                                state.response_scroll = 0;
-                                state.reveal_captures = false;
-                            }
-                            Err(error) => {
-                                // The loaded document is still the pre-delete
-                                // one — `candidate` was a clone, never
-                                // written back — so nothing here is lost;
-                                // the prompt stays open, showing the failure,
-                                // so the user can retry or cancel.
-                                if let Some(confirm) = &mut state.delete_confirm {
-                                    confirm.error = Some(error.to_string());
-                                }
-                            }
+                    Some(Err(error)) => {
+                        // The loaded document is still the pre-delete one —
+                        // `try_delete_request`'s candidate was a clone,
+                        // never written back — so nothing here is lost; the
+                        // prompt stays open, showing the failure, so the
+                        // user can retry or cancel.
+                        if let Some(confirm) = &mut state.delete_confirm {
+                            confirm.error = Some(error.to_string());
                         }
                     }
                     // The document changed shape out from under the prompt
@@ -851,19 +814,17 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                 return;
             };
 
-            let mut candidate = named.environment.clone();
-            candidate.variables = variables;
-
-            match candidate.save_to_path(&path) {
-                Ok(()) => {
+            match try_save_environment(&named.environment, &path, variables) {
+                Ok(candidate) => {
                     state.environments[index].environment = candidate;
                     state.environment_edit = None;
                 }
                 Err(error) => {
                     // The stored environment is still the pre-edit one —
-                    // `candidate` was a clone, never written back — so
-                    // nothing here is lost; the session stays open, showing
-                    // the failure, so the user can retry or cancel.
+                    // `try_save_environment`'s candidate was a clone, never
+                    // written back — so nothing here is lost; the session
+                    // stays open, showing the failure, so the user can retry
+                    // or cancel.
                     if let Some(env_edit) = &mut state.environment_edit {
                         env_edit.save_error = Some(error.to_string());
                     }
@@ -1256,6 +1217,129 @@ fn apply_body_edit(request: &mut Request, body: &BodyEdit) {
         request.body = Some(text.value().to_string());
         request.json = None;
     }
+}
+
+/// The result of a successful `Message::SaveEdit` write: the freshly saved
+/// `Document` plus the `selected`/`base_dir`/`path` triple
+/// `LoadState::Loaded` needs alongside it — everything the `SaveEdit` arm
+/// applies to `state` once [`try_save_edit`] has already proven the write
+/// reached disk.
+struct SavedEdit {
+    document: Document,
+    selected: usize,
+    base_dir: PathBuf,
+    path: PathBuf,
+}
+
+/// Builds the candidate `Document` `edit` describes — clone the loaded one,
+/// apply `edit`'s fields onto the selected request via
+/// [`apply_edit_to_request`] — and attempts to save it (see
+/// `Document::save_to_path`'s own doc comment for the atomic write). Pure
+/// with respect to `AppState`: takes exactly what it needs and returns a
+/// `Result` for `Message::SaveEdit`'s arm to apply, rather than mutating
+/// `state` itself, so a failed write is provably a no-op on the caller's own
+/// state — the candidate here was always a clone, never written back —
+/// without that guarantee having to live inside this function.
+///
+/// `None` only when `load_state` isn't `Loaded` at all — `Message::SaveEdit`
+/// never actually reaches this with anything else, since edit mode only
+/// ever opens against a loaded document (see `Message::EnterEditMode`).
+/// When `selected` no longer indexes a real request — likewise unreachable
+/// in practice, since nothing can change `selected` while `edit_mode` is
+/// `Some` (see the mode-exclusivity guards at the top of `update_session`)
+/// — the edit is silently not applied to anything, but the (unmodified)
+/// candidate is still saved, exactly mirroring what this code did before
+/// being pulled out into its own function.
+fn try_save_edit(
+    load_state: &LoadState,
+    edit: &EditState,
+) -> Option<Result<SavedEdit, SendraError>> {
+    let LoadState::Loaded {
+        document,
+        selected,
+        base_dir,
+        path,
+    } = load_state
+    else {
+        return None;
+    };
+    let selected = *selected;
+    let mut candidate = (**document).clone();
+    if let Some(request) = request_mut(&mut candidate, selected) {
+        apply_edit_to_request(request, edit);
+    }
+
+    Some(candidate.save_to_path(path).map(|()| SavedEdit {
+        document: candidate,
+        selected,
+        base_dir: base_dir.clone(),
+        path: path.clone(),
+    }))
+}
+
+/// The result of a successful `Message::ConfirmDelete` write: the freshly
+/// saved `Document` (with the request removed), the selection that should
+/// land after it, plus the `base_dir`/`path` pair `LoadState::Loaded` needs
+/// alongside them — everything the `ConfirmDelete` arm applies to `state`
+/// once [`try_delete_request`] has already proven the write reached disk.
+struct SavedDelete {
+    document: Document,
+    selected: usize,
+    base_dir: PathBuf,
+    path: PathBuf,
+}
+
+/// Builds the candidate `Document` with the request at `index` removed —
+/// clone the loaded one, [`remove_request`] — and attempts to save it. Pure
+/// with respect to `AppState`, the same shape and the same reason as
+/// [`try_save_edit`] above.
+///
+/// `None` when `load_state` isn't `Loaded`, or `index` can no longer be
+/// deleted (see [`can_delete`]) — `Message::ConfirmDelete`'s own fallback
+/// for either is to close the confirmation prompt rather than act on stale
+/// state, the same as this code did before being pulled out into its own
+/// function.
+fn try_delete_request(
+    load_state: &LoadState,
+    index: usize,
+) -> Option<Result<SavedDelete, SendraError>> {
+    let LoadState::Loaded {
+        document,
+        base_dir,
+        path,
+        ..
+    } = load_state
+    else {
+        return None;
+    };
+    if !can_delete(document, index) {
+        return None;
+    }
+    let mut candidate = (**document).clone();
+    remove_request(&mut candidate, index);
+    let selected = new_selection_after_delete(index, candidate.requests().len());
+
+    Some(candidate.save_to_path(path).map(|()| SavedDelete {
+        document: candidate,
+        selected,
+        base_dir: base_dir.clone(),
+        path: path.clone(),
+    }))
+}
+
+/// Builds `named`'s candidate `Environment` with `variables` replacing its
+/// own, and attempts to save it to `path` (`Environment::save_to_path`
+/// mirrors `Document::save_to_path`'s own atomic write). Pure with respect
+/// to `AppState`, the same shape as [`try_save_edit`]/[`try_delete_request`]
+/// above — `Message::SaveEnvironmentEdit`'s arm applies the `Result` itself.
+fn try_save_environment(
+    named: &Environment,
+    path: &Path,
+    variables: BTreeMap<String, String>,
+) -> Result<Environment, SendraError> {
+    let mut candidate = named.clone();
+    candidate.variables = variables;
+    candidate.save_to_path(path).map(|()| candidate)
 }
 
 /// Applies `mutate` to whichever field `EditState::focus` currently points
