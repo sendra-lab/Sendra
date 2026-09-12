@@ -23,7 +23,7 @@ use crate::run_request::RunOutcome;
 use super::preview::{self, resolve_browsing_preview};
 use super::state::{
     AppState, AssertionRow, AuthEdit, AuthField, BodyEdit, CaptureKind, CaptureRow,
-    CollectionSession, DeleteConfirm, EditField, EditState, EnvVarField, EnvironmentEditState,
+    CollectionSession, ConfirmPrompt, EditField, EditState, EnvVarField, EnvironmentEditState,
     HistoryOverlay, JsonOperator, LoadState, NamedEnvironment, OpenCollectionPromptState, RunState,
 };
 
@@ -102,15 +102,31 @@ pub fn view(state: &AppState, frame: &mut Frame) {
     }
 
     if let Some(confirm) = &state.delete_confirm {
-        render_delete_confirm_overlay(frame, state, confirm);
+        render_confirm_prompt(frame, "Delete request", &confirm.prompt);
+    }
+
+    if let Some(pending) = state
+        .environment_edit
+        .as_ref()
+        .and_then(|env_edit| env_edit.pending_delete.as_ref())
+    {
+        render_confirm_prompt(frame, "Delete variable", &pending.prompt);
     }
 
     if let Some(prompt) = &state.open_collection_prompt {
         render_open_collection_prompt(frame, prompt);
     }
 
-    if let Some(id) = state.close_confirm {
-        render_close_confirm_overlay(frame, state, id);
+    if let Some(confirm) = &state.close_confirm {
+        render_confirm_prompt(frame, "Close collection", &confirm.prompt);
+    }
+
+    // Checked — and so drawn — last: `quit_confirm` can appear over *any*
+    // other state (see its own doc comment), so it has to sit visually on
+    // top of every other overlay this function might have just drawn, not
+    // only the ordinary panes underneath.
+    if let Some(prompt) = &state.quit_confirm {
+        render_confirm_prompt(frame, "Quit sendra-tui", prompt);
     }
 }
 
@@ -143,7 +159,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 /// with none, the file's stem when a `Document::Collection` was never given
 /// a `name:`, or a short, honest placeholder for a tab that never finished
 /// loading anything.
-fn collection_label(session: &CollectionSession) -> String {
+pub(super) fn collection_label(session: &CollectionSession) -> String {
     match &session.load_state {
         LoadState::Loading => "loading…".to_string(),
         LoadState::NoPathProvided => "(none)".to_string(),
@@ -1322,15 +1338,34 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 /// (invalid-method save-refusal, dirty-marker bookkeeping) confirm their
 /// effect is visible in this bar too, rather than duplicating a second
 /// "what does the help bar say" check inside `view`'s own test module.
+/// The status-bar line for any [`ConfirmPrompt`] — one format string shared
+/// by every destructive-action confirmation's `status_help_text` branch
+/// (request-delete, env-var-delete, close-tab, quit), the exact status-bar
+/// counterpart to [`render_confirm_prompt`] sharing the same content one
+/// level up in the UI.
+fn confirm_status_line(prompt: &ConfirmPrompt) -> String {
+    let failed = if prompt.error.is_some() {
+        "  (failed — see message)"
+    } else {
+        ""
+    };
+    format!(
+        "{}{failed}  |  y/enter confirm  n/esc cancel  q quit",
+        prompt.message
+    )
+}
+
 pub(super) fn status_help_text(state: &AppState) -> String {
-    if let Some(id) = state.close_confirm {
-        let label = state
-            .collections
-            .iter()
-            .find(|session| session.id == id)
-            .map(collection_label)
-            .unwrap_or_else(|| "this collection".to_string());
-        return format!("Close '{label}'?  |  y/enter confirm  n/esc cancel  q quit");
+    // Checked before every other context: `quit_confirm` can appear over
+    // *any* of them (see its own doc comment on why quitting is guarded
+    // ahead of everything else), so its own keys are the only ones actually
+    // live no matter what else this bar would otherwise say.
+    if let Some(prompt) = &state.quit_confirm {
+        return confirm_status_line(prompt);
+    }
+
+    if let Some(confirm) = &state.close_confirm {
+        return confirm_status_line(&confirm.prompt);
     }
 
     if let Some(prompt) = &state.open_collection_prompt {
@@ -1343,17 +1378,12 @@ pub(super) fn status_help_text(state: &AppState) -> String {
     }
 
     if let Some(confirm) = &state.delete_confirm {
-        let failed = if confirm.error.is_some() {
-            "  (delete failed — see message)"
-        } else {
-            ""
-        };
-        return format!("Confirm delete{failed}  |  y/enter confirm  n/esc cancel  q quit");
+        return confirm_status_line(&confirm.prompt);
     }
 
     if let Some(env_edit) = &state.environment_edit {
-        if env_edit.pending_delete.is_some() {
-            return "Delete variable?  |  y/enter confirm  n/esc cancel  q quit".to_string();
+        if let Some(pending) = &env_edit.pending_delete {
+            return confirm_status_line(&pending.prompt);
         }
         let failed = if env_edit.save_error.is_some() {
             "  (save failed — see message)"
@@ -1897,10 +1927,11 @@ fn format_elapsed(when: std::time::SystemTime) -> String {
 /// whichever half of whichever row has focus — the same "mark focus inline
 /// in the text, no separate cursor widget" convention `render_edit_pane`'s
 /// header rows already use. A row pending deletion
-/// (`EnvironmentEditState::pending_delete`) is called out inline rather than
-/// drawn as a second overlay on top of this one, keeping this a single,
-/// minimal screen rather than a stack of them — see this issue's own scoping
-/// note on why a unified confirmation component is a later concern.
+/// (`EnvironmentEditState::pending_delete`) is drawn as a real modal on top
+/// of this screen, through the same [`render_confirm_prompt`] every other
+/// destructive-action confirmation in this crate uses (see `view()`'s own
+/// call site) — not called out inline the way it used to be, before this
+/// issue's unified confirmation component covered this case too.
 fn render_environment_edit(frame: &mut Frame, state: &AppState, env_edit: &EnvironmentEditState) {
     let name = state
         .environments
@@ -1933,11 +1964,7 @@ fn render_environment_edit(frame: &mut Frame, state: &AppState, env_edit: &Envir
             } else {
                 row.value.value().to_string()
             };
-            let mut line = format!("{name_text} = {value_text}");
-            if env_edit.pending_delete == Some(index) {
-                line.push_str("   ⚠ delete this variable? y/n");
-            }
-            lines.push(line);
+            lines.push(format!("{name_text} = {value_text}"));
         }
     }
 
@@ -1952,46 +1979,39 @@ fn render_environment_edit(frame: &mut Frame, state: &AppState, env_edit: &Envir
     );
 }
 
-/// The delete confirmation prompt — a small, functional stub, deliberately
-/// not the shared confirmation component every destructive action in this
-/// batch will eventually use (see this issue's own scoping notes). Named the
-/// request it would delete, so confirming is never a guess about which row
-/// `y`/Enter is about to remove, and shows `DeleteConfirm::error` inline,
-/// through the same [`format_error`] every other error in the crate goes
-/// through, when a previous confirm attempt failed to write to disk.
-fn render_delete_confirm_overlay(frame: &mut Frame, state: &AppState, confirm: &DeleteConfirm) {
+/// The one confirmation-prompt component every destructive action in this
+/// crate is rendered through — deleting a request, deleting an environment
+/// variable, closing a tab, and quitting with unsaved work — mirroring how
+/// [`format_error`] already gives every *error* one shared rendering instead
+/// of each feature formatting its own. `heading` is the only thing that
+/// varies per call site (`"Delete request"`, `"Close collection"`, ...);
+/// everything else — the modal chrome (`modal_frame`, itself already unified
+/// — see this issue's own audit notes), the "y/Enter confirm, n/Esc cancel"
+/// wording, `prompt.message`, and `prompt.error` shown inline through the
+/// same [`format_error`] every other error in the crate goes through — comes
+/// from [`ConfirmPrompt`] and is built exactly once, here.
+fn render_confirm_prompt(frame: &mut Frame, heading: &str, prompt: &ConfirmPrompt) {
     let inner = modal_frame(
         frame,
         60,
         30,
-        "Delete request — y/Enter confirm, n/Esc cancel",
+        format!("{heading} — y/Enter confirm, n/Esc cancel"),
     );
 
-    let name = match &state.load_state {
-        LoadState::Loaded { document, .. } => document
-            .requests()
-            .get(confirm.index)
-            .and_then(|request| request.name.as_deref())
-            .unwrap_or("(unnamed)")
-            .to_string(),
-        LoadState::Loading | LoadState::NoPathProvided | LoadState::Failed(_) => {
-            "(unnamed)".to_string()
-        }
-    };
-
-    let mut text = format!("Delete '{name}'? This cannot be undone.");
-    if let Some(error) = &confirm.error {
+    let mut text = prompt.message.clone();
+    if let Some(error) = &prompt.error {
         text.push_str("\n\n");
-        text.push_str(&format_error("Failed to delete", error));
+        text.push_str(&format_error("Failed", error));
     }
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
 /// The "open another collection" path-input prompt — a minimal, single-field
-/// overlay in the same visual family as `render_delete_confirm_overlay`,
-/// showing the path typed so far and (once a load attempt has actually
-/// failed) the real error inline, through the same `format_error` every
-/// other error in the crate goes through.
+/// overlay in the same visual family as [`render_confirm_prompt`] (built on
+/// the same `modal_frame` chrome and the same inline-error convention), but
+/// not itself a yes/no confirmation — there is nothing destructive about
+/// typing a path — so it stays its own function rather than being forced
+/// into [`ConfirmPrompt`]'s shape.
 fn render_open_collection_prompt(frame: &mut Frame, prompt: &OpenCollectionPromptState) {
     let inner = modal_frame(
         frame,
@@ -2005,29 +2025,6 @@ fn render_open_collection_prompt(frame: &mut Frame, prompt: &OpenCollectionPromp
         text.push_str("\n\n");
         text.push_str(&format_error("Failed to open", error));
     }
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
-}
-
-/// The close-tab confirmation — shown only when
-/// `CollectionSession::is_dirty()` said there was something at stake (see
-/// `Message::CloseCollectionRequested`'s own arm); a clean tab closes with
-/// no prompt at all, so reaching this screen already means real, unsaved
-/// state would be lost.
-fn render_close_confirm_overlay(frame: &mut Frame, state: &AppState, collection_id: u64) {
-    let inner = modal_frame(
-        frame,
-        60,
-        30,
-        "Close collection — y/Enter confirm, n/Esc cancel",
-    );
-
-    let label = state
-        .collections
-        .iter()
-        .find(|session| session.id == collection_id)
-        .map(collection_label)
-        .unwrap_or_else(|| "this collection".to_string());
-    let text = format!("Close '{label}'? Unsaved changes will be lost.");
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
@@ -4506,7 +4503,7 @@ requests:
     }
 
     #[test]
-    fn env_var_delete_confirmation_shows_up_inline_on_the_pending_row() {
+    fn env_var_delete_confirmation_renders_through_the_shared_confirm_prompt() {
         let (mut state, _dir, _path) = loaded_state_with_saved_environment("https://example.com");
         update(&mut state, Message::OpenEnvironmentOverlay);
         update(&mut state, Message::EnterEnvironmentEdit);
@@ -4515,8 +4512,13 @@ requests:
 
         let screen = render_screen(&state);
         assert!(
-            screen.contains("delete this variable"),
-            "a pending row delete must show an inline confirmation:\n{screen}"
+            screen.contains("Delete variable"),
+            "a pending row delete must show the shared confirmation modal, \
+             the same component every other destructive action uses:\n{screen}"
+        );
+        assert!(
+            screen.contains("y/Enter confirm"),
+            "the shared confirmation modal's own keys must be advertised:\n{screen}"
         );
     }
 

@@ -269,15 +269,17 @@ pub struct EnvironmentEditState {
     /// type has to represent "editing an environment with nothing in it yet"
     /// cleanly rather than pretend a row exists to focus.
     pub focus: Option<EnvVarField>,
-    /// `Some(index)` into `rows` while a delete confirmation is pending for
-    /// that row — the actual removal happens only on
+    /// `Some(...)` while a delete confirmation is pending for one of `rows`
+    /// — the actual removal happens only on
     /// `Message::ConfirmDeleteEnvVarRow`; `Message::CancelDeleteEnvVarRow`
     /// (or starting any other row action) drops this without touching
-    /// `rows` at all. A minimal, single-purpose confirmation, the same scope
-    /// note `AppState::delete_confirm` already makes for deleting a whole
-    /// request: a unified confirmation shared by every destructive action in
-    /// this batch is a later, separate concern.
-    pub pending_delete: Option<usize>,
+    /// `rows` at all. Built on the same shared [`ConfirmPrompt`] every other
+    /// destructive-action confirmation in this crate uses, rendered as a
+    /// real modal on top of this screen (`view::render_confirm_prompt`)
+    /// rather than the inline row annotation this used to be — see this
+    /// issue's own scoping notes on why a unified confirmation component
+    /// covers this case too now.
+    pub pending_delete: Option<PendingEnvVarDelete>,
     /// `Some(message)` right after `Message::SaveEnvironmentEdit` refused to
     /// save — either live validation (an empty or duplicated variable name —
     /// see `update::validate_env_var_rows`) or a real failure writing to
@@ -371,7 +373,16 @@ impl EnvironmentEditState {
             Some(EnvVarField::Name(index) | EnvVarField::Value(index)) => index,
             None => return,
         };
-        self.pending_delete = Some(index);
+        let name = self
+            .rows
+            .get(index)
+            .map(|row| row.key.value())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("(unnamed)");
+        self.pending_delete = Some(PendingEnvVarDelete {
+            index,
+            prompt: ConfirmPrompt::new(format!("Delete variable '{name}'? This cannot be undone.")),
+        });
     }
 
     /// Drops a pending deletion without removing anything — visible to
@@ -387,9 +398,10 @@ impl EnvironmentEditState {
     /// last), or to `None` if no rows remain — the zero-variables state this
     /// type's own `focus` doc comment describes.
     pub(super) fn confirm_pending_delete(&mut self) {
-        let Some(index) = self.pending_delete.take() else {
+        let Some(pending) = self.pending_delete.take() else {
             return;
         };
+        let index = pending.index;
         if index >= self.rows.len() {
             return;
         }
@@ -400,6 +412,17 @@ impl EnvironmentEditState {
             Some(EnvVarField::Name(index.min(self.rows.len() - 1)))
         };
     }
+}
+
+/// What `Message::RequestDeleteEnvVarRow` opens and
+/// `Message::ConfirmDeleteEnvVarRow`/`Message::CancelDeleteEnvVarRow` close —
+/// which row is pending deletion, plus the shared confirmation UI itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEnvVarDelete {
+    /// Index into `EnvironmentEditState::rows` — fixed for the life of this
+    /// prompt.
+    pub index: usize,
+    pub prompt: ConfirmPrompt,
 }
 
 /// Which auth sub-field currently has focus, when the selected request's
@@ -2186,24 +2209,54 @@ pub struct HistoryOverlay {
     pub view_reveal_captures: bool,
 }
 
+/// The one shared shape behind every yes/no confirmation in this crate —
+/// deleting a request, deleting an environment variable, closing a tab, and
+/// quitting with unsaved work — mirroring how `format_error` already gives
+/// every *error* in the crate one shared rendering, rather than each feature
+/// formatting its own. `message` is the question itself (built once, when
+/// the prompt opens, from whatever real data it names — a request's name, a
+/// tab's label, a count of dirty tabs — so `view::render_confirm_prompt`
+/// never has to re-derive it, and can render this exact same type no matter
+/// which destructive action it came from), and `error` is `Some` only after
+/// a confirmed attempt actually failed to carry it out.
+///
+/// **Not itself a place to say *what* is pending confirmation or *how* to
+/// carry it out.** Every caller pairs this with whatever it alone needs to
+/// act on `Message::Confirm*` — `DeleteConfirm`'s own `index`, `CloseConfirm`'s
+/// own `collection_id`, an env-var row's own index — since that part is
+/// genuinely feature-specific in a way the confirmation UI itself is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmPrompt {
+    pub message: String,
+    /// `Some(message)` right after a confirmed attempt actually failed to
+    /// carry out the action (e.g. `Message::ConfirmDelete` failing to write
+    /// to disk) — the prompt stays open with this set so the failure is
+    /// visible and the user can retry or cancel, the same way
+    /// `EditState::save_error` keeps edit mode open on a failed `SaveEdit`
+    /// rather than silently discarding the pending change. Never set by
+    /// [`Self::new`]: every prompt starts with nothing to report yet.
+    pub error: Option<String>,
+}
+
+impl ConfirmPrompt {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            error: None,
+        }
+    }
+}
+
 /// What `Message::RequestDelete` opens and `Message::ConfirmDelete`/
-/// `Message::CancelDelete` close — which request is pending deletion, and
-/// (once a confirmed deletion has actually been attempted) whatever went
-/// wrong writing it back to disk.
+/// `Message::CancelDelete` close — which request is pending deletion (needed
+/// to act on it), plus the shared confirmation UI itself.
 #[derive(Debug, Clone)]
 pub struct DeleteConfirm {
     /// Index into the loaded document's `requests()` — fixed for the life of
     /// this prompt; nothing else can change the selection while it is open
     /// (see `update()`'s browsing-message guard for `delete_confirm`).
     pub index: usize,
-    /// `Some(message)` right after `Message::ConfirmDelete` attempted to
-    /// write the deletion to disk (via `sendra_core::Document::save_to_path`)
-    /// and that write failed — a full disk, a permissions error, anything
-    /// `save_to_path`'s own doc comment covers. The prompt stays open with
-    /// this set so the failure is visible and the user can retry or cancel,
-    /// the same way `EditState::save_error` keeps edit mode open on a failed
-    /// `SaveEdit` rather than silently discarding the pending change.
-    pub error: Option<String>,
+    pub prompt: ConfirmPrompt,
 }
 
 /// What `Message::CancelEdit` restores after `Message::AddRequest` is
@@ -2375,18 +2428,34 @@ pub struct AppState {
     /// session-scoped message while this is open, the same way a session's
     /// own modals refuse browsing messages within that session.
     pub open_collection_prompt: Option<OpenCollectionPromptState>,
-    /// `Some(id)` while a confirmation is pending for closing the session
-    /// named by that id — a minimal, single-purpose confirmation, the same
-    /// scope note `DeleteConfirm`/issue 27's own delete confirmation already
-    /// makes: a unified confirmation shared by every destructive action in
-    /// this crate (requests, environment variables, now collections) is
-    /// issue 31's later, separate concern. Named by id rather than always
-    /// meaning "the active collection": pinning it is what keeps a
-    /// mid-confirmation tab switch (were one ever allowed — `update()`'s own
-    /// guard in fact refuses tab-switching while this is open, the same way
-    /// every other modal in this crate refuses navigation) from ever closing
-    /// a different tab than the one the prompt was actually asking about.
-    pub close_confirm: Option<u64>,
+    /// `Some(...)` while a confirmation is pending for closing the session
+    /// named by `CloseConfirm::collection_id` — built on the same shared
+    /// [`ConfirmPrompt`] every other destructive-action confirmation in this
+    /// crate uses. Named by id rather than always meaning "the active
+    /// collection": pinning it is what keeps a mid-confirmation tab switch
+    /// (were one ever allowed — `update()`'s own guard in fact refuses
+    /// tab-switching while this is open, the same way every other modal in
+    /// this crate refuses navigation) from ever closing a different tab than
+    /// the one the prompt was actually asking about.
+    pub close_confirm: Option<CloseConfirm>,
+    /// `Some(...)` while quitting is pending confirmation because at least
+    /// one open tab has something `CollectionSession::is_dirty()` says would
+    /// be lost — checked across *every* open tab, not just the active one
+    /// (`Message::Quit`'s own arm in `update()`), since a run in flight or an
+    /// edit left open in a tab the user has since switched away from is just
+    /// as real a loss as one in the tab currently on screen. `None` — and so
+    /// quitting with nothing at stake anywhere exits immediately, with no
+    /// prompt — the instant every tab reports clean.
+    pub quit_confirm: Option<ConfirmPrompt>,
+}
+
+/// What `Message::CloseCollectionRequested` opens and
+/// `Message::ConfirmCloseCollection`/`Message::CancelCloseCollection` close —
+/// which tab is pending closure, plus the shared confirmation UI itself.
+#[derive(Debug, Clone)]
+pub struct CloseConfirm {
+    pub collection_id: u64,
+    pub prompt: ConfirmPrompt,
 }
 
 /// What `Message::OpenCollectionPrompt` opens and
@@ -2422,6 +2491,7 @@ impl Default for AppState {
             next_session_id: 1,
             open_collection_prompt: None,
             close_confirm: None,
+            quit_confirm: None,
         }
     }
 }
@@ -2501,7 +2571,19 @@ pub enum LoadState {
 
 #[derive(Debug)]
 pub enum Message {
+    /// `q`/Ctrl+C. Exits immediately when no open tab has anything
+    /// `CollectionSession::is_dirty()` would call unsaved; otherwise opens
+    /// `AppState::quit_confirm` instead of exiting — see that field's own
+    /// doc comment. Sent again while that confirmation is already open (the
+    /// quit key pressed a second time, `q` or Ctrl+C either one) it confirms
+    /// and exits, the same low-friction "ask once, then get out of the way"
+    /// behavior `Message::ConfirmQuit` gives the dedicated `y`/Enter key.
     Quit,
+    /// `y`/Enter while `AppState::quit_confirm` is open: exits.
+    ConfirmQuit,
+    /// `n`/Esc while `AppState::quit_confirm` is open: closes the prompt
+    /// without exiting, every open tab's state exactly as it was.
+    CancelQuit,
     Tick,
     NoCollectionPath,
     CollectionLoaded {
