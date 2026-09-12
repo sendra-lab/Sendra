@@ -1423,14 +1423,24 @@ pub struct AppState {
     /// changed request-list selection both reset it, in `update` and
     /// `select` respectively.
     pub response_scroll: usize,
-    /// Whether captured values are shown in the clear rather than masked —
-    /// `Message::ToggleRevealCaptures`, bound to `c`. Starts `false` (masked)
-    /// every time, is never written anywhere but this in-memory field, and is
-    /// reset back to `false` on the same two events that reset `run_state`
-    /// (a fresh `RunRequested`, a changed request-list selection) — see the
-    /// doc comment on `render_capture_section` for why "never persisted,
-    /// never auto-revealed on the next run" means resetting it there too,
-    /// not only at process start.
+    /// Whether captured values, and (see `view::format_resolved_request`)
+    /// auth-derived header/query values in the read-only request preview,
+    /// are shown in the clear rather than masked — `Message::
+    /// ToggleRevealCaptures`, bound to `c`. One flag for both, not a second
+    /// toggle: both are the same "sensitive value a screen-share or a
+    /// terminal recording shouldn't casually expose while just browsing"
+    /// concern, and a user who has already asked to see one kind of secret
+    /// this session is not asking to keep the other hidden. Never affects
+    /// edit mode, where auth values are always shown in the clear regardless
+    /// — editing them is the whole point there, and there is nothing to
+    /// browse-and-forget about a value you are actively typing. Starts
+    /// `false` (masked) every time, is never written anywhere but this
+    /// in-memory field, and is reset back to `false` on the same two events
+    /// that reset `run_state` (a fresh `RunRequested`, a changed
+    /// request-list selection) — see the doc comment on
+    /// `format_capture_section` for why "never persisted, never
+    /// auto-revealed on the next run" means resetting it there too, not only
+    /// at process start.
     pub reveal_captures: bool,
     /// `Some(EditState)` while the request at `selected` (in
     /// `LoadState::Loaded`) is being edited, `None` while merely browsing.
@@ -1559,9 +1569,11 @@ pub enum Message {
     /// clamp every other scroll value already goes through, so this needs
     /// no separate "what's the last valid position" calculation here.
     ScrollResponseBottom,
-    /// `c`: flips `reveal_captures`. Masked values become visible, visible
-    /// values become masked again — a toggle rather than a one-way reveal,
-    /// so hiding them again does not need a second, differently-named key.
+    /// `c`: flips `reveal_captures`. Masked values — captured values and,
+    /// while merely browsing, auth-derived header/query values in the
+    /// request preview — become visible, visible values become masked
+    /// again — a toggle rather than a one-way reveal, so hiding them again
+    /// does not need a second, differently-named key.
     ToggleRevealCaptures,
     /// Enters edit mode for the currently selected request — see
     /// `AppState::edit_mode`. A no-op (see [`super::update::update`]) unless a request is
