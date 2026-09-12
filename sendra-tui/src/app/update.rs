@@ -4,15 +4,18 @@
 //! own doc comment and `super::state::CollectionSession::edit_mode`'s for why that
 //! invariant matters.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use sendra_core::{Collection, Document, Environment, Request, SendraError};
 
+use crate::run_request::RunOutcome;
+
 use super::state::{
     non_empty, validate_assertion_value_text, validate_method_text, AppState, BodyEdit,
     CollectionSession, DeleteConfirm, EditField, EditState, EnvironmentEditState, HeaderRow,
-    LoadState, Message, PendingNewRequest, RunState, TextField,
+    HistoryOverlay, LoadState, Message, PendingNewRequest, RunHistoryEntry, RunState, TextField,
+    RUN_HISTORY_CAP,
 };
 
 /// Moves `selected` by `delta` (`1` or `-1`) through `len` items, wrapping at
@@ -161,7 +164,8 @@ pub fn update(state: &mut AppState, msg: Message) {
             outcome,
         } => {
             if let Some(session) = state.session_by_id_mut(collection_id) {
-                session.run_state = RunState::Completed(outcome);
+                push_history_entry(session, outcome);
+                session.run_state = RunState::Completed;
             }
             return;
         }
@@ -262,6 +266,7 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                 | Message::OpenEnvironmentOverlay
                 | Message::CloseEnvironmentOverlay
                 | Message::ConfirmEnvironmentSelection
+                | Message::OpenHistoryOverlay
                 | Message::RunRequested
                 | Message::EnterEditMode
                 | Message::AddRequest
@@ -288,6 +293,7 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                 | Message::OpenEnvironmentOverlay
                 | Message::CloseEnvironmentOverlay
                 | Message::ConfirmEnvironmentSelection
+                | Message::OpenHistoryOverlay
                 | Message::RunRequested
                 | Message::RequestDelete
         )
@@ -311,6 +317,7 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                 | Message::OpenEnvironmentOverlay
                 | Message::CloseEnvironmentOverlay
                 | Message::ConfirmEnvironmentSelection
+                | Message::OpenHistoryOverlay
                 | Message::RunRequested
                 | Message::EnterEditMode
                 | Message::AddRequest
@@ -335,10 +342,36 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                 | Message::SelectPrevious
                 | Message::CloseEnvironmentOverlay
                 | Message::ConfirmEnvironmentSelection
+                | Message::OpenHistoryOverlay
                 | Message::RunRequested
                 | Message::EnterEditMode
                 | Message::AddRequest
                 | Message::RequestDelete
+        )
+    {
+        return;
+    }
+
+    // While the run-history browser is open, browsing/overlay/run/edit-entry
+    // messages are refused the same way every other modal's own guard above
+    // refuses them — it is exclusive with every other mode, not a state
+    // layered on top of ordinary browsing. `CloseHistoryOverlay`/
+    // `ViewHistoryEntry`/`CloseHistoryEntryView` are exempt: they are exactly
+    // the messages that navigate or end this state (see those variants' own
+    // doc comments). `SelectNext`/`SelectPrevious`/`ScrollResponseDown`/`Up`/
+    // `Top`/`Bottom`/`ToggleRevealCaptures` are exempt too — they are how
+    // this overlay is itself browsed (see `select`/`viewed_history_entry_mut`),
+    // not messages that would leak through to the collection browser
+    // underneath.
+    if state.history_overlay.is_some()
+        && matches!(
+            msg,
+            Message::OpenEnvironmentOverlay
+                | Message::RunRequested
+                | Message::EnterEditMode
+                | Message::AddRequest
+                | Message::RequestDelete
+                | Message::EnterEnvironmentEdit
         )
     {
         return;
@@ -401,19 +434,66 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                 state.reveal_captures = false;
             }
         }
-        Message::ScrollResponseDown => {
-            state.response_scroll = state.response_scroll.saturating_add(SCROLL_STEP_LINES);
-        }
-        Message::ScrollResponseUp => {
-            state.response_scroll = state.response_scroll.saturating_sub(SCROLL_STEP_LINES);
-        }
-        Message::ScrollResponseTop => state.response_scroll = 0,
+        // Scrolling/reveal route to whichever response panel is actually on
+        // screen: the history overlay's own viewed entry while one is open
+        // (see `HistoryOverlay::view_scroll`/`view_reveal_captures`'s own doc
+        // comments for why those are separate fields from the live run's),
+        // the live run's `response_scroll`/`reveal_captures` otherwise —
+        // exactly the same "route to whichever list/session is open" pattern
+        // `select` already uses for `SelectNext`/`SelectPrevious`.
+        Message::ScrollResponseDown => match viewed_history_entry_mut(state) {
+            Some(overlay) => {
+                overlay.view_scroll = overlay.view_scroll.saturating_add(SCROLL_STEP_LINES);
+            }
+            None => {
+                state.response_scroll = state.response_scroll.saturating_add(SCROLL_STEP_LINES);
+            }
+        },
+        Message::ScrollResponseUp => match viewed_history_entry_mut(state) {
+            Some(overlay) => {
+                overlay.view_scroll = overlay.view_scroll.saturating_sub(SCROLL_STEP_LINES);
+            }
+            None => {
+                state.response_scroll = state.response_scroll.saturating_sub(SCROLL_STEP_LINES);
+            }
+        },
+        Message::ScrollResponseTop => match viewed_history_entry_mut(state) {
+            Some(overlay) => overlay.view_scroll = 0,
+            None => state.response_scroll = 0,
+        },
         // See the doc comment on this variant: the real clamp happens in
         // `render_response_panel`, against whatever area is current at
         // render time, the same way an over-scroll from any other source
         // already does.
-        Message::ScrollResponseBottom => state.response_scroll = usize::MAX,
-        Message::ToggleRevealCaptures => state.reveal_captures = !state.reveal_captures,
+        Message::ScrollResponseBottom => match viewed_history_entry_mut(state) {
+            Some(overlay) => overlay.view_scroll = usize::MAX,
+            None => state.response_scroll = usize::MAX,
+        },
+        Message::ToggleRevealCaptures => match viewed_history_entry_mut(state) {
+            Some(overlay) => overlay.view_reveal_captures = !overlay.view_reveal_captures,
+            None => state.reveal_captures = !state.reveal_captures,
+        },
+        Message::OpenHistoryOverlay => {
+            if state.history_overlay.is_none() && state.environment_overlay.is_none() {
+                state.history_overlay = Some(HistoryOverlay::default());
+            }
+        }
+        Message::CloseHistoryOverlay => state.history_overlay = None,
+        Message::ViewHistoryEntry => {
+            let history_len = state.selected_history().len();
+            if let Some(overlay) = &mut state.history_overlay {
+                if overlay.viewing.is_none() && overlay.cursor < history_len {
+                    overlay.viewing = Some(overlay.cursor);
+                    overlay.view_scroll = 0;
+                    overlay.view_reveal_captures = false;
+                }
+            }
+        }
+        Message::CloseHistoryEntryView => {
+            if let Some(overlay) = &mut state.history_overlay {
+                overlay.viewing = None;
+            }
+        }
         Message::AddRequest => {
             // Same guard `EnterEditMode` uses, for the same reason: adding a
             // request also immediately opens an edit session, so it is
@@ -624,6 +704,10 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                         };
                         state.dirty_requests =
                             reindex_dirty_after_delete(&state.dirty_requests, index);
+                        state.run_history = reindex_history_after_delete(
+                            std::mem::take(&mut state.run_history),
+                            index,
+                        );
                         state.delete_confirm = None;
                         // A different (or no longer any) request is now
                         // selected, the same reset `select()` already
@@ -1044,6 +1128,57 @@ fn reindex_dirty_after_delete(dirty: &HashSet<usize>, deleted_index: usize) -> H
             std::cmp::Ordering::Greater => Some(index - 1),
         })
         .collect()
+}
+
+/// `run_history` with every key shifted to still name the same request after
+/// deleting the one at `deleted_index` — the exact same reindexing
+/// `reindex_dirty_after_delete` already does for `dirty_requests`, applied to
+/// a `HashMap<usize, Vec<RunHistoryEntry>>` instead of a `HashSet<usize>`:
+/// keys before `deleted_index` are untouched, `deleted_index` itself (and
+/// whatever history it held) is dropped — there is no longer a request for
+/// it to be about — and every key after it moves down by one to keep
+/// pointing at the request it was really about through the removal.
+fn reindex_history_after_delete(
+    history: HashMap<usize, Vec<RunHistoryEntry>>,
+    deleted_index: usize,
+) -> HashMap<usize, Vec<RunHistoryEntry>> {
+    history
+        .into_iter()
+        .filter_map(|(index, entries)| match index.cmp(&deleted_index) {
+            std::cmp::Ordering::Less => Some((index, entries)),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some((index - 1, entries)),
+        })
+        .collect()
+}
+
+/// Records `outcome` as the selected request's newest history entry, then
+/// trims that request's history back down to [`RUN_HISTORY_CAP`] if it grew
+/// past it — the one place `Message::RunCompleted` writes into
+/// `CollectionSession::run_history`, done in the same step as setting
+/// `run_state` back to `RunState::Completed` (see that arm's own call site)
+/// so the two can never drift out of step — see
+/// `CollectionSession::current_run`'s own doc comment for why `RunState`
+/// leans on history for the data instead of holding a second copy.
+///
+/// A no-op (`outcome` silently dropped) if nothing is loaded/selected —
+/// unreachable in ordinary operation, since `Message::RunRequested` itself
+/// refuses to start a run without a selected request (see
+/// `request_is_selected`), so there is never an in-flight run whose
+/// `RunCompleted` could arrive with nothing selected to attribute it to.
+fn push_history_entry(session: &mut CollectionSession, outcome: RunOutcome) {
+    let LoadState::Loaded { selected, .. } = &session.load_state else {
+        return;
+    };
+    let entries = session.run_history.entry(*selected).or_default();
+    entries.insert(
+        0,
+        RunHistoryEntry {
+            completed_at: std::time::SystemTime::now(),
+            outcome,
+        },
+    );
+    entries.truncate(RUN_HISTORY_CAP);
 }
 
 /// Appends a brand-new request to `document` and returns its index —
@@ -1484,12 +1619,48 @@ fn env_var_move(state: &mut CollectionSession, mutate: impl FnOnce(&mut TextFiel
     }
 }
 
+/// `state.history_overlay`'s own `view_scroll`/`view_reveal_captures`, but
+/// only while it is actually showing one entry's full result
+/// (`HistoryOverlay::viewing` is `Some`) — `None` while the overlay is closed
+/// or still just showing the list, which is when `ScrollResponseDown`/
+/// `ToggleRevealCaptures`/etc. still mean the *live* run's own
+/// `response_scroll`/`reveal_captures` instead. Shared by every one of those
+/// message arms so they all agree on which response panel is on screen right
+/// now, the same "route to whichever list/session is open" question
+/// `select()` already answers for `SelectNext`/`SelectPrevious`.
+fn viewed_history_entry_mut(state: &mut CollectionSession) -> Option<&mut HistoryOverlay> {
+    state
+        .history_overlay
+        .as_mut()
+        .filter(|overlay| overlay.viewing.is_some())
+}
+
 /// Routes `SelectNext`/`SelectPrevious` to the overlay's cursor when it is
 /// open, otherwise to the collection browser's selection — see the doc
 /// comment on those `Message` variants for why one pair serves both lists.
+///
+/// The history browser's own list is a third such list: while it's open and
+/// still showing the list (not one entry's full result — see
+/// `viewed_history_entry_mut`), these move `HistoryOverlay::cursor` through
+/// the selected request's history entries instead, clamped the same way the
+/// environment overlay's own cursor already is.
 fn select(state: &mut CollectionSession, delta: isize) {
     if let Some(cursor) = &mut state.environment_overlay {
         *cursor = move_selection(*cursor, state.environments.len(), delta);
+        return;
+    }
+
+    let history_len = state.selected_history().len();
+    if let Some(overlay) = &mut state.history_overlay {
+        // While viewing one entry's full result, there is no list here for
+        // `SelectNext`/`SelectPrevious` to move through — `PgUp`/`PgDn`
+        // (`ScrollResponseDown`/`Up`) are what move around within it instead
+        // (see `viewed_history_entry_mut`) — so this is a no-op rather than
+        // falling through to the request list underneath, which the overlay
+        // is still modal over.
+        if overlay.viewing.is_none() {
+            overlay.cursor = move_selection(overlay.cursor, history_len, delta);
+        }
         return;
     }
 
@@ -2064,13 +2235,14 @@ mod tests {
             },
         );
 
-        match &state.run_state {
-            RunState::Completed(RunOutcome {
+        assert!(matches!(state.run_state, RunState::Completed));
+        match state.current_run() {
+            Some(RunOutcome {
                 result: Ok(response),
                 ..
             }) => assert_eq!(response.status, 200),
             other => panic!(
-                "expected RunState::Completed(RunOutcome {{ result: Ok(_), .. }}), got {other:?}"
+                "expected current_run() to be Some(RunOutcome {{ result: Ok(_), .. }}), got {other:?}"
             ),
         }
     }
@@ -2090,9 +2262,10 @@ mod tests {
             },
         );
 
+        assert!(matches!(state.run_state, RunState::Completed));
         assert!(matches!(
-            state.run_state,
-            RunState::Completed(RunOutcome { result: Err(_), .. })
+            state.current_run(),
+            Some(RunOutcome { result: Err(_), .. })
         ));
     }
 
@@ -2141,10 +2314,8 @@ mod tests {
         );
 
         assert!(
-            matches!(
-                state.run_state,
-                RunState::Completed(RunOutcome { result: Ok(_), .. })
-            ),
+            matches!(state.run_state, RunState::Completed)
+                && matches!(state.current_run(), Some(RunOutcome { result: Ok(_), .. })),
             "RunCompleted must end the in-flight state even though it would \
              otherwise be blocked by it"
         );
@@ -2166,6 +2337,277 @@ mod tests {
         update(&mut state, Message::SelectNext);
 
         assert_eq!(selected(&state), 1);
+    }
+
+    // --- run history: recording, browsing, the cap, isolation, reindexing --
+
+    /// `RunRequested` then `RunCompleted(sample_outcome(status))` against
+    /// whichever tab is active — the same two-message shape every other run
+    /// test in this file already drives `update()` through, pulled out here
+    /// only because the history tests below do it many times in a row with a
+    /// different `status` each time.
+    fn run_to_completion(state: &mut AppState, status: u16) {
+        update(state, Message::RunRequested);
+        let collection_id = state.active().id;
+        update(
+            state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: sample_outcome(status),
+            },
+        );
+    }
+
+    #[test]
+    fn running_the_same_request_repeatedly_records_each_run_newest_first() {
+        let mut state = loaded_state(VALID_COLLECTION);
+
+        run_to_completion(&mut state, 200);
+        run_to_completion(&mut state, 201);
+        run_to_completion(&mut state, 202);
+
+        let history = state.selected_history();
+        assert_eq!(history.len(), 3, "one entry per run");
+        let statuses: Vec<u16> = history
+            .iter()
+            .map(|entry| match &entry.outcome.result {
+                Ok(response) => response.status,
+                Err(_) => panic!("every sample_outcome here is Ok"),
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![202, 201, 200],
+            "most recent run must be first, oldest last"
+        );
+
+        // `current_run()`/`RunState::Completed` must agree with history[0] —
+        // see `CollectionSession::current_run`'s own doc comment on why
+        // there is only ever this one copy of a run's data.
+        assert_eq!(
+            state.current_run().unwrap().result.as_ref().unwrap().status,
+            202
+        );
+    }
+
+    /// Proof requirement: running past `RUN_HISTORY_CAP` drops the oldest
+    /// entry rather than growing without bound — the cap this issue was
+    /// asked to pick and justify (see `RUN_HISTORY_CAP`'s own doc comment:
+    /// generous for what browsing needs, bounded against unbounded response
+    /// bodies accumulating over a long session).
+    #[test]
+    fn history_past_the_cap_drops_the_oldest_entry() {
+        let mut state = loaded_state(VALID_COLLECTION);
+
+        // Statuses 0..=RUN_HISTORY_CAP, i.e. RUN_HISTORY_CAP + 1 runs —
+        // exactly one past the cap.
+        for status in 0..=(RUN_HISTORY_CAP as u16) {
+            run_to_completion(&mut state, status);
+        }
+
+        let history = state.selected_history();
+        assert_eq!(
+            history.len(),
+            RUN_HISTORY_CAP,
+            "history must never grow past the documented cap"
+        );
+        let newest_status = match &history[0].outcome.result {
+            Ok(response) => response.status,
+            Err(_) => panic!("sample_outcome is always Ok"),
+        };
+        assert_eq!(
+            newest_status, RUN_HISTORY_CAP as u16,
+            "the newest run (the last one sent) must still be entry 0"
+        );
+        let oldest_status = match &history[history.len() - 1].outcome.result {
+            Ok(response) => response.status,
+            Err(_) => panic!("sample_outcome is always Ok"),
+        };
+        assert_eq!(
+            oldest_status, 1,
+            "run 0 (the very first, now the oldest past the cap) must have been \
+             dropped to make room, leaving run 1 as the oldest surviving entry"
+        );
+    }
+
+    #[test]
+    fn opening_history_overlay_starts_the_cursor_at_the_most_recent_run() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        run_to_completion(&mut state, 200);
+        run_to_completion(&mut state, 500);
+
+        update(&mut state, Message::OpenHistoryOverlay);
+
+        let overlay = state.history_overlay.as_ref().expect("just opened");
+        assert_eq!(overlay.cursor, 0);
+        assert_eq!(overlay.viewing, None);
+    }
+
+    #[test]
+    fn history_overlay_opens_even_with_no_runs_yet() {
+        let mut state = loaded_state(VALID_COLLECTION);
+
+        update(&mut state, Message::OpenHistoryOverlay);
+
+        assert!(
+            state.history_overlay.is_some(),
+            "the overlay itself is what tells the user there's nothing yet, \
+             not a refusal to open it at all"
+        );
+        assert!(state.selected_history().is_empty());
+    }
+
+    #[test]
+    fn selecting_and_viewing_a_past_entry_shows_that_entrys_own_outcome() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        run_to_completion(&mut state, 200);
+        run_to_completion(&mut state, 404);
+
+        update(&mut state, Message::OpenHistoryOverlay);
+        // cursor starts at 0 (the 404 run, most recent) — move to 1 (the 200
+        // run) with the overlay's own SelectNext, then view it.
+        update(&mut state, Message::SelectNext);
+        assert_eq!(state.history_overlay.as_ref().unwrap().cursor, 1);
+
+        update(&mut state, Message::ViewHistoryEntry);
+
+        let overlay = state.history_overlay.as_ref().unwrap();
+        assert_eq!(overlay.viewing, Some(1));
+        let viewed = &state.selected_history()[1];
+        match &viewed.outcome.result {
+            Ok(response) => assert_eq!(response.status, 200),
+            Err(_) => panic!("expected the older, 200 run"),
+        }
+    }
+
+    #[test]
+    fn viewing_a_history_entry_scrolls_and_reveals_independently_of_the_live_run() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        run_to_completion(&mut state, 200);
+        run_to_completion(&mut state, 200);
+        update(&mut state, Message::ScrollResponseDown);
+        update(&mut state, Message::ToggleRevealCaptures);
+        assert_eq!(state.response_scroll, SCROLL_STEP_LINES);
+        assert!(state.reveal_captures);
+
+        update(&mut state, Message::OpenHistoryOverlay);
+        update(&mut state, Message::ViewHistoryEntry);
+        update(&mut state, Message::ScrollResponseDown);
+        update(&mut state, Message::ToggleRevealCaptures);
+
+        let overlay = state.history_overlay.as_ref().unwrap();
+        assert_eq!(overlay.view_scroll, SCROLL_STEP_LINES);
+        assert!(overlay.view_reveal_captures);
+        // The live run's own fields, still sitting under the overlay, must
+        // be completely untouched by scrolling/revealing the viewed entry.
+        assert_eq!(state.response_scroll, SCROLL_STEP_LINES);
+        assert!(state.reveal_captures);
+    }
+
+    #[test]
+    fn esc_backs_out_of_viewing_then_closes_the_overlay() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        run_to_completion(&mut state, 200);
+
+        update(&mut state, Message::OpenHistoryOverlay);
+        update(&mut state, Message::ViewHistoryEntry);
+        assert!(state.history_overlay.as_ref().unwrap().viewing.is_some());
+
+        update(&mut state, Message::CloseHistoryEntryView);
+        assert!(
+            state.history_overlay.is_some(),
+            "closing the viewed entry goes back to the list, not out of the overlay entirely"
+        );
+        assert_eq!(state.history_overlay.as_ref().unwrap().viewing, None);
+
+        update(&mut state, Message::CloseHistoryOverlay);
+        assert!(state.history_overlay.is_none());
+    }
+
+    /// Proof requirement: history in one tab must be completely unaffected
+    /// by runs in another — the same isolation standard
+    /// `each_tab_keeps_independent_selection_run_state_and_edit_mode_with_no_bleed_through`
+    /// already proves for selection/`run_state`/edit mode.
+    #[test]
+    fn history_in_one_tab_does_not_bleed_into_another() {
+        let mut state = loaded_state(VALID_COLLECTION); // tab 0
+        run_to_completion(&mut state, 200);
+        run_to_completion(&mut state, 200);
+        assert_eq!(state.selected_history().len(), 2);
+
+        open_second_collection(&mut state, VALID_COLLECTION); // tab 1
+        assert!(
+            state.selected_history().is_empty(),
+            "a freshly opened tab must start with no history of its own"
+        );
+        run_to_completion(&mut state, 500);
+        assert_eq!(state.selected_history().len(), 1);
+
+        update(&mut state, Message::PreviousCollection);
+        assert_eq!(
+            state.selected_history().len(),
+            2,
+            "tab 0's own history must be exactly as it was left"
+        );
+
+        update(&mut state, Message::NextCollection);
+        assert_eq!(state.selected_history().len(), 1);
+    }
+
+    /// Proof requirement: deleting a request reindexes history exactly like
+    /// `dirty_requests` — see `dirty_requests_are_reindexed_after_a_delete`,
+    /// the model this mirrors.
+    #[test]
+    fn history_is_reindexed_after_a_delete() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION); // "One"/"Two"/"Three"
+        update(&mut state, Message::SelectNext); // "Two" (index 1)
+        run_to_completion(&mut state, 200);
+        update(&mut state, Message::SelectNext); // "Three" (index 2)
+        run_to_completion(&mut state, 404);
+        update(&mut state, Message::SelectNext); // wraps back to "One" (index 0)
+
+        // Delete "One" (index 0) — "Two"'s history must follow it down from
+        // index 1 to index 0, and "Three"'s from index 2 to index 1.
+        update(&mut state, Message::RequestDelete);
+        update(&mut state, Message::ConfirmDelete);
+
+        // After deleting index 0, the old index-1 request ("Two") is now at
+        // index 0, and the old index-2 request ("Three") is now at index 1.
+        assert_eq!(
+            state.run_history.get(&0).map(Vec::len),
+            Some(1),
+            "\"Two\"'s history must have followed it down to index 0"
+        );
+        assert_eq!(
+            state.run_history.get(&1).map(Vec::len),
+            Some(1),
+            "\"Three\"'s history must have followed it down to index 1"
+        );
+        assert!(
+            !state.run_history.contains_key(&2),
+            "no request is left at the old highest index"
+        );
+    }
+
+    #[test]
+    fn history_overlay_is_a_no_op_while_editing_or_run_in_flight() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        run_to_completion(&mut state, 200);
+
+        update(&mut state, Message::EnterEditMode);
+        update(&mut state, Message::OpenHistoryOverlay);
+        assert!(
+            state.history_overlay.is_none(),
+            "must not open while editing"
+        );
+        update(&mut state, Message::CancelEdit);
+
+        update(&mut state, Message::RunRequested);
+        update(&mut state, Message::OpenHistoryOverlay);
+        assert!(
+            state.history_overlay.is_none(),
+            "must not open while a run is in flight"
+        );
     }
 
     #[test]
@@ -3147,9 +3589,10 @@ requests:
             },
         );
         update(&mut state, Message::ScrollResponseDown);
+        assert!(matches!(state.run_state, RunState::Completed));
         assert!(matches!(
-            state.run_state,
-            RunState::Completed(RunOutcome { result: Ok(_), .. })
+            state.current_run(),
+            Some(RunOutcome { result: Ok(_), .. })
         ));
         assert_eq!(state.response_scroll, SCROLL_STEP_LINES);
 
@@ -3188,9 +3631,10 @@ requests:
 
         update(&mut state, Message::SelectNext);
 
+        assert!(matches!(state.run_state, RunState::Completed));
         assert!(matches!(
-            state.run_state,
-            RunState::Completed(RunOutcome { result: Ok(_), .. })
+            state.current_run(),
+            Some(RunOutcome { result: Ok(_), .. })
         ));
     }
 
@@ -3388,9 +3832,10 @@ requests:
                 outcome: failed_outcome(error),
             },
         );
+        assert!(matches!(state.run_state, RunState::Completed));
         assert!(matches!(
-            state.run_state,
-            RunState::Completed(RunOutcome { result: Err(_), .. })
+            state.current_run(),
+            Some(RunOutcome { result: Err(_), .. })
         ));
 
         update(&mut state, Message::SelectNext);
@@ -5373,7 +5818,7 @@ requests:
                 outcome: sample_outcome(200),
             },
         );
-        assert!(matches!(state.run_state, RunState::Completed(_)));
+        assert!(matches!(state.run_state, RunState::Completed));
 
         // Start (but never finish) editing the selected request in tab 1.
         update(&mut state, Message::EnterEditMode);
@@ -5402,7 +5847,7 @@ requests:
         // left — the run result and the open edit session both still there.
         update(&mut state, Message::NextCollection);
         assert_eq!(state.active_collection, 1);
-        assert!(matches!(state.run_state, RunState::Completed(_)));
+        assert!(matches!(state.run_state, RunState::Completed));
         assert!(state.edit_mode.is_some());
     }
 
@@ -5600,7 +6045,7 @@ requests:
 
         // ...and tab A picked up its own result, right where it was left.
         update(&mut state, Message::PreviousCollection);
-        assert!(matches!(state.run_state, RunState::Completed(_)));
+        assert!(matches!(state.run_state, RunState::Completed));
     }
 
     #[test]

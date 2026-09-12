@@ -221,6 +221,8 @@ fn next_message(
     delete_confirm_open: bool,
     edit_mode_open: bool,
     body_focused: bool,
+    history_overlay_open: bool,
+    history_viewing_open: bool,
 ) -> io::Result<Message> {
     if !event::poll(Duration::from_millis(100))? {
         return Ok(Message::Tick);
@@ -236,6 +238,8 @@ fn next_message(
         delete_confirm_open,
         edit_mode_open,
         body_focused,
+        history_overlay_open,
+        history_viewing_open,
     ))
 }
 
@@ -260,6 +264,8 @@ fn translate_event(
     delete_confirm_open: bool,
     edit_mode_open: bool,
     body_focused: bool,
+    history_overlay_open: bool,
+    history_viewing_open: bool,
 ) -> Message {
     match event {
         Event::Resize(_, _) => Message::Resize,
@@ -378,6 +384,36 @@ fn translate_event(
                 };
             }
 
+            // The run-history browser's own key set — checked ahead of the
+            // delete confirmation/edit-mode branches below for the same
+            // reason the environment overlay's own branch above is: it is
+            // modal and drawn on top of everything else. `history_viewing_open`
+            // (showing one entry's full result) gets a different keymap than
+            // `history_overlay_open` alone (still just the list) — the same
+            // "innermost nested modal has its own keys" shape
+            // `env_var_delete_pending` already has one level inside
+            // `environment_edit_open`.
+            if history_viewing_open {
+                return match key.code {
+                    KeyCode::Esc => Message::CloseHistoryEntryView,
+                    KeyCode::PageDown => Message::ScrollResponseDown,
+                    KeyCode::PageUp => Message::ScrollResponseUp,
+                    KeyCode::Home => Message::ScrollResponseTop,
+                    KeyCode::End => Message::ScrollResponseBottom,
+                    KeyCode::Char('c') => Message::ToggleRevealCaptures,
+                    _ => Message::Tick,
+                };
+            }
+            if history_overlay_open {
+                return match key.code {
+                    KeyCode::Esc => Message::CloseHistoryOverlay,
+                    KeyCode::Enter => Message::ViewHistoryEntry,
+                    KeyCode::Down | KeyCode::Char('j') => Message::SelectNext,
+                    KeyCode::Up | KeyCode::Char('k') => Message::SelectPrevious,
+                    _ => Message::Tick,
+                };
+            }
+
             // The delete confirmation prompt's own key set — mutually
             // exclusive with the environment overlay above and edit mode
             // below (`update()`'s own guards refuse to open either while the
@@ -469,6 +505,7 @@ fn translate_event(
 
             match key.code {
                 KeyCode::Char('e') => Message::OpenEnvironmentOverlay,
+                KeyCode::Char('h') => Message::OpenHistoryOverlay,
                 KeyCode::Char('i') => Message::EnterEditMode,
                 KeyCode::Char('n') => Message::AddRequest,
                 KeyCode::Char('d') => Message::RequestDelete,
@@ -564,6 +601,11 @@ fn run(
             state.delete_confirm.is_some(),
             state.edit_mode.is_some(),
             state.body_focused(),
+            state.history_overlay.is_some(),
+            state
+                .history_overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.viewing.is_some()),
         )?;
         // `Message::ConfirmOpenCollectionPath` is never handed to `update()`
         // as-is — see that variant's own doc comment on why the reducer
@@ -721,9 +763,13 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            false,
             false,
             false,
             false,
@@ -753,12 +799,16 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
             false,
             false,
             true,
+            false,
+            false,
             false,
             false,
             false,
@@ -786,6 +836,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -793,6 +845,8 @@ mod tests {
             false,
             false,
             true,
+            false,
+            false,
             false,
             false,
             false,
@@ -818,6 +872,8 @@ mod tests {
             true,
             false,
             false,
+            false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -827,6 +883,8 @@ mod tests {
             false,
             false,
             true,
+            false,
+            false,
             false,
             false,
         );
@@ -852,6 +910,8 @@ mod tests {
             false,
             true,
             false,
+            false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -862,6 +922,8 @@ mod tests {
             false,
             false,
             true,
+            false,
+            false,
             false,
         );
 
@@ -876,6 +938,8 @@ mod tests {
         // conflated the two would make an ordinary keystroke exit the app.
         let message = translate_event(
             press(KeyCode::Char('c')),
+            false,
+            false,
             false,
             false,
             false,
@@ -905,6 +969,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
 
         assert!(
@@ -917,6 +983,8 @@ mod tests {
     fn resize_events_translate_to_the_resize_message() {
         let message = translate_event(
             Event::Resize(40, 20),
+            false,
+            false,
             false,
             false,
             false,
@@ -944,6 +1012,8 @@ mod tests {
             false,
             true,
             false,
+            false,
+            false,
         );
         let save = translate_event(
             press_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
@@ -954,6 +1024,8 @@ mod tests {
             false,
             false,
             true,
+            false,
+            false,
             false,
         );
 
@@ -983,6 +1055,8 @@ mod tests {
                 false,
                 true,
                 false,
+                false,
+                false,
             );
             assert!(
                 matches!(message, Message::Tick),
@@ -1009,6 +1083,8 @@ mod tests {
                 false,
                 true,
                 false,
+                false,
+                false,
             );
             assert!(
                 matches!(message, Message::EditInsertChar(c) if c == ch),
@@ -1029,7 +1105,9 @@ mod tests {
                 false,
                 false,
                 true,
-                false
+                false,
+                false,
+                false,
             ),
             Message::EditFocusNext
         ));
@@ -1043,7 +1121,9 @@ mod tests {
                 false,
                 false,
                 true,
-                false
+                false,
+                false,
+                false,
             ),
             Message::EditFocusPrev
         ));
@@ -1057,7 +1137,9 @@ mod tests {
                 false,
                 false,
                 true,
-                false
+                false,
+                false,
+                false,
             ),
             Message::EditBackspace
         ));
@@ -1071,7 +1153,9 @@ mod tests {
                 false,
                 false,
                 true,
-                false
+                false,
+                false,
+                false,
             ),
             Message::EditDelete
         ));
@@ -1085,7 +1169,9 @@ mod tests {
                 false,
                 false,
                 true,
-                false
+                false,
+                false,
+                false,
             ),
             Message::EditCursorLeft
         ));
@@ -1099,7 +1185,9 @@ mod tests {
                 false,
                 false,
                 true,
-                false
+                false,
+                false,
+                false,
             ),
             Message::EditCursorRight
         ));
@@ -1117,7 +1205,9 @@ mod tests {
                 false,
                 false,
                 true,
-                true
+                true,
+                false,
+                false,
             ),
             Message::EditInsertChar('\n')
         ));
@@ -1131,7 +1221,9 @@ mod tests {
                 false,
                 false,
                 true,
-                true
+                true,
+                false,
+                false,
             ),
             Message::EditCursorUp
         ));
@@ -1145,7 +1237,9 @@ mod tests {
                 false,
                 false,
                 true,
-                true
+                true,
+                false,
+                false,
             ),
             Message::EditCursorDown
         ));
@@ -1163,6 +1257,8 @@ mod tests {
             false,
             true,
             false,
+            false,
+            false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
@@ -1173,6 +1269,8 @@ mod tests {
             false,
             false,
             true,
+            false,
+            false,
             false,
         );
 
@@ -1192,6 +1290,8 @@ mod tests {
             false,
             true,
             false,
+            false,
+            false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('x'), KeyModifiers::CONTROL),
@@ -1202,6 +1302,8 @@ mod tests {
             false,
             false,
             true,
+            false,
+            false,
             false,
         );
 
@@ -1221,6 +1323,8 @@ mod tests {
             false,
             true,
             false,
+            false,
+            false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('k'), KeyModifiers::CONTROL),
@@ -1231,6 +1335,8 @@ mod tests {
             false,
             false,
             true,
+            false,
+            false,
             false,
         );
 
@@ -1256,6 +1362,8 @@ mod tests {
             false,
             true,
             false,
+            false,
+            false,
         );
         assert!(matches!(message, Message::Tick));
     }
@@ -1264,6 +1372,8 @@ mod tests {
     fn i_enters_edit_mode_outside_the_overlay_and_outside_edit_mode() {
         let message = translate_event(
             press(KeyCode::Char('i')),
+            false,
+            false,
             false,
             false,
             false,
@@ -1288,6 +1398,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         assert!(matches!(message, Message::AddRequest));
     }
@@ -1304,8 +1416,173 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         assert!(matches!(message, Message::RequestDelete));
+    }
+
+    #[test]
+    fn h_opens_the_history_overlay_outside_the_overlay_and_outside_edit_mode() {
+        let message = translate_event(
+            press(KeyCode::Char('h')),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(matches!(message, Message::OpenHistoryOverlay));
+    }
+
+    // --- the run-history browser's own key set ------------------------------
+
+    #[test]
+    fn history_overlay_list_navigates_views_and_closes() {
+        let esc = translate_event(
+            press(KeyCode::Esc),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert!(matches!(esc, Message::CloseHistoryOverlay));
+
+        let enter = translate_event(
+            press(KeyCode::Enter),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert!(matches!(enter, Message::ViewHistoryEntry));
+
+        for code in [KeyCode::Down, KeyCode::Char('j')] {
+            let message = translate_event(
+                press(code),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+            );
+            assert!(matches!(message, Message::SelectNext));
+        }
+        for code in [KeyCode::Up, KeyCode::Char('k')] {
+            let message = translate_event(
+                press(code),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+            );
+            assert!(matches!(message, Message::SelectPrevious));
+        }
+    }
+
+    #[test]
+    fn history_entry_view_scrolls_reveals_and_backs_out_on_esc() {
+        let esc = translate_event(
+            press(KeyCode::Esc),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            true,
+        );
+        assert!(matches!(esc, Message::CloseHistoryEntryView));
+
+        let cases = [
+            (KeyCode::PageDown, Message::ScrollResponseDown),
+            (KeyCode::PageUp, Message::ScrollResponseUp),
+            (KeyCode::Home, Message::ScrollResponseTop),
+            (KeyCode::End, Message::ScrollResponseBottom),
+            (KeyCode::Char('c'), Message::ToggleRevealCaptures),
+        ];
+        for (code, expected) in cases {
+            let message = translate_event(
+                press(code),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+            );
+            assert_eq!(
+                std::mem::discriminant(&message),
+                std::mem::discriminant(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn q_and_ctrl_c_quit_even_while_the_history_overlay_is_open() {
+        let from_q = translate_event(
+            press(KeyCode::Char('q')),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        let from_ctrl_c = translate_event(
+            press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert!(matches!(from_q, Message::Quit));
+        assert!(matches!(from_ctrl_c, Message::Quit));
     }
 
     // --- delete confirmation prompt's own key set --------------------------
@@ -1323,6 +1600,8 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
+                false,
             );
             assert!(
                 matches!(message, Message::ConfirmDelete),
@@ -1338,6 +1617,8 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
+                false,
                 false,
                 false,
             );
@@ -1359,6 +1640,8 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
+                false,
                 false,
                 false,
             );
@@ -1384,6 +1667,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         assert!(matches!(message, Message::EnterEnvironmentEdit));
     }
@@ -1400,6 +1685,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         let save = translate_event(
             press_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
@@ -1407,6 +1694,8 @@ mod tests {
             false,
             false,
             true,
+            false,
+            false,
             false,
             false,
             false,
@@ -1429,6 +1718,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
@@ -1436,6 +1727,8 @@ mod tests {
             false,
             false,
             true,
+            false,
+            false,
             false,
             false,
             false,
@@ -1458,7 +1751,9 @@ mod tests {
                 false,
                 false,
                 false,
-                false
+                false,
+                false,
+                false,
             ),
             Message::EditFocusNext
         ));
@@ -1472,7 +1767,9 @@ mod tests {
                 false,
                 false,
                 false,
-                false
+                false,
+                false,
+                false,
             ),
             Message::EditFocusPrev
         ));
@@ -1486,7 +1783,9 @@ mod tests {
                 false,
                 false,
                 false,
-                false
+                false,
+                false,
+                false,
             ),
             Message::EditBackspace
         ));
@@ -1500,7 +1799,9 @@ mod tests {
                 false,
                 false,
                 false,
-                false
+                false,
+                false,
+                false,
             ),
             Message::EditDelete
         ));
@@ -1514,7 +1815,9 @@ mod tests {
                 false,
                 false,
                 false,
-                false
+                false,
+                false,
+                false,
             ),
             Message::EditInsertChar('x')
         ));
@@ -1532,6 +1835,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -1539,6 +1844,8 @@ mod tests {
             false,
             false,
             true,
+            false,
+            false,
             false,
             false,
             false,
@@ -1561,6 +1868,8 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
+                false,
             );
             assert!(
                 matches!(message, Message::ConfirmDeleteEnvVarRow),
@@ -1575,6 +1884,8 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
+                false,
                 false,
                 false,
                 false,
@@ -1599,6 +1910,8 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
+                false,
                 false,
                 false,
                 false,
