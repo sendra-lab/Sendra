@@ -371,6 +371,7 @@ fn selected_run(state: &AppState) -> Option<(sendra_core::Request, Environment, 
         document,
         selected,
         base_dir,
+        ..
     } = &state.load_state
     else {
         return None;
@@ -491,6 +492,7 @@ fn main() -> io::Result<()> {
         Some(path) => Message::CollectionLoaded {
             base_dir: base_dir(&path).to_path_buf(),
             result: Box::new(Document::from_path(&path)),
+            path,
         },
         None => Message::NoCollectionPath,
     };

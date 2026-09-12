@@ -72,12 +72,17 @@ pub fn update(state: &mut AppState, msg: Message) {
         Message::Quit => state.should_quit = true,
         Message::Tick => state.spinner_tick = state.spinner_tick.wrapping_add(1),
         Message::NoCollectionPath => state.load_state = LoadState::NoPathProvided,
-        Message::CollectionLoaded { base_dir, result } => {
+        Message::CollectionLoaded {
+            base_dir,
+            path,
+            result,
+        } => {
             state.load_state = match *result {
                 Ok(document) => LoadState::Loaded {
                     document: Box::new(document),
                     selected: 0,
                     base_dir,
+                    path,
                 },
                 Err(error) => LoadState::Failed(error),
             };
@@ -160,9 +165,13 @@ pub fn update(state: &mut AppState, msg: Message) {
         Message::SaveEdit => {
             // Body validation happens exactly here, once per save attempt —
             // see `EditState::body_error`'s doc comment for why it is never
-            // computed on every keystroke the way `method_error` is.
+            // computed on every keystroke the way `method_error` is. A fresh
+            // attempt also clears any stale `save_error` from a previous
+            // failed one — a validation failure this time around should show
+            // its own message, not a leftover disk error from before.
             if let Some(edit) = &mut state.edit_mode {
                 edit.body_error = validate_body_for_save(&edit.body);
+                edit.save_error = None;
             }
             // Refuses to save — but, deliberately, does *not* clear
             // `edit_mode` — while `method_error`, `body_error`, or any
@@ -179,34 +188,62 @@ pub fn update(state: &mut AppState, msg: Message) {
                     && edit.assertions.iter().all(|row| row.value_error.is_none())
             });
             if can_save {
-                if let Some(edit) = state.edit_mode.take() {
-                    if let LoadState::Loaded {
-                        document, selected, ..
-                    } = &mut state.load_state
-                    {
-                        if let Some(request) = request_mut(document, *selected) {
-                            // `method_error` was already confirmed `None`
-                            // above, so this cannot fail — matched rather
-                            // than trusted blindly, so a bug in that
-                            // invariant leaves the request's method
-                            // untouched instead of panicking.
-                            if let Ok(method) = validate_method_text(edit.method.value()) {
-                                request.method = method;
-                            }
-                            request.url = edit.url.value().to_string();
-                            request.headers = edit
-                                .headers
-                                .iter()
-                                .map(|row| {
-                                    (row.key.value().to_string(), row.value.value().to_string())
-                                })
-                                .collect();
-                            apply_body_edit(request, &edit.body);
-                            request.auth = edit.auth.to_auth();
-                            request.assertions = edit.to_assertions(request.assertions.as_ref());
-                            request.capture = edit.to_captures();
+                // Everything the save needs, copied out of `state.load_state`
+                // as owned values rather than matched by reference: the
+                // candidate document built below has to be a full, separate
+                // clone (see the comment on it) attempted against disk
+                // *before* anything in `state` changes, so a failed write
+                // leaves both the loaded document and `edit_mode` completely
+                // untouched — the same "nothing happens until it's known to
+                // work" guarantee `CancelEdit` already relies on for its own
+                // "there is nothing to undo" claim.
+                let loaded = match &state.load_state {
+                    LoadState::Loaded {
+                        document,
+                        selected,
+                        base_dir,
+                        path,
+                    } => Some((
+                        (**document).clone(),
+                        *selected,
+                        base_dir.clone(),
+                        path.clone(),
+                    )),
+                    LoadState::Loading | LoadState::NoPathProvided | LoadState::Failed(_) => None,
+                };
+                if let Some((mut candidate, selected, base_dir, path)) = loaded {
+                    if let Some(request) = request_mut(&mut candidate, selected) {
+                        // `edit_mode` is guaranteed `Some` here: `can_save`
+                        // above is itself `Option::is_some_and`, so it can
+                        // only be `true` when there is an edit to apply.
+                        if let Some(edit) = &state.edit_mode {
+                            apply_edit_to_request(request, edit);
                         }
-                        state.dirty_requests.remove(selected);
+                    }
+                    match candidate.save_to_path(&path) {
+                        Ok(()) => {
+                            state.load_state = LoadState::Loaded {
+                                document: Box::new(candidate),
+                                selected,
+                                base_dir,
+                                path,
+                            };
+                            state.dirty_requests.remove(&selected);
+                            state.edit_mode = None;
+                        }
+                        Err(error) => {
+                            // The loaded document is still the pre-edit one —
+                            // `candidate` was a clone, never written back —
+                            // and `dirty_requests` still names this request,
+                            // exactly as it should: the edit is neither lost
+                            // nor silently marked clean over a save that
+                            // never actually reached disk. `edit_mode` stays
+                            // `Some` so the same typed changes are still
+                            // there to retry, or to `CancelEdit` away.
+                            if let Some(edit) = &mut state.edit_mode {
+                                edit.save_error = Some(error.to_string());
+                            }
+                        }
                     }
                 }
             }
@@ -314,6 +351,32 @@ fn request_mut(document: &mut Document, index: usize) -> Option<&mut Request> {
         Document::Single(request) => (index == 0).then_some(request),
         Document::Collection(collection) => collection.requests.get_mut(index),
     }
+}
+
+/// Writes every field `EditState` can hold a working copy of — `method`,
+/// `url`, `headers`, `body`, `auth`, `assertions`, `capture` — into `request`.
+/// The one place this happens, shared between `Message::SaveEdit`'s real save
+/// and (indirectly, via `EditState::to_request`) the live "resolved auth"
+/// preview, so the two can never drift into applying the edit two different
+/// ways.
+fn apply_edit_to_request(request: &mut Request, edit: &EditState) {
+    // `method_error` is confirmed `None` before this is ever called — see
+    // `Message::SaveEdit`'s own `can_save` check — so this cannot fail;
+    // matched rather than trusted blindly, so a bug in that invariant leaves
+    // the request's method untouched instead of panicking.
+    if let Ok(method) = validate_method_text(edit.method.value()) {
+        request.method = method;
+    }
+    request.url = edit.url.value().to_string();
+    request.headers = edit
+        .headers
+        .iter()
+        .map(|row| (row.key.value().to_string(), row.value.value().to_string()))
+        .collect();
+    apply_body_edit(request, &edit.body);
+    request.auth = edit.auth.to_auth();
+    request.assertions = edit.to_assertions(request.assertions.as_ref());
+    request.capture = edit.to_captures();
 }
 
 /// The one place body text is actually checked against JSON's grammar —
@@ -550,6 +613,7 @@ mod tests {
             &mut state,
             Message::CollectionLoaded {
                 base_dir: PathBuf::from("."),
+                path: PathBuf::from("collection.yaml"),
                 result: Box::new(Ok(document)),
             },
         );
@@ -583,6 +647,7 @@ mod tests {
             &mut state,
             Message::CollectionLoaded {
                 base_dir: PathBuf::from("."),
+                path: PathBuf::from("collection.yaml"),
                 result: Box::new(Err(error)),
             },
         );
@@ -1833,6 +1898,7 @@ requests:
             &mut state,
             Message::CollectionLoaded {
                 base_dir: PathBuf::from("."),
+                path: PathBuf::from("collection.yaml"),
                 result: Box::new(Err(error)),
             },
         );
@@ -2944,6 +3010,229 @@ requests:
         assert!(
             !capture.evaluate(&without_header, &environment).passed(),
             "with no such header, the capture genuinely fails"
+        );
+    }
+
+    // --- Persisting to disk --------------------------------------------------
+
+    /// Builds a `state` whose `LoadState::Loaded` really points at `path` on
+    /// disk (unlike `loaded_state`'s own shared scratch file, this lets a
+    /// test control exactly what's on disk before and after `SaveEdit`) —
+    /// shared by every test below that needs to inspect real bytes on a real
+    /// filesystem rather than just the in-memory `Document`.
+    fn state_loaded_from(path: &std::path::Path) -> AppState {
+        let mut state = AppState::default();
+        let document = Document::from_path(path).expect("the fixture file must parse");
+        update(
+            &mut state,
+            Message::CollectionLoaded {
+                base_dir: path.parent().unwrap().to_path_buf(),
+                path: path.to_path_buf(),
+                result: Box::new(Ok(document)),
+            },
+        );
+        state
+    }
+
+    /// Proof requirement: a saved edit must actually reach disk, not just the
+    /// in-memory `Document` — verified by reloading the file with a brand-new
+    /// `Document::from_path` call, the same thing a freshly started process
+    /// would do, rather than reading anything still sitting in `state`.
+    #[test]
+    fn save_edit_actually_persists_to_disk_and_a_fresh_load_from_disk_sees_it() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        std::fs::write(&path, "method: GET\nurl: https://example.com\n").unwrap();
+
+        let mut state = state_loaded_from(&path);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Url;
+        backspace_n(&mut state, "https://example.com".len());
+        type_into_focused_field(&mut state, "https://example.com/changed");
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(
+            state.edit_mode.is_none(),
+            "a successful save must leave edit mode"
+        );
+        assert!(state.dirty_requests.is_empty());
+
+        // The proof itself: a fresh `Document::from_path`, not `state`.
+        let reloaded = Document::from_path(&path).expect("the saved file must exist and parse");
+        assert_eq!(reloaded.requests()[0].url, "https://example.com/changed");
+    }
+
+    /// Formatting/comment-preservation policy, demonstrated live rather than
+    /// only documented: saving reformats the whole file through
+    /// `serde_yaml`'s own writer, so hand-written comments (and any custom
+    /// spacing/quoting/key order) do not survive a save. This is the
+    /// documented, deliberate choice `Document::to_yaml_string`'s own doc
+    /// comment and `save_to_path`'s make: real YAML comment-preserving
+    /// round-tripping is a much larger undertaking (it needs a CST-based
+    /// writer, not `serde`), and reformatting the whole file is the honest,
+    /// simple alternative — never silently assumed, always visible right
+    /// here as a real `#`-stripped file on disk.
+    #[test]
+    fn saving_reformats_the_whole_file_and_drops_hand_written_comments() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        let original = "\
+# This collection talks to the staging API -- do not point it at prod.
+name: test
+requests:
+  - name: One  # the only request for now
+    method: GET
+    url: https://example.com
+";
+        std::fs::write(&path, original).unwrap();
+
+        let mut state = state_loaded_from(&path);
+        update(&mut state, Message::EnterEditMode);
+        // Save with no changes at all: even an edit session that touched
+        // nothing still rewrites the file through the same serializer, so
+        // this isolates "saving reformats" from "saving also changed a
+        // value".
+        update(&mut state, Message::SaveEdit);
+
+        assert!(
+            state.edit_mode.is_none(),
+            "an unmodified save must still succeed"
+        );
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !saved.contains('#'),
+            "comments are not preserved through a save — a real, visible \
+             consequence of this policy, not just a claim about it: {saved}"
+        );
+
+        // The data itself is completely intact — only the formatting/comments
+        // are gone.
+        let reloaded = Document::from_path(&path).unwrap();
+        assert_eq!(reloaded.requests()[0].name.as_deref(), Some("One"));
+        assert_eq!(reloaded.requests()[0].url, "https://example.com");
+    }
+
+    /// Proof requirement: a failed write must never lose the edit, never
+    /// silently mark it clean, and must show a real error — reusing
+    /// `format_error`'s own inline rendering via `EditState::save_error`
+    /// (see its doc comment), not a new, separate error-display path.
+    /// Forces a real, deterministic failure the same way sendra-core's own
+    /// `save_to_path` tests do: the destination is a directory, so the final
+    /// rename genuinely fails on both POSIX and Windows.
+    #[test]
+    fn a_failed_disk_write_keeps_the_edit_dirty_and_surfaces_a_real_error_without_losing_it() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        std::fs::create_dir(&path).expect("a directory blocking the target path");
+
+        let mut state = AppState::default();
+        let document = Document::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
+        update(
+            &mut state,
+            Message::CollectionLoaded {
+                base_dir: dir.path().to_path_buf(),
+                path: path.clone(),
+                result: Box::new(Ok(document)),
+            },
+        );
+
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Url;
+        backspace_n(&mut state, "https://example.com".len());
+        type_into_focused_field(&mut state, "https://example.com/changed");
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(
+            state.edit_mode.is_some(),
+            "a failed save must not discard the edit the way CancelEdit would"
+        );
+        assert!(
+            state.dirty_requests.contains(&0),
+            "a failed save must leave the request marked dirty, not silently clean"
+        );
+        let error = state
+            .edit_mode
+            .as_ref()
+            .unwrap()
+            .save_error
+            .as_ref()
+            .expect("a failed save must surface a real error message");
+        assert!(!error.is_empty());
+
+        // The typed edit itself is completely intact, ready to retry.
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().url.value(),
+            "https://example.com/changed"
+        );
+
+        // The loaded document was never replaced by the failed candidate —
+        // it still holds exactly what it did before this `SaveEdit` at all.
+        match &state.load_state {
+            LoadState::Loaded { document, .. } => {
+                assert_eq!(document.requests()[0].url, "https://example.com");
+            }
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+
+        // Removing the obstruction and retrying the exact same edit must now
+        // succeed — proof the edit was never lost, only blocked.
+        std::fs::remove_dir(&path).expect("removing the blocking directory");
+        update(&mut state, Message::SaveEdit);
+
+        assert!(
+            state.edit_mode.is_none(),
+            "retrying after the fix must succeed"
+        );
+        assert!(state.dirty_requests.is_empty());
+        let reloaded =
+            Document::from_path(&path).expect("the retried save must have written a real file");
+        assert_eq!(reloaded.requests()[0].url, "https://example.com/changed");
+    }
+
+    /// A fresh `Message::SaveEdit` attempt clears a stale `save_error` from a
+    /// previous failed one before deciding whether this attempt can even
+    /// proceed — so a validation failure (an invalid method, say) on a retry
+    /// shows *that* message, not a leftover disk error from before it was
+    /// fixed.
+    #[test]
+    fn a_new_save_attempt_clears_a_stale_save_error_even_if_this_attempt_also_fails_validation() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        std::fs::create_dir(&path).expect("a directory blocking the target path");
+
+        let mut state = AppState::default();
+        let document = Document::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
+        update(
+            &mut state,
+            Message::CollectionLoaded {
+                base_dir: dir.path().to_path_buf(),
+                path: path.clone(),
+                result: Box::new(Ok(document)),
+            },
+        );
+
+        update(&mut state, Message::EnterEditMode);
+        update(&mut state, Message::SaveEdit);
+        assert!(
+            state.edit_mode.as_ref().unwrap().save_error.is_some(),
+            "the blocked write must have set a save error"
+        );
+
+        // Now also break validation, without fixing the blocked directory.
+        state.edit_mode.as_mut().unwrap().focus = EditField::Method;
+        type_into_focused_field(&mut state, "x");
+        update(&mut state, Message::SaveEdit);
+
+        assert!(
+            state.edit_mode.as_ref().unwrap().method_error.is_some(),
+            "an invalid method must still block this save attempt"
+        );
+        assert!(
+            state.edit_mode.as_ref().unwrap().save_error.is_none(),
+            "a fresh attempt must clear the stale disk error even though it also failed, so the \
+             pane shows the current, real reason this save didn't go through"
         );
     }
 }
