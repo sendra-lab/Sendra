@@ -81,13 +81,46 @@ requests:
         yaml
     }
 
+    /// Where `loaded_state` points `LoadState::Loaded::path`/`base_dir` at —
+    /// one real, writable directory shared by every test in this binary
+    /// (`OnceLock` rather than a fresh `tempfile::tempdir()` per call), so
+    /// `Message::SaveEdit`'s real `Document::save_to_path` has somewhere
+    /// genuine to write to. `TempDir::keep()` deliberately leaks this one
+    /// directory rather than deleting it when the `TempDir` guard would
+    /// otherwise drop: there is nowhere in this fixture's signature to hold
+    /// that guard alive for the rest of the test binary's run, and one
+    /// leaked scratch directory per test binary (not one per `loaded_state`
+    /// call — hundreds of tests call it) is an acceptable, bounded cost for
+    /// tests that need `SaveEdit` to genuinely reach disk.
+    fn save_test_scratch_dir() -> &'static std::path::Path {
+        use std::sync::OnceLock;
+        static DIR: OnceLock<PathBuf> = OnceLock::new();
+        DIR.get_or_init(|| {
+            tempfile::tempdir()
+                .expect("a scratch directory for save-to-disk tests")
+                .keep()
+        })
+    }
+
     pub(crate) fn loaded_state(yaml: &str) -> AppState {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
         let mut state = AppState::default();
         let document = Document::from_yaml_str(yaml).expect("valid test YAML");
+
+        // Each call gets its own file name in the shared scratch directory —
+        // never written ahead of time (`Document::save_to_path` creates it
+        // via `rename` on first save, the same as it would for a brand-new
+        // collection file), just a real path a save can actually land on.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = save_test_scratch_dir().join(format!("collection-{id}.yaml"));
+
         update(
             &mut state,
             Message::CollectionLoaded {
-                base_dir: PathBuf::from("."),
+                base_dir: save_test_scratch_dir().to_path_buf(),
+                path,
                 result: Box::new(Ok(document)),
             },
         );

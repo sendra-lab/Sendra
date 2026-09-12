@@ -53,6 +53,7 @@ pub fn view(state: &AppState, frame: &mut Frame) {
             document,
             selected,
             base_dir,
+            ..
         } => {
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
@@ -382,6 +383,20 @@ fn render_edit_pane(
         for (index, row) in edit.captures.iter().enumerate() {
             lines.push(capture_row_line(edit.focus, index, row));
         }
+    }
+
+    // A failed disk write (`EditState::save_error`'s own doc comment covers
+    // when this is set) is shown the same `⚠ heading\nerror` way a failed run
+    // or a failed collection load already are — see `format_error` — rather
+    // than a bespoke error format invented just for this. Reserved only when
+    // there is one to show: unlike `method_error`'s always-present blank row
+    // (edited on every keystroke), a save attempt is a discrete event, not a
+    // per-character validation state, so there is no "currently passing"
+    // moment where a blank placeholder row would need to keep the layout
+    // from jumping.
+    if let Some(error) = &edit.save_error {
+        lines.push(String::new());
+        lines.push(format_error("Save failed", error));
     }
 
     lines.push(String::new());
@@ -3129,6 +3144,7 @@ requests:
                     &mut s,
                     Message::CollectionLoaded {
                         base_dir: PathBuf::from("."),
+                        path: PathBuf::from("collection.yaml"),
                         result: Box::new(Err(error)),
                     },
                 );
@@ -3163,6 +3179,7 @@ requests:
             &mut state,
             Message::CollectionLoaded {
                 base_dir: PathBuf::from("."),
+                path: PathBuf::from("collection.yaml"),
                 result: Box::new(Err(error)),
             },
         );
@@ -3364,6 +3381,7 @@ requests:
                 &mut failed,
                 Message::CollectionLoaded {
                     base_dir: PathBuf::from("."),
+                    path: PathBuf::from("collection.yaml"),
                     result: Box::new(Err(error)),
                 },
             );
@@ -3374,6 +3392,46 @@ requests:
             type_into_focused_field(&mut editing, "X");
             draw(&editing, width, height);
         }
+    }
+
+    /// The visual half of `update`'s own
+    /// `a_failed_disk_write_keeps_the_edit_dirty_and_surfaces_a_real_error_without_losing_it`:
+    /// a save that fails to reach disk must show a real, readable message in
+    /// the pane itself, through the same `format_error` shape a failed run or
+    /// a failed collection load already use — not just set a field nothing
+    /// on screen ever reads.
+    #[test]
+    fn edit_pane_shows_a_save_error_inline_after_a_failed_write() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        // A directory at the target path makes the final rename in
+        // `Document::save_to_path` fail deterministically — the same
+        // portable failure mode sendra-core's own tests use.
+        std::fs::create_dir(&path).unwrap();
+
+        let mut state = AppState::default();
+        let document = Document::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
+        update(
+            &mut state,
+            Message::CollectionLoaded {
+                base_dir: dir.path().to_path_buf(),
+                path,
+                result: Box::new(Ok(document)),
+            },
+        );
+        update(&mut state, Message::EnterEditMode);
+
+        update(&mut state, Message::SaveEdit);
+
+        let screen = render_screen(&state);
+        assert!(
+            screen.contains("Save failed"),
+            "a failed save must show a readable error in the pane:\n{screen}"
+        );
+        assert!(
+            state.edit_mode.is_some(),
+            "the pane must still be in edit mode after a failed save"
+        );
     }
 
     /// The edit pane itself: both fields' current text, the `▶` focus

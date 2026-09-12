@@ -1249,6 +1249,20 @@ pub struct EditState {
     /// `update::edit_mutate`) rather than leaving a now-possibly-wrong error
     /// on screen until the next save attempt.
     pub body_error: Option<String>,
+    /// `Some(message)` right after `Message::SaveEdit` attempted to write the
+    /// edit to disk (via `sendra_core::Document::save_to_path`) and that
+    /// write failed — a full disk, a permissions error, a removed directory,
+    /// anything `save_to_path`'s own doc comment covers. Unlike
+    /// `method_error`/`body_error`, this is never something the user can fix
+    /// by typing — it is an environment problem, not a bad value — so
+    /// `edit_mutate` never touches it; it clears only when a save attempt
+    /// actually succeeds (`Message::SaveEdit`'s own arm) or the whole edit is
+    /// cancelled (dropped along with the rest of `EditState`). Reusing
+    /// `format_error`'s inline rendering (see `render_edit_pane`) is what
+    /// "issue 11's render_error/format_error path" means here: the same
+    /// `⚠ heading\nerror` shape a failed run or a failed collection load
+    /// already use, not a new error-display convention just for this.
+    pub save_error: Option<String>,
 }
 
 impl EditState {
@@ -1308,6 +1322,7 @@ impl EditState {
             focus: EditField::default(),
             method_error,
             body_error: None,
+            save_error: None,
         }
     }
 
@@ -1781,6 +1796,13 @@ pub enum LoadState {
         /// resolve relative to — the directory containing the collection's
         /// own YAML file, exactly as `Request::resolve_body` expects.
         base_dir: PathBuf,
+        /// The collection's own YAML file — what `Message::SaveEdit` calls
+        /// `Document::save_to_path` with. Distinct from `base_dir`, which is
+        /// only ever the *directory* a request's own relative paths resolve
+        /// against; this is the file itself, and the two serve entirely
+        /// different callers (`Request::resolve_body` vs. `save_to_path`)
+        /// even though one is always the other's parent.
+        path: PathBuf,
     },
     Failed(SendraError),
 }
@@ -1792,6 +1814,12 @@ pub enum Message {
     NoCollectionPath,
     CollectionLoaded {
         base_dir: PathBuf,
+        /// The file `result` was loaded from (or attempted to be loaded
+        /// from) — carried through regardless of whether `result` is `Ok` or
+        /// `Err`, since `update()` only actually stores it in
+        /// `LoadState::Loaded` on success, but the message itself is built
+        /// before that outcome is known.
+        path: PathBuf,
         result: Box<Result<Document, SendraError>>,
     },
     /// The environments `main::load_environments` found at startup — the

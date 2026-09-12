@@ -2,7 +2,7 @@
 //! file, and the two shapes a Sendra file can hold.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -202,6 +202,107 @@ impl Document {
             Document::Collection(collection) => collection.get(name),
         }
     }
+
+    /// Serializes this document back to YAML, exactly the shape
+    /// [`from_yaml_str`](Self::from_yaml_str)/[`from_path`](Self::from_path)
+    /// parse: a bare [`Request`] for `Single`, a [`Collection`] for
+    /// `Collection`.
+    ///
+    /// **Not a derived `Serialize` impl on `Document` itself.** `Document`
+    /// deliberately has no `#[derive(Serialize)]` (nor a hand-written
+    /// externally-tagged one): serde's default representation for an enum
+    /// like this one wraps the output in a `Single:`/`Collection:` key
+    /// (`!Single ...` in YAML's own tag syntax, depending on the
+    /// representation), which is not a shape `from_yaml_str`'s own shape
+    /// detection — "a top-level `requests` key means a collection, anything
+    /// else is a single request" (see this type's own doc comment) — was ever
+    /// written to expect. Serializing whichever variant is actually held,
+    /// unwrapped, is what keeps
+    /// `Document::from_yaml_str(&doc.to_yaml_string()?)` equal to `doc` for
+    /// every real collection or request file — round-tripping through the
+    /// same shape a hand-written file already has, not a new one only this
+    /// method would produce.
+    pub fn to_yaml_string(&self) -> Result<String, SendraError> {
+        match self {
+            Document::Single(request) => serde_yaml::to_string(request),
+            Document::Collection(collection) => serde_yaml::to_string(collection),
+        }
+        .map_err(SendraError::Serialize)
+    }
+
+    /// Writes this document back to `path`, atomically: the new content is
+    /// written to a sibling temp file in the same directory first, then
+    /// [`std::fs::rename`]d over `path` — never written in place — so a
+    /// crash or a killed process mid-write can never leave `path` holding a
+    /// truncated or half-written file. A rename onto an existing file is
+    /// atomic on the same volume on both POSIX (`rename(2)`) and Windows
+    /// (`std::fs::rename` there is implemented as `MoveFileExW` with
+    /// `MOVEFILE_REPLACE_EXISTING`) — the two platforms sendra-tui ships
+    /// on — so `path` is always either its old content in full or its new
+    /// content in full, never a mix of both, no matter when the process is
+    /// interrupted.
+    ///
+    /// The temp file is created in the *same directory* as `path`, not the
+    /// system temp directory: a rename across filesystems/mount points is not
+    /// atomic (POSIX `rename(2)` fails outright with `EXDEV`), so the temp
+    /// file has to already live on whatever volume `path` is on for the final
+    /// rename to be the one atomic operation this whole guarantee rests on.
+    ///
+    /// If either the initial write or the rename fails, `path` is left
+    /// completely untouched (the failure can only ever happen to the temp
+    /// file, before `path` itself is touched at all) and the temp file is
+    /// removed on a best-effort basis rather than left behind as a stray
+    /// dotfile — the original error is what gets returned either way, not
+    /// whatever the cleanup did.
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SendraError> {
+        let path = path.as_ref();
+        let yaml = self.to_yaml_string()?;
+        let temp_path = unique_temp_path(path);
+
+        std::fs::write(&temp_path, yaml.as_bytes()).map_err(|source| SendraError::SaveIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        std::fs::rename(&temp_path, path).map_err(|source| {
+            let _ = std::fs::remove_file(&temp_path);
+            SendraError::SaveIo {
+                path: path.to_path_buf(),
+                source,
+            }
+        })
+    }
+}
+
+/// A path, next to `target`, that nothing else is using — what
+/// [`Document::save_to_path`] writes the new content to before renaming it
+/// over `target`. Named with a leading dot (hidden on Unix, and merely
+/// unusual rather than special on Windows) and a `sendra-tmp-` marker so a
+/// stray one left behind by a process that was killed between the write and
+/// the rename reads as obviously disposable rather than a mystery file.
+///
+/// Unique per call within one process via a process-wide counter — `target`'s
+/// own name plus the process id alone would collide if `save_to_path` were
+/// ever called twice for the same path in quick succession (e.g. two rapid
+/// saves) inside the same process.
+fn unique_temp_path(target: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let dir = target
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document.yaml");
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    dir.join(format!(
+        ".{file_name}.sendra-tmp-{}-{unique}",
+        std::process::id()
+    ))
 }
 
 #[cfg(test)]
@@ -407,5 +508,214 @@ enviroment: staging
             SendraError::Io { path, .. } => assert_eq!(path, Path::new("does/not/exist.yaml")),
             other => panic!("expected Io, got {other:?}"),
         }
+    }
+
+    // --- to_yaml_string / save_to_path --------------------------------------
+
+    #[test]
+    fn to_yaml_string_round_trips_a_collection_with_every_nested_shape() {
+        let yaml = "\
+name: test
+requests:
+  - name: One
+    method: POST
+    url: https://example.com
+    headers:
+      X-Test: abc
+    body: '{}'
+    auth:
+      bearer: secret-token
+    assertions:
+      status: 200
+      json:
+        $.ok: true
+    capture:
+      id: $.id
+      trace:
+        header: X-Trace-Id
+";
+        let document = Document::from_yaml_str(yaml).unwrap();
+
+        let serialized = document
+            .to_yaml_string()
+            .expect("a valid document always serializes");
+        let round_tripped =
+            Document::from_yaml_str(&serialized).expect("what was just serialized must reparse");
+
+        assert_eq!(
+            round_tripped, document,
+            "round-tripping through to_yaml_string must not lose or change anything"
+        );
+    }
+
+    #[test]
+    fn to_yaml_string_serializes_a_single_request_as_a_bare_request_not_wrapped() {
+        let yaml = "method: GET\nurl: https://example.com\n";
+        let document = Document::from_yaml_str(yaml).unwrap();
+
+        let serialized = document.to_yaml_string().unwrap();
+
+        assert_eq!(Document::from_yaml_str(&serialized).unwrap(), document);
+        // The regression this guards against: a derived `Serialize` on
+        // `Document` itself would wrap the output in a `Single:` key, which
+        // `from_yaml_str`'s own shape detection was never written to expect.
+        assert!(
+            !serialized.contains("Single") && !serialized.contains("Collection"),
+            "a Document must serialize as whichever bare shape it holds, not tagged with its \
+             own variant name: got {serialized}"
+        );
+    }
+
+    #[test]
+    fn save_to_path_writes_the_document_and_a_reload_from_disk_matches() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        let document = Document::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
+
+        document
+            .save_to_path(&path)
+            .expect("saving into a writable directory must succeed");
+
+        let reloaded = Document::from_path(&path).expect("the saved file must parse back");
+        assert_eq!(reloaded, document);
+    }
+
+    #[test]
+    fn save_to_path_leaves_no_temp_file_behind_on_success() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        let document = Document::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
+
+        document.save_to_path(&path).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("collection.yaml")],
+            "no stray temp file should remain after a successful save: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn save_to_path_fails_without_touching_anything_when_the_parent_is_not_a_directory() {
+        // A real, deterministic write-phase failure (before `path` is ever
+        // touched): the temp file's own write fails because its parent
+        // component names a plain file, not a directory — reproducible on
+        // both POSIX (`ENOTDIR`) and Windows without needing OS-specific
+        // permission setup.
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let blocking_file = dir.path().join("not-a-directory");
+        std::fs::write(&blocking_file, "just a file").unwrap();
+        let path = blocking_file.join("collection.yaml");
+
+        let document = Document::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
+        let err = document
+            .save_to_path(&path)
+            .expect_err("a non-directory parent must fail the write");
+        assert!(matches!(err, SendraError::SaveIo { .. }), "got {err:?}");
+
+        assert_eq!(
+            std::fs::read_to_string(&blocking_file).unwrap(),
+            "just a file",
+            "the unrelated file the failure was caused by must be untouched"
+        );
+    }
+
+    #[test]
+    fn save_to_path_fails_without_corrupting_an_existing_directory_at_the_target() {
+        // A different, later failure point than the previous test: the temp
+        // file's own write succeeds (its parent — `dir` — is a real,
+        // writable directory), and the failure is specifically the final
+        // rename, which always fails on both POSIX (`EISDIR`) and Windows
+        // when the destination is an existing directory. This proves the
+        // target is left alone even when the new content was already written
+        // somewhere, not just when nothing was ever written at all.
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        std::fs::create_dir(&path).unwrap();
+
+        let document = Document::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
+        let err = document
+            .save_to_path(&path)
+            .expect_err("renaming a file over an existing directory must fail");
+        assert!(matches!(err, SendraError::SaveIo { .. }), "got {err:?}");
+
+        assert!(
+            path.is_dir(),
+            "the original directory at the target path must be left exactly as it was"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from("collection.yaml")],
+            "no leftover temp file should remain after a failed rename: {entries:?}"
+        );
+    }
+
+    /// The one failure mode the two tests above can't reach: a write refused
+    /// purely by filesystem permissions rather than by the path shape.
+    /// Windows-only because `std::fs::Permissions::set_readonly` on a
+    /// *directory* is cosmetic there and does not actually block file
+    /// creation inside it — reproducing a genuinely write-denied directory
+    /// needs a real ACL deny via `icacls`, which only exists on Windows. The
+    /// POSIX equivalent (`set_permissions` clearing the write bit on the
+    /// directory) is not exercised here since this workspace's dev/CI
+    /// environment for this crate is Windows; the *mechanism* being proved —
+    /// a failed write leaves the original file completely untouched — is
+    /// already covered cross-platform by the two tests above.
+    #[test]
+    #[cfg(windows)]
+    fn a_write_denied_target_directory_leaves_the_original_file_completely_untouched() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        let original = "method: GET\nurl: https://example.com/original\n";
+        std::fs::write(&path, original).unwrap();
+
+        let user = std::env::var("USERNAME").expect("USERNAME must be set on Windows");
+        let deny = Command::new("icacls")
+            .arg(dir.path())
+            .arg("/deny")
+            .arg(format!("{user}:(OI)(CI)W"))
+            .status()
+            .expect("icacls must be available on Windows");
+        assert!(
+            deny.success(),
+            "icacls /deny must succeed to set up this test"
+        );
+
+        let new_document =
+            Document::from_yaml_str("method: POST\nurl: https://example.com/new\n").unwrap();
+        let result = new_document.save_to_path(&path);
+
+        // Restore permissions before asserting anything, so a failing
+        // assertion never leaves the temp directory locked for cleanup.
+        let restore = Command::new("icacls")
+            .arg(dir.path())
+            .arg("/remove:d")
+            .arg(&user)
+            .status()
+            .expect("icacls must be available on Windows");
+        assert!(
+            restore.success(),
+            "icacls /remove:d must succeed to clean this test up"
+        );
+
+        assert!(
+            result.is_err(),
+            "a write-denied directory must fail the save rather than silently succeeding"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the original file must be completely unchanged after the failed save"
+        );
     }
 }

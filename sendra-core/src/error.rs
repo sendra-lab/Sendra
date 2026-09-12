@@ -30,6 +30,33 @@ pub enum SendraError {
     #[error("could not parse request")]
     ParseStr(#[source] serde_yaml::Error),
 
+    /// A document could not be serialized back to YAML —
+    /// [`Document::to_yaml_string`](crate::Document::to_yaml_string).
+    ///
+    /// In practice this should never happen for a `Document` built by
+    /// [`Document::from_path`](crate::Document::from_path)/[`from_yaml_str`](crate::Document::from_yaml_str):
+    /// every field that came from real YAML serializes back out the same
+    /// way. But `serde_yaml::to_string` still returns a `Result`, and
+    /// `.unwrap()`-ing it would turn a theoretical serialization bug into a
+    /// panic on save instead of a message a front-end can show and recover
+    /// from.
+    #[error("could not serialize this document back to YAML")]
+    Serialize(#[source] serde_yaml::Error),
+
+    /// A document could not be written back to disk after an edit —
+    /// [`Document::save_to_path`](crate::Document::save_to_path). The save
+    /// half of [`Io`](Self::Io), kept separate because the message has to say
+    /// "write" rather than "read", and because a write failure here means the
+    /// edit was never persisted: the file at `path` is left exactly as it was
+    /// before the save was attempted (see `save_to_path`'s own doc comment
+    /// for why the write can never leave `path` half-written).
+    #[error("could not write collection file `{path}`")]
+    SaveIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("header `{name}` is not valid: {reason}")]
     InvalidHeader { name: String, reason: String },
 
