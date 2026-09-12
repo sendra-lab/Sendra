@@ -20,7 +20,8 @@ use crate::run_request::RunOutcome;
 
 use super::state::{
     AppState, AssertionRow, AuthEdit, AuthField, BodyEdit, CaptureKind, CaptureRow, DeleteConfirm,
-    EditField, EditState, JsonOperator, LoadState, NamedEnvironment, RunState,
+    EditField, EditState, EnvVarField, EnvironmentEditState, JsonOperator, LoadState,
+    NamedEnvironment, RunState,
 };
 
 /// Body preview is capped rather than shown in full — scrolling through a
@@ -1169,6 +1170,15 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 /// `view()`'s own overlay-vs-response-panel-vs-preview dispatch already
 /// imply:
 ///
+/// 0. **An environment's variables are being edited**
+///    (`environment_edit.is_some()`) — checked ahead of the plain overlay
+///    context below since this session only ever opens from inside the
+///    overlay and takes over the whole thing (see
+///    `render_environment_overlay`'s own comment). Within it, a pending
+///    row deletion (`EnvironmentEditState::pending_delete`) is its own,
+///    innermost context: only `y`/`n`/Enter/Esc/quit apply while it is
+///    open, the exact same "nested modal" shape `AppState::delete_confirm`
+///    already has one level up.
 /// 1. **The environment overlay is open** (`environment_overlay.is_some()`,
 ///    the same condition `view()` checks to draw it) — only the overlay's
 ///    own keys apply, checked first because the overlay is drawn on top of
@@ -1219,8 +1229,23 @@ pub(super) fn status_help_text(state: &AppState) -> String {
         return format!("Confirm delete{failed}  |  y/enter confirm  n/esc cancel  q quit");
     }
 
+    if let Some(env_edit) = &state.environment_edit {
+        if env_edit.pending_delete.is_some() {
+            return "Delete variable?  |  y/enter confirm  n/esc cancel  q quit".to_string();
+        }
+        let failed = if env_edit.save_error.is_some() {
+            "  (save failed — see message)"
+        } else {
+            ""
+        };
+        return format!(
+            "Editing variables{failed}  |  tab/shift+tab switch field  ctrl+n add  \
+             ctrl+d delete  ctrl+s save  esc cancel  q quit"
+        );
+    }
+
     if state.environment_overlay.is_some() {
-        return "↑/↓ nav  enter confirm  esc cancel  q quit".to_string();
+        return "↑/↓ nav  enter confirm  i edit variables  esc cancel  q quit".to_string();
     }
 
     if let Some(edit) = &state.edit_mode {
@@ -1538,12 +1563,23 @@ fn inset(area: Rect) -> Rect {
 }
 
 fn render_environment_overlay(frame: &mut Frame, state: &AppState, cursor: usize) {
+    // An in-progress variable edit takes over the whole overlay, the same
+    // way `render_detail_pane` lets edit mode take over the whole detail
+    // pane: there is no meaningful "picker vs. editor" split to preserve
+    // underneath one, and `update()`'s own guard keeps the overlay's cursor
+    // from moving while this session is open, so the environment it names
+    // cannot drift out from under `cursor` while this branch renders it.
+    if let Some(env_edit) = &state.environment_edit {
+        render_environment_edit(frame, state, env_edit);
+        return;
+    }
+
     let area = centered_rect(70, 70, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .title("Select environment — Enter to confirm, Esc to cancel"),
+            .title("Select environment — Enter to confirm, i to edit, Esc to cancel"),
         area,
     );
 
@@ -1629,6 +1665,69 @@ fn render_environment_overlay(frame: &mut Frame, state: &AppState, cursor: usize
     frame.render_widget(
         Paragraph::new(lines.join("\n")).wrap(Wrap { trim: false }),
         panes[1],
+    );
+}
+
+/// The environment-variable edit session — what `render_environment_overlay`
+/// shows instead of the picker list while `AppState::environment_edit` is
+/// `Some`. One row per variable, `name = value`, with `»`/`«` bracketing
+/// whichever half of whichever row has focus — the same "mark focus inline
+/// in the text, no separate cursor widget" convention `render_edit_pane`'s
+/// header rows already use. A row pending deletion
+/// (`EnvironmentEditState::pending_delete`) is called out inline rather than
+/// drawn as a second overlay on top of this one, keeping this a single,
+/// minimal screen rather than a stack of them — see this issue's own scoping
+/// note on why a unified confirmation component is a later concern.
+fn render_environment_edit(frame: &mut Frame, state: &AppState, env_edit: &EnvironmentEditState) {
+    let name = state
+        .environments
+        .get(env_edit.index)
+        .map(|named| named.name.as_str())
+        .unwrap_or("?");
+
+    let area = centered_rect(70, 70, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().borders(Borders::ALL).title(format!(
+            "Edit variables for '{name}' — tab switch field, ctrl+n add, ctrl+d delete, \
+             ctrl+s save, esc cancel"
+        )),
+        area,
+    );
+
+    let inner = inset(area);
+
+    let mut lines = Vec::new();
+    if env_edit.rows.is_empty() {
+        lines.push("(no variables — ctrl+n to add one)".to_string());
+    } else {
+        for (index, row) in env_edit.rows.iter().enumerate() {
+            let name_text = if env_edit.focus == Some(EnvVarField::Name(index)) {
+                format!("»{}«", row.key.value())
+            } else {
+                row.key.value().to_string()
+            };
+            let value_text = if env_edit.focus == Some(EnvVarField::Value(index)) {
+                format!("»{}«", row.value.value())
+            } else {
+                row.value.value().to_string()
+            };
+            let mut line = format!("{name_text} = {value_text}");
+            if env_edit.pending_delete == Some(index) {
+                line.push_str("   ⚠ delete this variable? y/n");
+            }
+            lines.push(line);
+        }
+    }
+
+    if let Some(error) = &env_edit.save_error {
+        lines.push(String::new());
+        lines.push(format_error("Could not save", error));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines.join("\n")).wrap(Wrap { trim: false }),
+        inner,
     );
 }
 
@@ -3940,5 +4039,159 @@ requests:
             screen.contains(&format!("of {total_lines}")),
             "the footer must report the real total even after the area shrank:\n{screen}"
         );
+    }
+
+    // --- Editing environment variables --------------------------------------
+
+    /// A loaded collection whose one request substitutes `{{base_url}}`,
+    /// paired with a real environment file on disk that defines it —
+    /// everything `resolve_preview`'s real pipeline needs to resolve a live
+    /// URL, and everything `Message::SaveEnvironmentEdit` needs to persist
+    /// an edit to. Mirrors `super::super::update::tests::
+    /// state_with_saved_environment` (which has no loaded collection to
+    /// preview against) plus `loaded_state` (which has no real environment
+    /// file), rather than reusing either alone.
+    fn loaded_state_with_saved_environment(
+        variable_value: &str,
+    ) -> (AppState, tempfile::TempDir, PathBuf) {
+        let mut state = loaded_state(
+            "name: test\nrequests:\n  - name: One\n    method: GET\n    \
+             url: 'https://example.com/{{base_url}}'\n",
+        );
+
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = sendra_core::environment::environment_path(dir.path(), "staging");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("base_url: {variable_value}\n")).unwrap();
+        let environment = Environment::from_path(&path).expect("the fixture file must parse");
+
+        state.environments = vec![super::super::state::NamedEnvironment {
+            name: "staging".to_string(),
+            environment,
+        }];
+        state.active_environment = Some(0);
+
+        (state, dir, path)
+    }
+
+    /// Proof requirement: after editing an environment variable and saving,
+    /// the detail pane's resolved-request preview — built through the real
+    /// `resolve_preview`/`resolve_auth` pipeline `render_detail_pane` always
+    /// uses, not a reformatted stand-in — shows the new value live, with no
+    /// further action needed once the overlay closes.
+    #[test]
+    fn saved_environment_variable_edits_show_up_live_in_the_resolved_preview() {
+        let (mut state, _dir, _path) = loaded_state_with_saved_environment("old-value");
+
+        let before = render_screen(&state);
+        assert!(
+            before.contains("https://example.com/old-value"),
+            "sanity: the preview must resolve against the original value first:\n{before}"
+        );
+
+        update(&mut state, Message::OpenEnvironmentOverlay);
+        update(&mut state, Message::EnterEnvironmentEdit);
+        // The one row (`base_url`) starts focused on its name field — move
+        // onto the value to edit it, the same way a real user would.
+        update(&mut state, Message::EditFocusNext);
+        for _ in 0.."old-value".len() {
+            update(&mut state, Message::EditBackspace);
+        }
+        for ch in "new-value".chars() {
+            update(&mut state, Message::EditInsertChar(ch));
+        }
+        update(&mut state, Message::SaveEnvironmentEdit);
+        assert!(
+            state.environment_edit.is_none(),
+            "the save must succeed for this test to mean anything"
+        );
+        update(&mut state, Message::CloseEnvironmentOverlay);
+
+        let after = render_screen(&state);
+        assert!(
+            after.contains("https://example.com/new-value"),
+            "the resolved preview must reflect the saved edit live:\n{after}"
+        );
+        assert!(
+            !after.contains("old-value"),
+            "the stale value must not linger anywhere on screen:\n{after}"
+        );
+    }
+
+    #[test]
+    fn environment_edit_screen_renders_rows_and_the_focus_marker() {
+        let (mut state, _dir, _path) = loaded_state_with_saved_environment("https://example.com");
+        update(&mut state, Message::OpenEnvironmentOverlay);
+        update(&mut state, Message::EnterEnvironmentEdit);
+
+        let screen = render_screen(&state);
+        assert!(
+            screen.contains("base_url"),
+            "the variable's name must be on screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("»base_url«"),
+            "the focused name field must carry a visible focus marker:\n{screen}"
+        );
+        assert!(
+            screen.contains("https://example.com"),
+            "the variable's value must be on screen too:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn environment_edit_screen_shows_no_variables_placeholder_when_empty() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = sendra_core::environment::environment_path(dir.path(), "empty");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        let environment = Environment::from_path(&path).expect("an empty file is still valid");
+
+        let mut state = AppState {
+            environments: vec![super::super::state::NamedEnvironment {
+                name: "empty".to_string(),
+                environment,
+            }],
+            environment_overlay: Some(0),
+            ..AppState::default()
+        };
+        update(&mut state, Message::EnterEnvironmentEdit);
+
+        let screen = render_screen(&state);
+        assert!(
+            screen.contains("no variables"),
+            "the zero-variables case must render a clear placeholder, not a blank \
+             or broken screen:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn env_var_delete_confirmation_shows_up_inline_on_the_pending_row() {
+        let (mut state, _dir, _path) = loaded_state_with_saved_environment("https://example.com");
+        update(&mut state, Message::OpenEnvironmentOverlay);
+        update(&mut state, Message::EnterEnvironmentEdit);
+
+        update(&mut state, Message::RequestDeleteEnvVarRow);
+
+        let screen = render_screen(&state);
+        assert!(
+            screen.contains("delete this variable"),
+            "a pending row delete must show an inline confirmation:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn help_bar_shows_environment_edit_keys_and_the_row_delete_confirmation_keys() {
+        let (mut state, _dir, _path) = loaded_state_with_saved_environment("https://example.com");
+        update(&mut state, Message::OpenEnvironmentOverlay);
+        update(&mut state, Message::EnterEnvironmentEdit);
+
+        let editing_text = status_help_text(&state);
+        assert!(editing_text.contains("ctrl+s save"), "{editing_text}");
+        assert!(editing_text.contains("ctrl+d delete"), "{editing_text}");
+
+        update(&mut state, Message::RequestDeleteEnvVarRow);
+        let pending_text = status_help_text(&state);
+        assert!(pending_text.contains("y/enter confirm"), "{pending_text}");
     }
 }

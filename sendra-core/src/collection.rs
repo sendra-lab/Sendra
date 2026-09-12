@@ -321,7 +321,7 @@ impl Document {
 /// own name plus the process id alone would collide if `save_to_path` were
 /// ever called twice for the same path in quick succession (e.g. two rapid
 /// saves) inside the same process.
-fn unique_temp_path(target: &Path) -> PathBuf {
+pub(crate) fn unique_temp_path(target: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 

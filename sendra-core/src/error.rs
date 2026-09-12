@@ -220,6 +220,20 @@ pub enum SendraError {
         source: serde_yaml::Error,
     },
 
+    /// An environment could not be written back to disk after an edit —
+    /// [`Environment::save_to_path`](crate::Environment::save_to_path). The
+    /// save half of [`EnvIo`](Self::EnvIo), kept separate for the same reason
+    /// [`SaveIo`](Self::SaveIo) is split from [`Io`](Self::Io): the message
+    /// has to say "write" rather than "read", and a write failure here means
+    /// the edit was never persisted — the file at `path` is left exactly as
+    /// it was before the save was attempted.
+    #[error("could not write environment file `{path}`")]
+    EnvSaveIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// An environment file parsed as valid YAML, but its `auth:` block broke
     /// a rule `serde` cannot express: exactly one of `bearer`/`basic`/
     /// `api_key` may be set — the same rule

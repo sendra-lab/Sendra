@@ -84,8 +84,9 @@ mod substitute;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
+use crate::collection::unique_temp_path;
 use crate::config::PROJECT_DIR_NAME;
 use crate::{Auth, SendraError};
 
@@ -361,6 +362,88 @@ impl Environment {
             environment: self.source.clone(),
         })
     }
+
+    /// Every rule `Deserialize` cannot express, checked directly rather than
+    /// only ever at parse time: `auth`'s own mutual-exclusivity and (for
+    /// `oauth`) grant-field rules — the exact same checks
+    /// [`from_file`](Self::from_file) already runs when reading a file from
+    /// disk, exposed here so a caller building or mutating an `Environment`
+    /// in memory (a front-end applying an edit, say) can ask the question
+    /// before [`save_to_path`](Self::save_to_path) ever writes it, the same
+    /// "check before writing rather than only discover it broken on the next
+    /// load" reasoning [`Document::validate`](crate::Document::validate)
+    /// documents for its own callers. `variables` has no rule of its own to
+    /// check: every `BTreeMap<String, String>`, empty included, is already a
+    /// valid environment — see this module's own doc comment on why an empty
+    /// file is not an error.
+    pub fn validate(&self) -> Result<(), SendraError> {
+        let Some(auth) = &self.auth else {
+            return Ok(());
+        };
+        let invalid = |reason: String| {
+            Err(SendraError::InvalidEnvironment {
+                path: self.source.clone(),
+                reason,
+            })
+        };
+        if let Err(reason) = auth.validate_exclusivity() {
+            return invalid(reason);
+        }
+        if let Some(oauth) = &auth.oauth {
+            if let Err(reason) = oauth.validate_grant_fields() {
+                return invalid(reason);
+            }
+        }
+        Ok(())
+    }
+
+    /// Serializes this environment back to YAML, exactly the flat shape
+    /// [`from_yaml_str`](Self::from_yaml_str)/[`from_path`](Self::from_path)
+    /// parse: every variable as a top-level key, plus `auth:` when set — see
+    /// [`EnvironmentFile`]'s own `Serialize` impl for why this goes through
+    /// that type's hand-written map serialization rather than a derived one
+    /// on `Environment` itself. `captured`/`os_env_override` are runtime-only
+    /// (never part of a file — see their own doc comments) and so play no
+    /// part here; only `variables` and `auth` round-trip.
+    pub fn to_yaml_string(&self) -> Result<String, SendraError> {
+        let file = EnvironmentFile {
+            auth: self.auth.clone(),
+            variables: self.variables.clone(),
+        };
+        serde_yaml::to_string(&file).map_err(SendraError::Serialize)
+    }
+
+    /// Writes this environment back to `path`, atomically — the exact same
+    /// write-to-a-sibling-temp-file-then-rename guarantee
+    /// [`Document::save_to_path`](crate::Document::save_to_path) documents
+    /// for a collection file, reusing its own [`unique_temp_path`] helper
+    /// rather than a second implementation of the same atomicity argument.
+    /// Refuses to write an invalid environment (see
+    /// [`validate`](Self::validate)) before the temp file is even created,
+    /// for the same reason `Document::save_to_path` checks first: an
+    /// in-memory edit that left `auth` invalid would otherwise still produce
+    /// a file that parses back as YAML but fails validation the next time
+    /// anything loads it.
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SendraError> {
+        self.validate()?;
+
+        let path = path.as_ref();
+        let yaml = self.to_yaml_string()?;
+        let temp_path = unique_temp_path(path);
+
+        std::fs::write(&temp_path, yaml.as_bytes()).map_err(|source| SendraError::EnvSaveIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        std::fs::rename(&temp_path, path).map_err(|source| {
+            let _ = std::fs::remove_file(&temp_path);
+            SendraError::EnvSaveIo {
+                path: path.to_path_buf(),
+                source,
+            }
+        })
+    }
 }
 
 /// The on-disk shape of one environment file: every top-level key is a
@@ -411,6 +494,35 @@ pub struct EnvironmentFile {
     pub auth: Option<Auth>,
     #[cfg_attr(feature = "schema", schemars(flatten))]
     pub variables: BTreeMap<String, String>,
+}
+
+/// The exact mirror of [`EnvironmentFile`]'s hand-written `Deserialize`
+/// above: `auth` (when set) plus every variable, all as sibling top-level
+/// keys in one flat map — never `{auth: ..., variables: {...}}`, which is
+/// what a derived `Serialize` would produce and not a shape
+/// [`Deserialize`](struct@EnvironmentFile)'s own `Visitor` (or a hand-written
+/// environment file) recognises. Variables are written in `BTreeMap` order
+/// (i.e. sorted by name) — deterministic, and irrelevant to substitution,
+/// which looks values up by name rather than position. `auth` is written
+/// first when present, matching the position most hand-written environment
+/// files already put it in (see this module's own doc comment).
+impl Serialize for EnvironmentFile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map =
+            serializer.serialize_map(Some(self.variables.len() + self.auth.is_some() as usize))?;
+        if let Some(auth) = &self.auth {
+            map.serialize_entry("auth", auth)?;
+        }
+        for (name, value) in &self.variables {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
 }
 
 impl<'de> Deserialize<'de> for EnvironmentFile {
@@ -848,6 +960,167 @@ mod tests {
         let err = Environment::from_yaml_str("auth:\n  bogus: x\n")
             .expect_err("Auth::deny_unknown_fields rejects it");
         assert!(matches!(err, SendraError::ParseStr(_)), "got {err:?}");
+    }
+
+    // --- Serializing back to YAML / saving to disk ------------------------
+
+    #[test]
+    fn to_yaml_string_round_trips_variables_and_auth() {
+        let mut environment = Environment::from_yaml_str(
+            "base_url: https://staging.example.com\nauth:\n  bearer: '{{token}}'\n",
+        )
+        .unwrap();
+        environment
+            .variables
+            .insert("port".to_string(), "443".to_string());
+
+        let yaml = environment.to_yaml_string().unwrap();
+        let reloaded = Environment::from_yaml_str(&yaml).unwrap();
+
+        assert_eq!(reloaded.variables, environment.variables);
+        assert_eq!(reloaded.auth, environment.auth);
+    }
+
+    #[test]
+    fn to_yaml_string_of_an_empty_environment_round_trips_to_the_same_empty_environment() {
+        // The zero-variables case: an environment with nothing in it must
+        // serialize and reload cleanly, not as some special "empty" marker —
+        // see this module's own doc comment on why an empty file is not an
+        // error.
+        let environment = Environment::default();
+        let yaml = environment.to_yaml_string().unwrap();
+        let reloaded = Environment::from_yaml_str(&yaml).unwrap();
+
+        assert!(reloaded.variables.is_empty());
+        assert!(reloaded.auth.is_none());
+    }
+
+    #[test]
+    fn save_to_path_writes_the_environment_and_a_reload_from_disk_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = environment_path(temp.path(), "staging");
+        write(&path, "base_url: https://old.example.com\n");
+
+        let mut environment = Environment::from_path(&path).unwrap();
+        environment.variables.insert(
+            "base_url".to_string(),
+            "https://new.example.com".to_string(),
+        );
+        environment
+            .variables
+            .insert("token".to_string(), "abc123".to_string());
+
+        environment.save_to_path(&path).unwrap();
+
+        // The proof itself: a fresh `Environment::from_path`, not anything
+        // still held in memory.
+        let reloaded = Environment::from_path(&path).unwrap();
+        assert_eq!(
+            reloaded.variables.get("base_url").map(String::as_str),
+            Some("https://new.example.com")
+        );
+        assert_eq!(
+            reloaded.variables.get("token").map(String::as_str),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn save_to_path_can_write_an_environment_down_to_zero_variables() {
+        // The other half of the zero-variables investigation, against real
+        // disk this time: deleting every variable and saving must produce a
+        // file that reloads as a real, valid, empty environment — never an
+        // error, and never a file that fails to write at all. Unlike
+        // `Document::Collection` (which `Collection::validate` refuses to
+        // save empty), `Environment` has no such rule: a flat map has no
+        // "must have at least one entry" requirement.
+        let temp = tempfile::tempdir().unwrap();
+        let path = environment_path(temp.path(), "staging");
+        write(&path, "base_url: https://example.com\n");
+
+        let mut environment = Environment::from_path(&path).unwrap();
+        environment.variables.clear();
+
+        environment
+            .save_to_path(&path)
+            .expect("saving down to zero variables must succeed");
+
+        let reloaded = Environment::from_path(&path).unwrap();
+        assert!(reloaded.variables.is_empty());
+        assert!(reloaded.auth.is_none());
+    }
+
+    #[test]
+    fn save_to_path_can_write_an_environment_up_from_zero_variables() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = environment_path(temp.path(), "staging");
+        write(&path, "");
+
+        let mut environment = Environment::from_path(&path).unwrap();
+        assert!(environment.variables.is_empty());
+        environment
+            .variables
+            .insert("base_url".to_string(), "https://example.com".to_string());
+
+        environment.save_to_path(&path).unwrap();
+
+        let reloaded = Environment::from_path(&path).unwrap();
+        assert_eq!(
+            reloaded.variables.get("base_url").map(String::as_str),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn save_to_path_leaves_no_temp_file_behind_on_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = environment_path(temp.path(), "staging");
+        write(&path, "base_url: https://example.com\n");
+
+        Environment::from_path(&path)
+            .unwrap()
+            .save_to_path(&path)
+            .unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![path.file_name().unwrap().to_os_string()],
+            "no stray sendra-tmp- file should be left behind: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn save_to_path_refuses_to_write_an_invalid_environment_and_touches_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = environment_path(temp.path(), "staging");
+        let original = "base_url: https://example.com\nauth:\n  bearer: '{{token}}'\n";
+        write(&path, original);
+
+        let mut environment = Environment::from_path(&path).unwrap();
+        // Break `auth`'s own mutual-exclusivity rule directly on the
+        // in-memory value — `Auth`'s own fields are `pub`, so this needs no
+        // API beyond what `save_to_path`'s caller already has.
+        environment.auth.as_mut().unwrap().basic = Some(crate::BasicAuth {
+            user: "u".to_string(),
+            pass: "p".to_string(),
+        });
+
+        let err = environment
+            .save_to_path(&path)
+            .expect_err("bearer + basic together must be refused");
+        assert!(
+            matches!(err, SendraError::InvalidEnvironment { .. }),
+            "got {err:?}"
+        );
+
+        // Untouched: still exactly the original bytes.
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, original);
     }
 
     #[test]

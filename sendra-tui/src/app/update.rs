@@ -4,14 +4,14 @@
 //! own doc comment and `super::state::AppState::edit_mode`'s for why that
 //! invariant matters.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use sendra_core::{Collection, Document, Request};
 
 use super::state::{
     non_empty, validate_assertion_value_text, validate_method_text, AppState, BodyEdit,
-    DeleteConfirm, EditField, EditState, LoadState, Message, PendingNewRequest, RunState,
-    TextField,
+    DeleteConfirm, EditField, EditState, EnvironmentEditState, HeaderRow, LoadState, Message,
+    PendingNewRequest, RunState, TextField,
 };
 
 /// Moves `selected` by `delta` (`1` or `-1`) through `len` items, wrapping at
@@ -46,6 +46,7 @@ pub fn update(state: &mut AppState, msg: Message) {
                 | Message::EnterEditMode
                 | Message::AddRequest
                 | Message::RequestDelete
+                | Message::EnterEnvironmentEdit
         )
     {
         return;
@@ -93,6 +94,31 @@ pub fn update(state: &mut AppState, msg: Message) {
                 | Message::RunRequested
                 | Message::EnterEditMode
                 | Message::AddRequest
+        )
+    {
+        return;
+    }
+
+    // While an environment's variables are being edited, browsing/overlay-
+    // closing/run/edit-entry messages are refused the same way edit mode's
+    // own guard above refuses them — this session is exclusive with every
+    // other mode, not a state layered on top of the overlay it opened from.
+    // `SaveEnvironmentEdit`/`CancelEnvironmentEdit` are exempt: they are
+    // exactly the messages that end this state. `SelectNext`/`SelectPrevious`
+    // in particular must not leak through to move the overlay's own cursor
+    // out from under an edit session that names a fixed environment index —
+    // see `EnvironmentEditState::index`'s own doc comment.
+    if state.environment_edit.is_some()
+        && matches!(
+            msg,
+            Message::SelectNext
+                | Message::SelectPrevious
+                | Message::CloseEnvironmentOverlay
+                | Message::ConfirmEnvironmentSelection
+                | Message::RunRequested
+                | Message::EnterEditMode
+                | Message::AddRequest
+                | Message::RequestDelete
         )
     {
         return;
@@ -457,6 +483,8 @@ pub fn update(state: &mut AppState, msg: Message) {
                     edit.assertion_row_count(),
                     edit.capture_row_count(),
                 );
+            } else if let Some(env_edit) = &mut state.environment_edit {
+                env_edit.focus_next();
             }
         }
         Message::EditFocusPrev => {
@@ -469,6 +497,8 @@ pub fn update(state: &mut AppState, msg: Message) {
                     edit.assertion_row_count(),
                     edit.capture_row_count(),
                 );
+            } else if let Some(env_edit) = &mut state.environment_edit {
+                env_edit.focus_prev();
             }
         }
         Message::AddHeaderRow => edit_state_mutate(state, EditState::add_header_row),
@@ -481,19 +511,205 @@ pub fn update(state: &mut AppState, msg: Message) {
         Message::DeleteCaptureRow => {
             edit_state_mutate(state, EditState::delete_focused_capture_row)
         }
-        Message::EditInsertChar(ch) => edit_mutate(state, |field| field.insert_char(ch)),
-        Message::EditBackspace => edit_mutate(state, TextField::backspace),
-        Message::EditDelete => edit_mutate(state, TextField::delete),
-        Message::EditCursorLeft => edit_move_or_toggle(state, false, TextField::move_left),
-        Message::EditCursorRight => edit_move_or_toggle(state, true, TextField::move_right),
+        // `EditInsertChar`/`EditBackspace`/`EditDelete`/`EditCursorLeft`/
+        // `EditCursorRight` are the generic text-field messages both a
+        // request edit session and an environment-variable edit session use
+        // for their own focused field — the two are mutually exclusive (see
+        // `EnvironmentEditState`'s own doc comment), so routing to whichever
+        // one is actually active, `edit_mode` first, covers both without a
+        // second set of messages just for environment variables.
+        // `EditCursorUp`/`EditCursorDown` stay request-only: every
+        // environment-variable field is single-line, the same as every
+        // request field except the body.
+        Message::EditInsertChar(ch) => {
+            if state.edit_mode.is_some() {
+                edit_mutate(state, |field| field.insert_char(ch));
+            } else {
+                env_var_mutate(state, |field| field.insert_char(ch));
+            }
+        }
+        Message::EditBackspace => {
+            if state.edit_mode.is_some() {
+                edit_mutate(state, TextField::backspace);
+            } else {
+                env_var_mutate(state, TextField::backspace);
+            }
+        }
+        Message::EditDelete => {
+            if state.edit_mode.is_some() {
+                edit_mutate(state, TextField::delete);
+            } else {
+                env_var_mutate(state, TextField::delete);
+            }
+        }
+        Message::EditCursorLeft => {
+            if state.edit_mode.is_some() {
+                edit_move_or_toggle(state, false, TextField::move_left);
+            } else {
+                env_var_move(state, TextField::move_left);
+            }
+        }
+        Message::EditCursorRight => {
+            if state.edit_mode.is_some() {
+                edit_move_or_toggle(state, true, TextField::move_right);
+            } else {
+                env_var_move(state, TextField::move_right);
+            }
+        }
         Message::EditCursorUp => edit_move(state, TextField::move_up),
         Message::EditCursorDown => edit_move(state, TextField::move_down),
+        Message::EnterEnvironmentEdit => {
+            // `state.edit_mode.is_none()` is redundant with real message
+            // flow alone — `OpenEnvironmentOverlay` is already refused while
+            // `edit_mode` is `Some` (see the guard block above), and
+            // `EnterEditMode` refuses to run while the overlay is open — but
+            // checked directly anyway, the same defense-in-depth every other
+            // mode-entry arm (`EnterEditMode`/`AddRequest`/`RequestDelete`)
+            // already applies, rather than leaning on an invariant enforced
+            // two steps away.
+            if state.edit_mode.is_none()
+                && state.environment_edit.is_none()
+                && !matches!(state.run_state, RunState::InFlight)
+            {
+                if let Some(cursor) = state.environment_overlay {
+                    if let Some(named) = state.environments.get(cursor) {
+                        state.environment_edit =
+                            Some(EnvironmentEditState::new(cursor, &named.environment));
+                    }
+                }
+            }
+        }
+        Message::CancelEnvironmentEdit => {
+            // Dropping `environment_edit` is the entire mechanism: nothing
+            // real is ever written into `AppState::environments` before
+            // `SaveEnvironmentEdit` actually runs, so there is nothing else
+            // to undo — the same "nothing happened" guarantee `CancelEdit`
+            // already has for a pre-existing request's edit.
+            state.environment_edit = None;
+        }
+        Message::SaveEnvironmentEdit => {
+            // A fresh attempt clears a stale error from a previous one
+            // first — the same "this attempt's own reason, not a leftover"
+            // rule `Message::SaveEdit` already follows for `save_error`.
+            if let Some(env_edit) = &mut state.environment_edit {
+                env_edit.save_error = None;
+            }
+            let Some((index, rows)) = state
+                .environment_edit
+                .as_ref()
+                .map(|env_edit| (env_edit.index, env_edit.rows.clone()))
+            else {
+                return;
+            };
+
+            let variables = match validate_env_var_rows(&rows) {
+                Ok(variables) => variables,
+                Err(message) => {
+                    if let Some(env_edit) = &mut state.environment_edit {
+                        env_edit.save_error = Some(message);
+                    }
+                    return;
+                }
+            };
+
+            // The environment list cannot change shape while this session is
+            // open (see `update()`'s own `environment_edit` guard), so
+            // `index` staying valid here is an invariant, not something this
+            // needs to recover from gracefully — but matched rather than
+            // indexed directly, so a bug in that invariant closes the
+            // session instead of panicking.
+            let Some(named) = state.environments.get(index) else {
+                state.environment_edit = None;
+                return;
+            };
+            // Every environment `AppState::environments` ever holds came
+            // from `main::load_environments` actually finding a real file on
+            // disk (see that function's own doc comment) — there is no path
+            // through the TUI that puts a sourceless `Environment` in this
+            // list — but this is still matched rather than unwrapped, so a
+            // violated invariant surfaces as a clear message instead of a
+            // panic.
+            let Some(path) = named.environment.source.clone() else {
+                if let Some(env_edit) = &mut state.environment_edit {
+                    env_edit.save_error =
+                        Some("this environment has no file on disk to save to".to_string());
+                }
+                return;
+            };
+
+            let mut candidate = named.environment.clone();
+            candidate.variables = variables;
+
+            match candidate.save_to_path(&path) {
+                Ok(()) => {
+                    state.environments[index].environment = candidate;
+                    state.environment_edit = None;
+                }
+                Err(error) => {
+                    // The stored environment is still the pre-edit one —
+                    // `candidate` was a clone, never written back — so
+                    // nothing here is lost; the session stays open, showing
+                    // the failure, so the user can retry or cancel.
+                    if let Some(env_edit) = &mut state.environment_edit {
+                        env_edit.save_error = Some(error.to_string());
+                    }
+                }
+            }
+        }
+        Message::AddEnvVarRow => {
+            if let Some(env_edit) = &mut state.environment_edit {
+                env_edit.add_row();
+            }
+        }
+        Message::RequestDeleteEnvVarRow => {
+            if let Some(env_edit) = &mut state.environment_edit {
+                env_edit.request_delete_focused();
+            }
+        }
+        Message::ConfirmDeleteEnvVarRow => {
+            if let Some(env_edit) = &mut state.environment_edit {
+                env_edit.confirm_pending_delete();
+            }
+        }
+        Message::CancelDeleteEnvVarRow => {
+            if let Some(env_edit) = &mut state.environment_edit {
+                env_edit.cancel_pending_delete();
+            }
+        }
         // See the doc comment on `Message::Resize` — the redraw itself
         // comes from `terminal.draw` re-running `view` against the
         // already-resized backend on the loop's next iteration; there is no
         // state here for a resize to change.
         Message::Resize => {}
     }
+}
+
+/// Builds the real `BTreeMap` a save writes from `rows`, or refuses with a
+/// message naming the problem: an empty (post-trim) name, or two rows
+/// sharing the same name — either of which a plain `collect()` into a map
+/// would silently resolve by dropping one entry rather than by refusing the
+/// save. Checked once, at save time (the same "computed fresh only when save
+/// is actually attempted" timing `validate_body_for_save` already uses),
+/// rather than on every keystroke: a name mid-edit is expected to pass
+/// through empty/duplicate states before settling on something real, and
+/// flagging every one of them as the user types would make ordinary editing
+/// look like a wall of errors. Visible to `super::update`'s
+/// `Message::SaveEnvironmentEdit` arm.
+fn validate_env_var_rows(rows: &[HeaderRow]) -> Result<BTreeMap<String, String>, String> {
+    let mut variables = BTreeMap::new();
+    for row in rows {
+        let name = row.key.value().trim();
+        if name.is_empty() {
+            return Err("every variable needs a name".to_string());
+        }
+        if variables.contains_key(name) {
+            return Err(format!(
+                "two variables are both named '{name}'; names must be unique"
+            ));
+        }
+        variables.insert(name.to_string(), row.value.value().to_string());
+    }
+    Ok(variables)
 }
 
 /// Lines moved per `PageUp`/`PageDown` on the response panel. Not tied to
@@ -914,6 +1130,37 @@ fn edit_move_or_toggle(state: &mut AppState, forward: bool, mutate: impl FnOnce(
     }
 }
 
+/// Applies `mutate` to whichever field `AppState::environment_edit`'s own
+/// `EnvironmentEditState::focus` currently points at — the same role
+/// `edit_mutate` plays for a request's own fields, but for an
+/// environment-variable edit session. A no-op when that session is not
+/// active, or nothing is focused (an empty `rows` — the zero-variables
+/// case), so every dispatch arm above can call this unconditionally.
+fn env_var_mutate(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
+    let Some(env_edit) = &mut state.environment_edit else {
+        return;
+    };
+    let Some(field) = env_edit.focused_field_mut() else {
+        return;
+    };
+    mutate(field);
+}
+
+/// Like `env_var_mutate`, but for cursor movement — mirrors `edit_move`
+/// exactly. Unlike `edit_move_or_toggle` (which `EditCursorLeft`/
+/// `EditCursorRight` call instead of `edit_move` for a request's own
+/// fields), there is no fixed-enum sub-field to special-case here: every
+/// environment-variable row is a plain name/value pair with a real
+/// `TextField` on both sides, so `Left`/`Right` are always ordinary cursor
+/// movement.
+fn env_var_move(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
+    if let Some(env_edit) = &mut state.environment_edit {
+        if let Some(field) = env_edit.focused_field_mut() {
+            mutate(field);
+        }
+    }
+}
+
 /// Routes `SelectNext`/`SelectPrevious` to the overlay's cursor when it is
 /// open, otherwise to the collection browser's selection — see the doc
 /// comment on those `Message` variants for why one pair serves both lists.
@@ -950,7 +1197,9 @@ mod tests {
         ApiKeyLocation, Assertions, CaptureSource, Captures, Environment, Method, Response,
     };
 
-    use super::super::state::{AuthEdit, AuthField, CaptureKind, JsonOperator};
+    use super::super::state::{
+        AuthEdit, AuthField, CaptureKind, EnvVarField, JsonOperator, NamedEnvironment,
+    };
     use super::super::test_support::*;
     use super::super::view::status_help_text;
     use super::*;
@@ -1146,6 +1395,319 @@ mod tests {
             state.active_environment,
             Some(0),
             "cancel must leave the previously active environment untouched"
+        );
+    }
+
+    // --- Editing environment variables -------------------------------------
+
+    /// Builds an `AppState` with one real environment file on disk (unlike
+    /// `state_with_environments`, whose `Environment`s have no `source` and
+    /// so cannot be saved), the overlay open with its cursor on that
+    /// environment, and returns `(state, path)` — everything a test needs
+    /// to open an edit session and later reload the same file fresh from
+    /// disk to check what was actually written.
+    fn state_with_saved_environment(
+        name: &str,
+        variables: &[(&str, &str)],
+    ) -> (AppState, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = sendra_core::environment::environment_path(dir.path(), name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let yaml: String = variables
+            .iter()
+            .map(|(key, value)| format!("{key}: {value}\n"))
+            .collect();
+        std::fs::write(&path, yaml).unwrap();
+
+        let environment = Environment::from_path(&path).expect("the fixture file must parse");
+        let state = AppState {
+            environments: vec![NamedEnvironment {
+                name: name.to_string(),
+                environment,
+            }],
+            environment_overlay: Some(0),
+            ..AppState::default()
+        };
+        // `dir` (the `TempDir` guard) is returned alongside `state`/`path`
+        // rather than dropped here: dropping it deletes the whole directory
+        // tree immediately, which would pull the file out from under every
+        // caller before it ever gets to read or write it again.
+        (state, dir, path)
+    }
+
+    #[test]
+    fn enter_environment_edit_seeds_rows_from_the_overlay_cursors_environment() {
+        let (mut state, _dir, _path) =
+            state_with_saved_environment("staging", &[("base_url", "https://example.com")]);
+
+        update(&mut state, Message::EnterEnvironmentEdit);
+
+        let env_edit = state
+            .environment_edit
+            .as_ref()
+            .expect("EnterEnvironmentEdit must open a session");
+        assert_eq!(env_edit.index, 0);
+        assert_eq!(env_edit.rows.len(), 1);
+        assert_eq!(env_edit.rows[0].key.value(), "base_url");
+        assert_eq!(env_edit.rows[0].value.value(), "https://example.com");
+    }
+
+    /// The zero-variables investigation, demonstrated directly against the
+    /// reducer: an environment with nothing in it opens a session with no
+    /// rows and no focus, rather than refusing to open or panicking —
+    /// unlike a request's `Document`, there is no shape an `Environment`
+    /// needs to be lifted into just to hold zero variables.
+    #[test]
+    fn enter_environment_edit_on_an_empty_environment_opens_with_no_rows_and_no_focus() {
+        let (mut state, _dir, _path) = state_with_saved_environment("empty", &[]);
+
+        update(&mut state, Message::EnterEnvironmentEdit);
+
+        let env_edit = state.environment_edit.as_ref().unwrap();
+        assert!(env_edit.rows.is_empty());
+        assert_eq!(env_edit.focus, None);
+    }
+
+    #[test]
+    fn cancel_environment_edit_leaves_everything_untouched() {
+        let (mut state, _dir, path) =
+            state_with_saved_environment("staging", &[("base_url", "https://example.com")]);
+        let original_bytes = std::fs::read(&path).unwrap();
+
+        update(&mut state, Message::EnterEnvironmentEdit);
+        update(&mut state, Message::AddEnvVarRow);
+        type_into_focused_field(&mut state, "token");
+
+        update(&mut state, Message::CancelEnvironmentEdit);
+
+        assert!(state.environment_edit.is_none());
+        assert_eq!(
+            state.environments[0].environment.variables.len(),
+            1,
+            "the in-memory environment must be exactly as it was"
+        );
+        let bytes_after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            original_bytes, bytes_after,
+            "cancelling must never touch the file on disk"
+        );
+    }
+
+    /// Proof requirement, end to end: add a variable, edit an existing one,
+    /// delete a third, save, and reload the file with a brand-new
+    /// `Environment::from_path` — not anything still sitting in `state` —
+    /// to confirm every change genuinely reached disk.
+    #[test]
+    fn adding_editing_and_deleting_variables_then_saving_persists_all_three_changes_to_disk() {
+        let (mut state, _dir, path) = state_with_saved_environment(
+            "staging",
+            &[
+                ("base_url", "https://old.example.com"),
+                ("to_delete", "gone-soon"),
+            ],
+        );
+
+        update(&mut state, Message::EnterEnvironmentEdit);
+        assert_eq!(
+            state.environment_edit.as_ref().unwrap().focus,
+            Some(EnvVarField::Name(0)),
+            "sanity: a fresh session focuses the first row's name field"
+        );
+
+        // Edit `base_url` (row 0): move onto its value field, clear it and
+        // type a new value.
+        update(&mut state, Message::EditFocusNext);
+        backspace_n(&mut state, "https://old.example.com".len());
+        type_into_focused_field(&mut state, "https://new.example.com");
+
+        // Delete `to_delete` (row 1): focus its name field, request then
+        // confirm the delete.
+        state.environment_edit.as_mut().unwrap().focus = Some(EnvVarField::Name(1));
+        update(&mut state, Message::RequestDeleteEnvVarRow);
+        update(&mut state, Message::ConfirmDeleteEnvVarRow);
+
+        // Add a brand-new `token` variable.
+        update(&mut state, Message::AddEnvVarRow);
+        type_into_focused_field(&mut state, "token");
+        update(&mut state, Message::EditFocusNext);
+        type_into_focused_field(&mut state, "abc123");
+
+        update(&mut state, Message::SaveEnvironmentEdit);
+        assert!(state.environment_edit.is_none(), "the save must succeed");
+
+        // The proof itself: a fresh `Environment::from_path`.
+        let reloaded = Environment::from_path(&path).expect("the saved file must exist and parse");
+        assert_eq!(reloaded.variables.len(), 2);
+        assert_eq!(
+            reloaded.variables.get("base_url").map(String::as_str),
+            Some("https://new.example.com")
+        );
+        assert_eq!(
+            reloaded.variables.get("token").map(String::as_str),
+            Some("abc123")
+        );
+        assert!(!reloaded.variables.contains_key("to_delete"));
+
+        // The in-memory `AppState::environments` was updated too, not just
+        // the file — the resolved preview reads from here, live.
+        assert_eq!(
+            state.environments[0].environment.variables,
+            reloaded.variables
+        );
+    }
+
+    /// The other half of the zero-variables investigation: deleting every
+    /// variable and saving must succeed and produce a real, reloadable
+    /// empty environment file — never an error, and never a document this
+    /// crate refuses to write the way it refuses an empty `Collection`.
+    #[test]
+    fn deleting_every_variable_and_saving_persists_a_genuinely_empty_environment() {
+        let (mut state, _dir, path) = state_with_saved_environment("staging", &[("only", "value")]);
+
+        update(&mut state, Message::EnterEnvironmentEdit);
+        state.environment_edit.as_mut().unwrap().focus = Some(EnvVarField::Name(0));
+        update(&mut state, Message::RequestDeleteEnvVarRow);
+        update(&mut state, Message::ConfirmDeleteEnvVarRow);
+        assert_eq!(state.environment_edit.as_ref().unwrap().rows.len(), 0);
+
+        update(&mut state, Message::SaveEnvironmentEdit);
+
+        assert!(
+            state.environment_edit.is_none(),
+            "saving down to zero variables must succeed, not refuse"
+        );
+        let reloaded = Environment::from_path(&path).unwrap();
+        assert!(reloaded.variables.is_empty());
+    }
+
+    #[test]
+    fn saving_with_an_empty_variable_name_refuses_and_keeps_the_session_open() {
+        let (mut state, _dir, path) = state_with_saved_environment("staging", &[("base_url", "x")]);
+        update(&mut state, Message::EnterEnvironmentEdit);
+        backspace_n(&mut state, "base_url".len());
+
+        update(&mut state, Message::SaveEnvironmentEdit);
+
+        assert!(
+            state.environment_edit.is_some(),
+            "a refused save must not discard the session"
+        );
+        let error = state
+            .environment_edit
+            .as_ref()
+            .unwrap()
+            .save_error
+            .as_ref()
+            .expect("an empty name must set a real error message");
+        assert!(!error.is_empty());
+        // Untouched on disk: still exactly the original file.
+        let reloaded = Environment::from_path(&path).unwrap();
+        assert_eq!(
+            reloaded.variables.get("base_url").map(String::as_str),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn saving_with_two_rows_sharing_a_name_refuses_and_keeps_the_session_open() {
+        let (mut state, _dir, path) = state_with_saved_environment("staging", &[("base_url", "x")]);
+        update(&mut state, Message::EnterEnvironmentEdit);
+        update(&mut state, Message::AddEnvVarRow);
+        type_into_focused_field(&mut state, "base_url");
+
+        update(&mut state, Message::SaveEnvironmentEdit);
+
+        assert!(
+            state.environment_edit.is_some(),
+            "a refused save must not discard the session"
+        );
+        assert!(state
+            .environment_edit
+            .as_ref()
+            .unwrap()
+            .save_error
+            .is_some());
+        let reloaded = Environment::from_path(&path).unwrap();
+        assert_eq!(
+            reloaded.variables.len(),
+            1,
+            "the original single-variable file must be untouched"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_pending_row_delete_leaves_the_row_untouched() {
+        let (mut state, _dir, _path) =
+            state_with_saved_environment("staging", &[("base_url", "https://example.com")]);
+        update(&mut state, Message::EnterEnvironmentEdit);
+        state.environment_edit.as_mut().unwrap().focus = Some(EnvVarField::Name(0));
+
+        update(&mut state, Message::RequestDeleteEnvVarRow);
+        assert_eq!(
+            state.environment_edit.as_ref().unwrap().pending_delete,
+            Some(0)
+        );
+
+        update(&mut state, Message::CancelDeleteEnvVarRow);
+
+        let env_edit = state.environment_edit.as_ref().unwrap();
+        assert_eq!(env_edit.pending_delete, None);
+        assert_eq!(env_edit.rows.len(), 1, "the row must still be there");
+        assert_eq!(env_edit.rows[0].key.value(), "base_url");
+    }
+
+    #[test]
+    fn environment_edit_is_a_no_op_while_already_editing_a_request_or_run_in_flight() {
+        // Real message flow already keeps `edit_mode` and `environment_
+        // overlay` mutually exclusive two different ways (`OpenEnvironmentOverlay`
+        // refuses while `edit_mode` is `Some`; `EnterEditMode` refuses while
+        // the overlay is open) — so reaching "both at once" needs setting
+        // `edit_mode` directly rather than through `Message::EnterEditMode`,
+        // to prove `EnterEnvironmentEdit`'s own defense-in-depth check
+        // actually does something rather than merely restating an invariant
+        // enforced elsewhere.
+        let mut editing = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut editing, Message::EnterEditMode);
+        assert!(editing.edit_mode.is_some(), "sanity: edit mode is active");
+        editing.environments = vec![named_environment("staging", &[])];
+        editing.environment_overlay = Some(0);
+
+        update(&mut editing, Message::EnterEnvironmentEdit);
+
+        assert!(editing.environment_edit.is_none());
+
+        let mut running = loaded_state(THREE_REQUEST_COLLECTION);
+        running.environments = vec![named_environment("staging", &[])];
+        running.environment_overlay = Some(0);
+        update(&mut running, Message::RunRequested);
+        update(&mut running, Message::EnterEnvironmentEdit);
+        assert!(running.environment_edit.is_none());
+    }
+
+    /// The same exclusivity `navigation_and_edit_entry_are_blocked_while_
+    /// the_delete_confirm_prompt_is_open` already proves for request
+    /// deletion, checked for the environment-variable edit session's own
+    /// guard: while it is open, the overlay's cursor must not move out from
+    /// under it, and no other mode can be entered on top of it.
+    #[test]
+    fn navigation_and_mode_entry_are_blocked_while_editing_environment_variables() {
+        let (mut state, _dir, _path) =
+            state_with_saved_environment("staging", &[("base_url", "https://example.com")]);
+        update(&mut state, Message::EnterEnvironmentEdit);
+        assert!(state.environment_edit.is_some());
+
+        update(&mut state, Message::SelectNext);
+        assert_eq!(state.environment_overlay, Some(0), "cursor must not move");
+
+        update(&mut state, Message::CloseEnvironmentOverlay);
+        assert!(
+            state.environment_overlay.is_some(),
+            "overlay must stay open"
+        );
+
+        assert!(
+            state.environment_edit.is_some(),
+            "the edit session itself must still be open throughout"
         );
     }
 
