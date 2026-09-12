@@ -342,6 +342,7 @@ fn translate_event(
             match key.code {
                 KeyCode::Char('e') => Message::OpenEnvironmentOverlay,
                 KeyCode::Char('i') => Message::EnterEditMode,
+                KeyCode::Char('n') => Message::AddRequest,
                 KeyCode::Down | KeyCode::Char('j') => Message::SelectNext,
                 KeyCode::Up | KeyCode::Char('k') => Message::SelectPrevious,
                 KeyCode::Enter | KeyCode::Char('r') => Message::RunRequested,
@@ -650,11 +651,11 @@ mod tests {
 
     #[test]
     fn letters_that_double_as_browsing_keys_insert_into_the_field_while_editing() {
-        // `r`/`e`/`i` are bound to run/env/enter-edit while browsing, but
-        // while editing they are just ordinary letters a method or URL can
-        // contain — the same reasoning `ctrl_c_quits_while_editing_but_
-        // bare_q_types_a_character_instead` applies to `q`.
-        for ch in ['r', 'e', 'i'] {
+        // `r`/`e`/`i`/`n` are bound to run/env/enter-edit/add-request while
+        // browsing, but while editing they are just ordinary letters a
+        // method or URL can contain — the same reasoning `ctrl_c_quits_
+        // while_editing_but_bare_q_types_a_character_instead` applies to `q`.
+        for ch in ['r', 'e', 'i', 'n'] {
             let message = translate_event(press(KeyCode::Char(ch)), false, true, false);
             assert!(
                 matches!(message, Message::EditInsertChar(c) if c == ch),
@@ -785,6 +786,12 @@ mod tests {
     fn i_enters_edit_mode_outside_the_overlay_and_outside_edit_mode() {
         let message = translate_event(press(KeyCode::Char('i')), false, false, false);
         assert!(matches!(message, Message::EnterEditMode));
+    }
+
+    #[test]
+    fn n_adds_a_request_outside_the_overlay_and_outside_edit_mode() {
+        let message = translate_event(press(KeyCode::Char('n')), false, false, false);
+        assert!(matches!(message, Message::AddRequest));
     }
 
     // --- clean-exit audit: panic-hook thread gating -----------------------

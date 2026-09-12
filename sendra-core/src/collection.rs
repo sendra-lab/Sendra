@@ -203,6 +203,29 @@ impl Document {
         }
     }
 
+    /// Every rule `Deserialize` cannot express, checked directly rather than
+    /// only ever at parse time: a single request's own `Request::validate`
+    /// (at most one body source, `auth` exclusivity, ...), or, for a
+    /// collection, `Collection::validate` (non-empty, every request named,
+    /// no name used twice) plus that same per-request check for each one.
+    ///
+    /// `from_yaml_str`/`from_path` already run this before ever handing a
+    /// `Document` back, so a `Document` that came from a real file is always
+    /// already valid — this exists for the other direction: a `Document`
+    /// built or mutated in memory (a front-end applying an edit, say) can
+    /// check *before* [`save_to_path`](Self::save_to_path) writes it, rather
+    /// than only discovering it was invalid the next time something tries to
+    /// load it back. `save_to_path` calls this itself for exactly that
+    /// reason — this is exposed as its own method mainly so a caller can ask
+    /// the question earlier, e.g. to show a validation message before ever
+    /// attempting a write.
+    pub fn validate(&self) -> Result<(), SendraError> {
+        match self {
+            Document::Single(request) => request.validate(),
+            Document::Collection(collection) => collection.validate(),
+        }
+    }
+
     /// Serializes this document back to YAML, exactly the shape
     /// [`from_yaml_str`](Self::from_yaml_str)/[`from_path`](Self::from_path)
     /// parse: a bare [`Request`] for `Single`, a [`Collection`] for
@@ -254,7 +277,20 @@ impl Document {
     /// removed on a best-effort basis rather than left behind as a stray
     /// dotfile — the original error is what gets returned either way, not
     /// whatever the cleanup did.
+    ///
+    /// **Refuses to write an invalid document at all** — [`validate`](Self::validate)
+    /// is checked first, before the temp file is even created. Without this,
+    /// an in-memory edit that left the document invalid (a collection request
+    /// edited down to an empty `name`, say) would still write out a file that
+    /// parses back as YAML but fails `Collection::validate` the very next
+    /// time anything loads it — a real file that looks saved but is
+    /// silently broken. Catching it here means the caller learns about it
+    /// immediately, through the same `Result` a disk-level failure already
+    /// comes back through, rather than the next `Document::from_path` call
+    /// discovering it days later.
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SendraError> {
+        self.validate()?;
+
         let path = path.as_ref();
         let yaml = self.to_yaml_string()?;
         let temp_path = unique_temp_path(path);
@@ -563,6 +599,73 @@ requests:
             !serialized.contains("Single") && !serialized.contains("Collection"),
             "a Document must serialize as whichever bare shape it holds, not tagged with its \
              own variant name: got {serialized}"
+        );
+    }
+
+    #[test]
+    fn document_validate_accepts_a_valid_single_and_a_valid_collection() {
+        let single = Document::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
+        single
+            .validate()
+            .expect("a real, already-parsed Single document must validate");
+
+        let collection = Document::from_yaml_str(
+            "requests:\n  - name: One\n    method: GET\n    url: https://example.com\n",
+        )
+        .unwrap();
+        collection
+            .validate()
+            .expect("a real, already-parsed Collection document must validate");
+    }
+
+    #[test]
+    fn document_validate_rejects_a_collection_with_an_unnamed_request() {
+        // Built directly rather than through `from_yaml_str`, which would
+        // already reject this at parse time — `validate` has to be checked
+        // independently, since it exists precisely for a `Document` that
+        // didn't come from a file (an in-memory edit, say).
+        let request = Request::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
+        let document = Document::Collection(Collection {
+            name: None,
+            requests: vec![request],
+        });
+
+        let err = document
+            .validate()
+            .expect_err("an unnamed request in a collection is invalid");
+        assert!(
+            matches!(err, SendraError::InvalidCollection { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn save_to_path_refuses_to_write_an_invalid_document_and_touches_nothing() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        let request = Request::from_yaml_str("method: GET\nurl: https://example.com\n").unwrap();
+        let invalid = Document::Collection(Collection {
+            name: None,
+            requests: vec![request], // unnamed -- invalid inside a collection
+        });
+
+        let err = invalid
+            .save_to_path(&path)
+            .expect_err("an invalid document must never be written");
+        assert!(
+            matches!(err, SendraError::InvalidCollection { .. }),
+            "got {err:?}"
+        );
+
+        assert!(
+            !path.exists(),
+            "nothing should be written for a document that fails validation"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert!(
+            entries.is_empty(),
+            "no temp file should be created either, since validation happens before the write: \
+             {entries:?}"
         );
     }
 

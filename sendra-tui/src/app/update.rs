@@ -4,11 +4,11 @@
 //! own doc comment and `super::state::AppState::edit_mode`'s for why that
 //! invariant matters.
 
-use sendra_core::{Document, Request};
+use sendra_core::{Collection, Document, Request};
 
 use super::state::{
-    validate_assertion_value_text, validate_method_text, AppState, BodyEdit, EditField, EditState,
-    LoadState, Message, RunState, TextField,
+    non_empty, validate_assertion_value_text, validate_method_text, AppState, BodyEdit, EditField,
+    EditState, LoadState, Message, PendingNewRequest, RunState, TextField,
 };
 
 /// Moves `selected` by `delta` (`1` or `-1`) through `len` items, wrapping at
@@ -41,6 +41,7 @@ pub fn update(state: &mut AppState, msg: Message) {
                 | Message::ConfirmEnvironmentSelection
                 | Message::RunRequested
                 | Message::EnterEditMode
+                | Message::AddRequest
         )
     {
         return;
@@ -143,6 +144,44 @@ pub fn update(state: &mut AppState, msg: Message) {
         // already does.
         Message::ScrollResponseBottom => state.response_scroll = usize::MAX,
         Message::ToggleRevealCaptures => state.reveal_captures = !state.reveal_captures,
+        Message::AddRequest => {
+            // Same guard `EnterEditMode` uses, for the same reason: adding a
+            // request also immediately opens an edit session, so it is
+            // exclusive with the overlay and an in-flight run the same way.
+            if state.edit_mode.is_none()
+                && state.environment_overlay.is_none()
+                && !matches!(state.run_state, RunState::InFlight)
+            {
+                if let LoadState::Loaded {
+                    document, selected, ..
+                } = &mut state.load_state
+                {
+                    // Snapshotted *before* the insertion — see
+                    // `PendingNewRequest`'s own doc comment for why
+                    // `Message::CancelEdit` needs the whole `Document` as it
+                    // was, not just "the new request's index, to remove".
+                    let document_before = Box::new((**document).clone());
+                    let previous_selected = *selected;
+
+                    let index = add_request_to_document(document);
+                    *selected = index;
+                    state.dirty_requests.insert(index);
+                    state.pending_new_request = Some(PendingNewRequest {
+                        previous_selected,
+                        document_before,
+                    });
+                    // A different request is now selected, the same reset
+                    // `select()` already applies when the selection moves.
+                    state.run_state = RunState::Idle;
+                    state.response_scroll = 0;
+                    state.reveal_captures = false;
+
+                    if let Some(new_request) = document.requests().get(index) {
+                        state.edit_mode = Some(EditState::new(new_request));
+                    }
+                }
+            }
+        }
         Message::EnterEditMode => {
             // Guarded here, not just left to the block above: the block
             // above only refuses messages while edit mode is *already*
@@ -230,6 +269,12 @@ pub fn update(state: &mut AppState, msg: Message) {
                             };
                             state.dirty_requests.remove(&selected);
                             state.edit_mode = None;
+                            // Whatever `Message::AddRequest` might have
+                            // staged for `CancelEdit` to undo no longer
+                            // applies — the request (new or not) is now
+                            // genuinely saved, so there is nothing left to
+                            // roll back.
+                            state.pending_new_request = None;
                         }
                         Err(error) => {
                             // The loaded document is still the pre-edit one —
@@ -249,14 +294,34 @@ pub fn update(state: &mut AppState, msg: Message) {
             }
         }
         Message::CancelEdit => {
-            // Dropping `edit_mode` here is the entire mechanism: `method`
-            // and `url` only ever lived in that working copy (see
-            // `EditState`'s own doc comment), never written into the loaded
-            // document until `SaveEdit`, so there is nothing else to undo —
-            // no snapshot to restore, because nothing real was ever changed.
+            // Dropping `edit_mode` here is the entire mechanism for an edit
+            // of a pre-existing request: `method`/`url`/etc. only ever lived
+            // in that working copy (see `EditState`'s own doc comment),
+            // never written into the loaded document until `SaveEdit`, so
+            // there is nothing else to undo — no snapshot to restore,
+            // because nothing real was ever changed.
             if state.edit_mode.take().is_some() {
-                if let LoadState::Loaded { selected, .. } = &state.load_state {
-                    state.dirty_requests.remove(selected);
+                match state.pending_new_request.take() {
+                    // `Message::AddRequest` is the one case where something
+                    // *was* already changed for real before `SaveEdit` — see
+                    // `PendingNewRequest`'s own doc comment — so undoing it
+                    // means restoring the whole `Document` from just before
+                    // that insertion, not merely dropping `edit_mode`.
+                    Some(pending) => {
+                        if let LoadState::Loaded {
+                            document, selected, ..
+                        } = &mut state.load_state
+                        {
+                            state.dirty_requests.remove(selected);
+                            *document = pending.document_before;
+                            *selected = pending.previous_selected;
+                        }
+                    }
+                    None => {
+                        if let LoadState::Loaded { selected, .. } = &state.load_state {
+                            state.dirty_requests.remove(selected);
+                        }
+                    }
                 }
             }
         }
@@ -353,6 +418,88 @@ fn request_mut(document: &mut Document, index: usize) -> Option<&mut Request> {
     }
 }
 
+/// Appends a brand-new request to `document` and returns its index —
+/// visible to `super::update`'s `Message::AddRequest` arm.
+///
+/// The new request is built from real YAML (`Request::from_yaml_str`)
+/// rather than a hand-assembled struct literal: `method`/`url` are the only
+/// two fields `Request` actually requires (no `#[serde(default)]`, no
+/// `Option`) — checked directly against sendra-core's own type rather than
+/// assumed — every other field already defaults to "not set" through serde,
+/// which is exactly "sensible defaults: empty headers, no body, no auth, no
+/// assertions/captures" without this function having to name each one and
+/// silently go stale the day `Request` grows another optional field.
+///
+/// **The real structural question this raises**: `sendra_core::Document::
+/// Single` holds exactly one `Request`, not a list, so it cannot itself grow
+/// a second one — confirmed by reading `Document`'s own definition, not
+/// assumed. Adding to a `Document::Single` therefore first turns it into a
+/// `Document::Collection` holding both requests: the original (given a
+/// synthesized `name` — its own `label()` if it didn't already have one,
+/// since `Collection::validate` requires every request in a collection to be
+/// named) and the new one, in that order, so file order still reads as
+/// "what was there before, then what got added". A `Document::Collection`
+/// simply gets the new request pushed onto its existing `requests`.
+///
+/// The new request's own name is `"New request"`, or `"New request 2"`,
+/// `"New request 3"`, ... if that collides with a name already in the
+/// collection (see [`unique_request_name`]) — `Collection::validate` rejects
+/// a duplicate name outright, so this has to be resolved before the request
+/// is even inserted, not discovered at the next save.
+fn add_request_to_document(document: &mut Document) -> usize {
+    let mut new_request = Request::from_yaml_str("method: GET\nurl: \"\"\n")
+        .expect("a bare GET request with an empty url is always a valid Request");
+
+    match document {
+        Document::Single(existing) => {
+            let mut converted = existing.clone();
+            let existing_name = converted.name.clone().unwrap_or_else(|| converted.label());
+            converted.name = Some(existing_name.clone());
+
+            new_request.name = Some(unique_request_name(
+                "New request",
+                std::slice::from_ref(&existing_name),
+            ));
+
+            *document = Document::Collection(Collection {
+                name: None,
+                requests: vec![converted, new_request],
+            });
+            1
+        }
+        Document::Collection(collection) => {
+            let existing_names: Vec<String> = collection
+                .requests
+                .iter()
+                .filter_map(|request| request.name.clone())
+                .collect();
+            new_request.name = Some(unique_request_name("New request", &existing_names));
+            collection.requests.push(new_request);
+            collection.requests.len() - 1
+        }
+    }
+}
+
+/// `base`, or `base 2`/`base 3`/... — whichever is the first not already
+/// present in `existing` — so a synthesized request name never collides with
+/// one already in the collection. `Collection::validate` rejects a duplicate
+/// name outright (two requests named the same thing cannot both be selected
+/// by name), so `add_request_to_document` has to guarantee uniqueness itself
+/// before ever constructing the `Collection`, not merely hope for the best.
+fn unique_request_name(base: &str, existing: &[String]) -> String {
+    if !existing.iter().any(|name| name == base) {
+        return base.to_string();
+    }
+    let mut suffix = 2;
+    loop {
+        let candidate = format!("{base} {suffix}");
+        if !existing.iter().any(|name| name == &candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
 /// Writes every field `EditState` can hold a working copy of — `method`,
 /// `url`, `headers`, `body`, `auth`, `assertions`, `capture` — into `request`.
 /// The one place this happens, shared between `Message::SaveEdit`'s real save
@@ -360,6 +507,14 @@ fn request_mut(document: &mut Document, index: usize) -> Option<&mut Request> {
 /// preview, so the two can never drift into applying the edit two different
 /// ways.
 fn apply_edit_to_request(request: &mut Request, edit: &EditState) {
+    // Empty means "no name", the same convention `AuthEdit::to_auth` already
+    // uses for OAuth's optional fields — see `non_empty`'s own doc comment.
+    // Whether a name is actually *required* here (a request inside a
+    // collection needs one; a bare request doesn't) is not decided here at
+    // all: `Message::SaveEdit` leans on `Document::save_to_path` calling
+    // `Document::validate` for that, the same real rule
+    // `Collection::validate` already enforces on load.
+    request.name = non_empty(edit.name.value());
     // `method_error` is confirmed `None` before this is ever called — see
     // `Message::SaveEdit`'s own `can_save` check — so this cannot fail;
     // matched rather than trusted blindly, so a bug in that invariant leaves
@@ -908,7 +1063,7 @@ mod tests {
         );
         assert_eq!(edit.method.value(), "GET");
         assert_eq!(edit.url.value(), "https://example.com");
-        assert_eq!(edit.focus, EditField::Method);
+        assert_eq!(edit.focus, EditField::Name);
         assert_eq!(
             edit.method_error, None,
             "the request's own method is always valid"
@@ -1009,6 +1164,7 @@ mod tests {
     fn save_edit_writes_the_new_method_and_url_into_the_loaded_document() {
         let mut state = loaded_state(THREE_REQUEST_COLLECTION);
         update(&mut state, Message::EnterEditMode);
+        update(&mut state, Message::EditFocusNext); // -> Method
 
         backspace_n(&mut state, "GET".len());
         type_into_focused_field(&mut state, "POST");
@@ -1037,10 +1193,146 @@ mod tests {
         assert_eq!(request.url, "https://example.com/updated");
     }
 
+    // --- Naming a request -----------------------------------------------------
+
+    #[test]
+    fn enter_edit_mode_seeds_the_name_field_from_the_real_request() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+
+        update(&mut state, Message::EnterEditMode);
+
+        let edit = state.edit_mode.as_ref().unwrap();
+        assert_eq!(edit.name.value(), "One");
+        assert_eq!(edit.focus, EditField::Name, "Name is the default focus");
+    }
+
+    #[test]
+    fn a_request_with_no_name_seeds_an_empty_name_field() {
+        let mut state = loaded_state(REQUEST_WITHOUT_A_NAME);
+
+        update(&mut state, Message::EnterEditMode);
+
+        assert_eq!(state.edit_mode.as_ref().unwrap().name.value(), "");
+    }
+
+    #[test]
+    fn typing_into_the_name_field_edits_the_working_copy_and_marks_dirty() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+
+        type_into_focused_field(&mut state, " (renamed)");
+
+        let edit = state.edit_mode.as_ref().unwrap();
+        assert_eq!(edit.name.value(), "One (renamed)");
+        assert!(edit.dirty);
+        assert!(state.dirty_requests.contains(&0));
+    }
+
+    #[test]
+    fn save_edit_writes_the_new_name_into_the_loaded_document() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+        backspace_n(&mut state, "One".len());
+        type_into_focused_field(&mut state, "Renamed");
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(
+            state.edit_mode.is_none(),
+            "a real, unique name must save cleanly"
+        );
+        assert_eq!(saved_request(&state).name.as_deref(), Some("Renamed"));
+    }
+
+    #[test]
+    fn clearing_the_name_on_a_standalone_request_saves_as_no_name_at_all() {
+        // `REQUEST_WITHOUT_A_NAME` is a `Document::Single`, where a name is
+        // entirely optional (`Collection::validate`'s "every request must be
+        // named" rule only applies inside a collection) — so an empty Name
+        // field here must save as genuinely `None`, not as the request
+        // having a name that happens to be the empty string.
+        let mut state = loaded_state(REQUEST_WITHOUT_A_NAME);
+        update(&mut state, Message::EnterEditMode);
+        type_into_focused_field(&mut state, "a name, then cleared");
+        backspace_n(&mut state, "a name, then cleared".len());
+        assert_eq!(state.edit_mode.as_ref().unwrap().name.value(), "");
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(state.edit_mode.is_none());
+        assert_eq!(saved_request(&state).name, None);
+    }
+
+    /// Proof requirement: renaming a request inside a real collection and
+    /// saving must actually reach disk, verified with a fresh
+    /// `Document::from_path` rather than anything still held in `state`.
+    #[test]
+    fn renaming_a_request_and_saving_persists_the_new_name_to_disk() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        std::fs::write(
+            &path,
+            "name: test\nrequests:\n  - name: One\n    method: GET\n    url: https://example.com\n",
+        )
+        .unwrap();
+
+        let mut state = state_loaded_from(&path);
+        update(&mut state, Message::EnterEditMode);
+        backspace_n(&mut state, "One".len());
+        type_into_focused_field(&mut state, "Renamed");
+        update(&mut state, Message::SaveEdit);
+        assert!(state.edit_mode.is_none());
+
+        let reloaded = Document::from_path(&path).expect("the saved file must exist and parse");
+        assert_eq!(reloaded.requests()[0].name.as_deref(), Some("Renamed"));
+    }
+
+    /// The rule this whole feature has to respect, proven live: clearing a
+    /// request's name down to empty inside a collection must be refused at
+    /// save time — reusing `Document::save_to_path`'s own `validate` check,
+    /// which `Collection::validate` requires every request in a collection
+    /// to have a name for — rather than silently writing a file that would
+    /// fail to load the very next time anything opens it. Surfaced through
+    /// the exact same `save_error`/`format_error` path a disk-level failure
+    /// already uses; no separate "name is required" check was added to
+    /// `EditState`/`EditField::Name` itself (see that variant's own doc
+    /// comment for why).
+    #[test]
+    fn save_edit_refuses_to_leave_a_collection_request_unnamed() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+        backspace_n(&mut state, "One".len());
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(
+            state.edit_mode.is_some(),
+            "an invalid save must not discard the edit"
+        );
+        assert!(state.dirty_requests.contains(&0));
+        let error = state
+            .edit_mode
+            .as_ref()
+            .unwrap()
+            .save_error
+            .as_ref()
+            .expect("clearing the name of a request inside a collection must be refused");
+        assert!(!error.is_empty());
+        // The loaded document must still hold the original, valid name.
+        assert_eq!(saved_request(&state).name.as_deref(), Some("One"));
+
+        // Fixing it — giving it back a real name — must now save cleanly.
+        type_into_focused_field(&mut state, "One Again");
+        update(&mut state, Message::SaveEdit);
+        assert!(state.edit_mode.is_none());
+        assert_eq!(saved_request(&state).name.as_deref(), Some("One Again"));
+    }
+
     #[test]
     fn invalid_method_shows_an_inline_error_blocks_save_and_stays_editable() {
         let mut state = loaded_state(THREE_REQUEST_COLLECTION);
         update(&mut state, Message::EnterEditMode);
+        update(&mut state, Message::EditFocusNext); // -> Method
 
         backspace_n(&mut state, "GET".len());
         type_into_focused_field(&mut state, "FOOBAR");
@@ -1180,6 +1472,7 @@ requests:
     fn tab_moves_focus_from_url_into_the_first_header_rows_key_and_value() {
         let mut state = loaded_state(REQUEST_WITH_HEADERS);
         update(&mut state, Message::EnterEditMode);
+        update(&mut state, Message::EditFocusNext); // Name -> Method
         update(&mut state, Message::EditFocusNext); // Method -> Url
 
         update(&mut state, Message::EditFocusNext); // Url -> HeaderKey(0)
@@ -1234,14 +1527,14 @@ requests:
     }
 
     #[test]
-    fn tab_wraps_from_the_body_field_back_to_method() {
+    fn tab_wraps_from_the_body_field_back_to_name() {
         let mut state = loaded_state(REQUEST_WITH_HEADERS);
         update(&mut state, Message::EnterEditMode);
         state.edit_mode.as_mut().unwrap().focus = EditField::Body;
 
         update(&mut state, Message::EditFocusNext);
 
-        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Method);
+        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Name);
     }
 
     #[test]
@@ -1292,14 +1585,14 @@ requests:
     fn delete_header_row_is_a_no_op_while_focus_is_on_method_or_url() {
         let mut state = loaded_state(REQUEST_WITH_HEADERS);
         update(&mut state, Message::EnterEditMode);
-        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Method);
+        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Name);
 
         update(&mut state, Message::DeleteHeaderRow);
 
         assert_eq!(
             state.edit_mode.as_ref().unwrap().headers.len(),
             2,
-            "nothing should be deleted while focus is on method"
+            "nothing should be deleted while focus is on name"
         );
     }
 
@@ -1997,7 +2290,7 @@ requests:
     }
 
     #[test]
-    fn tab_moves_focus_from_body_into_the_bearer_token_field_and_wraps_to_method() {
+    fn tab_moves_focus_from_body_into_the_bearer_token_field_and_wraps_to_name() {
         let mut state = loaded_state(REQUEST_WITH_BEARER_AUTH);
         update(&mut state, Message::EnterEditMode);
         state.edit_mode.as_mut().unwrap().focus = EditField::Body;
@@ -2011,13 +2304,13 @@ requests:
         update(&mut state, Message::EditFocusNext);
         assert_eq!(
             state.edit_mode.as_ref().unwrap().focus,
-            EditField::Method,
-            "the last (only) auth field wraps back to Method"
+            EditField::Name,
+            "the last (only) auth field wraps back to Name"
         );
     }
 
     #[test]
-    fn shift_tab_from_method_moves_into_the_last_auth_field() {
+    fn shift_tab_from_name_moves_into_the_last_auth_field() {
         let mut state = loaded_state(REQUEST_WITH_API_KEY_AUTH);
         update(&mut state, Message::EnterEditMode);
 
@@ -2026,7 +2319,7 @@ requests:
         assert_eq!(
             state.edit_mode.as_ref().unwrap().focus,
             EditField::Auth(AuthField::ApiKeyLocation),
-            "Shift+Tab from Method must land on the last auth field"
+            "Shift+Tab from Name must land on the last auth field"
         );
     }
 
@@ -2338,14 +2631,14 @@ requests:
     fn delete_assertion_row_is_a_no_op_while_focus_is_elsewhere() {
         let mut state = loaded_state(REQUEST_WITH_JSON_ASSERTION);
         update(&mut state, Message::EnterEditMode);
-        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Method);
+        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Name);
 
         update(&mut state, Message::DeleteAssertionRow);
 
         assert_eq!(
             state.edit_mode.as_ref().unwrap().assertions.len(),
             1,
-            "nothing should be deleted while focus is on method"
+            "nothing should be deleted while focus is on name"
         );
     }
 
@@ -2378,8 +2671,8 @@ requests:
         update(&mut state, Message::EditFocusNext);
         assert_eq!(
             state.edit_mode.as_ref().unwrap().focus,
-            EditField::Method,
-            "the last assertion row's negate flag wraps back to Method"
+            EditField::Name,
+            "the last assertion row's negate flag wraps back to Name"
         );
     }
 
@@ -2738,14 +3031,14 @@ requests:
     fn delete_capture_row_is_a_no_op_while_focus_is_elsewhere() {
         let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
         update(&mut state, Message::EnterEditMode);
-        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Method);
+        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Name);
 
         update(&mut state, Message::DeleteCaptureRow);
 
         assert_eq!(
             state.edit_mode.as_ref().unwrap().captures.len(),
             1,
-            "nothing should be deleted while focus is on method"
+            "nothing should be deleted while focus is on name"
         );
     }
 
@@ -2775,8 +3068,8 @@ requests:
         update(&mut state, Message::EditFocusNext);
         assert_eq!(
             state.edit_mode.as_ref().unwrap().focus,
-            EditField::Method,
-            "the only capture row's value field wraps back to Method"
+            EditField::Name,
+            "the only capture row's value field wraps back to Name"
         );
     }
 
@@ -3234,5 +3527,279 @@ requests:
             "a fresh attempt must clear the stale disk error even though it also failed, so the \
              pane shows the current, real reason this save didn't go through"
         );
+    }
+
+    // --- Adding a request -----------------------------------------------------
+
+    const REQUEST_WITHOUT_A_NAME: &str = "method: GET\nurl: https://example.com\n";
+
+    /// Proof requirement: adding to a `Document::Single` — investigated
+    /// directly against `sendra_core::Document`'s own definition (`Single`
+    /// holds exactly one `Request`, not a list — see `add_request_to_
+    /// document`'s own doc comment) rather than assumed — must convert it
+    /// into a real `Document::Collection` holding both requests, the
+    /// original given a synthesized name since `Collection::validate`
+    /// requires one.
+    #[test]
+    fn adding_a_request_to_a_document_single_converts_it_into_a_collection() {
+        let mut state = loaded_state(REQUEST_WITHOUT_A_NAME);
+        assert!(
+            matches!(saved_document(&state), Document::Single(_)),
+            "the fixture must start as a Single document for this test to mean anything"
+        );
+
+        update(&mut state, Message::AddRequest);
+
+        match saved_document(&state) {
+            Document::Collection(collection) => {
+                assert_eq!(collection.requests.len(), 2);
+                assert_eq!(
+                    collection.requests[0].name.as_deref(),
+                    Some("GET https://example.com"),
+                    "the original, unnamed request must get a synthesized name (its own label)"
+                );
+                assert_eq!(collection.requests[0].url, "https://example.com");
+                assert_eq!(collection.requests[1].name.as_deref(), Some("New request"));
+                assert_eq!(collection.requests[1].method, Method::Get);
+                assert_eq!(collection.requests[1].url, "");
+            }
+            other => panic!("expected Document::Collection after AddRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adding_a_request_to_an_existing_collection_appends_it() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+
+        update(&mut state, Message::AddRequest);
+
+        match saved_document(&state) {
+            Document::Collection(collection) => {
+                assert_eq!(collection.requests.len(), 4);
+                assert_eq!(collection.requests[3].name.as_deref(), Some("New request"));
+                assert_eq!(collection.names()[..3], ["One", "Two", "Three"]);
+            }
+            other => panic!("expected Document::Collection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adding_a_request_selects_it_and_opens_it_in_edit_mode_immediately() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+
+        update(&mut state, Message::AddRequest);
+
+        assert_eq!(
+            selected(&state),
+            3,
+            "the new request must be the selected one"
+        );
+        let edit = state
+            .edit_mode
+            .as_ref()
+            .expect("edit mode must open immediately");
+        assert_eq!(edit.method.value(), "GET");
+        assert_eq!(edit.url.value(), "");
+        assert!(state.dirty_requests.contains(&3));
+    }
+
+    #[test]
+    fn adding_a_request_twice_disambiguates_the_synthesized_names() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+
+        update(&mut state, Message::AddRequest);
+        update(&mut state, Message::SaveEdit); // commit the first before adding a second
+        update(&mut state, Message::AddRequest);
+
+        match saved_document(&state) {
+            Document::Collection(collection) => {
+                assert_eq!(
+                    collection.names()[3..],
+                    ["New request", "New request 2"],
+                    "a second added request must not collide with the first's synthesized name"
+                );
+            }
+            other => panic!("expected Document::Collection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancelling_a_freshly_added_request_removes_it_and_restores_the_previous_selection() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::SelectNext); // select index 1 ("Two")
+        assert_eq!(selected(&state), 1);
+
+        update(&mut state, Message::AddRequest);
+        assert_eq!(selected(&state), 3);
+
+        update(&mut state, Message::CancelEdit);
+
+        assert!(state.edit_mode.is_none());
+        assert_eq!(
+            selected(&state),
+            1,
+            "cancelling a fresh AddRequest must restore the selection it replaced"
+        );
+        match saved_document(&state) {
+            Document::Collection(collection) => {
+                assert_eq!(
+                    collection.requests.len(),
+                    3,
+                    "the never-saved request must be gone entirely, not just deselected"
+                );
+                assert_eq!(collection.names(), ["One", "Two", "Three"]);
+            }
+            other => panic!("expected Document::Collection, got {other:?}"),
+        }
+        assert!(!state.dirty_requests.contains(&3));
+    }
+
+    /// The other half of the `Document::Single` proof: cancelling a request
+    /// added to what started as a single-request file must undo the
+    /// `Single` → `Collection` conversion too, not just remove the new
+    /// request and leave the conversion (and the original's synthesized
+    /// name) behind — see `PendingNewRequest`'s own doc comment for why a
+    /// wholesale document restore, not an in-place removal, is what this
+    /// takes.
+    #[test]
+    fn cancelling_a_request_added_to_a_document_single_restores_it_to_single() {
+        let mut state = loaded_state(REQUEST_WITHOUT_A_NAME);
+
+        update(&mut state, Message::AddRequest);
+        assert!(matches!(saved_document(&state), Document::Collection(_)));
+
+        update(&mut state, Message::CancelEdit);
+
+        match saved_document(&state) {
+            Document::Single(request) => {
+                assert_eq!(
+                    request.name, None,
+                    "the original request's name must be untouched too"
+                );
+                assert_eq!(request.url, "https://example.com");
+            }
+            other => panic!("expected Document::Single restored, got {other:?}"),
+        }
+        assert_eq!(selected(&state), 0);
+    }
+
+    #[test]
+    fn add_request_is_a_no_op_while_already_editing_or_overlay_open_or_run_in_flight() {
+        let mut editing = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut editing, Message::EnterEditMode);
+        update(&mut editing, Message::AddRequest);
+        assert_eq!(
+            editing.edit_mode.as_ref().unwrap().method.value(),
+            "GET",
+            "AddRequest must not replace an edit already in progress"
+        );
+        assert_eq!(saved_document(&editing).requests().len(), 3);
+
+        let mut overlaid = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut overlaid, Message::OpenEnvironmentOverlay);
+        update(&mut overlaid, Message::AddRequest);
+        assert_eq!(saved_document(&overlaid).requests().len(), 3);
+        assert!(overlaid.edit_mode.is_none());
+
+        let mut running = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut running, Message::RunRequested);
+        update(&mut running, Message::AddRequest);
+        assert_eq!(saved_document(&running).requests().len(), 3);
+        assert!(running.edit_mode.is_none());
+    }
+
+    /// Proof requirement, end to end: add a request, fill in its fields
+    /// through the exact same editors issues 18-24 already built (method,
+    /// URL, a header), save, and reload the collection with a brand-new
+    /// `Document::from_path` — not anything still sitting in `state` — to
+    /// confirm the new request genuinely reached disk with the fields it was
+    /// given.
+    #[test]
+    fn adding_a_request_filling_it_in_and_saving_persists_it_to_disk() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        std::fs::write(
+            &path,
+            "name: test\nrequests:\n  - name: One\n    method: GET\n    url: https://example.com\n",
+        )
+        .unwrap();
+
+        let mut state = state_loaded_from(&path);
+        update(&mut state, Message::AddRequest);
+
+        // Fill in the new request through the ordinary field editors — focus
+        // starts on Name (`EditField::default`).
+        update(&mut state, Message::EditFocusNext); // -> Method
+        backspace_n(&mut state, "GET".len());
+        type_into_focused_field(&mut state, "POST");
+        update(&mut state, Message::EditFocusNext); // -> Url
+        type_into_focused_field(&mut state, "https://example.com/new");
+        update(&mut state, Message::AddHeaderRow);
+        type_into_focused_field(&mut state, "X-Test");
+        update(&mut state, Message::EditFocusNext); // -> header value
+        type_into_focused_field(&mut state, "abc");
+
+        update(&mut state, Message::SaveEdit);
+        assert!(state.edit_mode.is_none(), "the save must succeed");
+
+        // The proof itself: a fresh `Document::from_path`.
+        let reloaded = Document::from_path(&path).expect("the saved file must exist and parse");
+        let requests = reloaded.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].name.as_deref(), Some("One"));
+        let new_request = &requests[1];
+        assert_eq!(new_request.name.as_deref(), Some("New request"));
+        assert_eq!(new_request.method, Method::Post);
+        assert_eq!(new_request.url, "https://example.com/new");
+        assert_eq!(
+            new_request.header("X-Test"),
+            Some("abc"),
+            "the header added through the ordinary header editor must be saved too"
+        );
+    }
+
+    /// The other end-to-end proof: a `Document::Single` file, a request
+    /// added to it, filled in, saved — and a fresh reload must show a real
+    /// `requests:` collection with both, on disk, not just in memory.
+    #[test]
+    fn adding_a_request_to_a_single_request_file_persists_as_a_real_collection_on_disk() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("request.yaml");
+        std::fs::write(&path, "method: GET\nurl: https://example.com\n").unwrap();
+
+        let mut state = state_loaded_from(&path);
+        update(&mut state, Message::AddRequest);
+        update(&mut state, Message::EditFocusNext); // Name -> Method
+        update(&mut state, Message::EditFocusNext); // Method -> Url
+        type_into_focused_field(&mut state, "/new");
+        update(&mut state, Message::SaveEdit);
+        assert!(state.edit_mode.is_none());
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            on_disk.contains("requests:"),
+            "a Document::Single file must become a real requests: collection on disk: {on_disk}"
+        );
+
+        let reloaded = Document::from_path(&path).expect("the saved file must exist and parse");
+        match reloaded {
+            Document::Collection(collection) => {
+                assert_eq!(collection.requests.len(), 2);
+                assert_eq!(collection.requests[0].url, "https://example.com");
+                assert_eq!(collection.requests[1].url, "/new");
+            }
+            other => panic!("expected Document::Collection on disk, got {other:?}"),
+        }
+    }
+
+    /// `saved_document` mirrors `saved_request` but hands back the whole
+    /// `Document` — what the tests above about `Document::Single`/
+    /// `Document::Collection`'s own shape need, rather than one request out
+    /// of it.
+    fn saved_document(state: &AppState) -> &Document {
+        match &state.load_state {
+            LoadState::Loaded { document, .. } => document,
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
     }
 }

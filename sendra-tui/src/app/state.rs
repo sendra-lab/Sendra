@@ -251,9 +251,20 @@ pub enum AuthField {
 /// what one row covers. `CaptureName(i)`/`CaptureKind(i)`/`CaptureValue(i)`
 /// index into `EditState::captures` — see `EditState::capture_row_count` and
 /// `CaptureRow`'s own doc comment.
+///
+/// `Name` is first in the cycle (and the default focus a fresh edit session
+/// opens on) — a request's identity comes before what it does. Unlike
+/// `Method`, an empty `Name` is never rejected here the way `method_error`
+/// rejects a bad method: `Request::name` is a plain `Option<String>`, valid
+/// empty or not, and *whether* a name is required at all depends on context
+/// this `EditField`/`EditState` don't have (a bare request needs none; one
+/// inside a collection needs a real, unique one) — see
+/// `sendra_core::Document::validate`, which `Message::SaveEdit` relies on
+/// `Document::save_to_path` to check instead of duplicating that rule here.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EditField {
     #[default]
+    Name,
     Method,
     Url,
     HeaderKey(usize),
@@ -281,11 +292,11 @@ impl EditField {
     /// focus), which auth fields (if any) `EditState::auth` currently
     /// offers (see `AuthEdit::field_order`, empty for a request with no
     /// `auth:` at all), and how many assertion/capture rows currently exist.
-    /// Order: Method → URL → each header row's key then value, in index
-    /// order → Body (if editable) → each auth field, in order → each
+    /// Order: Name → Method → URL → each header row's key then value, in
+    /// index order → Body (if editable) → each auth field, in order → each
     /// assertion row's path, operator, value then negate flag, in index
     /// order → each capture row's name, kind then value, in index order →
-    /// back to Method.
+    /// back to Name.
     pub(super) fn next(
         self,
         header_count: usize,
@@ -295,6 +306,7 @@ impl EditField {
         capture_row_count: usize,
     ) -> Self {
         match self {
+            EditField::Name => EditField::Method,
             EditField::Method => EditField::Url,
             EditField::Url => {
                 if header_count > 0 {
@@ -347,7 +359,7 @@ impl EditField {
                 if index + 1 < capture_row_count {
                     EditField::CaptureName(index + 1)
                 } else {
-                    EditField::Method
+                    EditField::Name
                 }
             }
         }
@@ -399,12 +411,12 @@ impl EditField {
     /// What comes right after the last assertion row (or straight after
     /// auth/headers/`Url`/`Body`, with no assertion rows at all): the first
     /// capture row's name, if there is one, otherwise wrapping back to
-    /// `Method`.
+    /// `Name`.
     fn after_assertions(capture_row_count: usize) -> Self {
         if capture_row_count > 0 {
             EditField::CaptureName(0)
         } else {
-            EditField::Method
+            EditField::Name
         }
     }
 
@@ -419,13 +431,14 @@ impl EditField {
         capture_row_count: usize,
     ) -> Self {
         match self {
-            EditField::Method => Self::before_method(
+            EditField::Name => Self::before_name(
                 header_count,
                 has_body,
                 auth_fields,
                 assertion_row_count,
                 capture_row_count,
             ),
+            EditField::Method => EditField::Name,
             EditField::Url => EditField::Method,
             EditField::HeaderKey(0) => EditField::Url,
             EditField::HeaderKey(index) => EditField::HeaderValue(index - 1),
@@ -503,13 +516,13 @@ impl EditField {
         }
     }
 
-    /// What comes right before `Method` when the cycle wraps backward: the
+    /// What comes right before `Name` when the cycle wraps backward: the
     /// last capture row's value field, if there are any capture rows;
     /// otherwise whatever [`Self::before_captures`] says. The exact mirror
     /// of how [`Self::after_headers`]/[`Self::after_body`]/
     /// [`Self::after_auth`]/[`Self::after_assertions`] decide what comes
     /// *after* those same sections going forward.
-    fn before_method(
+    fn before_name(
         header_count: usize,
         has_body: bool,
         auth_fields: &[AuthField],
@@ -866,8 +879,10 @@ impl AuthEdit {
 /// `Some(text)` unless `text` is empty — what `AuthEdit::to_auth` uses for
 /// `OAuthAuth`'s optional `scope`/`username`/`password`, so clearing one of
 /// these fields back to blank saves as the field being genuinely absent
-/// again, not present-but-empty.
-fn non_empty(text: &str) -> Option<String> {
+/// again, not present-but-empty. Also visible to `super::update`, which
+/// applies the same convention to `EditState::name` when writing it back
+/// into `Request::name`.
+pub(super) fn non_empty(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
@@ -1202,6 +1217,16 @@ impl CaptureRow {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EditState {
     pub dirty: bool,
+    /// Working copy of `Request::name`. Empty means "no name" — see
+    /// `EditState::to_request`/`apply_edit_to_request` in `update`, which
+    /// save it back through the same `non_empty` convention `AuthEdit`'s
+    /// optional OAuth fields already use, so clearing this field back to
+    /// blank saves as the request genuinely having no name again, not a
+    /// name that happens to be the empty string. Never itself rejected the
+    /// way an invalid `method` is — see `EditField::Name`'s own doc comment
+    /// for why "is a name required here" is not a question this type can
+    /// answer on its own.
+    pub name: TextField,
     pub method: TextField,
     pub url: TextField,
     /// Working copies of the request's headers, in the same order as
@@ -1269,6 +1294,7 @@ impl EditState {
     /// Visible to `super::update`'s `Message::EnterEditMode` arm, which is
     /// the only place outside this module allowed to start an edit.
     pub(super) fn new(request: &Request) -> Self {
+        let name = TextField::new(request.name.clone().unwrap_or_default());
         let method = TextField::new(request.method.as_str());
         let method_error = validate_method_text(method.value()).err();
         let headers = request
@@ -1312,6 +1338,7 @@ impl EditState {
             .unwrap_or_default();
         Self {
             dirty: false,
+            name,
             method,
             url: TextField::new(request.url.clone()),
             headers,
@@ -1332,6 +1359,7 @@ impl EditState {
     /// `edit_mutate`/`edit_move`/`edit_move_or_toggle` helpers.
     pub(super) fn focused_field_mut(&mut self) -> Option<&mut TextField> {
         match self.focus {
+            EditField::Name => Some(&mut self.name),
             EditField::Method => Some(&mut self.method),
             EditField::Url => Some(&mut self.url),
             EditField::HeaderKey(index) => Some(&mut self.headers[index].key),
@@ -1371,7 +1399,8 @@ impl EditState {
     pub(super) fn delete_focused_header_row(&mut self) {
         let index = match self.focus {
             EditField::HeaderKey(index) | EditField::HeaderValue(index) => index,
-            EditField::Method
+            EditField::Name
+            | EditField::Method
             | EditField::Url
             | EditField::Body
             | EditField::Auth(_)
@@ -1413,7 +1442,8 @@ impl EditState {
             | EditField::AssertionOperator(index)
             | EditField::AssertionValue(index)
             | EditField::AssertionNegate(index) => index,
-            EditField::Method
+            EditField::Name
+            | EditField::Method
             | EditField::Url
             | EditField::HeaderKey(_)
             | EditField::HeaderValue(_)
@@ -1456,7 +1486,8 @@ impl EditState {
             EditField::CaptureName(index)
             | EditField::CaptureKind(index)
             | EditField::CaptureValue(index) => index,
-            EditField::Method
+            EditField::Name
+            | EditField::Method
             | EditField::Url
             | EditField::HeaderKey(_)
             | EditField::HeaderValue(_)
@@ -1566,6 +1597,7 @@ impl EditState {
     /// method it refuses to save.
     pub(super) fn to_request(&self, base: &Request) -> Request {
         let mut request = base.clone();
+        request.name = non_empty(self.name.value());
         if let Ok(method) = validate_method_text(self.method.value()) {
             request.method = method;
         }
@@ -1768,6 +1800,41 @@ pub struct AppState {
     /// have unsaved TUI-local edits" is sendra-tui's own bookkeeping, not
     /// something a collection file format should have to represent.
     pub dirty_requests: HashSet<usize>,
+    /// `Some(...)` while the currently open edit session is for a request
+    /// `Message::AddRequest` just inserted and that has never been saved —
+    /// `None` for an edit of a pre-existing request. What
+    /// `Message::CancelEdit` needs to undo the insertion itself, not merely
+    /// drop `edit_mode`: unlike every other edit (which never touches the
+    /// real `Document` until `Message::SaveEdit`), adding a request has to
+    /// mutate the loaded `Document` immediately — it has to actually exist,
+    /// selected, for `EditState::new` to seed an edit session from and for
+    /// the collection browser to show it — so cancelling has real work to
+    /// undo here that it never has anywhere else. See
+    /// `PendingNewRequest`'s own doc comment for why that undo restores the
+    /// whole `Document` wholesale rather than trying to reverse the
+    /// insertion in place.
+    pub pending_new_request: Option<PendingNewRequest>,
+}
+
+/// What `Message::CancelEdit` restores after `Message::AddRequest` is
+/// cancelled without ever being saved.
+///
+/// `document_before` is the *entire* loaded `Document`, cloned the instant
+/// before the new request was inserted — not just "the new request's index,
+/// to remove". Restoring the whole thing wholesale is what correctly undoes
+/// a `Document::Single` having been converted into a `Document::Collection`
+/// along the way (see `update::add_request_to_document`): removing only the
+/// newly added request would leave that conversion — and the synthesized
+/// `name` it gave the original, single request — behind, which is not
+/// "nothing happened", the same guarantee every other cancelled edit already
+/// gets.
+#[derive(Debug, Clone)]
+pub struct PendingNewRequest {
+    /// Where the collection browser's selection was before `AddRequest` ran
+    /// — restored on cancel rather than left on the now-removed request's
+    /// former index.
+    pub previous_selected: usize,
+    pub document_before: Box<Document>,
 }
 
 impl AppState {
@@ -1897,6 +1964,16 @@ pub enum Message {
     /// again — a toggle rather than a one-way reveal, so hiding them again
     /// does not need a second, differently-named key.
     ToggleRevealCaptures,
+    /// `n` while browsing: appends a brand-new, mostly-empty request to the
+    /// loaded document, selects it, and immediately opens it in edit mode —
+    /// the same `EditState`/`Message::SaveEdit`/`CancelEdit` machinery every
+    /// other field edit already goes through, not a separate "create
+    /// request" UI. A no-op under the same conditions `EnterEditMode` is:
+    /// nothing loaded, the environment overlay open, or a run in flight.
+    /// See `update::add_request_to_document` for what "mostly-empty" means
+    /// and how `sendra_core::Document::Single` (which cannot itself hold a
+    /// second request) is handled.
+    AddRequest,
     /// Enters edit mode for the currently selected request — see
     /// `AppState::edit_mode`. A no-op (see [`super::update::update`]) unless a request is
     /// actually selected, the environment overlay is closed, and no run is
@@ -2223,9 +2300,14 @@ mod tests {
     }
 
     #[test]
-    fn edit_field_next_alternates_between_method_and_url_with_no_headers_or_body() {
+    fn edit_field_next_walks_name_method_and_url_in_order_with_nothing_else() {
+        assert_eq!(EditField::Name.next(0, false, &[], 0, 0), EditField::Method);
         assert_eq!(EditField::Method.next(0, false, &[], 0, 0), EditField::Url);
-        assert_eq!(EditField::Url.next(0, false, &[], 0, 0), EditField::Method);
+        assert_eq!(
+            EditField::Url.next(0, false, &[], 0, 0),
+            EditField::Name,
+            "with nothing else configured, Url wraps back to Name"
+        );
     }
 
     #[test]
@@ -2248,8 +2330,8 @@ mod tests {
         );
         assert_eq!(
             EditField::HeaderValue(1).next(2, false, &[], 0, 0),
-            EditField::Method,
-            "with no body, auth or assertion field, the last header row's value wraps back to Method"
+            EditField::Name,
+            "with no body, auth or assertion field, the last header row's value wraps back to Name"
         );
     }
 
@@ -2263,8 +2345,8 @@ mod tests {
         );
         assert_eq!(
             EditField::Body.next(2, true, &[], 0, 0),
-            EditField::Method,
-            "Body wraps back to Method when there is no auth or assertion field"
+            EditField::Name,
+            "Body wraps back to Name when there is no auth or assertion field"
         );
         assert_eq!(
             EditField::Body.next(2, true, &[AuthField::BearerToken], 0, 0),
@@ -2283,13 +2365,13 @@ mod tests {
     fn edit_field_next_skips_body_entirely_when_unsupported() {
         assert_eq!(
             EditField::Url.next(0, false, &[], 0, 0),
-            EditField::Method,
+            EditField::Name,
             "with no headers, no editable body, no auth and no assertions, Url wraps straight \
-             back to Method"
+             back to Name"
         );
         assert_eq!(
             EditField::HeaderValue(1).next(2, false, &[], 0, 0),
-            EditField::Method
+            EditField::Name
         );
     }
 
@@ -2315,8 +2397,8 @@ mod tests {
         );
         assert_eq!(
             EditField::Auth(AuthField::ApiKeyLocation).next(0, false, &auth_fields, 0, 0),
-            EditField::Method,
-            "the last auth field wraps back to Method when there are no assertion rows"
+            EditField::Name,
+            "the last auth field wraps back to Name when there are no assertion rows"
         );
         assert_eq!(
             EditField::Auth(AuthField::ApiKeyLocation).next(0, false, &auth_fields, 2, 0),
@@ -2326,7 +2408,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_field_next_walks_through_one_assertion_rows_four_sub_fields_and_wraps_to_method() {
+    fn edit_field_next_walks_through_one_assertion_rows_four_sub_fields_and_wraps_to_name() {
         assert_eq!(
             EditField::AssertionPath(0).next(0, false, &[], 1, 0),
             EditField::AssertionOperator(0)
@@ -2341,8 +2423,8 @@ mod tests {
         );
         assert_eq!(
             EditField::AssertionNegate(0).next(0, false, &[], 1, 0),
-            EditField::Method,
-            "the only assertion row's negate flag wraps back to Method"
+            EditField::Name,
+            "the only assertion row's negate flag wraps back to Name"
         );
     }
 
@@ -2355,8 +2437,8 @@ mod tests {
         );
         assert_eq!(
             EditField::AssertionNegate(1).next(0, false, &[], 2, 0),
-            EditField::Method,
-            "the last row's negate flag wraps back to Method"
+            EditField::Name,
+            "the last row's negate flag wraps back to Name"
         );
     }
 
@@ -2377,7 +2459,8 @@ mod tests {
                 for auth_fields in auth_layouts {
                     for assertion_row_count in [0, 1, 2] {
                         for capture_row_count in [0, 1, 2] {
-                            let mut every_field = vec![EditField::Method, EditField::Url];
+                            let mut every_field =
+                                vec![EditField::Name, EditField::Method, EditField::Url];
                             for index in 0..header_count {
                                 every_field.push(EditField::HeaderKey(index));
                                 every_field.push(EditField::HeaderValue(index));
@@ -2455,45 +2538,54 @@ mod tests {
     }
 
     #[test]
-    fn edit_field_prev_from_method_prefers_assertions_over_auth_body_and_headers() {
+    fn edit_field_prev_from_method_is_always_name() {
+        assert_eq!(EditField::Method.prev(0, false, &[], 0, 0), EditField::Name);
         assert_eq!(
-            EditField::Method.prev(2, true, &[AuthField::BearerToken], 2, 0),
+            EditField::Method.prev(2, true, &[AuthField::BearerToken], 2, 3),
+            EditField::Name
+        );
+    }
+
+    #[test]
+    fn edit_field_prev_from_name_prefers_assertions_over_auth_body_and_headers() {
+        assert_eq!(
+            EditField::Name.prev(2, true, &[AuthField::BearerToken], 2, 0),
             EditField::AssertionNegate(1)
         );
     }
 
     #[test]
-    fn edit_field_prev_from_method_prefers_captures_over_assertions_auth_body_and_headers() {
+    fn edit_field_prev_from_name_prefers_captures_over_assertions_auth_body_and_headers() {
         assert_eq!(
-            EditField::Method.prev(2, true, &[AuthField::BearerToken], 2, 3),
+            EditField::Name.prev(2, true, &[AuthField::BearerToken], 2, 3),
             EditField::CaptureValue(2)
         );
     }
 
     #[test]
-    fn edit_field_prev_from_method_prefers_auth_over_body_and_headers_with_no_assertions() {
+    fn edit_field_prev_from_name_prefers_auth_over_body_and_headers_with_no_assertions() {
         assert_eq!(
-            EditField::Method.prev(2, true, &[AuthField::BearerToken], 0, 0),
+            EditField::Name.prev(2, true, &[AuthField::BearerToken], 0, 0),
             EditField::Auth(AuthField::BearerToken)
         );
     }
 
     #[test]
-    fn edit_field_prev_from_method_prefers_body_over_headers_with_no_auth_or_assertions() {
-        assert_eq!(EditField::Method.prev(2, true, &[], 0, 0), EditField::Body);
+    fn edit_field_prev_from_name_prefers_body_over_headers_with_no_auth_or_assertions() {
+        assert_eq!(EditField::Name.prev(2, true, &[], 0, 0), EditField::Body);
     }
 
     #[test]
-    fn edit_field_prev_from_method_wraps_to_the_last_header_value_with_nothing_else() {
+    fn edit_field_prev_from_name_wraps_to_the_last_header_value_with_nothing_else() {
         assert_eq!(
-            EditField::Method.prev(2, false, &[], 0, 0),
+            EditField::Name.prev(2, false, &[], 0, 0),
             EditField::HeaderValue(1)
         );
     }
 
     #[test]
-    fn edit_field_prev_from_method_wraps_to_url_with_nothing_at_all() {
-        assert_eq!(EditField::Method.prev(0, false, &[], 0, 0), EditField::Url);
+    fn edit_field_prev_from_name_wraps_to_url_with_nothing_at_all() {
+        assert_eq!(EditField::Name.prev(0, false, &[], 0, 0), EditField::Url);
     }
 
     // --- EditState: headers -----------------------------------------------
