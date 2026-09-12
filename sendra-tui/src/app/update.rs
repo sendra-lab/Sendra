@@ -4,11 +4,14 @@
 //! own doc comment and `super::state::AppState::edit_mode`'s for why that
 //! invariant matters.
 
+use std::collections::HashSet;
+
 use sendra_core::{Collection, Document, Request};
 
 use super::state::{
-    non_empty, validate_assertion_value_text, validate_method_text, AppState, BodyEdit, EditField,
-    EditState, LoadState, Message, PendingNewRequest, RunState, TextField,
+    non_empty, validate_assertion_value_text, validate_method_text, AppState, BodyEdit,
+    DeleteConfirm, EditField, EditState, LoadState, Message, PendingNewRequest, RunState,
+    TextField,
 };
 
 /// Moves `selected` by `delta` (`1` or `-1`) through `len` items, wrapping at
@@ -42,6 +45,7 @@ pub fn update(state: &mut AppState, msg: Message) {
                 | Message::RunRequested
                 | Message::EnterEditMode
                 | Message::AddRequest
+                | Message::RequestDelete
         )
     {
         return;
@@ -64,6 +68,31 @@ pub fn update(state: &mut AppState, msg: Message) {
                 | Message::CloseEnvironmentOverlay
                 | Message::ConfirmEnvironmentSelection
                 | Message::RunRequested
+                | Message::RequestDelete
+        )
+    {
+        return;
+    }
+
+    // While the delete confirmation prompt is open, browsing/overlay/run/
+    // edit-entry messages are refused the same way edit mode's own guard
+    // above refuses them — the prompt is exclusive with every other mode,
+    // not a state layered on top of ordinary browsing. `ConfirmDelete`/
+    // `CancelDelete` are exempt: they are exactly the messages that end this
+    // state, the same reason `SaveEdit`/`CancelEdit` are exempt from the
+    // edit-mode guard. `Quit`/`Tick` keep working for the same reason they
+    // always do.
+    if state.delete_confirm.is_some()
+        && matches!(
+            msg,
+            Message::SelectNext
+                | Message::SelectPrevious
+                | Message::OpenEnvironmentOverlay
+                | Message::CloseEnvironmentOverlay
+                | Message::ConfirmEnvironmentSelection
+                | Message::RunRequested
+                | Message::EnterEditMode
+                | Message::AddRequest
         )
     {
         return;
@@ -325,6 +354,99 @@ pub fn update(state: &mut AppState, msg: Message) {
                 }
             }
         }
+        Message::RequestDelete => {
+            // Same guard `EnterEditMode`/`AddRequest` use, for the same
+            // reason: deletion also opens a modal prompt, exclusive with the
+            // overlay, edit mode and an in-flight run the same way.
+            if state.edit_mode.is_none()
+                && state.environment_overlay.is_none()
+                && state.delete_confirm.is_none()
+                && !matches!(state.run_state, RunState::InFlight)
+            {
+                if let LoadState::Loaded {
+                    document, selected, ..
+                } = &state.load_state
+                {
+                    if can_delete(document, *selected) {
+                        state.delete_confirm = Some(DeleteConfirm {
+                            index: *selected,
+                            error: None,
+                        });
+                    }
+                }
+            }
+        }
+        Message::CancelDelete => {
+            // Dropping `delete_confirm` is the entire mechanism: nothing
+            // real is ever mutated before `ConfirmDelete` actually runs (see
+            // that arm below), so there is nothing else to undo — the exact
+            // same "nothing happened" guarantee `CancelEdit` already has for
+            // a pre-existing request's edit.
+            state.delete_confirm = None;
+        }
+        Message::ConfirmDelete => {
+            if let Some(confirm) = &state.delete_confirm {
+                let index = confirm.index;
+                // Everything the delete needs, copied out of
+                // `state.load_state` as owned values — the same
+                // "attempt the write against a clone before anything in
+                // `state` changes" shape `Message::SaveEdit` already uses,
+                // so a failed write leaves the loaded document, `selected`
+                // and `dirty_requests` completely untouched.
+                let loaded = match &state.load_state {
+                    LoadState::Loaded {
+                        document,
+                        base_dir,
+                        path,
+                        ..
+                    } if can_delete(document, index) => {
+                        Some(((**document).clone(), base_dir.clone(), path.clone()))
+                    }
+                    _ => None,
+                };
+                match loaded {
+                    Some((mut candidate, base_dir, path)) => {
+                        remove_request(&mut candidate, index);
+                        match candidate.save_to_path(&path) {
+                            Ok(()) => {
+                                let new_selected =
+                                    new_selection_after_delete(index, candidate.requests().len());
+                                state.load_state = LoadState::Loaded {
+                                    document: Box::new(candidate),
+                                    selected: new_selected,
+                                    base_dir,
+                                    path,
+                                };
+                                state.dirty_requests =
+                                    reindex_dirty_after_delete(&state.dirty_requests, index);
+                                state.delete_confirm = None;
+                                // A different (or no longer any) request is
+                                // now selected, the same reset `select()`
+                                // already applies when the selection moves.
+                                state.run_state = RunState::Idle;
+                                state.response_scroll = 0;
+                                state.reveal_captures = false;
+                            }
+                            Err(error) => {
+                                // The loaded document is still the pre-delete
+                                // one — `candidate` was a clone, never
+                                // written back — so nothing here is lost;
+                                // the prompt stays open, showing the failure,
+                                // so the user can retry or cancel.
+                                if let Some(confirm) = &mut state.delete_confirm {
+                                    confirm.error = Some(error.to_string());
+                                }
+                            }
+                        }
+                    }
+                    // The document changed shape out from under the prompt
+                    // (or deleting is no longer valid, e.g. down to the last
+                    // request) between `RequestDelete` and this — nothing to
+                    // do but close it rather than act on stale state.
+                    None => state.delete_confirm = None,
+                }
+            }
+        }
         Message::EditFocusNext => {
             if let Some(edit) = &mut state.edit_mode {
                 let has_body = edit.has_editable_body();
@@ -416,6 +538,100 @@ fn request_mut(document: &mut Document, index: usize) -> Option<&mut Request> {
         Document::Single(request) => (index == 0).then_some(request),
         Document::Collection(collection) => collection.requests.get_mut(index),
     }
+}
+
+/// Whether the request at `index` in `document` can be deleted at all.
+///
+/// **The structural question this issue raises, in reverse from
+/// `add_request_to_document`'s own.** `sendra_core::Document::Single` holds
+/// exactly one `Request` with no way to hold zero — there is no `Document`
+/// variant for "a file with no request in it" — so deleting the only request
+/// out of a `Document::Single` has no valid document to land on; deletion is
+/// disabled outright for `Document::Single`; not "delete it and fall back to
+/// some placeholder", since there is no placeholder `Request` this could
+/// invent that wouldn't be a silent, surprising rewrite of the file's
+/// content. `Document::Collection` has the same problem at the boundary:
+/// `Collection::validate` rejects an empty `requests` list (see its own doc
+/// comment — "at least one request"), and `Document::save_to_path` refuses to
+/// write anything that doesn't validate, so deleting a collection's last
+/// remaining request would build a document that could never actually be
+/// saved. Rather than let `Message::ConfirmDelete` discover that at save time
+/// (the same failure `save_to_path` would report for any other invalid
+/// document, but a confusing one to see after confirming what looked like an
+/// ordinary delete), this is checked up front, at the same point
+/// `Message::RequestDelete` decides whether to even open the confirmation
+/// prompt — the zero-requests-remaining state this guards against is
+/// therefore never actually reachable through the TUI at all, not merely
+/// handled gracefully after the fact.
+///
+/// A `Document::Collection` brought down to exactly one request (deleting the
+/// second-to-last) *is* allowed and does **not** convert back into a
+/// `Document::Single` — the exact reverse of the conversion
+/// `add_request_to_document` performs going the other way is deliberately
+/// not mirrored here. Unlike growing past one request (where `Document::
+/// Single` has no way to hold a second request at all, forcing the
+/// conversion), a `Collection` with one request is already a completely
+/// valid document — `Collection::validate` only requires *non-empty*, not
+/// more than one — so there is no structural reason to change shape, and
+/// doing so anyway would be a second, unrequested transformation on top of
+/// the delete itself: it would silently drop the collection's own `name:` (if
+/// set) and change the file's on-disk shape from `requests: [...]` to a bare
+/// request the next time anything else touches it, neither of which the user
+/// asked for by deleting one entry.
+fn can_delete(document: &Document, index: usize) -> bool {
+    match document {
+        Document::Single(_) => false,
+        Document::Collection(collection) => {
+            collection.requests.len() > 1 && index < collection.requests.len()
+        }
+    }
+}
+
+/// Removes the request at `index` from `document` — a no-op for
+/// `Document::Single` or an out-of-range `index`, both of which
+/// `Message::ConfirmDelete` already refuses via `can_delete` before this is
+/// ever called.
+fn remove_request(document: &mut Document, index: usize) {
+    if let Document::Collection(collection) = document {
+        if index < collection.requests.len() {
+            collection.requests.remove(index);
+        }
+    }
+}
+
+/// Where the collection browser's selection lands right after deleting the
+/// request at `deleted_index`, given `new_len` — the document's request
+/// count *after* the removal. Selects the previous request (`deleted_index -
+/// 1`) rather than the one that slid into the deleted slot, or `0` when the
+/// first request was the one deleted — there is no "previous" to land on.
+/// `can_delete` guarantees `new_len >= 1` (deleting the last remaining
+/// request is refused outright — see its own doc comment), so the result
+/// here is always a valid index into the post-deletion document.
+fn new_selection_after_delete(deleted_index: usize, new_len: usize) -> usize {
+    if deleted_index == 0 {
+        0
+    } else {
+        (deleted_index - 1).min(new_len.saturating_sub(1))
+    }
+}
+
+/// `dirty_requests` with every index shifted to still name the same request
+/// after deleting the one at `deleted_index` — indices before it are
+/// untouched, `deleted_index` itself is dropped (there is no longer a request
+/// there to be dirty), and every index after it moves down by one to follow
+/// the request it pointed at through the removal. Without this, a dirty
+/// marker left in place would either vanish from the wrong row or point at a
+/// request it was never about, since `Vec::remove` shifts every later
+/// element down by one.
+fn reindex_dirty_after_delete(dirty: &HashSet<usize>, deleted_index: usize) -> HashSet<usize> {
+    dirty
+        .iter()
+        .filter_map(|&index| match index.cmp(&deleted_index) {
+            std::cmp::Ordering::Less => Some(index),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(index - 1),
+        })
+        .collect()
 }
 
 /// Appends a brand-new request to `document` and returns its index —
@@ -3790,6 +4006,290 @@ requests:
             }
             other => panic!("expected Document::Collection on disk, got {other:?}"),
         }
+    }
+
+    // --- Deleting a request -----------------------------------------------
+
+    #[test]
+    fn request_delete_opens_a_confirmation_prompt_and_touches_nothing_yet() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::SelectNext); // select index 1 ("Two")
+
+        update(&mut state, Message::RequestDelete);
+
+        let confirm = state
+            .delete_confirm
+            .as_ref()
+            .expect("RequestDelete must open the confirmation prompt");
+        assert_eq!(confirm.index, 1);
+        assert!(confirm.error.is_none());
+        // Nothing about the document or selection has moved yet — opening
+        // the prompt is not itself a mutation.
+        assert_eq!(saved_document(&state).requests().len(), 3);
+        assert_eq!(selected(&state), 1);
+    }
+
+    /// Proof requirement: cancelling must leave the collection completely
+    /// untouched — verified against real bytes on disk, not just the
+    /// in-memory `Document`, since a partial or accidental write would still
+    /// leave the in-memory state looking fine.
+    #[test]
+    fn cancelling_delete_leaves_the_file_byte_for_byte_unchanged_on_disk() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        std::fs::write(&path, THREE_REQUEST_COLLECTION).unwrap();
+        let original_bytes = std::fs::read(&path).unwrap();
+
+        let mut state = state_loaded_from(&path);
+        update(&mut state, Message::SelectNext); // select index 1 ("Two")
+        update(&mut state, Message::RequestDelete);
+        assert!(state.delete_confirm.is_some());
+
+        update(&mut state, Message::CancelDelete);
+
+        assert!(state.delete_confirm.is_none());
+        assert_eq!(saved_document(&state).requests().len(), 3);
+        assert_eq!(
+            selected(&state),
+            1,
+            "cancelling must not move the selection either"
+        );
+        let bytes_after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            original_bytes, bytes_after,
+            "cancelling a delete must never touch the file on disk"
+        );
+    }
+
+    /// Proof requirement, end to end: confirm a delete, then reload the
+    /// collection with a brand-new `Document::from_path` — not anything
+    /// still sitting in `state` — to confirm the request is genuinely gone
+    /// from disk and the other two are completely unaffected.
+    #[test]
+    fn confirming_delete_removes_the_request_and_a_reload_from_disk_shows_it_gone() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        std::fs::write(&path, THREE_REQUEST_COLLECTION).unwrap();
+
+        let mut state = state_loaded_from(&path);
+        update(&mut state, Message::SelectNext); // select index 1 ("Two")
+        update(&mut state, Message::RequestDelete);
+
+        update(&mut state, Message::ConfirmDelete);
+
+        assert!(state.delete_confirm.is_none());
+        assert_eq!(selected(&state), 0, "deleting selects the previous request");
+
+        let reloaded = Document::from_path(&path).expect("the saved file must exist and parse");
+        match reloaded {
+            Document::Collection(collection) => {
+                assert_eq!(collection.names(), ["One", "Three"]);
+                assert_eq!(collection.requests[0].url, "https://example.com");
+                assert_eq!(collection.requests[1].url, "https://example.com/three");
+            }
+            other => panic!("expected Document::Collection on disk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deleting_the_first_request_selects_index_zero_not_a_negative_previous() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        std::fs::write(&path, THREE_REQUEST_COLLECTION).unwrap();
+
+        let mut state = state_loaded_from(&path);
+        update(&mut state, Message::RequestDelete); // index 0 ("One")
+        update(&mut state, Message::ConfirmDelete);
+
+        assert_eq!(selected(&state), 0);
+        let reloaded = Document::from_path(&path).unwrap();
+        assert_eq!(reloaded.requests()[0].name.as_deref(), Some("Two"));
+    }
+
+    /// The investigation this issue asked for, demonstrated live:
+    /// `Document::Single` cannot hold zero requests (there is no `Document`
+    /// variant for an empty file — see `can_delete`'s own doc comment), so
+    /// deletion is disabled outright rather than attempted and failed later.
+    #[test]
+    fn deleting_is_disabled_for_a_document_single() {
+        let mut state = loaded_state("method: GET\nurl: https://example.com\n");
+        assert!(matches!(saved_document(&state), Document::Single(_)));
+
+        update(&mut state, Message::RequestDelete);
+
+        assert!(
+            state.delete_confirm.is_none(),
+            "RequestDelete must be a no-op for a Document::Single"
+        );
+        assert!(matches!(saved_document(&state), Document::Single(_)));
+    }
+
+    /// The other half of the same investigation: `Collection::validate`
+    /// rejects an empty `requests` list, so deleting a collection's last
+    /// remaining request is refused the same way — the zero-requests-
+    /// remaining state is therefore never actually reachable, handled
+    /// without a crash by never letting it happen at all.
+    #[test]
+    fn deleting_the_last_remaining_request_in_a_collection_is_refused() {
+        let mut state = loaded_state(
+            "name: test\nrequests:\n  - name: Only\n    method: GET\n    url: https://example.com\n",
+        );
+        assert_eq!(saved_document(&state).requests().len(), 1);
+
+        update(&mut state, Message::RequestDelete);
+
+        assert!(
+            state.delete_confirm.is_none(),
+            "RequestDelete must be a no-op on a collection's last remaining request"
+        );
+        assert_eq!(saved_document(&state).requests().len(), 1);
+    }
+
+    /// A `Document::Collection` brought down to exactly one request *is*
+    /// allowed — only zero is refused — and does not convert back into a
+    /// `Document::Single` (see `can_delete`'s own doc comment for why that
+    /// conversion is deliberately not mirrored from `add_request_to_document`).
+    #[test]
+    fn deleting_down_to_one_remaining_request_keeps_it_a_collection() {
+        let mut state = loaded_state(
+            "name: test\nrequests:\n  - name: One\n    method: GET\n    url: https://example.com\n  - name: Two\n    method: GET\n    url: https://example.com/two\n",
+        );
+
+        update(&mut state, Message::RequestDelete); // index 0 ("One")
+        update(&mut state, Message::ConfirmDelete);
+
+        match saved_document(&state) {
+            Document::Collection(collection) => {
+                assert_eq!(collection.names(), ["Two"]);
+            }
+            other => panic!(
+                "a collection with one request remaining must stay a Collection, got {other:?}"
+            ),
+        }
+    }
+
+    /// Dirty markers must follow their request through the index shift a
+    /// deletion causes — a marker on an index after the deleted one must
+    /// move down by one to keep naming the same request; one on the deleted
+    /// index itself must simply disappear.
+    #[test]
+    fn dirty_requests_are_reindexed_after_a_delete() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        state.dirty_requests.insert(2); // "Three" is marked dirty
+
+        update(&mut state, Message::RequestDelete); // index 0 ("One")
+        update(&mut state, Message::ConfirmDelete);
+
+        let names: Vec<Option<&str>> = saved_document(&state)
+            .requests()
+            .iter()
+            .map(|request| request.name.as_deref())
+            .collect();
+        assert_eq!(
+            names,
+            [Some("Two"), Some("Three")],
+            "sanity: index 0 is really what got removed"
+        );
+        assert!(
+            state.dirty_requests.contains(&1),
+            "the dirty marker on the old index 2 (\"Three\") must follow it to its new index 1"
+        );
+        assert!(!state.dirty_requests.contains(&2));
+    }
+
+    #[test]
+    fn request_delete_is_a_no_op_while_already_editing_or_overlay_open_or_run_in_flight() {
+        let mut editing = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut editing, Message::EnterEditMode);
+        update(&mut editing, Message::RequestDelete);
+        assert!(editing.delete_confirm.is_none());
+
+        let mut overlaid = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut overlaid, Message::OpenEnvironmentOverlay);
+        update(&mut overlaid, Message::RequestDelete);
+        assert!(overlaid.delete_confirm.is_none());
+
+        let mut running = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut running, Message::RunRequested);
+        update(&mut running, Message::RequestDelete);
+        assert!(running.delete_confirm.is_none());
+    }
+
+    /// The same exclusivity as `navigation_run_and_overlay_are_blocked_
+    /// while_editing`, checked for the delete confirmation prompt's own
+    /// guard: while it is open, ordinary browsing/overlay/run/edit-entry
+    /// messages must not slip through and act on state out from under it.
+    #[test]
+    fn navigation_and_edit_entry_are_blocked_while_the_delete_confirm_prompt_is_open() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::RequestDelete);
+        assert!(state.delete_confirm.is_some());
+
+        update(&mut state, Message::SelectNext);
+        assert_eq!(selected(&state), 0, "selection must not move");
+
+        update(&mut state, Message::EnterEditMode);
+        assert!(state.edit_mode.is_none());
+
+        update(&mut state, Message::AddRequest);
+        assert_eq!(saved_document(&state).requests().len(), 3);
+
+        update(&mut state, Message::OpenEnvironmentOverlay);
+        assert!(state.environment_overlay.is_none());
+
+        assert!(
+            state.delete_confirm.is_some(),
+            "the prompt itself must still be open throughout"
+        );
+    }
+
+    /// Proof requirement: a failed write must never lose track of the
+    /// pending delete or silently apply it — the prompt stays open with a
+    /// real error, the same "no-op that keeps you where you can retry or
+    /// cancel" shape `a_failed_disk_write_keeps_the_edit_dirty_and_surfaces_
+    /// a_real_error_without_losing_it` already proves for `SaveEdit`.
+    #[test]
+    fn a_failed_disk_write_keeps_the_prompt_open_with_a_real_error_without_losing_anything() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("collection.yaml");
+        std::fs::write(&path, THREE_REQUEST_COLLECTION).unwrap();
+
+        let mut state = state_loaded_from(&path);
+        // Block the target path with a directory only *after* the initial
+        // load, so `state_loaded_from` itself succeeds and only the delete's
+        // own write fails.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).expect("a directory blocking the target path");
+
+        update(&mut state, Message::RequestDelete);
+        update(&mut state, Message::ConfirmDelete);
+
+        assert!(
+            state.delete_confirm.is_some(),
+            "a failed write must not silently close the prompt"
+        );
+        let error = state
+            .delete_confirm
+            .as_ref()
+            .unwrap()
+            .error
+            .as_ref()
+            .expect("a failed write must surface a real error message");
+        assert!(!error.is_empty());
+        assert_eq!(
+            saved_document(&state).requests().len(),
+            3,
+            "the loaded document must be untouched by the failed attempt"
+        );
+
+        // Removing the obstruction and retrying must now succeed.
+        std::fs::remove_dir(&path).unwrap();
+        update(&mut state, Message::ConfirmDelete);
+
+        assert!(state.delete_confirm.is_none());
+        let reloaded =
+            Document::from_path(&path).expect("the retried delete must have written a real file");
+        assert_eq!(reloaded.requests().len(), 2);
     }
 
     /// `saved_document` mirrors `saved_request` but hands back the whole

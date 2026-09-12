@@ -19,8 +19,8 @@ use sendra_core::{
 use crate::run_request::RunOutcome;
 
 use super::state::{
-    AppState, AssertionRow, AuthEdit, AuthField, BodyEdit, CaptureKind, CaptureRow, EditField,
-    EditState, JsonOperator, LoadState, NamedEnvironment, RunState,
+    AppState, AssertionRow, AuthEdit, AuthField, BodyEdit, CaptureKind, CaptureRow, DeleteConfirm,
+    EditField, EditState, JsonOperator, LoadState, NamedEnvironment, RunState,
 };
 
 /// Body preview is capped rather than shown in full — scrolling through a
@@ -69,6 +69,10 @@ pub fn view(state: &AppState, frame: &mut Frame) {
 
     if let Some(cursor) = state.environment_overlay {
         render_environment_overlay(frame, state, cursor);
+    }
+
+    if let Some(confirm) = &state.delete_confirm {
+        render_delete_confirm_overlay(frame, state, confirm);
     }
 }
 
@@ -1148,6 +1152,11 @@ const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '�
 /// Built entirely from [`status_help_text`], which is also what the tests
 /// below exercise directly: this function's only job is handing that string
 /// to a `Paragraph`.
+///
+/// [`status_help_text`] checks `delete_confirm` first, ahead of every other
+/// context documented there — the delete confirmation prompt is modal and
+/// drawn on top of everything else, the same reason the environment overlay
+/// is checked ahead of edit mode.
 fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(status_help_text(state)), area);
 }
@@ -1201,6 +1210,15 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 /// effect is visible in this bar too, rather than duplicating a second
 /// "what does the help bar say" check inside `view`'s own test module.
 pub(super) fn status_help_text(state: &AppState) -> String {
+    if let Some(confirm) = &state.delete_confirm {
+        let failed = if confirm.error.is_some() {
+            "  (delete failed — see message)"
+        } else {
+            ""
+        };
+        return format!("Confirm delete{failed}  |  y/enter confirm  n/esc cancel  q quit");
+    }
+
     if state.environment_overlay.is_some() {
         return "↑/↓ nav  enter confirm  esc cancel  q quit".to_string();
     }
@@ -1225,7 +1243,7 @@ pub(super) fn status_help_text(state: &AppState) -> String {
     match &state.run_state {
         RunState::Idle => {
             format!(
-                "↑/↓ nav  enter/r run  i edit  n new request  e env{}  q quit",
+                "↑/↓ nav  enter/r run  i edit  n new request  d delete  e env{}  q quit",
                 idle_reveal_hint(state)
             )
         }
@@ -1255,7 +1273,7 @@ pub(super) fn status_help_text(state: &AppState) -> String {
                 "  c reveal/hide captures"
             };
             format!(
-                "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn/Home/End scroll{reveal}  i edit  n new request  e env  q quit"
+                "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn/Home/End scroll{reveal}  i edit  n new request  d delete  e env  q quit"
             )
         }
     }
@@ -1612,6 +1630,43 @@ fn render_environment_overlay(frame: &mut Frame, state: &AppState, cursor: usize
         Paragraph::new(lines.join("\n")).wrap(Wrap { trim: false }),
         panes[1],
     );
+}
+
+/// The delete confirmation prompt — a small, functional stub, deliberately
+/// not the shared confirmation component every destructive action in this
+/// batch will eventually use (see this issue's own scoping notes). Named the
+/// request it would delete, so confirming is never a guess about which row
+/// `y`/Enter is about to remove, and shows `DeleteConfirm::error` inline,
+/// through the same [`format_error`] every other error in the crate goes
+/// through, when a previous confirm attempt failed to write to disk.
+fn render_delete_confirm_overlay(frame: &mut Frame, state: &AppState, confirm: &DeleteConfirm) {
+    let area = centered_rect(60, 30, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Delete request — y/Enter confirm, n/Esc cancel"),
+        area,
+    );
+
+    let name = match &state.load_state {
+        LoadState::Loaded { document, .. } => document
+            .requests()
+            .get(confirm.index)
+            .and_then(|request| request.name.as_deref())
+            .unwrap_or("(unnamed)")
+            .to_string(),
+        LoadState::Loading | LoadState::NoPathProvided | LoadState::Failed(_) => {
+            "(unnamed)".to_string()
+        }
+    };
+
+    let mut text = format!("Delete '{name}'? This cannot be undone.");
+    if let Some(error) = &confirm.error {
+        text.push_str("\n\n");
+        text.push_str(&format_error("Failed to delete", error));
+    }
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inset(area));
 }
 
 #[cfg(test)]
