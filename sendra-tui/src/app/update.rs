@@ -204,6 +204,7 @@ pub fn update(state: &mut AppState, msg: Message) {
                             apply_body_edit(request, &edit.body);
                             request.auth = edit.auth.to_auth();
                             request.assertions = edit.to_assertions(request.assertions.as_ref());
+                            request.capture = edit.to_captures();
                         }
                         state.dirty_requests.remove(selected);
                     }
@@ -230,6 +231,7 @@ pub fn update(state: &mut AppState, msg: Message) {
                     has_body,
                     edit.auth_field_order(),
                     edit.assertion_row_count(),
+                    edit.capture_row_count(),
                 );
             }
         }
@@ -241,6 +243,7 @@ pub fn update(state: &mut AppState, msg: Message) {
                     has_body,
                     edit.auth_field_order(),
                     edit.assertion_row_count(),
+                    edit.capture_row_count(),
                 );
             }
         }
@@ -249,6 +252,10 @@ pub fn update(state: &mut AppState, msg: Message) {
         Message::AddAssertionRow => edit_state_mutate(state, EditState::add_assertion_row),
         Message::DeleteAssertionRow => {
             edit_state_mutate(state, EditState::delete_focused_assertion_row)
+        }
+        Message::AddCaptureRow => edit_state_mutate(state, EditState::add_capture_row),
+        Message::DeleteCaptureRow => {
+            edit_state_mutate(state, EditState::delete_focused_capture_row)
         }
         Message::EditInsertChar(ch) => edit_mutate(state, |field| field.insert_char(ch)),
         Message::EditBackspace => edit_mutate(state, TextField::backspace),
@@ -505,9 +512,11 @@ fn select(state: &mut AppState, delta: isize) {
 mod tests {
     use std::path::PathBuf;
 
-    use sendra_core::{ApiKeyLocation, Assertions, Method, Response};
+    use sendra_core::{
+        ApiKeyLocation, Assertions, CaptureSource, Captures, Environment, Method, Response,
+    };
 
-    use super::super::state::{AuthEdit, AuthField, JsonOperator};
+    use super::super::state::{AuthEdit, AuthField, CaptureKind, JsonOperator};
     use super::super::test_support::*;
     use super::super::view::status_help_text;
     use super::*;
@@ -2556,6 +2565,385 @@ requests:
         assert!(
             !assertions.evaluate(&failing).passed(),
             "5 is genuinely not greater than 10"
+        );
+    }
+
+    // --- Capture editing -----------------------------------------------------
+
+    const REQUEST_WITH_JSON_PATH_CAPTURE: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    capture:
+      auth_token: $.token
+";
+
+    const REQUEST_WITH_MIXED_CAPTURES: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+    capture:
+      auth_token: $.token
+      code:
+        status: true
+      trace:
+        header: X-Trace-Id
+";
+
+    const REQUEST_WITH_NO_CAPTURE: &str = "\
+name: test
+requests:
+  - name: One
+    method: GET
+    url: https://example.com
+";
+
+    fn response_with_headers(status: u16, headers: &[(&str, &str)], body: &str) -> Response {
+        Response {
+            status,
+            status_text: String::new(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            body: body.to_string(),
+            elapsed: std::time::Duration::from_millis(1),
+            redirects: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn enter_edit_mode_seeds_capture_rows_from_the_real_request_in_name_order() {
+        let mut state = loaded_state(REQUEST_WITH_MIXED_CAPTURES);
+
+        update(&mut state, Message::EnterEditMode);
+
+        let edit = state.edit_mode.as_ref().expect("edit mode just entered");
+        assert_eq!(edit.captures.len(), 3);
+        // `Captures::entries` iterates a `BTreeMap`, so seeding order is
+        // alphabetical by name, the same deterministic order `AssertionRow`
+        // seeding relies on for `Assertions::json`.
+        assert_eq!(edit.captures[0].name.value(), "auth_token");
+        assert_eq!(edit.captures[0].kind, CaptureKind::JsonPath);
+        assert_eq!(edit.captures[0].value.value(), "$.token");
+
+        assert_eq!(edit.captures[1].name.value(), "code");
+        assert_eq!(edit.captures[1].kind, CaptureKind::Status);
+
+        assert_eq!(edit.captures[2].name.value(), "trace");
+        assert_eq!(edit.captures[2].kind, CaptureKind::Header);
+        assert_eq!(edit.captures[2].value.value(), "X-Trace-Id");
+    }
+
+    #[test]
+    fn add_capture_row_appends_a_new_row_and_focuses_its_name() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+
+        update(&mut state, Message::AddCaptureRow);
+
+        let edit = state.edit_mode.as_ref().unwrap();
+        assert_eq!(edit.captures.len(), 2);
+        assert_eq!(edit.captures[1].name.value(), "");
+        assert_eq!(edit.captures[1].kind, CaptureKind::JsonPath);
+        assert_eq!(edit.focus, EditField::CaptureName(1));
+        assert!(edit.dirty);
+        assert!(state.dirty_requests.contains(&0));
+    }
+
+    #[test]
+    fn delete_capture_row_removes_the_focused_one() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::CaptureValue(0);
+
+        update(&mut state, Message::DeleteCaptureRow);
+
+        let edit = state.edit_mode.as_ref().unwrap();
+        assert!(edit.captures.is_empty());
+        assert!(edit.dirty);
+    }
+
+    #[test]
+    fn delete_capture_row_is_a_no_op_while_focus_is_elsewhere() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+        assert_eq!(state.edit_mode.as_ref().unwrap().focus, EditField::Method);
+
+        update(&mut state, Message::DeleteCaptureRow);
+
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().captures.len(),
+            1,
+            "nothing should be deleted while focus is on method"
+        );
+    }
+
+    #[test]
+    fn tab_reaches_the_capture_section_after_the_assertion_section() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+        // This request has no assertions, so the capture section follows
+        // directly after Body (no auth on this request either).
+        state.edit_mode.as_mut().unwrap().focus = EditField::Body;
+
+        update(&mut state, Message::EditFocusNext);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::CaptureName(0)
+        );
+        update(&mut state, Message::EditFocusNext);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::CaptureKind(0)
+        );
+        update(&mut state, Message::EditFocusNext);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::CaptureValue(0)
+        );
+        update(&mut state, Message::EditFocusNext);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().focus,
+            EditField::Method,
+            "the only capture row's value field wraps back to Method"
+        );
+    }
+
+    #[test]
+    fn typing_into_the_focused_name_field_edits_the_working_copy_and_marks_dirty() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::CaptureName(0);
+        type_into_focused_field(&mut state, "x");
+
+        let edit = state.edit_mode.as_ref().unwrap();
+        assert_eq!(edit.captures[0].name.value(), "auth_tokenx");
+        assert!(edit.dirty);
+        assert!(state.dirty_requests.contains(&0));
+    }
+
+    #[test]
+    fn left_right_toggle_the_capture_kind() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::CaptureKind(0);
+
+        update(&mut state, Message::EditCursorRight);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().captures[0].kind,
+            CaptureKind::Header
+        );
+        update(&mut state, Message::EditCursorRight);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().captures[0].kind,
+            CaptureKind::Status
+        );
+        update(&mut state, Message::EditCursorLeft);
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().captures[0].kind,
+            CaptureKind::Header
+        );
+        assert!(state.edit_mode.as_ref().unwrap().dirty);
+    }
+
+    #[test]
+    fn save_edit_writes_added_and_edited_capture_rows_into_the_loaded_document() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+
+        // Edit the existing row's path.
+        state.edit_mode.as_mut().unwrap().focus = EditField::CaptureValue(0);
+        backspace_n(&mut state, "$.token".len());
+        type_into_focused_field(&mut state, "$.session.token");
+
+        // Add a brand-new header capture.
+        update(&mut state, Message::AddCaptureRow);
+        type_into_focused_field(&mut state, "trace");
+        update(&mut state, Message::EditFocusNext); // -> kind
+        update(&mut state, Message::EditCursorRight); // JsonPath -> Header
+        update(&mut state, Message::EditFocusNext); // -> value
+        type_into_focused_field(&mut state, "X-Trace-Id");
+
+        update(&mut state, Message::SaveEdit);
+
+        assert!(state.edit_mode.is_none());
+        let request = saved_request(&state);
+        let capture = request.capture.as_ref().expect("capture must remain set");
+        assert_eq!(
+            capture.entries().get("auth_token"),
+            Some(&CaptureSource::JsonPath("$.session.token".to_string())),
+            "the edited row's new path must be saved"
+        );
+        assert_eq!(
+            capture.entries().get("trace"),
+            Some(&CaptureSource::Header {
+                header: "X-Trace-Id".to_string()
+            }),
+            "the added row must be saved as a real header capture"
+        );
+    }
+
+    #[test]
+    fn cancel_edit_discards_every_capture_change() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        let before_document = match &state.load_state {
+            LoadState::Loaded { document, .. } => (**document).clone(),
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        update(&mut state, Message::EnterEditMode);
+        update(&mut state, Message::AddCaptureRow);
+        type_into_focused_field(&mut state, "new_var");
+        state.edit_mode.as_mut().unwrap().focus = EditField::CaptureName(0);
+        update(&mut state, Message::DeleteCaptureRow);
+
+        update(&mut state, Message::CancelEdit);
+
+        assert!(state.edit_mode.is_none());
+        match &state.load_state {
+            LoadState::Loaded { document, .. } => {
+                assert_eq!(
+                    **document, before_document,
+                    "cancel must leave the real request's captures completely untouched"
+                );
+            }
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_request_with_no_capture_offers_none_to_edit_and_save_adds_none() {
+        let mut state = loaded_state(REQUEST_WITH_NO_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+        assert!(state.edit_mode.as_ref().unwrap().captures.is_empty());
+
+        update(&mut state, Message::SaveEdit);
+
+        assert_eq!(saved_request(&state).capture, None);
+    }
+
+    /// Proof requirement: adding, editing and deleting captures must be
+    /// verified against `Captures::evaluate`'s *actual* output — a real
+    /// captured value (or failure) against a real response — not just that
+    /// the working-copy struct fields changed. `run_request.rs` never gets
+    /// touched: this calls `Captures::evaluate` directly, as a plain library
+    /// function, the same way `run_request::execute` itself does, without
+    /// spawning a run or wiring the editor into it. Mirrors
+    /// `edited_assertions_actually_change_what_assertions_evaluate_reports`
+    /// exactly, for `Captures` instead of `Assertions` — the one real
+    /// difference is `Captures::evaluate`'s extra `&Environment` argument, an
+    /// empty one here since nothing in this test collides with it.
+    #[test]
+    fn edited_captures_actually_change_what_captures_evaluate_reports() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+        let environment = Environment::default();
+
+        // Before editing: `$.token` captures from a body that has one, and
+        // fails (`NoMatch`) against a body that doesn't.
+        let request = saved_request(&state).clone();
+        let original_captures = request.capture.clone().unwrap();
+        let has_token = response_with_headers(200, &[], r#"{"token": "abc123"}"#);
+        let no_token = response_with_headers(200, &[], r#"{"nope": "x"}"#);
+        assert!(original_captures
+            .evaluate(&has_token, &environment)
+            .passed());
+        assert!(!original_captures.evaluate(&no_token, &environment).passed());
+
+        // Edit it to read `$.nope` instead — a real, in-progress edit, run
+        // through the exact same `to_captures` `Message::SaveEdit` uses.
+        state.edit_mode.as_mut().unwrap().focus = EditField::CaptureValue(0);
+        backspace_n(&mut state, "$.token".len());
+        type_into_focused_field(&mut state, "$.nope");
+        let edited_captures = state.edit_mode.as_ref().unwrap().to_captures().unwrap();
+
+        // The real report must have flipped: what used to capture now fails,
+        // and vice versa — proof the edit takes effect in evaluation, not
+        // only in the struct.
+        let report_against_has_token = edited_captures.evaluate(&has_token, &environment);
+        assert!(
+            !report_against_has_token.passed(),
+            "the old path no longer matches anything in this body"
+        );
+        let report_against_no_token = edited_captures.evaluate(&no_token, &environment);
+        assert!(
+            report_against_no_token.passed(),
+            "the edited path must now capture from this body"
+        );
+        assert_eq!(
+            report_against_no_token.values().get("auth_token"),
+            Some(&"x".to_string())
+        );
+
+        // Now actually save it, and prove the exact same thing against the
+        // request sitting in the loaded document afterward.
+        update(&mut state, Message::SaveEdit);
+        let saved_captures = saved_request(&state).capture.clone().unwrap();
+        assert!(!saved_captures.evaluate(&has_token, &environment).passed());
+        assert!(saved_captures.evaluate(&no_token, &environment).passed());
+    }
+
+    /// The same proof, for deleting a row: once removed, `evaluate` must
+    /// report nothing at all rather than a lingering capture — an empty
+    /// report is a different, real outcome (`CaptureReport::is_empty`), not
+    /// the same "passed" a capture that still exists but happens to succeed
+    /// would report.
+    #[test]
+    fn deleting_a_capture_row_and_saving_removes_it_from_what_evaluate_checks() {
+        let mut state = loaded_state(REQUEST_WITH_JSON_PATH_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::CaptureName(0);
+
+        update(&mut state, Message::DeleteCaptureRow);
+        update(&mut state, Message::SaveEdit);
+
+        assert_eq!(
+            saved_request(&state).capture,
+            None,
+            "deleting the only capture must leave nothing behind"
+        );
+        // Confirmed the same way through evaluation itself, not only the
+        // struct: an absent `capture:` block is `Captures::default()`, which
+        // evaluates to an empty report that trivially "passed".
+        let report = Captures::default().evaluate(
+            &response_with_headers(200, &[], "anything"),
+            &Environment::default(),
+        );
+        assert!(report.is_empty());
+        assert!(report.passed());
+    }
+
+    /// The same proof, for adding a brand-new header capture: a real header
+    /// value that genuinely gets pulled out of the response once evaluated
+    /// for real, and a genuine `HeaderNotFound` failure when it isn't there.
+    #[test]
+    fn adding_a_header_capture_and_saving_actually_captures_it() {
+        let mut state = loaded_state(REQUEST_WITH_NO_CAPTURE);
+        update(&mut state, Message::EnterEditMode);
+
+        update(&mut state, Message::AddCaptureRow);
+        type_into_focused_field(&mut state, "trace");
+        update(&mut state, Message::EditFocusNext); // -> kind
+        update(&mut state, Message::EditCursorRight); // JsonPath -> Header
+        update(&mut state, Message::EditFocusNext); // -> value
+        type_into_focused_field(&mut state, "X-Trace-Id");
+
+        update(&mut state, Message::SaveEdit);
+
+        let capture = saved_request(&state).capture.clone().unwrap();
+        let environment = Environment::default();
+        let with_header = response_with_headers(200, &[("X-Trace-Id", "abc-123")], "{}");
+        let without_header = response_with_headers(200, &[], "{}");
+        let passing = capture.evaluate(&with_header, &environment);
+        assert!(passing.passed(), "the header is genuinely present");
+        assert_eq!(passing.values().get("trace"), Some(&"abc-123".to_string()));
+        assert!(
+            !capture.evaluate(&without_header, &environment).passed(),
+            "with no such header, the capture genuinely fails"
         );
     }
 }
