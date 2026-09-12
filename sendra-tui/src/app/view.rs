@@ -1674,6 +1674,29 @@ fn inset(area: Rect) -> Rect {
     }
 }
 
+/// Draws a bordered, titled popup centered at `percent_x`/`percent_y` of the
+/// frame — `Clear` first, so nothing behind it shows through, then a
+/// bordered `Block` with `title` — and returns the inset `Rect` inside the
+/// border where the caller's own content goes. The shared shell behind
+/// every full-screen modal this crate draws (the environment overlay and
+/// its variable editor, the delete and close confirmations, and the
+/// open-collection prompt), which differ only in their percentage, title,
+/// and what they draw inside.
+fn modal_frame(
+    frame: &mut Frame,
+    percent_x: u16,
+    percent_y: u16,
+    title: impl Into<String>,
+) -> Rect {
+    let area = centered_rect(percent_x, percent_y, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default().borders(Borders::ALL).title(title.into()),
+        area,
+    );
+    inset(area)
+}
+
 fn render_environment_overlay(frame: &mut Frame, state: &AppState, cursor: usize) {
     // An in-progress variable edit takes over the whole overlay, the same
     // way `render_detail_pane` lets edit mode take over the whole detail
@@ -1686,16 +1709,12 @@ fn render_environment_overlay(frame: &mut Frame, state: &AppState, cursor: usize
         return;
     }
 
-    let area = centered_rect(70, 70, frame.area());
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Select environment — Enter to confirm, i to edit, Esc to cancel"),
-        area,
+    let inner = modal_frame(
+        frame,
+        70,
+        70,
+        "Select environment — Enter to confirm, i to edit, Esc to cancel",
     );
-
-    let inner = inset(area);
 
     // Environments that were found in `.sendra/environments/` but failed to
     // load (see `AppState::environment_errors`'s own doc comment) get a
@@ -1797,17 +1816,15 @@ fn render_environment_edit(frame: &mut Frame, state: &AppState, env_edit: &Envir
         .map(|named| named.name.as_str())
         .unwrap_or("?");
 
-    let area = centered_rect(70, 70, frame.area());
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Block::default().borders(Borders::ALL).title(format!(
+    let inner = modal_frame(
+        frame,
+        70,
+        70,
+        format!(
             "Edit variables for '{name}' — tab switch field, ctrl+n add, ctrl+d delete, \
              ctrl+s save, esc cancel"
-        )),
-        area,
+        ),
     );
-
-    let inner = inset(area);
 
     let mut lines = Vec::new();
     if env_edit.rows.is_empty() {
@@ -1851,13 +1868,11 @@ fn render_environment_edit(frame: &mut Frame, state: &AppState, env_edit: &Envir
 /// through the same [`format_error`] every other error in the crate goes
 /// through, when a previous confirm attempt failed to write to disk.
 fn render_delete_confirm_overlay(frame: &mut Frame, state: &AppState, confirm: &DeleteConfirm) {
-    let area = centered_rect(60, 30, frame.area());
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Delete request — y/Enter confirm, n/Esc cancel"),
-        area,
+    let inner = modal_frame(
+        frame,
+        60,
+        30,
+        "Delete request — y/Enter confirm, n/Esc cancel",
     );
 
     let name = match &state.load_state {
@@ -1877,7 +1892,7 @@ fn render_delete_confirm_overlay(frame: &mut Frame, state: &AppState, confirm: &
         text.push_str("\n\n");
         text.push_str(&format_error("Failed to delete", error));
     }
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inset(area));
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
 /// The "open another collection" path-input prompt — a minimal, single-field
@@ -1886,13 +1901,11 @@ fn render_delete_confirm_overlay(frame: &mut Frame, state: &AppState, confirm: &
 /// failed) the real error inline, through the same `format_error` every
 /// other error in the crate goes through.
 fn render_open_collection_prompt(frame: &mut Frame, prompt: &OpenCollectionPromptState) {
-    let area = centered_rect(70, 30, frame.area());
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Open collection — Enter to confirm, Esc to cancel"),
-        area,
+    let inner = modal_frame(
+        frame,
+        70,
+        30,
+        "Open collection — Enter to confirm, Esc to cancel",
     );
 
     let mut text = format!("Path: {}", prompt.path.value());
@@ -1900,7 +1913,7 @@ fn render_open_collection_prompt(frame: &mut Frame, prompt: &OpenCollectionPromp
         text.push_str("\n\n");
         text.push_str(&format_error("Failed to open", error));
     }
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inset(area));
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
 /// The close-tab confirmation — shown only when
@@ -1909,13 +1922,11 @@ fn render_open_collection_prompt(frame: &mut Frame, prompt: &OpenCollectionPromp
 /// no prompt at all, so reaching this screen already means real, unsaved
 /// state would be lost.
 fn render_close_confirm_overlay(frame: &mut Frame, state: &AppState, collection_id: u64) {
-    let area = centered_rect(60, 30, frame.area());
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Close collection — y/Enter confirm, n/Esc cancel"),
-        area,
+    let inner = modal_frame(
+        frame,
+        60,
+        30,
+        "Close collection — y/Enter confirm, n/Esc cancel",
     );
 
     let label = state
@@ -1925,7 +1936,7 @@ fn render_close_confirm_overlay(frame: &mut Frame, state: &AppState, collection_
         .map(collection_label)
         .unwrap_or_else(|| "this collection".to_string());
     let text = format!("Close '{label}'? Unsaved changes will be lost.");
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inset(area));
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
 }
 
 #[cfg(test)]
