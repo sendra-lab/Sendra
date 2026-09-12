@@ -1073,6 +1073,24 @@ pub(super) fn non_empty(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
+/// Cycles `value` forward through the fixed, closed set `all` (wrapping past
+/// the last entry back to the first) — the shared shell behind
+/// `JsonOperator::next`/`CaptureKind::next`, which differ only in which
+/// closed set they cycle through. `value` not found in `all` at all (never
+/// happens in practice — every caller passes its own variant) falls back to
+/// index 0, the same permissive default the pre-extraction code already had.
+fn cycle_next<T: Copy + PartialEq>(value: T, all: &[T]) -> T {
+    let index = all.iter().position(|item| *item == value).unwrap_or(0);
+    all[(index + 1) % all.len()]
+}
+
+/// The exact reverse of [`cycle_next`] — the shared shell behind
+/// `JsonOperator::prev`/`CaptureKind::prev`.
+fn cycle_prev<T: Copy + PartialEq>(value: T, all: &[T]) -> T {
+    let index = all.iter().position(|item| *item == value).unwrap_or(0);
+    all[(index + all.len() - 1) % all.len()]
+}
+
 /// Which operator a `json:` path assertion compares with — the fixed, closed
 /// set sendra-core's own (private) `JsonSpec::parse` recognises as a
 /// single-key operator object, plus bare equality. A real, closed
@@ -1109,13 +1127,11 @@ impl JsonOperator {
     /// and [`Self::prev`] for `Left` — an ordinary forward/backward cycle
     /// through [`Self::ALL`], wrapping at either end.
     pub(super) fn next(self) -> Self {
-        let index = Self::ALL.iter().position(|op| *op == self).unwrap_or(0);
-        Self::ALL[(index + 1) % Self::ALL.len()]
+        cycle_next(self, &Self::ALL)
     }
 
     pub(super) fn prev(self) -> Self {
-        let index = Self::ALL.iter().position(|op| *op == self).unwrap_or(0);
-        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+        cycle_prev(self, &Self::ALL)
     }
 
     /// The one-key operator name sendra-core's real YAML schema uses
@@ -1317,13 +1333,11 @@ impl CaptureKind {
     /// through [`Self::ALL`], wrapping at either end, the same shape
     /// `JsonOperator::next` already has.
     pub(super) fn next(self) -> Self {
-        let index = Self::ALL.iter().position(|kind| *kind == self).unwrap_or(0);
-        Self::ALL[(index + 1) % Self::ALL.len()]
+        cycle_next(self, &Self::ALL)
     }
 
     pub(super) fn prev(self) -> Self {
-        let index = Self::ALL.iter().position(|kind| *kind == self).unwrap_or(0);
-        Self::ALL[(index + Self::ALL.len() - 1) % Self::ALL.len()]
+        cycle_prev(self, &Self::ALL)
     }
 
     /// The label shown in the edit pane — `"json path"`, `"header"` or
@@ -1477,6 +1491,42 @@ pub struct EditState {
     pub save_error: Option<String>,
 }
 
+/// Appends `T::default()` onto `rows` and returns the `EditField` that
+/// should receive focus afterward (`first_field` applied to the new row's
+/// index) — the shared shell behind `EditState::add_header_row`/
+/// `add_assertion_row`/`add_capture_row`, which differ only in which `Vec`
+/// and which `EditField` variant wraps a row index.
+fn add_row<T: Default>(
+    rows: &mut Vec<T>,
+    first_field: impl FnOnce(usize) -> EditField,
+) -> EditField {
+    rows.push(T::default());
+    first_field(rows.len() - 1)
+}
+
+/// Removes `rows[index]` and returns the `EditField` that should receive
+/// focus afterward: the row now at the same position (clamped, via
+/// `first_field`), or `fallback()` if that was the last row — the shared
+/// shell behind `EditState::delete_focused_header_row`/
+/// `delete_focused_assertion_row`/`delete_focused_capture_row`, which differ
+/// only in which `Vec`, which `EditField` variant wraps a row index, and
+/// what precedes the section once it empties out. Callers are responsible
+/// for first checking that `focus` actually names a row in `rows` at all —
+/// see each caller's own exhaustive match on `EditField`.
+fn delete_row<T>(
+    rows: &mut Vec<T>,
+    index: usize,
+    first_field: impl FnOnce(usize) -> EditField,
+    fallback: impl FnOnce() -> EditField,
+) -> EditField {
+    rows.remove(index);
+    if rows.is_empty() {
+        fallback()
+    } else {
+        first_field(index.saturating_sub(1).min(rows.len() - 1))
+    }
+}
+
 impl EditState {
     /// Visible to `super::update`'s `Message::EnterEditMode` arm, which is
     /// the only place outside this module allowed to start an edit.
@@ -1573,8 +1623,7 @@ impl EditState {
     /// to its key field — visible to `super::update`'s `Message::AddHeaderRow`
     /// arm.
     pub(super) fn add_header_row(&mut self) {
-        self.headers.push(HeaderRow::default());
-        self.focus = EditField::HeaderKey(self.headers.len() - 1);
+        self.focus = add_row(&mut self.headers, EditField::HeaderKey);
     }
 
     /// Removes whichever header row `focus` currently points at — a no-op
@@ -1599,20 +1648,17 @@ impl EditState {
             | EditField::CaptureKind(_)
             | EditField::CaptureValue(_) => return,
         };
-        self.headers.remove(index);
-        self.focus = if self.headers.is_empty() {
+        self.focus = delete_row(&mut self.headers, index, EditField::HeaderKey, || {
             EditField::Url
-        } else {
-            EditField::HeaderKey(index.saturating_sub(1).min(self.headers.len() - 1))
-        };
+        });
     }
 
     /// Appends a new, empty assertion row at the end and moves focus
     /// straight to its path field — visible to `super::update`'s
-    /// `Message::AddAssertionRow` arm. Mirrors `add_header_row` exactly.
+    /// `Message::AddAssertionRow` arm. Shares [`add_row`] with
+    /// `add_header_row`/`add_capture_row`.
     pub(super) fn add_assertion_row(&mut self) {
-        self.assertions.push(AssertionRow::default());
-        self.focus = EditField::AssertionPath(self.assertions.len() - 1);
+        self.focus = add_row(&mut self.assertions, EditField::AssertionPath);
     }
 
     /// Removes whichever assertion row `focus` currently points at — a
@@ -1620,8 +1666,9 @@ impl EditState {
     /// never dangles on a removed row: it moves to the previous row's path
     /// (or, if the deleted row was the first one, the new first row's
     /// path), or to whatever field would ordinarily precede the assertions
-    /// section if none remain (see `EditField::before_assertions`). Mirrors
-    /// `delete_focused_header_row` exactly. Visible to `super::update`'s
+    /// section if none remain (see `EditField::before_assertions`). Shares
+    /// [`delete_row`] with `delete_focused_header_row`/
+    /// `delete_focused_capture_row`. Visible to `super::update`'s
     /// `Message::DeleteAssertionRow` arm.
     pub(super) fn delete_focused_assertion_row(&mut self) {
         let index = match self.focus {
@@ -1640,24 +1687,23 @@ impl EditState {
             | EditField::CaptureKind(_)
             | EditField::CaptureValue(_) => return,
         };
-        self.assertions.remove(index);
-        self.focus = if self.assertions.is_empty() {
-            EditField::before_assertions(
-                self.headers.len(),
-                self.has_editable_body(),
-                self.auth_field_order(),
-            )
-        } else {
-            EditField::AssertionPath(index.saturating_sub(1).min(self.assertions.len() - 1))
-        };
+        let headers_len = self.headers.len();
+        let has_editable_body = self.has_editable_body();
+        let auth_field_order = self.auth_field_order();
+        self.focus = delete_row(
+            &mut self.assertions,
+            index,
+            EditField::AssertionPath,
+            || EditField::before_assertions(headers_len, has_editable_body, auth_field_order),
+        );
     }
 
     /// Appends a new, empty capture row at the end and moves focus straight
     /// to its name field — visible to `super::update`'s
-    /// `Message::AddCaptureRow` arm. Mirrors `add_assertion_row` exactly.
+    /// `Message::AddCaptureRow` arm. Shares [`add_row`] with
+    /// `add_header_row`/`add_assertion_row`.
     pub(super) fn add_capture_row(&mut self) {
-        self.captures.push(CaptureRow::default());
-        self.focus = EditField::CaptureName(self.captures.len() - 1);
+        self.focus = add_row(&mut self.captures, EditField::CaptureName);
     }
 
     /// Removes whichever capture row `focus` currently points at — a no-op
@@ -1665,9 +1711,9 @@ impl EditState {
     /// dangles on a removed row: it moves to the previous row's name (or, if
     /// the deleted row was the first one, the new first row's name), or to
     /// whatever field would ordinarily precede the captures section if none
-    /// remain (see `EditField::before_captures`). Mirrors
-    /// `delete_focused_assertion_row` exactly. Visible to `super::update`'s
-    /// `Message::DeleteCaptureRow` arm.
+    /// remain (see `EditField::before_captures`). Shares [`delete_row`] with
+    /// `delete_focused_header_row`/`delete_focused_assertion_row`. Visible
+    /// to `super::update`'s `Message::DeleteCaptureRow` arm.
     pub(super) fn delete_focused_capture_row(&mut self) {
         let index = match self.focus {
             EditField::CaptureName(index)
@@ -1685,17 +1731,18 @@ impl EditState {
             | EditField::AssertionValue(_)
             | EditField::AssertionNegate(_) => return,
         };
-        self.captures.remove(index);
-        self.focus = if self.captures.is_empty() {
+        let headers_len = self.headers.len();
+        let has_editable_body = self.has_editable_body();
+        let auth_field_order = self.auth_field_order();
+        let assertion_row_count = self.assertion_row_count();
+        self.focus = delete_row(&mut self.captures, index, EditField::CaptureName, || {
             EditField::before_captures(
-                self.headers.len(),
-                self.has_editable_body(),
-                self.auth_field_order(),
-                self.assertion_row_count(),
+                headers_len,
+                has_editable_body,
+                auth_field_order,
+                assertion_row_count,
             )
-        } else {
-            EditField::CaptureName(index.saturating_sub(1).min(self.captures.len() - 1))
-        };
+        });
     }
 
     /// Whether `body` currently has a real text field to focus at all — what
