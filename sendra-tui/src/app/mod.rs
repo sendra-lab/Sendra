@@ -141,13 +141,12 @@ requests:
     }
 
     pub(crate) fn state_with_environments(names: &[&str]) -> AppState {
-        AppState {
-            environments: names
-                .iter()
-                .map(|name| named_environment(name, &[]))
-                .collect(),
-            ..AppState::default()
-        }
+        let mut state = AppState::default();
+        state.environments = names
+            .iter()
+            .map(|name| named_environment(name, &[]))
+            .collect();
+        state
     }
 
     pub(crate) fn selected(state: &AppState) -> usize {

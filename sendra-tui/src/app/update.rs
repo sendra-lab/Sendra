@@ -1,7 +1,7 @@
 //! The reducer half of sendra-tui's Elm-style architecture: `update()`
-//! itself, and the private helpers it alone calls. Every `AppState`
+//! itself, and the private helpers it alone calls. Every `CollectionSession`
 //! mutation in the whole crate happens through this one function — see its
-//! own doc comment and `super::state::AppState::edit_mode`'s for why that
+//! own doc comment and `super::state::CollectionSession::edit_mode`'s for why that
 //! invariant matters.
 
 use std::collections::{BTreeMap, HashSet};
@@ -10,8 +10,8 @@ use sendra_core::{Collection, Document, Request};
 
 use super::state::{
     non_empty, validate_assertion_value_text, validate_method_text, AppState, BodyEdit,
-    DeleteConfirm, EditField, EditState, EnvironmentEditState, HeaderRow, LoadState, Message,
-    PendingNewRequest, RunState, TextField,
+    CollectionSession, DeleteConfirm, EditField, EditState, EnvironmentEditState, HeaderRow,
+    LoadState, Message, PendingNewRequest, RunState, TextField,
 };
 
 /// Moves `selected` by `delta` (`1` or `-1`) through `len` items, wrapping at
@@ -26,7 +26,226 @@ fn move_selection(selected: usize, len: usize, delta: isize) -> usize {
     next as usize
 }
 
+/// The real entry point — every message passes through here first.
+///
+/// Messages that are genuinely about the *process* (quitting, the shared
+/// spinner clock, opening/switching/closing tabs, and routing a finished run
+/// back to whichever collection it actually belongs to — see
+/// `Message::RunCompleted`'s own doc comment) are handled directly against
+/// `AppState::collections`/`active_collection` right here. Everything else —
+/// the vast majority of messages, covering selection, running, editing a
+/// request, the environment overlay, and every confirmation — is exactly the
+/// single-collection logic this crate had before multi-collection support,
+/// moved into `update_session` verbatim and handed the *active* session
+/// (`AppState::active_mut`) to operate on. That split is the whole of how
+/// tab isolation is enforced: a session-scoped message can only ever reach
+/// `update_session` with the one `&mut CollectionSession` it's allowed to
+/// touch, never `AppState` itself, so there is no field access anywhere in
+/// that (large, unchanged) body of code that could reach a different tab by
+/// accident.
+///
+/// Two modal, process-wide states — the open-collection prompt and a
+/// pending tab-close confirmation — block every session-scoped message the
+/// same way a session's own modals (edit mode, delete confirmation, ...)
+/// already block browsing *within* that session: this is that same rule one
+/// level up. `Quit`/`Tick` still get through regardless, for the same reason
+/// they always do everywhere else in this crate.
 pub fn update(state: &mut AppState, msg: Message) {
+    match msg {
+        Message::Quit => {
+            state.should_quit = true;
+            return;
+        }
+        Message::Tick => {
+            state.spinner_tick = state.spinner_tick.wrapping_add(1);
+            return;
+        }
+        Message::OpenCollectionPrompt => {
+            if state.open_collection_prompt.is_none()
+                && state.close_confirm.is_none()
+                && state.edit_mode.is_none()
+                && state.environment_overlay.is_none()
+                && state.delete_confirm.is_none()
+                && !matches!(state.run_state, RunState::InFlight)
+            {
+                state.open_collection_prompt =
+                    Some(super::state::OpenCollectionPromptState::default());
+            }
+            return;
+        }
+        // `main::run`'s loop always intercepts this and replaces it with a
+        // real `Message::CollectionOpened` before `update()` ever sees it —
+        // see this variant's own doc comment. Reachable here only from a
+        // test (or any other caller) that constructs it directly, where a
+        // no-op is the correct, safe behavior: there is no path typed yet to
+        // act on without `main::run`'s own I/O.
+        Message::ConfirmOpenCollectionPath => return,
+        Message::CancelOpenCollectionPrompt => {
+            state.open_collection_prompt = None;
+            return;
+        }
+        Message::CollectionOpened {
+            base_dir,
+            path,
+            result,
+            environments,
+            environment_errors,
+        } => {
+            match *result {
+                Ok(document) => {
+                    state.open_session(CollectionSession {
+                        load_state: LoadState::Loaded {
+                            document: Box::new(document),
+                            selected: 0,
+                            base_dir,
+                            path,
+                        },
+                        environments,
+                        environment_errors,
+                        ..CollectionSession::default()
+                    });
+                    state.open_collection_prompt = None;
+                }
+                Err(error) => {
+                    if let Some(prompt) = &mut state.open_collection_prompt {
+                        prompt.error = Some(error.to_string());
+                    }
+                }
+            }
+            return;
+        }
+        Message::NextCollection => {
+            if state.close_confirm.is_none() && state.open_collection_prompt.is_none() {
+                state.active_collection = (state.active_collection + 1) % state.collections.len();
+            }
+            return;
+        }
+        Message::PreviousCollection => {
+            if state.close_confirm.is_none() && state.open_collection_prompt.is_none() {
+                state.active_collection = (state.active_collection + state.collections.len() - 1)
+                    % state.collections.len();
+            }
+            return;
+        }
+        Message::CloseCollectionRequested => {
+            // Deliberately does *not* also require `edit_mode`/
+            // `environment_overlay`/`delete_confirm` to be `None` the way
+            // `EnterEnvironmentEdit`'s own guard does: closing a tab that is
+            // mid-edit (or has some other per-session modal open) is exactly
+            // the case `CollectionSession::is_dirty()` exists to catch and
+            // route through a confirmation, not a case to refuse outright —
+            // blocking on those here would make that branch of `is_dirty()`
+            // unreachable.
+            if state.close_confirm.is_none() && state.open_collection_prompt.is_none() {
+                if state.active().is_dirty() {
+                    state.close_confirm = Some(state.active().id);
+                } else {
+                    close_active_session(state);
+                }
+            }
+            return;
+        }
+        Message::ConfirmCloseCollection => {
+            if state.close_confirm.take().is_some() {
+                close_active_session(state);
+            }
+            return;
+        }
+        Message::CancelCloseCollection => {
+            state.close_confirm = None;
+            return;
+        }
+        Message::RunCompleted {
+            collection_id,
+            outcome,
+        } => {
+            if let Some(session) = state.session_by_id_mut(collection_id) {
+                session.run_state = RunState::Completed(outcome);
+            }
+            return;
+        }
+        _ => {}
+    }
+
+    // The generic text-field messages (also shared by `edit_mode`/
+    // `environment_edit` — see `env_var_mutate`'s own doc comment for that
+    // precedent) route to the open-collection prompt's own path field while
+    // it is open, rather than being blocked outright by the "every
+    // session-scoped message is refused" check below: this *is* how the
+    // prompt itself gets typed into. Any edit clears a stale error from a
+    // previous failed attempt, the same "typing again means this attempt is
+    // new" rule `EditState::body_error`'s own clearing already follows.
+    if let Some(prompt) = &mut state.open_collection_prompt {
+        match msg {
+            Message::EditInsertChar(ch) => {
+                prompt.path.insert_char(ch);
+                prompt.error = None;
+                return;
+            }
+            Message::EditBackspace => {
+                prompt.path.backspace();
+                prompt.error = None;
+                return;
+            }
+            Message::EditDelete => {
+                prompt.path.delete();
+                prompt.error = None;
+                return;
+            }
+            Message::EditCursorLeft => {
+                prompt.path.move_left();
+                return;
+            }
+            Message::EditCursorRight => {
+                prompt.path.move_right();
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // Every other message is scoped to whichever collection is on screen —
+    // refused here, exactly like a session's own modals refuse browsing
+    // messages, while either of the two process-wide modals above is open.
+    if state.open_collection_prompt.is_some() || state.close_confirm.is_some() {
+        return;
+    }
+    update_session(state.active_mut(), msg);
+}
+
+/// Closes the active session: removed from `collections` entirely when it
+/// is not the last one open (with `active_collection` clamped back into
+/// range — the tab that slides into the closed one's index, or the new last
+/// tab if the last one was closed); reset in place, never removed, when it
+/// is the only tab left (see `AppState::collections`'s own doc comment on
+/// why that Vec must never become empty).
+fn close_active_session(state: &mut AppState) {
+    if state.collections.len() > 1 {
+        state.collections.remove(state.active_collection);
+        if state.active_collection >= state.collections.len() {
+            state.active_collection = state.collections.len() - 1;
+        }
+    } else {
+        let id = state.collections[0].id;
+        state.collections[0] = CollectionSession {
+            id,
+            load_state: LoadState::NoPathProvided,
+            ..CollectionSession::default()
+        };
+    }
+}
+
+/// The single-collection reducer this crate had before multi-collection
+/// support — unchanged in every way that matters (same guards, same
+/// messages, same behavior) except that it now takes the one
+/// `&mut CollectionSession` it is allowed to touch directly, rather than
+/// `&mut AppState`, so every field access here is exactly the disjoint,
+/// ordinary struct field access it always was — never a `Deref`/`DerefMut`
+/// indirection through `AppState` (see that type's own doc comment for why
+/// that distinction matters for more than style: the borrow checker treats
+/// `Deref`/`DerefMut` field access as opaque, disallowing exactly the kind
+/// of disjoint-field borrow this function's own guards rely on throughout).
+fn update_session(state: &mut CollectionSession, msg: Message) {
     // While a run is in flight, every navigation/overlay/run message is
     // refused outright — the simplest correct behavior, and the one that
     // avoids the concurrent-state edge cases a second in-flight run, or a
@@ -56,7 +275,7 @@ pub fn update(state: &mut AppState, msg: Message) {
     // messages are refused the same way the InFlight guard above refuses
     // them — edit mode is exclusive with every other mode, not a state
     // layered on top of ordinary browsing (see the doc comment on
-    // `AppState::edit_mode`). `SaveEdit`/`CancelEdit` are exempt: they are
+    // `CollectionSession::edit_mode`). `SaveEdit`/`CancelEdit` are exempt: they are
     // exactly the messages that end this state, the same reason
     // `RunCompleted` is exempt from the InFlight guard. `Quit`/`Tick` keep
     // working for the same reason they always do.
@@ -125,8 +344,6 @@ pub fn update(state: &mut AppState, msg: Message) {
     }
 
     match msg {
-        Message::Quit => state.should_quit = true,
-        Message::Tick => state.spinner_tick = state.spinner_tick.wrapping_add(1),
         Message::NoCollectionPath => state.load_state = LoadState::NoPathProvided,
         Message::CollectionLoaded {
             base_dir,
@@ -182,9 +399,6 @@ pub fn update(state: &mut AppState, msg: Message) {
                 state.response_scroll = 0;
                 state.reveal_captures = false;
             }
-        }
-        Message::RunCompleted(outcome) => {
-            state.run_state = RunState::Completed(outcome);
         }
         Message::ScrollResponseDown => {
             state.response_scroll = state.response_scroll.saturating_add(SCROLL_STEP_LINES);
@@ -242,7 +456,7 @@ pub fn update(state: &mut AppState, msg: Message) {
             // above only refuses messages while edit mode is *already*
             // active, so entering it needs its own check against the
             // overlay and InFlight — the two states edit mode is exclusive
-            // with (see `AppState::edit_mode`'s doc comment).
+            // with (see `CollectionSession::edit_mode`'s doc comment).
             // `selected_request` both confirms there is something
             // to act on (the same check `RunRequested` uses) and hands over
             // the real `method`/`url` `EditState::new` seeds the working
@@ -581,7 +795,7 @@ pub fn update(state: &mut AppState, msg: Message) {
         }
         Message::CancelEnvironmentEdit => {
             // Dropping `environment_edit` is the entire mechanism: nothing
-            // real is ever written into `AppState::environments` before
+            // real is ever written into `CollectionSession::environments` before
             // `SaveEnvironmentEdit` actually runs, so there is nothing else
             // to undo — the same "nothing happened" guarantee `CancelEdit`
             // already has for a pre-existing request's edit.
@@ -622,7 +836,7 @@ pub fn update(state: &mut AppState, msg: Message) {
                 state.environment_edit = None;
                 return;
             };
-            // Every environment `AppState::environments` ever holds came
+            // Every environment `CollectionSession::environments` ever holds came
             // from `main::load_environments` actually finding a real file on
             // disk (see that function's own doc comment) — there is no path
             // through the TUI that puts a sourceless `Environment` in this
@@ -681,6 +895,27 @@ pub fn update(state: &mut AppState, msg: Message) {
         // already-resized backend on the loop's next iteration; there is no
         // state here for a resize to change.
         Message::Resize => {}
+        // Every process-wide message — quitting, the shared spinner clock,
+        // opening/switching/closing tabs, and routing a finished run back by
+        // collection id — is handled by `update()` itself, which `return`s
+        // before ever calling this function for one of them (see `update`'s
+        // own doc comment). This function still has to be exhaustive over
+        // the whole `Message` enum, so this one arm covers everything that
+        // structurally cannot reach here in real operation; a test that
+        // calls `update_session` directly with one of these (rather than
+        // going through `update`) gets a safe no-op instead of a panic.
+        Message::Quit
+        | Message::Tick
+        | Message::OpenCollectionPrompt
+        | Message::ConfirmOpenCollectionPath
+        | Message::CancelOpenCollectionPrompt
+        | Message::CollectionOpened { .. }
+        | Message::NextCollection
+        | Message::PreviousCollection
+        | Message::CloseCollectionRequested
+        | Message::ConfirmCloseCollection
+        | Message::CancelCloseCollection
+        | Message::RunCompleted { .. } => {}
     }
 }
 
@@ -721,7 +956,7 @@ const SCROLL_STEP_LINES: usize = 10;
 /// exactly when `load_state` is `Loaded` and `selected` indexes a real
 /// request, which is always the case for a non-empty collection but not for
 /// an empty one.
-fn request_is_selected(state: &AppState) -> bool {
+fn request_is_selected(state: &CollectionSession) -> bool {
     matches!(
         &state.load_state,
         LoadState::Loaded { document, selected, .. } if document.requests().get(*selected).is_some()
@@ -732,7 +967,7 @@ fn request_is_selected(state: &AppState) -> bool {
 /// condition `request_is_selected` checks, but handing back the `&Request`
 /// `Message::EnterEditMode` needs to seed `EditState::new` from, instead of
 /// just the bool.
-fn selected_request(state: &AppState) -> Option<&Request> {
+fn selected_request(state: &CollectionSession) -> Option<&Request> {
     match &state.load_state {
         LoadState::Loaded {
             document, selected, ..
@@ -1033,7 +1268,7 @@ fn apply_body_edit(request: &mut Request, body: &BodyEdit) {
 /// when focus is on a fixed-enum auth sub-field (`api_key.in`/
 /// `oauth.grant_type`), which has no `TextField` for `focused_field_mut` to
 /// hand back at all; typing/backspacing/deleting has nothing to do there.
-fn edit_mutate(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
+fn edit_mutate(state: &mut CollectionSession, mutate: impl FnOnce(&mut TextField)) {
     let Some(edit) = &mut state.edit_mode else {
         return;
     };
@@ -1075,7 +1310,7 @@ fn edit_mutate(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
 /// edit (marks `dirty`/`dirty_requests`) but isn't a `TextField` operation.
 /// Unlike `edit_mutate`, this never touches `method_error`: neither
 /// operation can change what `method` says.
-fn edit_state_mutate(state: &mut AppState, mutate: impl FnOnce(&mut EditState)) {
+fn edit_state_mutate(state: &mut CollectionSession, mutate: impl FnOnce(&mut EditState)) {
     let Some(edit) = &mut state.edit_mode else {
         return;
     };
@@ -1092,7 +1327,7 @@ fn edit_state_mutate(state: &mut AppState, mutate: impl FnOnce(&mut EditState)) 
 /// auth sub-field, the same as `edit_mutate` — see `edit_move_or_toggle`,
 /// which is what `Left`/`Right` actually call instead of this, for the field
 /// where that would otherwise leave the key doing nothing at all.
-fn edit_move(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
+fn edit_move(state: &mut CollectionSession, mutate: impl FnOnce(&mut TextField)) {
     if let Some(edit) = &mut state.edit_mode {
         if let Some(field) = edit.focused_field_mut() {
             mutate(field);
@@ -1114,7 +1349,11 @@ fn edit_move(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
 /// really is an edit — it changes what gets saved — so this marks `dirty`/
 /// `dirty_requests` exactly the way `edit_mutate` does, not the way
 /// `edit_move` deliberately doesn't.
-fn edit_move_or_toggle(state: &mut AppState, forward: bool, mutate: impl FnOnce(&mut TextField)) {
+fn edit_move_or_toggle(
+    state: &mut CollectionSession,
+    forward: bool,
+    mutate: impl FnOnce(&mut TextField),
+) {
     let Some(edit) = &mut state.edit_mode else {
         return;
     };
@@ -1130,13 +1369,13 @@ fn edit_move_or_toggle(state: &mut AppState, forward: bool, mutate: impl FnOnce(
     }
 }
 
-/// Applies `mutate` to whichever field `AppState::environment_edit`'s own
+/// Applies `mutate` to whichever field `CollectionSession::environment_edit`'s own
 /// `EnvironmentEditState::focus` currently points at — the same role
 /// `edit_mutate` plays for a request's own fields, but for an
 /// environment-variable edit session. A no-op when that session is not
 /// active, or nothing is focused (an empty `rows` — the zero-variables
 /// case), so every dispatch arm above can call this unconditionally.
-fn env_var_mutate(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
+fn env_var_mutate(state: &mut CollectionSession, mutate: impl FnOnce(&mut TextField)) {
     let Some(env_edit) = &mut state.environment_edit else {
         return;
     };
@@ -1153,7 +1392,7 @@ fn env_var_mutate(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
 /// environment-variable row is a plain name/value pair with a real
 /// `TextField` on both sides, so `Left`/`Right` are always ordinary cursor
 /// movement.
-fn env_var_move(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
+fn env_var_move(state: &mut CollectionSession, mutate: impl FnOnce(&mut TextField)) {
     if let Some(env_edit) = &mut state.environment_edit {
         if let Some(field) = env_edit.focused_field_mut() {
             mutate(field);
@@ -1164,7 +1403,7 @@ fn env_var_move(state: &mut AppState, mutate: impl FnOnce(&mut TextField)) {
 /// Routes `SelectNext`/`SelectPrevious` to the overlay's cursor when it is
 /// open, otherwise to the collection browser's selection — see the doc
 /// comment on those `Message` variants for why one pair serves both lists.
-fn select(state: &mut AppState, delta: isize) {
+fn select(state: &mut CollectionSession, delta: isize) {
     if let Some(cursor) = &mut state.environment_overlay {
         *cursor = move_selection(*cursor, state.environments.len(), delta);
         return;
@@ -1238,12 +1477,12 @@ mod tests {
             },
         );
 
-        match state.load_state {
+        match &state.load_state {
             LoadState::Loaded {
                 document, selected, ..
             } => {
                 assert_eq!(document.requests().len(), 2);
-                assert_eq!(selected, 0);
+                assert_eq!(*selected, 0);
             }
             other => panic!("expected LoadState::Loaded, got {other:?}"),
         }
@@ -1420,14 +1659,12 @@ mod tests {
         std::fs::write(&path, yaml).unwrap();
 
         let environment = Environment::from_path(&path).expect("the fixture file must parse");
-        let state = AppState {
-            environments: vec![NamedEnvironment {
-                name: name.to_string(),
-                environment,
-            }],
-            environment_overlay: Some(0),
-            ..AppState::default()
-        };
+        let mut state = AppState::default();
+        state.environments = vec![NamedEnvironment {
+            name: name.to_string(),
+            environment,
+        }];
+        state.environment_overlay = Some(0);
         // `dir` (the `TempDir` guard) is returned alongside `state`/`path`
         // rather than dropped here: dropping it deletes the whole directory
         // tree immediately, which would pull the file out from under every
@@ -1548,7 +1785,7 @@ mod tests {
         );
         assert!(!reloaded.variables.contains_key("to_delete"));
 
-        // The in-memory `AppState::environments` was updated too, not just
+        // The in-memory `CollectionSession::environments` was updated too, not just
         // the file — the resolved preview reads from here, live.
         assert_eq!(
             state.environments[0].environment.variables,
@@ -1734,9 +1971,16 @@ mod tests {
         let mut state = loaded_state(VALID_COLLECTION);
         update(&mut state, Message::RunRequested);
 
-        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: sample_outcome(200),
+            },
+        );
 
-        match state.run_state {
+        match &state.run_state {
             RunState::Completed(RunOutcome {
                 result: Ok(response),
                 ..
@@ -1753,7 +1997,14 @@ mod tests {
         update(&mut state, Message::RunRequested);
         let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
 
-        update(&mut state, Message::RunCompleted(failed_outcome(error)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: failed_outcome(error),
+            },
+        );
 
         assert!(matches!(
             state.run_state,
@@ -1796,7 +2047,14 @@ mod tests {
         let mut state = loaded_state(VALID_COLLECTION);
         update(&mut state, Message::RunRequested);
 
-        update(&mut state, Message::RunCompleted(sample_outcome(204)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: sample_outcome(204),
+            },
+        );
 
         assert!(
             matches!(
@@ -1812,7 +2070,14 @@ mod tests {
     fn navigation_works_again_once_a_run_has_completed() {
         let mut state = loaded_state(THREE_REQUEST_COLLECTION);
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: sample_outcome(200),
+            },
+        );
 
         update(&mut state, Message::SelectNext);
 
@@ -1959,7 +2224,7 @@ mod tests {
         );
         // Re-inspect the request the same way re-selecting it in the
         // collection browser would read it — proving the new values are
-        // really in `AppState`'s in-memory request, not only in the
+        // really in `CollectionSession`'s in-memory request, not only in the
         // now-discarded `EditState`.
         let request = match &state.load_state {
             LoadState::Loaded {
@@ -2481,11 +2746,11 @@ requests:
       username: ada
 ";
 
-    fn focus_body(state: &mut AppState) {
+    fn focus_body(state: &mut CollectionSession) {
         state.edit_mode.as_mut().unwrap().focus = EditField::Body;
     }
 
-    fn saved_request(state: &AppState) -> &Request {
+    fn saved_request(state: &CollectionSession) -> &Request {
         match &state.load_state {
             LoadState::Loaded {
                 document, selected, ..
@@ -2498,7 +2763,7 @@ requests:
     /// seeded body with exactly the right number of `Message::EditBackspace`s
     /// before typing a replacement, the same purpose `backspace_n` is always
     /// used for elsewhere in this file.
-    fn body_text_len(state: &AppState) -> usize {
+    fn body_text_len(state: &CollectionSession) -> usize {
         match &state.edit_mode.as_ref().unwrap().body {
             BodyEdit::Editable { text, .. } => text.value().len(),
             other => panic!("expected BodyEdit::Editable, got {other:?}"),
@@ -2789,7 +3054,14 @@ requests:
     fn selecting_a_different_request_resets_run_state_and_scroll() {
         let mut state = loaded_state(THREE_REQUEST_COLLECTION);
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: sample_outcome(200),
+            },
+        );
         update(&mut state, Message::ScrollResponseDown);
         assert!(matches!(
             state.run_state,
@@ -2821,7 +3093,14 @@ requests:
             std::mem::swap(document.as_mut(), &mut trimmed);
         }
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: sample_outcome(200),
+            },
+        );
 
         update(&mut state, Message::SelectNext);
 
@@ -2835,7 +3114,14 @@ requests:
     fn starting_a_new_run_resets_the_previous_scroll_position() {
         let mut state = loaded_state(VALID_COLLECTION);
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: sample_outcome(200),
+            },
+        );
         update(&mut state, Message::ScrollResponseDown);
         assert_eq!(state.response_scroll, SCROLL_STEP_LINES);
 
@@ -2866,10 +3152,8 @@ requests:
 
     #[test]
     fn scroll_top_jumps_straight_to_zero_from_anywhere() {
-        let mut state = AppState {
-            response_scroll: 5_000,
-            ..AppState::default()
-        };
+        let mut state = AppState::default();
+        state.response_scroll = 5_000;
 
         update(&mut state, Message::ScrollResponseTop);
 
@@ -2908,7 +3192,14 @@ requests:
         update(&mut state, Message::RunRequested);
         update(&mut state, Message::ToggleRevealCaptures);
         assert!(state.reveal_captures);
-        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: sample_outcome(200),
+            },
+        );
         assert!(
             state.reveal_captures,
             "revealing must survive until the run it was revealed for is replaced"
@@ -2928,7 +3219,14 @@ requests:
     fn reveal_captures_resets_when_the_selection_changes() {
         let mut state = loaded_state(THREE_REQUEST_COLLECTION);
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: sample_outcome(200),
+            },
+        );
         update(&mut state, Message::ToggleRevealCaptures);
         assert!(state.reveal_captures);
 
@@ -2998,7 +3296,14 @@ requests:
         let mut state = loaded_state(THREE_REQUEST_COLLECTION);
         update(&mut state, Message::RunRequested);
         let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
-        update(&mut state, Message::RunCompleted(failed_outcome(error)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: failed_outcome(error),
+            },
+        );
         assert!(matches!(
             state.run_state,
             RunState::Completed(RunOutcome { result: Err(_), .. })
@@ -4858,10 +5163,434 @@ requests:
     /// `Document` — what the tests above about `Document::Single`/
     /// `Document::Collection`'s own shape need, rather than one request out
     /// of it.
-    fn saved_document(state: &AppState) -> &Document {
+    fn saved_document(state: &CollectionSession) -> &Document {
         match &state.load_state {
             LoadState::Loaded { document, .. } => document,
             other => panic!("expected LoadState::Loaded, got {other:?}"),
         }
+    }
+
+    // --- Multi-collection ---------------------------------------------------
+
+    /// Opens a brand-new collection as a real tab — exactly the
+    /// `Message::CollectionOpened` shape `main::run`'s own loop builds after
+    /// intercepting `Message::ConfirmOpenCollectionPath` (see that variant's
+    /// own doc comment), parsed from `yaml` and written to a real file in its
+    /// own temp directory so `Message::SaveEdit` has somewhere genuine to
+    /// land for this tab too — the same "real disk, not just an in-memory
+    /// `Document`" bar every other save/delete/environment-edit test in this
+    /// module already holds itself to. Returns the id
+    /// `AppState::open_session` assigned it, the `TempDir` guard (kept alive
+    /// by the caller — see `state_with_saved_environment`'s own doc comment
+    /// on why dropping it early would be fatal), and the file's path.
+    fn open_second_collection(
+        state: &mut AppState,
+        yaml: &str,
+    ) -> (u64, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("second.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let document = Document::from_path(&path).expect("valid test YAML");
+        update(
+            state,
+            Message::CollectionOpened {
+                base_dir: dir.path().to_path_buf(),
+                path,
+                result: Box::new(Ok(document)),
+                environments: Vec::new(),
+                environment_errors: Vec::new(),
+            },
+        );
+        (state.active().id, dir, state_path(state))
+    }
+
+    /// The real, on-disk path of the currently active session — what
+    /// `open_second_collection` hands back so a test can later reload that
+    /// exact file with a fresh `Document::from_path`.
+    fn state_path(state: &AppState) -> PathBuf {
+        match &state.load_state {
+            LoadState::Loaded { path, .. } => path.clone(),
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opening_a_second_collection_appends_a_new_tab_and_switches_to_it() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        let first_id = state.active().id;
+
+        let (second_id, _dir, _path) = open_second_collection(&mut state, VALID_COLLECTION);
+
+        assert_eq!(state.collections.len(), 2);
+        assert_ne!(
+            first_id, second_id,
+            "every open collection must have its own, distinct id"
+        );
+        assert_eq!(
+            state.active_collection, 1,
+            "opening a collection switches straight to its new tab"
+        );
+        assert_eq!(saved_document(&state).requests().len(), 2);
+    }
+
+    #[test]
+    fn a_failed_open_leaves_the_prompt_open_with_the_error_and_no_new_tab() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenCollectionPrompt);
+        assert!(state.open_collection_prompt.is_some());
+
+        let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
+        update(
+            &mut state,
+            Message::CollectionOpened {
+                base_dir: PathBuf::from("."),
+                path: PathBuf::from("bad.yaml"),
+                result: Box::new(Err(error)),
+                environments: Vec::new(),
+                environment_errors: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            state.collections.len(),
+            1,
+            "a failed open must not create a new tab"
+        );
+        let prompt = state
+            .open_collection_prompt
+            .as_ref()
+            .expect("the prompt must stay open so the path can be fixed and retried");
+        assert!(prompt.error.is_some());
+    }
+
+    /// Proof requirement: two collections open at once, each with its own
+    /// selection, `run_state` and edit session — switching between them must
+    /// show exactly the state each one actually has, never the other's.
+    #[test]
+    fn each_tab_keeps_independent_selection_run_state_and_edit_mode_with_no_bleed_through() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION); // tab 0: "One"/"Two"/"Three"
+        update(&mut state, Message::SelectNext); // tab 0 selects "Two" (index 1)
+
+        let (_second_id, _dir, _path) = open_second_collection(&mut state, VALID_COLLECTION); // tab 1
+        assert_eq!(state.active_collection, 1);
+        assert_eq!(
+            selected(&state),
+            0,
+            "a freshly opened tab starts at index 0"
+        );
+
+        // Run to completion in tab 1 only.
+        update(&mut state, Message::RunRequested);
+        let tab1_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id: tab1_id,
+                outcome: sample_outcome(200),
+            },
+        );
+        assert!(matches!(state.run_state, RunState::Completed(_)));
+
+        // Start (but never finish) editing the selected request in tab 1.
+        update(&mut state, Message::EnterEditMode);
+        assert!(state.edit_mode.is_some());
+
+        // Switch back to tab 0: its own selection must be exactly where it
+        // was left, and neither the run nor the edit session from tab 1 must
+        // have leaked across.
+        update(&mut state, Message::PreviousCollection);
+        assert_eq!(state.active_collection, 0);
+        assert_eq!(
+            selected(&state),
+            1,
+            "tab 0's own selection must be untouched by anything done in tab 1"
+        );
+        assert!(
+            matches!(state.run_state, RunState::Idle),
+            "tab 0 never ran anything — its run_state must still be Idle, not tab 1's Completed"
+        );
+        assert!(
+            state.edit_mode.is_none(),
+            "tab 0 was never put into edit mode — tab 1's own edit session must not appear here"
+        );
+
+        // Switching back to tab 1 must show its own state exactly as it was
+        // left — the run result and the open edit session both still there.
+        update(&mut state, Message::NextCollection);
+        assert_eq!(state.active_collection, 1);
+        assert!(matches!(state.run_state, RunState::Completed(_)));
+        assert!(state.edit_mode.is_some());
+    }
+
+    /// Proof requirement: an unsaved edit in one tab must be completely
+    /// unaffected by actions — including a real save — taken in another,
+    /// verified against real bytes on disk for both files, not just
+    /// in-memory state.
+    #[test]
+    fn saving_in_one_tab_does_not_affect_an_unsaved_edit_in_another() {
+        let dir_a = tempfile::tempdir().expect("a temp dir for this test");
+        let path_a = dir_a.path().join("a.yaml");
+        std::fs::write(&path_a, "method: GET\nurl: https://example.com\n").unwrap();
+        let mut state = state_loaded_from(&path_a);
+
+        let (_id_b, _dir_b, path_b) = open_second_collection(
+            &mut state,
+            "name: test\nrequests:\n  - name: One\n    method: GET\n    url: https://example.com\n",
+        );
+        let original_b_bytes = std::fs::read(&path_b).unwrap();
+
+        // Start editing tab B (the active one) without ever saving it.
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Url;
+        backspace_n(&mut state, "https://example.com".len());
+        type_into_focused_field(&mut state, "https://example.com/unsaved-in-b");
+        assert!(state.dirty_requests.contains(&0));
+
+        // Switch to tab A and save a completely different edit there.
+        update(&mut state, Message::PreviousCollection);
+        assert_eq!(state.active_collection, 0);
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Url;
+        backspace_n(&mut state, "https://example.com".len());
+        type_into_focused_field(&mut state, "https://example.com/saved-in-a");
+        update(&mut state, Message::SaveEdit);
+        assert!(state.edit_mode.is_none(), "tab A's save must succeed");
+
+        // Tab A's save reached disk...
+        let reloaded_a = Document::from_path(&path_a).unwrap();
+        assert_eq!(
+            reloaded_a.requests()[0].url,
+            "https://example.com/saved-in-a"
+        );
+
+        // ...and tab B's file on disk, and its still-open, still-unsaved
+        // edit session in memory, are both completely untouched by it.
+        let bytes_b_after = std::fs::read(&path_b).unwrap();
+        assert_eq!(
+            original_b_bytes, bytes_b_after,
+            "saving in tab A must never touch tab B's file on disk"
+        );
+        update(&mut state, Message::NextCollection);
+        assert_eq!(state.active_collection, 1);
+        assert!(
+            state.edit_mode.is_some(),
+            "tab B's own in-progress edit must still be open"
+        );
+        assert_eq!(
+            state.edit_mode.as_ref().unwrap().url.value(),
+            "https://example.com/unsaved-in-b",
+            "tab B's unsaved edit must still hold exactly what was typed into it"
+        );
+        assert!(state.dirty_requests.contains(&0));
+    }
+
+    #[test]
+    fn next_and_previous_collection_wrap_and_are_exact_inverses() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        let (_id, _dir, _path) = open_second_collection(&mut state, VALID_COLLECTION);
+        assert_eq!(state.active_collection, 1);
+
+        update(&mut state, Message::NextCollection);
+        assert_eq!(
+            state.active_collection, 0,
+            "must wrap from the last tab to the first"
+        );
+
+        update(&mut state, Message::PreviousCollection);
+        assert_eq!(
+            state.active_collection, 1,
+            "must wrap back from the first to the last"
+        );
+    }
+
+    #[test]
+    fn closing_a_clean_tab_removes_it_immediately_with_no_confirmation() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        let (_id, _dir, _path) = open_second_collection(&mut state, VALID_COLLECTION);
+        assert_eq!(state.collections.len(), 2);
+
+        update(&mut state, Message::CloseCollectionRequested);
+
+        assert!(
+            state.close_confirm.is_none(),
+            "a clean tab must close without ever opening a confirmation"
+        );
+        assert_eq!(state.collections.len(), 1);
+        assert_eq!(
+            saved_document(&state).requests().len(),
+            3,
+            "the remaining tab must be the other collection, untouched"
+        );
+    }
+
+    #[test]
+    fn closing_a_dirty_tab_requires_confirmation_and_cancelling_keeps_it_open() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        let (dirty_id, _dir, _path) = open_second_collection(&mut state, VALID_COLLECTION);
+        update(&mut state, Message::EnterEditMode); // makes the active tab dirty
+
+        update(&mut state, Message::CloseCollectionRequested);
+        assert_eq!(
+            state.close_confirm,
+            Some(dirty_id),
+            "a tab with an open edit session must ask before closing"
+        );
+        assert_eq!(state.collections.len(), 2, "nothing has closed yet");
+
+        update(&mut state, Message::CancelCloseCollection);
+        assert!(state.close_confirm.is_none());
+        assert_eq!(state.collections.len(), 2);
+        assert!(
+            state.edit_mode.is_some(),
+            "cancelling the close must leave the edit session exactly as it was"
+        );
+    }
+
+    #[test]
+    fn confirming_a_dirty_tab_close_actually_removes_it() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        open_second_collection(&mut state, VALID_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+
+        update(&mut state, Message::CloseCollectionRequested);
+        update(&mut state, Message::ConfirmCloseCollection);
+
+        assert!(state.close_confirm.is_none());
+        assert_eq!(state.collections.len(), 1);
+        assert_eq!(saved_document(&state).requests().len(), 3);
+    }
+
+    /// The one-tab edge case: closing the *only* open collection must not
+    /// shrink `collections` to zero (see `AppState::collections`'s own doc
+    /// comment on why that must never happen) — it resets that tab back to
+    /// the same blank `NoPathProvided` state a process with no collection
+    /// path at all already starts in.
+    #[test]
+    fn closing_the_last_remaining_tab_resets_it_instead_of_removing_it() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        assert_eq!(state.collections.len(), 1);
+
+        update(&mut state, Message::CloseCollectionRequested);
+
+        assert_eq!(
+            state.collections.len(),
+            1,
+            "the Vec must never become empty"
+        );
+        assert!(matches!(state.load_state, LoadState::NoPathProvided));
+        assert_eq!(state.active_collection, 0);
+    }
+
+    /// Proof requirement: a run started in one tab must route its result
+    /// back to *that* tab specifically, even if the user has since switched
+    /// to (or is actively using) a different one — see
+    /// `Message::RunCompleted`'s own doc comment on why this is tagged by a
+    /// stable id rather than trusting `active_collection` to still name the
+    /// same tab.
+    #[test]
+    fn run_completed_reaches_its_own_tab_even_after_switching_away() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        let tab_a_id = state.active().id;
+        update(&mut state, Message::RunRequested);
+        assert!(matches!(state.run_state, RunState::InFlight));
+
+        // Switch away before the run finishes — allowed precisely because a
+        // run in one tab must never block browsing another.
+        open_second_collection(&mut state, VALID_COLLECTION);
+        assert_eq!(state.active_collection, 1);
+
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id: tab_a_id,
+                outcome: sample_outcome(200),
+            },
+        );
+
+        // Tab B (still active) is untouched...
+        assert!(matches!(state.run_state, RunState::Idle));
+        assert_eq!(
+            state.active_collection, 1,
+            "the result must not switch tabs either"
+        );
+
+        // ...and tab A picked up its own result, right where it was left.
+        update(&mut state, Message::PreviousCollection);
+        assert!(matches!(state.run_state, RunState::Completed(_)));
+    }
+
+    #[test]
+    fn run_completed_for_a_since_closed_tab_is_silently_dropped_not_misrouted() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        let closed_id = state.active().id;
+        update(&mut state, Message::RunRequested);
+
+        open_second_collection(&mut state, VALID_COLLECTION);
+        // Close tab A (index 0) while its run is still notionally in
+        // flight — an in-flight run is one of `is_dirty`'s own signals, so
+        // this goes through (and confirms) the close prompt, same as any
+        // other dirty tab — the tab is gone before the result ever arrives.
+        update(&mut state, Message::PreviousCollection);
+        update(&mut state, Message::CloseCollectionRequested);
+        assert!(state.close_confirm.is_some());
+        update(&mut state, Message::ConfirmCloseCollection);
+        assert_eq!(state.collections.len(), 1);
+
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id: closed_id,
+                outcome: sample_outcome(200),
+            },
+        );
+
+        // Nothing to misroute onto — the remaining tab is untouched.
+        assert_eq!(state.collections.len(), 1);
+        assert!(matches!(state.run_state, RunState::Idle));
+    }
+
+    /// The environment-scoping investigation this issue asked for,
+    /// demonstrated live: a newly opened collection discovers its *own*
+    /// environments (passed in on `Message::CollectionOpened`, exactly as
+    /// `main::run`'s loop resolves them from that collection's own
+    /// `base_dir` — see that variant's own doc comment) rather than
+    /// inheriting whatever the first collection had. Picking an active
+    /// environment in one tab must not touch the other's.
+    #[test]
+    fn each_tabs_environments_and_active_environment_are_independent() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        state.environments = vec![
+            named_environment("prod", &[("base_url", "https://prod.example.com")]),
+            named_environment("staging", &[("base_url", "https://staging.example.com")]),
+        ];
+        update(&mut state, Message::OpenEnvironmentOverlay);
+        update(&mut state, Message::ConfirmEnvironmentSelection); // tab 0 -> "prod"
+        assert_eq!(state.active_environment, Some(0));
+
+        // Tab 1 opens with a completely different (here: empty) environment
+        // list of its own — exactly what a collection opened from another
+        // project's directory would have, since `main::run` discovers
+        // environments per collection, not once for the whole process.
+        open_second_collection(&mut state, VALID_COLLECTION);
+        assert!(
+            state.environments.is_empty(),
+            "a newly opened tab must not inherit another tab's environments"
+        );
+        assert_eq!(state.active_environment, None);
+
+        state.environments = vec![named_environment(
+            "only-here",
+            &[("base_url", "https://only-here.example.com")],
+        )];
+        update(&mut state, Message::OpenEnvironmentOverlay);
+        update(&mut state, Message::ConfirmEnvironmentSelection); // tab 1 -> "only-here"
+        assert_eq!(state.active_environment, Some(0));
+
+        // Back to tab 0: its own environment list and its own choice of
+        // active environment must both still be exactly what they were.
+        update(&mut state, Message::PreviousCollection);
+        assert_eq!(state.environments.len(), 2);
+        assert_eq!(state.active_environment, Some(0));
+        assert_eq!(state.environments[0].name, "prod");
     }
 }

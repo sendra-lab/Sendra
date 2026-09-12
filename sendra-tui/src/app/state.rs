@@ -1912,9 +1912,34 @@ pub(super) fn validate_method_text(text: &str) -> Result<Method, String> {
     })
 }
 
+/// All of one open collection's own state — one per tab in the multi-
+/// collection TUI. This is what used to be the entire `AppState`, back when
+/// the TUI could only ever have one collection open at a time; see
+/// [`AppState`]'s own doc comment for why it split into "one `CollectionSession`
+/// per open collection" plus a thin, genuinely process-wide wrapper around
+/// `Vec<CollectionSession>`.
+///
+/// Every field here is scoped to exactly one collection: switching tabs
+/// (`Message::NextCollection`/`PreviousCollection`) must never let one
+/// session's selection, run result, edit session, dirty markers, or active
+/// environment bleed into another's — the entire reason this type exists
+/// separately from `AppState` at all, rather than as a `Vec` of some smaller
+/// struct with the rest still flat. `should_quit`/`spinner_tick` are the only
+/// two fields that stayed on `AppState` itself: a clean exit and a shared
+/// animation clock are truly process-wide, not per-tab, concerns.
 #[derive(Debug, Default)]
-pub struct AppState {
-    pub should_quit: bool,
+pub struct CollectionSession {
+    /// Uniquely identifies this session for the lifetime of the process —
+    /// assigned once, by `AppState::open_session`, and never reused even
+    /// after the session is closed. Never a plain `Vec` index: closing an
+    /// earlier tab shifts every later tab's index, which would silently
+    /// misroute a `Message::RunCompleted` for an in-flight run that started
+    /// before the close and completes after it (see that variant's own doc
+    /// comment). `0` for the very first session `AppState::default` creates;
+    /// tests that build a `CollectionSession` directly rather than through
+    /// `AppState` never need to set this themselves; it defaults to `0` too,
+    /// as if it were the first (and, in a single-session test, only) tab.
+    pub id: u64,
     pub load_state: LoadState,
     /// Every environment discovered at startup, sorted by name.
     pub environments: Vec<NamedEnvironment>,
@@ -1940,11 +1965,6 @@ pub struct AppState {
     pub environment_overlay: Option<usize>,
     /// The selected request's most recent run, if any has been started.
     pub run_state: RunState,
-    /// Advanced by one on every `Message::Tick` (roughly every 100ms — see
-    /// `next_message` in `main.rs`), and read only to pick which spinner
-    /// glyph `render_status_bar` draws while `run_state` is `InFlight`. Not
-    /// meaningful on its own; it exists purely to make the spinner animate.
-    pub spinner_tick: usize,
     /// How many lines into the response panel's text the view is scrolled —
     /// see `render_response_panel`. Reset to `0` whenever it would otherwise
     /// point at a different run's text: a fresh `RunRequested` and a
@@ -2064,7 +2084,7 @@ pub struct PendingNewRequest {
     pub document_before: Box<Document>,
 }
 
-impl AppState {
+impl CollectionSession {
     /// Whether the body field specifically has focus right now — what
     /// `main::translate_event` needs to decide whether `Enter`/`Up`/`Down`
     /// mean "edit the body" (a newline, a line up/down) instead of their
@@ -2075,6 +2095,203 @@ impl AppState {
         self.edit_mode
             .as_ref()
             .is_some_and(|edit| edit.focus == EditField::Body)
+    }
+
+    /// Whether this session holds anything that closing it would lose —
+    /// `Message::CloseCollectionRequested`'s own guard: a session with
+    /// nothing at stake closes immediately, the same "don't ask a question
+    /// with only one honest answer" reasoning `can_delete` already applies
+    /// to a request that can't meaningfully be deleted. Every one of these
+    /// is state closing the tab would silently discard with no way back:
+    /// an edit in progress (`edit_mode`, whether or not it has actually been
+    /// typed into yet — an open session is itself something to lose, not
+    /// only a *dirty* one, since closing it is indistinguishable from
+    /// `CancelEdit` the user never asked for), a request added but not yet
+    /// saved (`dirty_requests`), a pending delete or environment-variable
+    /// edit, or a run still in flight whose response would never be seen.
+    pub fn is_dirty(&self) -> bool {
+        self.edit_mode.is_some()
+            || !self.dirty_requests.is_empty()
+            || self.pending_new_request.is_some()
+            || self.delete_confirm.is_some()
+            || self.environment_edit.is_some()
+            || matches!(self.run_state, RunState::InFlight)
+    }
+}
+
+/// The whole process's state: every open collection, which one is currently
+/// on screen, and the handful of things that are genuinely process-wide
+/// rather than scoped to any one collection.
+///
+/// **Why this split from the old, single-collection `AppState`.** Every
+/// field that used to live flat on `AppState` — `load_state`, `run_state`,
+/// `edit_mode`, `dirty_requests`, `delete_confirm`, the whole environment
+/// picker/editor, `response_scroll`, `reveal_captures` — was really a fact
+/// about *one collection*, not about the process. Opening a second
+/// collection without this split would mean either forcing every open tab to
+/// share one selection/run/edit session (impossible — they are genuinely
+/// independent activities happening in different files) or bolting a second,
+/// parallel copy of every one of those fields onto `AppState` by hand, which
+/// does not scale past two tabs and invites exactly the "state bleeds
+/// between tabs" bug this design has to rule out structurally. Moving every
+/// one of those fields onto [`CollectionSession`] and holding a `Vec` of them
+/// here instead makes "a session's own state cannot affect any other
+/// session" a fact about the type (each is a separate value in the `Vec`),
+/// not a rule every future message handler has to remember to uphold by
+/// hand.
+///
+/// **The `Deref`/`DerefMut` below are load-bearing, not a shortcut.** They
+/// make `state.load_state`, `state.edit_mode`, `state.dirty_requests`, and
+/// every other field `CollectionSession` carries resolve through
+/// `AppState::active`/`active_mut` to whichever session is currently on
+/// screen — exactly the field access every `render_*` function and every
+/// session-scoped `Message` arm already wrote before this issue, unchanged.
+/// That is deliberate: the entire reducer/view surface this crate had before
+/// multi-collection support is *about one collection*, and after this split
+/// it is still about exactly one collection — the active one — with no
+/// change to what it reads or writes. The only code that ever needs to look
+/// past the active session is genuinely tab-aware: opening, closing, listing,
+/// or switching between tabs (see `update()`'s own top-level dispatch, which
+/// handles those messages itself, directly against `state.collections`,
+/// before ever reaching a session-scoped one through `active_mut()`), and
+/// `Message::RunCompleted`, which is tagged with the run's own collection id
+/// specifically so it can reach a session that may no longer be the active
+/// one (see that variant's own doc comment). Anything that reads or writes
+/// through plain field access on an `&AppState`/`&mut AppState` is, by
+/// construction, only ever touching the one session currently in view —
+/// which is exactly the guarantee "no bleed-through between tabs" needs.
+#[derive(Debug)]
+pub struct AppState {
+    pub should_quit: bool,
+    /// Advanced by one on every `Message::Tick` (roughly every 100ms — see
+    /// `next_message` in `main.rs`) — shared by every tab's spinner rather
+    /// than one counter per session, since it carries no state worth keeping
+    /// separate: it only ever drives which spinner glyph
+    /// `render_status_bar` draws for whichever session is active, and two
+    /// tabs both showing "in flight" would look identical either way.
+    pub spinner_tick: usize,
+    /// Every collection currently open, in the order its own tab is shown —
+    /// never empty: closing the last remaining one resets it in place
+    /// (`LoadState::NoPathProvided`, every other field back to its own
+    /// default) rather than removing it, so `active_collection` is always a
+    /// valid index and `Deref`/`DerefMut` below never have anything to fail
+    /// on.
+    pub collections: Vec<CollectionSession>,
+    /// Index into `collections` for the tab currently on screen — what every
+    /// session-scoped `Message`, and every `render_*` function that takes an
+    /// `&AppState`, actually reads and writes through `Deref`/`DerefMut`
+    /// (see this struct's own doc comment).
+    pub active_collection: usize,
+    /// The next id `open_session` hands out — see `CollectionSession::id`'s
+    /// own doc comment for why a `Vec` index would be the wrong thing to tag
+    /// an in-flight run's eventual `Message::RunCompleted` with.
+    next_session_id: u64,
+    /// `Some(...)` while the "open another collection" path-input prompt is
+    /// on screen — a genuinely process-wide (not per-tab) piece of UI, since
+    /// it exists to *create* a new tab, not to edit an existing one's own
+    /// state. Modal in the same sense `delete_confirm`/`environment_edit`
+    /// already are: `update()`'s own top-level guard refuses every
+    /// session-scoped message while this is open, the same way a session's
+    /// own modals refuse browsing messages within that session.
+    pub open_collection_prompt: Option<OpenCollectionPromptState>,
+    /// `Some(id)` while a confirmation is pending for closing the session
+    /// named by that id — a minimal, single-purpose confirmation, the same
+    /// scope note `DeleteConfirm`/issue 27's own delete confirmation already
+    /// makes: a unified confirmation shared by every destructive action in
+    /// this crate (requests, environment variables, now collections) is
+    /// issue 31's later, separate concern. Named by id rather than always
+    /// meaning "the active collection": pinning it is what keeps a
+    /// mid-confirmation tab switch (were one ever allowed — `update()`'s own
+    /// guard in fact refuses tab-switching while this is open, the same way
+    /// every other modal in this crate refuses navigation) from ever closing
+    /// a different tab than the one the prompt was actually asking about.
+    pub close_confirm: Option<u64>,
+}
+
+/// What `Message::OpenCollectionPrompt` opens and
+/// `Message::ConfirmOpenCollectionPath`/`Message::CancelOpenCollectionPrompt`
+/// close: the path being typed, and (once a confirmed attempt to load it has
+/// actually failed) whatever `Document::from_path` said was wrong with it.
+#[derive(Debug, Clone, Default)]
+pub struct OpenCollectionPromptState {
+    pub path: TextField,
+    /// `Some(message)` right after a load attempt failed — the prompt stays
+    /// open with this set, the same "no-op that keeps you where you can
+    /// retry or cancel" shape every other fallible confirm/save in this
+    /// crate already has, rather than silently discarding the path that was
+    /// typed or leaving the user with no idea why nothing happened.
+    pub error: Option<String>,
+}
+
+impl Default for AppState {
+    /// Hand-written rather than `#[derive(Default)]`: `collections` must
+    /// start with exactly one session (see its own doc comment on "never
+    /// empty"), not an empty `Vec`, which is what a derived `Default` would
+    /// give it — `CollectionSession::default()`'s own `#[derive(Default)]`
+    /// is exactly the empty-but-valid starting point (`LoadState::Loading`,
+    /// nothing else set) `main::run` already fed straight into `update()`
+    /// via `Message::CollectionLoaded`/`NoCollectionPath` before this issue,
+    /// unchanged.
+    fn default() -> Self {
+        Self {
+            should_quit: false,
+            spinner_tick: 0,
+            collections: vec![CollectionSession::default()],
+            active_collection: 0,
+            next_session_id: 1,
+            open_collection_prompt: None,
+            close_confirm: None,
+        }
+    }
+}
+
+impl AppState {
+    /// The session currently on screen — what every `Deref`/`DerefMut` call
+    /// through `AppState` actually reaches. `collections`/`active_collection`
+    /// together guarantee this never panics: `active_collection` is kept in
+    /// `[0, collections.len())` by every piece of code that touches either
+    /// (`open_session`, `close_active_session`, `Message::NextCollection`/
+    /// `PreviousCollection`), and `collections` itself is never empty.
+    pub fn active(&self) -> &CollectionSession {
+        &self.collections[self.active_collection]
+    }
+
+    pub fn active_mut(&mut self) -> &mut CollectionSession {
+        &mut self.collections[self.active_collection]
+    }
+
+    /// The session named by `id`, if it is still open — what
+    /// `Message::RunCompleted` looks the run's own collection up by, since a
+    /// tab may have been closed (or reordered — id, not position, is exactly
+    /// what survives that) between the run starting and finishing.
+    pub fn session_by_id_mut(&mut self, id: u64) -> Option<&mut CollectionSession> {
+        self.collections.iter_mut().find(|session| session.id == id)
+    }
+
+    /// Appends `session` as a brand-new tab, assigns it the next id, and
+    /// switches to it — the one place a `CollectionSession` is ever added to
+    /// `collections`, so `next_session_id` can only ever move forward and
+    /// every session's id is unique for the life of the process. Visible to
+    /// `super::update`'s `Message::CollectionOpened` arm.
+    pub(super) fn open_session(&mut self, mut session: CollectionSession) {
+        session.id = self.next_session_id;
+        self.next_session_id += 1;
+        self.collections.push(session);
+        self.active_collection = self.collections.len() - 1;
+    }
+}
+
+impl std::ops::Deref for AppState {
+    type Target = CollectionSession;
+
+    fn deref(&self) -> &CollectionSession {
+        self.active()
+    }
+}
+
+impl std::ops::DerefMut for AppState {
+    fn deref_mut(&mut self) -> &mut CollectionSession {
+        self.active_mut()
     }
 }
 
@@ -2145,7 +2362,94 @@ pub enum Message {
     /// against it. Always accepted, even while another message would
     /// normally be blocked by an in-flight run, since this is the message
     /// that ends that state.
-    RunCompleted(RunOutcome),
+    ///
+    /// **Tagged with `collection_id`, not routed to "the active tab".** The
+    /// spawn happens against whichever collection was active *when*
+    /// `Message::RunRequested` fired, but the user is free to switch tabs
+    /// (or open/close others) before the response comes back — the whole
+    /// point of a run in one tab not blocking any other. `main::run`
+    /// captures the spawning session's `CollectionSession::id` in the
+    /// closure handed to `run_request::spawn`, and `update()` looks that id
+    /// up via `AppState::session_by_id_mut` rather than assuming
+    /// `active_collection` is still the same tab — a plain `Vec` index would
+    /// silently misroute this (or land on the wrong tab entirely) the moment
+    /// a tab closes or the user switches away and back in a different order.
+    /// A session that has since been closed simply has nowhere to apply the
+    /// result to; it is dropped rather than resurrecting a tab that no
+    /// longer exists.
+    RunCompleted {
+        collection_id: u64,
+        outcome: RunOutcome,
+    },
+    /// `o` while browsing: opens the "open another collection" path-input
+    /// prompt (`AppState::open_collection_prompt`). A no-op while any other
+    /// modal (edit mode, an overlay, a confirmation) is already open,
+    /// consistent with every other mode-entry message in this crate.
+    OpenCollectionPrompt,
+    /// Enter on the open-collection prompt. Never actually handled inside
+    /// `update()` itself — `main::run`'s own loop intercepts this message
+    /// before `update()` ever sees it, performs the real (synchronous)
+    /// `Document::from_path` + environment discovery the exact same way
+    /// `main::main` already does for the very first collection, and replaces
+    /// it with a `Message::CollectionOpened` carrying the outcome. This
+    /// keeps `update()` itself free of file I/O, the same separation
+    /// `Message::RunRequested`/`RunCompleted` already draw for a request
+    /// send — the reducer only ever sees results, never performs the I/O
+    /// that produces them. Kept as a real, distinct `Message` (rather than
+    /// building `CollectionOpened` straight from the keypress in
+    /// `main::translate_event`) because that function has no access to
+    /// `AppState` at all, by design — it only ever sees the raw key event
+    /// plus a handful of booleans, which is what keeps it unit-testable
+    /// without a real terminal. `update()` still gives this a real (empty)
+    /// arm rather than refusing to compile it as unreachable, since a
+    /// directly-constructed `update()` call in a test is exactly as valid a
+    /// caller as `main::run`'s own loop.
+    ConfirmOpenCollectionPath,
+    /// Esc on the open-collection prompt: closes it without opening
+    /// anything — nothing was ever created before this point, so there is
+    /// nothing to undo.
+    CancelOpenCollectionPrompt,
+    /// The result of a `Message::ConfirmOpenCollectionPath` that
+    /// `main::run`'s loop has already turned into a real load attempt (see
+    /// that variant's own doc comment) — carries exactly what
+    /// `Message::CollectionLoaded`/`EnvironmentsLoaded` together used to for
+    /// the very first collection, bundled into one message since `main::run`
+    /// now always produces both at once, for any collection, not just the
+    /// first. `Ok(document)` appends a brand-new tab (via
+    /// `AppState::open_session`) and switches to it; `Err(error)` opens
+    /// nothing and instead leaves the prompt open with the error on
+    /// `OpenCollectionPromptState::error`, the same "no-op that keeps you
+    /// where you can retry or cancel" shape every other fallible save/confirm
+    /// in this crate already has.
+    CollectionOpened {
+        base_dir: PathBuf,
+        path: PathBuf,
+        result: Box<Result<Document, SendraError>>,
+        environments: Vec<NamedEnvironment>,
+        environment_errors: Vec<(String, SendraError)>,
+    },
+    /// `]`: switches to the next tab, wrapping from the last back to the
+    /// first — the same wrap-around `move_selection` already gives the
+    /// request list and the environment overlay's own cursor. A no-op with
+    /// only one tab open (wrapping to the same index changes nothing).
+    NextCollection,
+    /// `[`: the exact reverse of `NextCollection`.
+    PreviousCollection,
+    /// Ctrl+W: closes the active tab — immediately if
+    /// `CollectionSession::is_dirty()` says there is nothing at stake, or
+    /// through `AppState::close_confirm` otherwise. Closing the very last
+    /// remaining tab does not shrink `collections` (see its own doc comment
+    /// on why that must never happen) — it resets that one session in place
+    /// instead, back to `LoadState::NoPathProvided` with every other field
+    /// at its own default, the same blank slate a process started with no
+    /// collection path at all already begins in.
+    CloseCollectionRequested,
+    /// `y`/Enter on the close-tab confirmation: actually closes the session
+    /// `AppState::close_confirm` named.
+    ConfirmCloseCollection,
+    /// `n`/Esc on the close-tab confirmation: leaves every open tab exactly
+    /// as it was.
+    CancelCloseCollection,
     /// PageDown on the response panel: scrolls its text down a few lines.
     /// A no-op whenever there is nothing showing that could scroll — see
     /// `render_response_panel`, which is the only place `response_scroll` is

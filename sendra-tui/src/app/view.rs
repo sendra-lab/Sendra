@@ -19,9 +19,9 @@ use sendra_core::{
 use crate::run_request::RunOutcome;
 
 use super::state::{
-    AppState, AssertionRow, AuthEdit, AuthField, BodyEdit, CaptureKind, CaptureRow, DeleteConfirm,
-    EditField, EditState, EnvVarField, EnvironmentEditState, JsonOperator, LoadState,
-    NamedEnvironment, RunState,
+    AppState, AssertionRow, AuthEdit, AuthField, BodyEdit, CaptureKind, CaptureRow,
+    CollectionSession, DeleteConfirm, EditField, EditState, EnvVarField, EnvironmentEditState,
+    JsonOperator, LoadState, NamedEnvironment, OpenCollectionPromptState, RunState,
 };
 
 /// Body preview is capped rather than shown in full — scrolling through a
@@ -31,6 +31,22 @@ use super::state::{
 const MAX_BODY_PREVIEW_CHARS: usize = 2000;
 
 pub fn view(state: &AppState, frame: &mut Frame) {
+    // The tab bar only ever takes a row away from the rest of the screen
+    // once there is something to switch between — a single open collection
+    // renders exactly as it always has, byte-for-byte the same layout every
+    // existing single-collection test already checks, rather than every
+    // screen growing a permanent one-tab bar nobody needed before this
+    // issue.
+    let show_tabs = state.collections.len() > 1;
+    let constraints = if show_tabs {
+        vec![
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![Constraint::Min(0), Constraint::Length(1)]
+    };
     // The bottom row is reserved in every `LoadState`, not only `Loaded` —
     // an error state must not dead-end the app, and the help bar showing
     // which keys still work (at minimum quit, per `status_help_text`) is
@@ -39,16 +55,22 @@ pub fn view(state: &AppState, frame: &mut Frame) {
     // honest instead of always claiming nav/run apply.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints(constraints)
         .split(frame.area());
+    let (main_row, status_row) = if show_tabs {
+        render_tab_bar(frame, rows[0], state);
+        (rows[1], rows[2])
+    } else {
+        (rows[0], rows[1])
+    };
 
     match &state.load_state {
-        LoadState::Loading => render_message(frame, rows[0], "Loading collection..."),
+        LoadState::Loading => render_message(frame, main_row, "Loading collection..."),
         LoadState::NoPathProvided => {
-            render_message(frame, rows[0], "No collection path provided.");
+            render_message(frame, main_row, "No collection path provided.");
         }
         LoadState::Failed(error) => {
-            render_error(frame, rows[0], "Failed to load collection", error);
+            render_error(frame, main_row, "Failed to load collection", error);
         }
         LoadState::Loaded {
             document,
@@ -59,14 +81,14 @@ pub fn view(state: &AppState, frame: &mut Frame) {
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-                .split(rows[0]);
+                .split(main_row);
 
             render_request_list(frame, panes[0], document, *selected, &state.dirty_requests);
             render_detail_pane(frame, panes[1], document, *selected, base_dir, state);
         }
     }
 
-    render_status_bar(frame, rows[1], state);
+    render_status_bar(frame, status_row, state);
 
     if let Some(cursor) = state.environment_overlay {
         render_environment_overlay(frame, state, cursor);
@@ -74,6 +96,63 @@ pub fn view(state: &AppState, frame: &mut Frame) {
 
     if let Some(confirm) = &state.delete_confirm {
         render_delete_confirm_overlay(frame, state, confirm);
+    }
+
+    if let Some(prompt) = &state.open_collection_prompt {
+        render_open_collection_prompt(frame, prompt);
+    }
+
+    if let Some(id) = state.close_confirm {
+        render_close_confirm_overlay(frame, state, id);
+    }
+}
+
+/// One label per open collection, `id` (its 1-based position, not
+/// `CollectionSession::id` — a stable id is what correctness needs
+/// internally, but a person switching tabs thinks in terms of "the second
+/// one", not an opaque counter) markers separated by `│`, the active one
+/// reversed the same way the request list's own selection highlight already
+/// is. Shown only once a second collection is open — see `view`'s own
+/// comment on why a single open collection draws with no tab bar at all.
+fn render_tab_bar(frame: &mut Frame, area: Rect, state: &AppState) {
+    let mut spans: Vec<ratatui::text::Span> = Vec::new();
+    for (index, session) in state.collections.iter().enumerate() {
+        if index > 0 {
+            spans.push(ratatui::text::Span::raw(" │ "));
+        }
+        let label = format!(" {}:{} ", index + 1, collection_label(session));
+        let style = if index == state.active_collection {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        spans.push(ratatui::text::Span::styled(label, style));
+    }
+    frame.render_widget(Paragraph::new(ratatui::text::Line::from(spans)), area);
+}
+
+/// What a tab shows for whichever collection it holds: the collection's own
+/// name if it has one, the request's own label for a `Document::Single`
+/// with none, the file's stem when a `Document::Collection` was never given
+/// a `name:`, or a short, honest placeholder for a tab that never finished
+/// loading anything.
+fn collection_label(session: &CollectionSession) -> String {
+    match &session.load_state {
+        LoadState::Loading => "loading…".to_string(),
+        LoadState::NoPathProvided => "(none)".to_string(),
+        LoadState::Failed(_) => "(failed)".to_string(),
+        LoadState::Loaded { document, path, .. } => match &**document {
+            Document::Single(request) => request
+                .name
+                .clone()
+                .unwrap_or_else(|| request.label().to_string()),
+            Document::Collection(collection) => collection.name.clone().unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("collection")
+                    .to_string()
+            }),
+        },
     }
 }
 
@@ -1220,6 +1299,25 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 /// effect is visible in this bar too, rather than duplicating a second
 /// "what does the help bar say" check inside `view`'s own test module.
 pub(super) fn status_help_text(state: &AppState) -> String {
+    if let Some(id) = state.close_confirm {
+        let label = state
+            .collections
+            .iter()
+            .find(|session| session.id == id)
+            .map(collection_label)
+            .unwrap_or_else(|| "this collection".to_string());
+        return format!("Close '{label}'?  |  y/enter confirm  n/esc cancel  q quit");
+    }
+
+    if let Some(prompt) = &state.open_collection_prompt {
+        let failed = if prompt.error.is_some() {
+            "  (open failed — see message)"
+        } else {
+            ""
+        };
+        return format!("Open collection{failed}  |  enter confirm  esc cancel  q quit");
+    }
+
     if let Some(confirm) = &state.delete_confirm {
         let failed = if confirm.error.is_some() {
             "  (delete failed — see message)"
@@ -1262,13 +1360,14 @@ pub(super) fn status_help_text(state: &AppState) -> String {
     }
 
     if !matches!(state.load_state, LoadState::Loaded { .. }) {
-        return "e env  q quit".to_string();
+        return format!("e env  o open{}  q quit", tab_hint(state));
     }
 
     match &state.run_state {
         RunState::Idle => {
             format!(
-                "↑/↓ nav  enter/r run  i edit  n new request  d delete  e env{}  q quit",
+                "↑/↓ nav  enter/r run  i edit  n new request  d delete  e env  o open{}{}  q quit",
+                tab_hint(state),
                 idle_reveal_hint(state)
             )
         }
@@ -1298,9 +1397,22 @@ pub(super) fn status_help_text(state: &AppState) -> String {
                 "  c reveal/hide captures"
             };
             format!(
-                "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn/Home/End scroll{reveal}  i edit  n new request  d delete  e env  q quit"
+                "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn/Home/End scroll{reveal}  i edit  n new request  d delete  e env  o open{}  q quit",
+                tab_hint(state)
             )
         }
+    }
+}
+
+/// `  [/] tabs  ctrl+w close` — advertised only once switching or closing a
+/// tab would actually do something, i.e. once a second collection is open;
+/// the same "don't advertise a key that would be a no-op right now" rule
+/// `idle_reveal_hint` already follows for its own auth-reveal hint.
+fn tab_hint(state: &AppState) -> &'static str {
+    if state.collections.len() > 1 {
+        "  [/] tabs  ctrl+w close"
+    } else {
+        ""
     }
 }
 
@@ -1765,6 +1877,54 @@ fn render_delete_confirm_overlay(frame: &mut Frame, state: &AppState, confirm: &
         text.push_str("\n\n");
         text.push_str(&format_error("Failed to delete", error));
     }
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inset(area));
+}
+
+/// The "open another collection" path-input prompt — a minimal, single-field
+/// overlay in the same visual family as `render_delete_confirm_overlay`,
+/// showing the path typed so far and (once a load attempt has actually
+/// failed) the real error inline, through the same `format_error` every
+/// other error in the crate goes through.
+fn render_open_collection_prompt(frame: &mut Frame, prompt: &OpenCollectionPromptState) {
+    let area = centered_rect(70, 30, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Open collection — Enter to confirm, Esc to cancel"),
+        area,
+    );
+
+    let mut text = format!("Path: {}", prompt.path.value());
+    if let Some(error) = &prompt.error {
+        text.push_str("\n\n");
+        text.push_str(&format_error("Failed to open", error));
+    }
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inset(area));
+}
+
+/// The close-tab confirmation — shown only when
+/// `CollectionSession::is_dirty()` said there was something at stake (see
+/// `Message::CloseCollectionRequested`'s own arm); a clean tab closes with
+/// no prompt at all, so reaching this screen already means real, unsaved
+/// state would be lost.
+fn render_close_confirm_overlay(frame: &mut Frame, state: &AppState, collection_id: u64) {
+    let area = centered_rect(60, 30, frame.area());
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Close collection — y/Enter confirm, n/Esc cancel"),
+        area,
+    );
+
+    let label = state
+        .collections
+        .iter()
+        .find(|session| session.id == collection_id)
+        .map(collection_label)
+        .unwrap_or_else(|| "this collection".to_string());
+    let text = format!("Close '{label}'? Unsaved changes will be lost.");
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inset(area));
 }
 
@@ -2371,7 +2531,14 @@ requests:
         };
 
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(outcome()));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: outcome(),
+            },
+        );
         let masked_screen = render(&state);
         assert!(
             capture_line_contains(&masked_screen, REDACTED_CAPTURE_VALUE),
@@ -2390,7 +2557,14 @@ requests:
         );
 
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(outcome()));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: outcome(),
+            },
+        );
         let next_run_screen = render(&state);
         assert!(
             capture_line_contains(&next_run_screen, REDACTED_CAPTURE_VALUE),
@@ -2488,7 +2662,14 @@ requests:
 
         let mut state = loaded_state(VALID_COLLECTION);
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(outcome));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome,
+            },
+        );
 
         let render = |state: &AppState| {
             let backend = TestBackend::new(60, 10);
@@ -2533,13 +2714,17 @@ requests:
         let mut state = loaded_state(VALID_COLLECTION);
         update(&mut state, Message::RunRequested);
         let response = response_with(&[("X-Request-Id", "abc123")], "hello world");
+        let collection_id = state.active().id;
         update(
             &mut state,
-            Message::RunCompleted(RunOutcome {
-                result: Ok(response),
-                assertions: AssertionReport::default(),
-                capture: CaptureReport::default(),
-            }),
+            Message::RunCompleted {
+                collection_id,
+                outcome: RunOutcome {
+                    result: Ok(response),
+                    assertions: AssertionReport::default(),
+                    capture: CaptureReport::default(),
+                },
+            },
         );
 
         let backend = TestBackend::new(100, 15);
@@ -2574,7 +2759,14 @@ requests:
         update(&mut state, Message::RunRequested);
         let error = Document::from_yaml_str(MALFORMED_YAML).expect_err("malformed test YAML");
         let expected_message = error.to_string();
-        update(&mut state, Message::RunCompleted(failed_outcome(error)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: failed_outcome(error),
+            },
+        );
 
         let backend = TestBackend::new(100, 15);
         let mut terminal = Terminal::new(backend).expect("a test terminal builds");
@@ -2656,7 +2848,14 @@ requests:
     fn help_bar_shows_scroll_and_nav_keys_once_a_run_has_completed() {
         let mut state = loaded_state(VALID_COLLECTION);
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: sample_outcome(200),
+            },
+        );
 
         let text = status_help_text(&state);
 
@@ -2671,7 +2870,14 @@ requests:
     fn help_bar_only_mentions_capture_reveal_when_there_is_something_to_reveal() {
         let mut state = loaded_state(VALID_COLLECTION);
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: sample_outcome(200),
+            },
+        );
         let no_captures_text = status_help_text(&state);
         assert!(
             !no_captures_text.contains("reveal"),
@@ -2684,13 +2890,17 @@ requests:
             &response,
         );
         update(&mut state, Message::RunRequested);
+        let collection_id = state.active().id;
         update(
             &mut state,
-            Message::RunCompleted(RunOutcome {
-                result: Ok(response),
-                assertions: AssertionReport::default(),
-                capture,
-            }),
+            Message::RunCompleted {
+                collection_id,
+                outcome: RunOutcome {
+                    result: Ok(response),
+                    assertions: AssertionReport::default(),
+                    capture,
+                },
+            },
         );
 
         let with_captures_text = status_help_text(&state);
@@ -2715,7 +2925,14 @@ requests:
 
         let mut completed = loaded_state(VALID_COLLECTION);
         update(&mut completed, Message::RunRequested);
-        update(&mut completed, Message::RunCompleted(sample_outcome(200)));
+        let collection_id = completed.active().id;
+        update(
+            &mut completed,
+            Message::RunCompleted {
+                collection_id,
+                outcome: sample_outcome(200),
+            },
+        );
 
         let texts = [
             status_help_text(&idle),
@@ -2763,7 +2980,14 @@ requests:
         assert!(in_flight_screen.contains("Running request"));
         assert!(!in_flight_screen.contains("nav"));
 
-        update(&mut state, Message::RunCompleted(sample_outcome(200)));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome: sample_outcome(200),
+            },
+        );
         let completed_screen = render(&state);
         assert!(completed_screen.contains("scroll"));
         assert!(completed_screen.contains("nav"));
@@ -3447,7 +3671,14 @@ requests:
 
         let mut state = loaded_state(VALID_COLLECTION);
         update(&mut state, Message::RunRequested);
-        update(&mut state, Message::RunCompleted(outcome));
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome,
+            },
+        );
         // Deep enough to be well past what any of the sizes below can show,
         // so every draw below exercises the render-time clamp.
         state.response_scroll = 10_000;
@@ -3527,7 +3758,14 @@ requests:
             draw(&browsing, width, height);
 
             update(&mut browsing, Message::RunRequested);
-            update(&mut browsing, Message::RunCompleted(sample_outcome(200)));
+            let collection_id = browsing.active().id;
+            update(
+                &mut browsing,
+                Message::RunCompleted {
+                    collection_id,
+                    outcome: sample_outcome(200),
+                },
+            );
             browsing.response_scroll = 9_999;
             draw(&browsing, width, height);
 
@@ -4147,14 +4385,12 @@ requests:
         std::fs::write(&path, "").unwrap();
         let environment = Environment::from_path(&path).expect("an empty file is still valid");
 
-        let mut state = AppState {
-            environments: vec![super::super::state::NamedEnvironment {
-                name: "empty".to_string(),
-                environment,
-            }],
-            environment_overlay: Some(0),
-            ..AppState::default()
-        };
+        let mut state = AppState::default();
+        state.environments = vec![super::super::state::NamedEnvironment {
+            name: "empty".to_string(),
+            environment,
+        }];
+        state.environment_overlay = Some(0);
         update(&mut state, Message::EnterEnvironmentEdit);
 
         let screen = render_screen(&state);
