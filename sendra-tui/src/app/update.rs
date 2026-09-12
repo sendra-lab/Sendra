@@ -11,11 +11,13 @@ use sendra_core::{Collection, Document, Environment, Request, SendraError};
 
 use crate::run_request::RunOutcome;
 
+use super::view::collection_label;
+
 use super::state::{
     non_empty, validate_assertion_value_text, validate_method_text, AppState, BodyEdit,
-    CollectionSession, DeleteConfirm, EditField, EditState, EnvironmentEditState, HeaderRow,
-    HistoryOverlay, LoadState, Message, PendingNewRequest, RunHistoryEntry, RunState, TextField,
-    RUN_HISTORY_CAP,
+    CloseConfirm, CollectionSession, ConfirmPrompt, DeleteConfirm, EditField, EditState,
+    EnvironmentEditState, HeaderRow, HistoryOverlay, LoadState, Message, PendingNewRequest,
+    RunHistoryEntry, RunState, TextField, RUN_HISTORY_CAP,
 };
 
 /// Moves `selected` by `delta` (`1` or `-1`) through `len` items, wrapping at
@@ -57,7 +59,31 @@ fn move_selection(selected: usize, len: usize, delta: isize) -> usize {
 pub fn update(state: &mut AppState, msg: Message) {
     match msg {
         Message::Quit => {
-            state.should_quit = true;
+            // Already confirming — the quit key pressed again (`q` or
+            // Ctrl+C, whichever) confirms it, the same low-friction "ask
+            // once, then get out of the way" shape `Message::ConfirmQuit`'s
+            // own dedicated key gives. See `Message::Quit`'s own doc
+            // comment.
+            if state.quit_confirm.take().is_some() {
+                state.should_quit = true;
+                return;
+            }
+            let dirty_tabs = state.collections.iter().filter(|s| s.is_dirty()).count();
+            if dirty_tabs == 0 {
+                state.should_quit = true;
+            } else {
+                state.quit_confirm = Some(ConfirmPrompt::new(quit_confirm_message(dirty_tabs)));
+            }
+            return;
+        }
+        Message::ConfirmQuit => {
+            if state.quit_confirm.take().is_some() {
+                state.should_quit = true;
+            }
+            return;
+        }
+        Message::CancelQuit => {
+            state.quit_confirm = None;
             return;
         }
         Message::Tick => {
@@ -67,6 +93,7 @@ pub fn update(state: &mut AppState, msg: Message) {
         Message::OpenCollectionPrompt => {
             if state.open_collection_prompt.is_none()
                 && state.close_confirm.is_none()
+                && state.quit_confirm.is_none()
                 && state.edit_mode.is_none()
                 && state.environment_overlay.is_none()
                 && state.delete_confirm.is_none()
@@ -119,13 +146,19 @@ pub fn update(state: &mut AppState, msg: Message) {
             return;
         }
         Message::NextCollection => {
-            if state.close_confirm.is_none() && state.open_collection_prompt.is_none() {
+            if state.close_confirm.is_none()
+                && state.open_collection_prompt.is_none()
+                && state.quit_confirm.is_none()
+            {
                 state.active_collection = (state.active_collection + 1) % state.collections.len();
             }
             return;
         }
         Message::PreviousCollection => {
-            if state.close_confirm.is_none() && state.open_collection_prompt.is_none() {
+            if state.close_confirm.is_none()
+                && state.open_collection_prompt.is_none()
+                && state.quit_confirm.is_none()
+            {
                 state.active_collection = (state.active_collection + state.collections.len() - 1)
                     % state.collections.len();
             }
@@ -140,18 +173,27 @@ pub fn update(state: &mut AppState, msg: Message) {
             // route through a confirmation, not a case to refuse outright —
             // blocking on those here would make that branch of `is_dirty()`
             // unreachable.
-            if state.close_confirm.is_none() && state.open_collection_prompt.is_none() {
+            if state.close_confirm.is_none()
+                && state.open_collection_prompt.is_none()
+                && state.quit_confirm.is_none()
+            {
                 if state.active().is_dirty() {
-                    state.close_confirm = Some(state.active().id);
+                    let label = collection_label(state.active());
+                    state.close_confirm = Some(CloseConfirm {
+                        collection_id: state.active().id,
+                        prompt: ConfirmPrompt::new(format!(
+                            "Close '{label}'? Unsaved changes will be lost."
+                        )),
+                    });
                 } else {
-                    close_active_session(state);
+                    close_session_by_id(state, state.active().id);
                 }
             }
             return;
         }
         Message::ConfirmCloseCollection => {
-            if state.close_confirm.take().is_some() {
-                close_active_session(state);
+            if let Some(confirm) = state.close_confirm.take() {
+                close_session_by_id(state, confirm.collection_id);
             }
             return;
         }
@@ -211,27 +253,58 @@ pub fn update(state: &mut AppState, msg: Message) {
 
     // Every other message is scoped to whichever collection is on screen —
     // refused here, exactly like a session's own modals refuse browsing
-    // messages, while either of the two process-wide modals above is open.
-    if state.open_collection_prompt.is_some() || state.close_confirm.is_some() {
+    // messages, while any of the three process-wide modals above is open.
+    // `quit_confirm` can appear over *any* other state (see its own doc
+    // comment on why quitting is checked before anything else), so it has to
+    // be refused here too, not just alongside `open_collection_prompt`/
+    // `close_confirm`.
+    if state.open_collection_prompt.is_some()
+        || state.close_confirm.is_some()
+        || state.quit_confirm.is_some()
+    {
         return;
     }
     update_session(state.active_mut(), msg);
 }
 
-/// Closes the active session: removed from `collections` entirely when it
-/// is not the last one open (with `active_collection` clamped back into
-/// range — the tab that slides into the closed one's index, or the new last
-/// tab if the last one was closed); reset in place, never removed, when it
-/// is the only tab left (see `AppState::collections`'s own doc comment on
+/// The question `Message::Quit`'s own arm asks once it finds at least one
+/// dirty tab — `dirty_tabs` is how many of `AppState::collections` reported
+/// `is_dirty()`, never zero (the caller only builds this message once it
+/// knows there is at least one).
+fn quit_confirm_message(dirty_tabs: usize) -> String {
+    format!(
+        "Quit with unsaved changes in {dirty_tabs} tab{}? This cannot be undone.",
+        if dirty_tabs == 1 { "" } else { "s" }
+    )
+}
+
+/// Closes the session named by `id`: removed from `collections` entirely
+/// when it is not the last one open (with `active_collection` clamped back
+/// into range — the tab that slides into the closed one's index, or the new
+/// last tab if the last one was closed); reset in place, never removed, when
+/// it is the only tab left (see `AppState::collections`'s own doc comment on
 /// why that Vec must never become empty).
-fn close_active_session(state: &mut AppState) {
+///
+/// Looks `id` up rather than assuming `active_collection` still names it —
+/// true today (`update()`'s own guards refuse tab-switching while a close
+/// confirmation is open, so it cannot have moved between
+/// `Message::CloseCollectionRequested` and `Message::ConfirmCloseCollection`)
+/// but this is what makes that a fact the code itself can't violate, not
+/// merely an invariant every future guard has to remember to uphold by hand
+/// — the same reasoning `CollectionSession::id`'s own doc comment gives for
+/// tagging `Message::RunCompleted` by id rather than trusting a `Vec` index.
+/// A no-op if `id` no longer names an open tab (unreachable in practice, for
+/// the same reason).
+fn close_session_by_id(state: &mut AppState, id: u64) {
+    let Some(index) = state.collections.iter().position(|s| s.id == id) else {
+        return;
+    };
     if state.collections.len() > 1 {
-        state.collections.remove(state.active_collection);
+        state.collections.remove(index);
         if state.active_collection >= state.collections.len() {
             state.active_collection = state.collections.len() - 1;
         }
     } else {
-        let id = state.collections[0].id;
         state.collections[0] = CollectionSession {
             id,
             load_state: LoadState::NoPathProvided,
@@ -669,9 +742,16 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                 } = &state.load_state
                 {
                     if can_delete(document, *selected) {
+                        let name = document
+                            .requests()
+                            .get(*selected)
+                            .and_then(|request| request.name.as_deref())
+                            .unwrap_or("(unnamed)");
                         state.delete_confirm = Some(DeleteConfirm {
                             index: *selected,
-                            error: None,
+                            prompt: ConfirmPrompt::new(format!(
+                                "Delete '{name}'? This cannot be undone."
+                            )),
                         });
                     }
                 }
@@ -723,7 +803,7 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                         // prompt stays open, showing the failure, so the
                         // user can retry or cancel.
                         if let Some(confirm) = &mut state.delete_confirm {
-                            confirm.error = Some(error.to_string());
+                            confirm.prompt.error = Some(error.to_string());
                         }
                     }
                     // The document changed shape out from under the prompt
@@ -950,6 +1030,8 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
         // calls `update_session` directly with one of these (rather than
         // going through `update`) gets a safe no-op instead of a panic.
         Message::Quit
+        | Message::ConfirmQuit
+        | Message::CancelQuit
         | Message::Tick
         | Message::OpenCollectionPrompt
         | Message::ConfirmOpenCollectionPath
@@ -2136,7 +2218,13 @@ mod tests {
 
         update(&mut state, Message::RequestDeleteEnvVarRow);
         assert_eq!(
-            state.environment_edit.as_ref().unwrap().pending_delete,
+            state
+                .environment_edit
+                .as_ref()
+                .unwrap()
+                .pending_delete
+                .as_ref()
+                .map(|pending| pending.index),
             Some(0)
         );
 
@@ -3567,13 +3655,62 @@ requests:
     }
 
     #[test]
-    fn quit_still_works_while_a_run_is_in_flight() {
+    fn quitting_while_a_run_is_in_flight_prompts_then_exits_on_confirm() {
         let mut state = loaded_state(VALID_COLLECTION);
         update(&mut state, Message::RunRequested);
 
         update(&mut state, Message::Quit);
+        assert!(
+            !state.should_quit,
+            "an in-flight run's result would be lost — this must prompt, not exit silently"
+        );
+        assert!(state.quit_confirm.is_some());
+
+        update(&mut state, Message::ConfirmQuit);
+        assert!(state.should_quit);
+    }
+
+    #[test]
+    fn cancelling_the_quit_prompt_leaves_the_in_flight_run_untouched() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+
+        update(&mut state, Message::Quit);
+        update(&mut state, Message::CancelQuit);
+
+        assert!(!state.should_quit);
+        assert!(state.quit_confirm.is_none());
+        assert!(
+            matches!(state.run_state, RunState::InFlight),
+            "cancelling quit must leave the in-flight run exactly as it was"
+        );
+    }
+
+    #[test]
+    fn pressing_the_quit_key_again_while_confirming_exits_immediately() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        update(&mut state, Message::RunRequested);
+
+        update(&mut state, Message::Quit);
+        assert!(state.quit_confirm.is_some());
+
+        // The quit key pressed a second time (`q` or Ctrl+C, either one —
+        // `main::translate_event` maps both to this same `Message::Quit`)
+        // confirms rather than reopening the same prompt, the low-friction
+        // "ask once" behavior `Message::Quit`'s own doc comment describes.
+        update(&mut state, Message::Quit);
 
         assert!(state.should_quit);
+    }
+
+    #[test]
+    fn quitting_with_nothing_unsaved_anywhere_exits_immediately_with_no_prompt() {
+        let mut state = loaded_state(VALID_COLLECTION);
+
+        update(&mut state, Message::Quit);
+
+        assert!(state.should_quit);
+        assert!(state.quit_confirm.is_none());
     }
 
     #[test]
@@ -3851,8 +3988,17 @@ requests:
             "a request must still be runnable again after a previous run failed"
         );
 
+        // The freshly-restarted run is itself now in flight and so counts as
+        // something quitting would lose (`CollectionSession::is_dirty()`) —
+        // quit must still *work*, just through the confirmation instead of
+        // silently discarding it.
         update(&mut state, Message::Quit);
-        assert!(state.should_quit, "quit must still work after a failed run");
+        assert!(!state.should_quit);
+        update(&mut state, Message::ConfirmQuit);
+        assert!(
+            state.should_quit,
+            "quit must still work (via its confirmation) after a failed run"
+        );
     }
 
     // --- Auth editing --------------------------------------------------------
@@ -5418,7 +5564,7 @@ requests:
             .as_ref()
             .expect("RequestDelete must open the confirmation prompt");
         assert_eq!(confirm.index, 1);
-        assert!(confirm.error.is_none());
+        assert!(confirm.prompt.error.is_none());
         // Nothing about the document or selection has moved yet — opening
         // the prompt is not itself a mutation.
         assert_eq!(saved_document(&state).requests().len(), 3);
@@ -5668,6 +5814,7 @@ requests:
             .delete_confirm
             .as_ref()
             .unwrap()
+            .prompt
             .error
             .as_ref()
             .expect("a failed write must surface a real error message");
@@ -5851,6 +5998,90 @@ requests:
         assert!(state.edit_mode.is_some());
     }
 
+    /// Proof requirement: quitting checks *every* open tab, not just the
+    /// active one — an edit left open in a tab the user has since switched
+    /// away from is just as real a loss as one in the tab on screen right
+    /// now, so it must still prompt.
+    #[test]
+    fn quit_prompts_for_unsaved_edits_in_a_tab_other_than_the_active_one() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION); // tab 0
+        update(&mut state, Message::EnterEditMode); // tab 0 now dirty
+        assert!(state.edit_mode.is_some());
+
+        open_second_collection(&mut state, VALID_COLLECTION); // tab 1, now active
+        assert_eq!(state.active_collection, 1);
+        assert!(
+            !state.active().is_dirty(),
+            "the active tab itself has nothing unsaved"
+        );
+
+        update(&mut state, Message::Quit);
+
+        assert!(
+            !state.should_quit,
+            "tab 0's still-open edit session must still block quitting even \
+             though tab 1, the active one, is completely clean"
+        );
+        assert!(state.quit_confirm.is_some());
+    }
+
+    /// Proof requirement: confirming the quit prompt discards everything and
+    /// exits; cancelling returns to the app with every tab's edits intact,
+    /// exactly where they were left.
+    #[test]
+    fn confirming_quit_exits_cancelling_preserves_every_tabs_edits() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION); // tab 0
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Url;
+        type_into_focused_field(&mut state, "/tab-0-unsaved-edit");
+        assert!(state.edit_mode.as_ref().unwrap().dirty);
+
+        open_second_collection(&mut state, VALID_COLLECTION); // tab 1
+        update(&mut state, Message::EnterEditMode);
+        state.edit_mode.as_mut().unwrap().focus = EditField::Url;
+        type_into_focused_field(&mut state, "/tab-1-unsaved-edit");
+        assert!(state.edit_mode.as_ref().unwrap().dirty);
+
+        // Cancelling the prompt must leave both tabs' in-progress edits
+        // completely untouched.
+        update(&mut state, Message::Quit);
+        update(&mut state, Message::CancelQuit);
+        assert!(!state.should_quit);
+        assert!(
+            state.edit_mode.is_some(),
+            "tab 1's own edit session must still be open after cancelling quit"
+        );
+        assert!(state
+            .edit_mode
+            .as_ref()
+            .unwrap()
+            .url
+            .value()
+            .ends_with("/tab-1-unsaved-edit"));
+        update(&mut state, Message::PreviousCollection);
+        assert_eq!(state.active_collection, 0);
+        assert!(
+            state.edit_mode.is_some(),
+            "tab 0's own edit session must still be open too — cancelling \
+             quit must not have touched any tab"
+        );
+        assert!(state
+            .edit_mode
+            .as_ref()
+            .unwrap()
+            .url
+            .value()
+            .ends_with("/tab-0-unsaved-edit"));
+
+        // Confirming, on the other hand, discards everything and exits —
+        // there is nothing left to check about the tabs' contents once the
+        // whole process is ending, only that it actually ends.
+        update(&mut state, Message::NextCollection);
+        update(&mut state, Message::Quit);
+        update(&mut state, Message::ConfirmQuit);
+        assert!(state.should_quit);
+    }
+
     /// Proof requirement: an unsaved edit in one tab must be completely
     /// unaffected by actions — including a real save — taken in another,
     /// verified against real bytes on disk for both files, not just
@@ -5960,7 +6191,10 @@ requests:
 
         update(&mut state, Message::CloseCollectionRequested);
         assert_eq!(
-            state.close_confirm,
+            state
+                .close_confirm
+                .as_ref()
+                .map(|confirm| confirm.collection_id),
             Some(dirty_id),
             "a tab with an open edit session must ask before closing"
         );

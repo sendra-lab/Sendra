@@ -223,6 +223,7 @@ fn next_message(
     body_focused: bool,
     history_overlay_open: bool,
     history_viewing_open: bool,
+    quit_confirm_open: bool,
 ) -> io::Result<Message> {
     if !event::poll(Duration::from_millis(100))? {
         return Ok(Message::Tick);
@@ -240,6 +241,7 @@ fn next_message(
         body_focused,
         history_overlay_open,
         history_viewing_open,
+        quit_confirm_open,
     ))
 }
 
@@ -266,6 +268,7 @@ fn translate_event(
     body_focused: bool,
     history_overlay_open: bool,
     history_viewing_open: bool,
+    quit_confirm_open: bool,
 ) -> Message {
     match event {
         Event::Resize(_, _) => Message::Resize,
@@ -284,6 +287,13 @@ fn translate_event(
             // reports it as `Char('c')` plus the control modifier, not
             // plain text input), and leaving *some* always-on quit key
             // matters for a clean exit.
+            //
+            // Both still translate to the same `Message::Quit` even while
+            // `quit_confirm_open` — `update()`'s own arm for it treats a
+            // second `Quit` as confirming (see that variant's own doc
+            // comment), which is what makes pressing the quit key again the
+            // fast path to actually exiting, on top of the dedicated
+            // `y`/Enter key the branch below also offers.
             let is_quit = is_ctrl_c
                 || (key.code == KeyCode::Char('q')
                     && !edit_mode_open
@@ -291,6 +301,21 @@ fn translate_event(
                     && !open_collection_prompt_open);
             if is_quit {
                 return Message::Quit;
+            }
+
+            // The quit confirmation can appear over *any* other state (see
+            // `AppState::quit_confirm`'s own doc comment), so its own keys
+            // are checked before even the two process-wide modals below —
+            // whichever key isn't `is_quit` above and isn't `y`/Enter/n/Esc
+            // here does nothing while this is open, rather than leaking
+            // through to whatever modal (if any) it happens to be sitting
+            // over.
+            if quit_confirm_open {
+                return match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') => Message::CancelQuit,
+                    KeyCode::Enter | KeyCode::Char('y') => Message::ConfirmQuit,
+                    _ => Message::Tick,
+                };
             }
 
             // The two process-wide modals — the open-collection prompt and a
@@ -606,6 +631,7 @@ fn run(
                 .history_overlay
                 .as_ref()
                 .is_some_and(|overlay| overlay.viewing.is_some()),
+            state.quit_confirm.is_some(),
         )?;
         // `Message::ConfirmOpenCollectionPath` is never handed to `update()`
         // as-is — see that variant's own doc comment on why the reducer
@@ -765,9 +791,11 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
             false,
             false,
             false,
@@ -801,12 +829,14 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -838,6 +868,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -845,6 +876,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -874,6 +906,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -883,6 +916,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -912,6 +946,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -922,6 +957,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -938,6 +974,7 @@ mod tests {
         // conflated the two would make an ordinary keystroke exit the app.
         let message = translate_event(
             press(KeyCode::Char('c')),
+            false,
             false,
             false,
             false,
@@ -971,6 +1008,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
 
         assert!(
@@ -983,6 +1021,7 @@ mod tests {
     fn resize_events_translate_to_the_resize_message() {
         let message = translate_event(
             Event::Resize(40, 20),
+            false,
             false,
             false,
             false,
@@ -1014,6 +1053,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let save = translate_event(
             press_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
@@ -1024,6 +1064,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1057,6 +1098,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             );
             assert!(
                 matches!(message, Message::Tick),
@@ -1085,6 +1127,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             );
             assert!(
                 matches!(message, Message::EditInsertChar(c) if c == ch),
@@ -1108,6 +1151,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditFocusNext
         ));
@@ -1121,6 +1165,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1140,6 +1185,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditBackspace
         ));
@@ -1153,6 +1199,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1172,6 +1219,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditCursorLeft
         ));
@@ -1185,6 +1233,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1208,6 +1257,7 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
             ),
             Message::EditInsertChar('\n')
         ));
@@ -1224,6 +1274,7 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
             ),
             Message::EditCursorUp
         ));
@@ -1238,6 +1289,7 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
                 false,
                 false,
             ),
@@ -1259,6 +1311,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
@@ -1269,6 +1322,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1292,6 +1346,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('x'), KeyModifiers::CONTROL),
@@ -1302,6 +1357,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1325,6 +1381,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('k'), KeyModifiers::CONTROL),
@@ -1335,6 +1392,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1364,6 +1422,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(matches!(message, Message::Tick));
     }
@@ -1372,6 +1431,7 @@ mod tests {
     fn i_enters_edit_mode_outside_the_overlay_and_outside_edit_mode() {
         let message = translate_event(
             press(KeyCode::Char('i')),
+            false,
             false,
             false,
             false,
@@ -1400,6 +1460,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(matches!(message, Message::AddRequest));
     }
@@ -1418,6 +1479,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(matches!(message, Message::RequestDelete));
     }
@@ -1426,6 +1488,7 @@ mod tests {
     fn h_opens_the_history_overlay_outside_the_overlay_and_outside_edit_mode() {
         let message = translate_event(
             press(KeyCode::Char('h')),
+            false,
             false,
             false,
             false,
@@ -1456,6 +1519,7 @@ mod tests {
             false,
             true,
             false,
+            false,
         );
         assert!(matches!(esc, Message::CloseHistoryOverlay));
 
@@ -1470,6 +1534,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
         );
         assert!(matches!(enter, Message::ViewHistoryEntry));
@@ -1487,6 +1552,7 @@ mod tests {
                 false,
                 true,
                 false,
+                false,
             );
             assert!(matches!(message, Message::SelectNext));
         }
@@ -1502,6 +1568,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
             );
             assert!(matches!(message, Message::SelectPrevious));
@@ -1522,6 +1589,7 @@ mod tests {
             false,
             true,
             true,
+            false,
         );
         assert!(matches!(esc, Message::CloseHistoryEntryView));
 
@@ -1545,6 +1613,7 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
             );
             assert_eq!(
                 std::mem::discriminant(&message),
@@ -1567,6 +1636,7 @@ mod tests {
             false,
             true,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -1579,6 +1649,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
         );
         assert!(matches!(from_q, Message::Quit));
@@ -1602,6 +1673,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             );
             assert!(
                 matches!(message, Message::ConfirmDelete),
@@ -1617,6 +1689,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1644,6 +1717,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             );
             assert!(
                 matches!(message, Message::Tick),
@@ -1651,6 +1725,116 @@ mod tests {
                  got {message:?}"
             );
         }
+    }
+
+    // --- quit confirmation's own key set ------------------------------------
+
+    #[test]
+    fn quit_confirm_prompt_confirms_on_y_or_enter_and_cancels_on_n_or_esc() {
+        for code in [KeyCode::Char('y'), KeyCode::Enter] {
+            let message = translate_event(
+                press(code),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+            );
+            assert!(
+                matches!(message, Message::ConfirmQuit),
+                "expected {code:?} to confirm quitting, got {message:?}"
+            );
+        }
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            let message = translate_event(
+                press(code),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+            );
+            assert!(
+                matches!(message, Message::CancelQuit),
+                "expected {code:?} to cancel quitting, got {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_keys_do_nothing_while_the_quit_confirm_prompt_is_open() {
+        for code in [KeyCode::Down, KeyCode::Up, KeyCode::Char('r')] {
+            let message = translate_event(
+                press(code),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+            );
+            assert!(
+                matches!(message, Message::Tick),
+                "expected {code:?} to be a no-op while the quit confirm prompt is open, \
+                 got {message:?}"
+            );
+        }
+    }
+
+    /// `q`/Ctrl+C still translate to `Message::Quit` even while the quit
+    /// confirmation is already open — `update()`'s own arm for `Quit` is what
+    /// turns a second press into a confirm (see that variant's own doc
+    /// comment); the translation layer's job is only to keep sending the
+    /// same message, not to special-case "already confirming" itself.
+    #[test]
+    fn q_and_ctrl_c_still_translate_to_quit_while_the_quit_confirm_prompt_is_open() {
+        let from_q = translate_event(
+            press(KeyCode::Char('q')),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        let from_ctrl_c = translate_event(
+            press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(matches!(from_q, Message::Quit));
+        assert!(matches!(from_ctrl_c, Message::Quit));
     }
 
     // --- environment-variable edit session's own key set --------------------
@@ -1662,6 +1846,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1687,6 +1872,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let save = translate_event(
             press_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
@@ -1694,6 +1880,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1720,6 +1907,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
@@ -1727,6 +1915,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1754,6 +1943,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditFocusNext
         ));
@@ -1764,6 +1954,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1786,6 +1977,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditBackspace
         ));
@@ -1802,6 +1994,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditDelete
         ));
@@ -1812,6 +2005,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1837,6 +2031,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -1844,6 +2039,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1870,6 +2066,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             );
             assert!(
                 matches!(message, Message::ConfirmDeleteEnvVarRow),
@@ -1884,6 +2081,7 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1910,6 +2108,7 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
                 false,
                 false,
                 false,
