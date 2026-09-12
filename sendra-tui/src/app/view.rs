@@ -225,8 +225,8 @@ fn render_detail_pane(
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
 }
 
-/// Edit mode's own half of the detail pane: `method` and `url` as live,
-/// cursor-addressable text fields, then a `Headers:` section listing every
+/// Edit mode's own half of the detail pane: `name`, `method` and `url` as
+/// live, cursor-addressable text fields, then a `Headers:` section listing every
 /// header row the same way (`▶` marking whichever `EditState::focus`
 /// currently points at, independently for a row's key and its value), then
 /// a `Body` section — either the raw/JSON text area (see
@@ -261,6 +261,11 @@ fn render_edit_pane(
     base_request: &Request,
     environment: &Environment,
 ) {
+    let name_marker = if edit.focus == EditField::Name {
+        "▶"
+    } else {
+        " "
+    };
     let method_marker = if edit.focus == EditField::Method {
         "▶"
     } else {
@@ -273,6 +278,8 @@ fn render_edit_pane(
     };
 
     let mut lines = vec![
+        format!("{name_marker} Name:   {}", edit.name.value()),
+        String::new(),
         format!("{method_marker} Method: {}", edit.method.value()),
         format!("  ⚠ {}", edit.method_error.as_deref().unwrap_or("")),
         String::new(),
@@ -286,9 +293,10 @@ fn render_edit_pane(
     // never let a row silently disappear" posture `render_response_panel`'s
     // footer already takes. Blank it out here instead: showing a bare `⚠`
     // marker with nothing after it on a passing method would look like a
-    // rendering bug, not "no error".
+    // rendering bug, not "no error". `Name` gets no such row at all — see
+    // `EditField::Name`'s own doc comment for why it is never rejected here.
     if edit.method_error.is_none() {
-        lines[1] = String::new();
+        lines[3] = String::new();
     }
 
     // The first line index a header row could occupy — needed below to turn
@@ -413,13 +421,15 @@ fn render_edit_pane(
         area,
     );
 
-    // Column offset: `▶ Method: ` / `▶ URL:    ` are the same width (10
-    // cells) by construction — `"Method: "` and `"URL:    "` are both
-    // 8 characters — so one constant serves both fields' cursor placement.
+    // Column offset: `▶ Name:   ` / `▶ Method: ` / `▶ URL:    ` are the same
+    // width (10 cells) by construction — `"Name:   "`, `"Method: "` and
+    // `"URL:    "` are all 8 characters — so one constant serves all three
+    // fields' cursor placement.
     const FIELD_PREFIX_WIDTH: u16 = 2 + 8;
     let (row, column) = match edit.focus {
-        EditField::Method => (0, FIELD_PREFIX_WIDTH + edit.method.cursor_chars() as u16),
-        EditField::Url => (3, FIELD_PREFIX_WIDTH + edit.url.cursor_chars() as u16),
+        EditField::Name => (0, FIELD_PREFIX_WIDTH + edit.name.cursor_chars() as u16),
+        EditField::Method => (2, FIELD_PREFIX_WIDTH + edit.method.cursor_chars() as u16),
+        EditField::Url => (5, FIELD_PREFIX_WIDTH + edit.url.cursor_chars() as u16),
         EditField::HeaderKey(index) => {
             let prefix = header_key_prefix(index);
             let cursor = edit.headers[index].key.cursor_chars();
@@ -1215,7 +1225,7 @@ pub(super) fn status_help_text(state: &AppState) -> String {
     match &state.run_state {
         RunState::Idle => {
             format!(
-                "↑/↓ nav  enter/r run  i edit  e env{}  q quit",
+                "↑/↓ nav  enter/r run  i edit  n new request  e env{}  q quit",
                 idle_reveal_hint(state)
             )
         }
@@ -1245,7 +1255,7 @@ pub(super) fn status_help_text(state: &AppState) -> String {
                 "  c reveal/hide captures"
             };
             format!(
-                "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn/Home/End scroll{reveal}  i edit  e env  q quit"
+                "{status}  |  ↑/↓ nav  enter/r run again  PgUp/PgDn/Home/End scroll{reveal}  i edit  n new request  e env  q quit"
             )
         }
     }
@@ -3434,6 +3444,69 @@ requests:
         );
     }
 
+    /// The visual half of `update`'s own
+    /// `adding_a_request_selects_it_and_opens_it_in_edit_mode_immediately`:
+    /// pressing `n` must show the new, dirty-marked request in the
+    /// collection browser and land straight in its edit pane, not a
+    /// separate "create request" screen.
+    #[test]
+    fn pressing_n_shows_the_new_request_selected_dirty_and_already_in_edit_mode() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+
+        update(&mut state, Message::AddRequest);
+
+        let screen = render_screen(&state);
+        assert!(
+            screen.contains("New request"),
+            "the new request must show up in the collection browser:\n{screen}"
+        );
+        assert!(
+            screen.contains('*'),
+            "the new, unsaved request must carry the same dirty marker any other unsaved \
+             edit does:\n{screen}"
+        );
+        assert!(
+            screen.contains("▶ Name:   New request"),
+            "AddRequest must land straight in the edit pane, focused on Name:\n{screen}"
+        );
+    }
+
+    /// The visual half of `update`'s own naming tests: the `Name:` field
+    /// shows the real name, carries the focus marker by default, and a
+    /// typed rename shows up live.
+    #[test]
+    fn edit_pane_shows_the_name_field_with_its_focus_marker_and_live_edits() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+
+        let before = render_screen(&state);
+        assert!(before.contains("▶ Name:   One"), "{before}");
+
+        type_into_focused_field(&mut state, " (renamed)");
+        let after = render_screen(&state);
+        assert!(after.contains("▶ Name:   One (renamed)"), "{after}");
+    }
+
+    /// The visual half of `update`'s own
+    /// `save_edit_refuses_to_leave_a_collection_request_unnamed`: a save
+    /// blocked for having no name must show a real, readable error the same
+    /// way a disk-level save failure already does.
+    #[test]
+    fn edit_pane_shows_a_save_error_inline_when_a_collection_request_is_left_unnamed() {
+        let mut state = loaded_state(THREE_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+        backspace_n(&mut state, "One".len());
+
+        update(&mut state, Message::SaveEdit);
+
+        let screen = render_screen(&state);
+        assert!(
+            screen.contains("Save failed"),
+            "an unnamed request inside a collection must be refused with a visible \
+             error:\n{screen}"
+        );
+    }
+
     /// The edit pane itself: both fields' current text, the `▶` focus
     /// marker moving with `Message::EditFocusNext`, and the inline
     /// validation message appearing for an invalid method and disappearing
@@ -3461,9 +3534,11 @@ requests:
         assert!(initial_screen.contains("Method: GET"));
         assert!(initial_screen.contains("URL:    https://example.com"));
         assert!(
-            initial_screen.contains("▶ Method"),
-            "focus starts on the method field:\n{initial_screen}"
+            initial_screen.contains("▶ Name"),
+            "focus starts on the name field:\n{initial_screen}"
         );
+
+        update(&mut state, Message::EditFocusNext); // -> Method
 
         backspace_n(&mut state, "GET".len());
         type_into_focused_field(&mut state, "FOOBAR");
@@ -3492,7 +3567,10 @@ requests:
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        let backend = TestBackend::new(80, 15);
+        // 17, not 15: the edit pane gained a `Name:` field and its own
+        // spacer line above `Method:`, so every fixed section below it sits
+        // two rows further down than before.
+        let backend = TestBackend::new(80, 17);
         let mut terminal = Terminal::new(backend).expect("a test terminal builds");
         terminal
             .draw(|frame| view(state, frame))
