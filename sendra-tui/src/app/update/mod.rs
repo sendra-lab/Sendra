@@ -18,8 +18,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::state::{
-    AppState, CollectionSession, EditState, HistoryOverlay, LoadState, Message, RunHistoryEntry,
-    RunState, TextField, RUN_HISTORY_CAP,
+    matching_request_indices, AppState, CollectionSession, EditState, HistoryOverlay, LoadState,
+    Message, RunHistoryEntry, RunState, TextField, RUN_HISTORY_CAP,
 };
 
 mod collection;
@@ -261,6 +261,7 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                 | Message::AddRequest
                 | Message::RequestDelete
                 | Message::EnterEnvironmentEdit
+                | Message::OpenRequestFilter
         )
     {
         return;
@@ -280,6 +281,7 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                 | Message::OpenHistoryOverlay
                 | Message::RunRequested
                 | Message::RequestDelete
+                | Message::OpenRequestFilter
         )
     {
         return;
@@ -300,6 +302,7 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                 | Message::RunRequested
                 | Message::EnterEditMode
                 | Message::AddRequest
+                | Message::OpenRequestFilter
         )
     {
         return;
@@ -320,6 +323,7 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                 | Message::EnterEditMode
                 | Message::AddRequest
                 | Message::RequestDelete
+                | Message::OpenRequestFilter
         )
     {
         return;
@@ -337,6 +341,37 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                 | Message::AddRequest
                 | Message::RequestDelete
                 | Message::EnterEnvironmentEdit
+                | Message::OpenRequestFilter
+        )
+    {
+        return;
+    }
+
+    // While the request filter is open, opening any *other* modal is
+    // refused the same way every other modal's own guard above refuses
+    // opening a sibling modal — `main::translate_event`'s own filter-open
+    // keymap never actually produces any of these (only `Esc`/Enter/
+    // arrows/text-editing keys are bound there), so this is belt-and-
+    // suspenders consistency with every guard above rather than a gap it
+    // closes on its own.
+    if state.request_filter.is_some()
+        && matches!(
+            msg,
+            Message::OpenEnvironmentOverlay
+                | Message::OpenHistoryOverlay
+                | Message::EnterEditMode
+                | Message::AddRequest
+                | Message::RequestDelete
+                | Message::EnterEnvironmentEdit
+                // Also guards re-entry with itself: `translate_event`'s
+                // filter-open keymap already routes `/` to a literal
+                // `EditInsertChar('/')` rather than this message (see
+                // `slash_types_a_literal_character_once_the_filter_is_already_open`),
+                // so this is unreachable in practice — but without it, a
+                // stray `OpenRequestFilter` from some other path would
+                // silently wipe an in-progress query back to empty via
+                // `TextField::default()`.
+                | Message::OpenRequestFilter
         )
     {
         return;
@@ -369,6 +404,26 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
             }
         }
         Message::RunRequested => {
+            // While the request filter is open and nothing currently
+            // matches its query, `render_request_list` highlights nothing
+            // at all (see its own "no requests match" placeholder) — Enter
+            // must be a no-op here too, rather than silently running
+            // whatever `selected` was left pointing at before the query
+            // narrowed to zero matches (see `reclamp_filtered_selection`'s
+            // own doc comment on why `selected` is deliberately left
+            // untouched in that case).
+            let filtered_to_nothing = if let Some(filter) = &state.request_filter {
+                if let LoadState::Loaded { document, .. } = &state.load_state {
+                    matching_request_indices(document, filter.value()).is_empty()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if filtered_to_nothing {
+                return;
+            }
             // While the welcome screen's discovery picker has a candidate
             // highlighted, Enter/`r` open it instead — see
             // `collection::confirm_discovered_selection`'s own doc comment.
@@ -502,16 +557,20 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
             request_edit::edit_state_mutate(state, EditState::delete_focused_capture_row)
         }
         // `EditInsertChar`/`EditBackspace`/`EditDelete`/`EditCursorLeft`/
-        // `EditCursorRight` are the generic text-field messages both a
-        // request edit session and an environment-variable edit session use
-        // for their own focused field — the two are mutually exclusive, so
-        // routing to whichever one is actually active, `edit_mode` first,
-        // covers both without a second set of messages just for environment
-        // variables. `EditCursorUp`/`EditCursorDown` stay request-only:
-        // every environment-variable field is single-line.
+        // `EditCursorRight` are the generic text-field messages a request
+        // edit session, an environment-variable edit session, and the
+        // request filter's own query field all use for their own focused
+        // field — routing to whichever one is actually active, `edit_mode`
+        // first, then the filter, covers all three without a separate set
+        // of messages for either. `EditCursorUp`/`EditCursorDown` stay
+        // request-only: every environment-variable field, and the filter's
+        // own query, are single-line.
         Message::EditInsertChar(ch) => {
             if state.edit_mode.is_some() {
                 request_edit::edit_mutate(state, |field| field.insert_char(ch));
+            } else if let Some(filter) = &mut state.request_filter {
+                filter.insert_char(ch);
+                reclamp_filtered_selection(state);
             } else {
                 environment_edit::env_var_mutate(state, |field| field.insert_char(ch));
             }
@@ -519,6 +578,9 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
         Message::EditBackspace => {
             if state.edit_mode.is_some() {
                 request_edit::edit_mutate(state, TextField::backspace);
+            } else if let Some(filter) = &mut state.request_filter {
+                filter.backspace();
+                reclamp_filtered_selection(state);
             } else {
                 environment_edit::env_var_mutate(state, TextField::backspace);
             }
@@ -526,6 +588,9 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
         Message::EditDelete => {
             if state.edit_mode.is_some() {
                 request_edit::edit_mutate(state, TextField::delete);
+            } else if let Some(filter) = &mut state.request_filter {
+                filter.delete();
+                reclamp_filtered_selection(state);
             } else {
                 environment_edit::env_var_mutate(state, TextField::delete);
             }
@@ -533,6 +598,8 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
         Message::EditCursorLeft => {
             if state.edit_mode.is_some() {
                 request_edit::edit_move_or_toggle(state, false, TextField::move_left);
+            } else if let Some(filter) = &mut state.request_filter {
+                filter.move_left();
             } else {
                 environment_edit::env_var_move(state, TextField::move_left);
             }
@@ -540,6 +607,8 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
         Message::EditCursorRight => {
             if state.edit_mode.is_some() {
                 request_edit::edit_move_or_toggle(state, true, TextField::move_right);
+            } else if let Some(filter) = &mut state.request_filter {
+                filter.move_right();
             } else {
                 environment_edit::env_var_move(state, TextField::move_right);
             }
@@ -557,6 +626,27 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
             environment_edit::handle_confirm_delete_env_var_row(state)
         }
         Message::CancelDeleteEnvVarRow => environment_edit::handle_cancel_delete_env_var_row(state),
+        // `/` while browsing: opens the request filter with an empty query
+        // — see `CollectionSession::request_filter`'s own doc comment.
+        // Always starts fresh (`TextField::default()`); nothing to guard
+        // against re-entry with since `translate_event` never emits this
+        // while the filter is already open (see `Message::OpenRequestFilter`'s
+        // own doc comment). Only meaningful once a collection is actually
+        // loaded — `/` is also reachable from the welcome screen's own
+        // discovery picker, since it shares the plain browsing keymap
+        // rather than having a separate one of its own, but that screen has
+        // no request list for a filter to apply to.
+        Message::OpenRequestFilter => {
+            if matches!(state.load_state, LoadState::Loaded { .. }) {
+                state.request_filter = Some(TextField::default());
+            }
+        }
+        // `Esc` while the request filter is open: clears it. `selected`
+        // stays exactly where it is — see `Message::CloseRequestFilter`'s
+        // own doc comment.
+        Message::CloseRequestFilter => {
+            state.request_filter = None;
+        }
         // See the doc comment on `Message::Resize` — the redraw itself
         // comes from `terminal.draw` re-running `view` against the
         // already-resized backend on the loop's next iteration; there is no
@@ -667,6 +757,20 @@ fn viewed_history_entry_mut(state: &mut CollectionSession) -> Option<&mut Histor
 /// open, otherwise to the collection browser's selection. The history
 /// browser's own list and the welcome screen's discovery picker are two more
 /// such lists.
+///
+/// **While the request filter is open** (`CollectionSession::request_filter`),
+/// the collection browser's own branch below moves through the *filtered*
+/// subset of `document.requests()` instead of every request — computed
+/// fresh each call via [`matching_request_indices`] rather than cached
+/// anywhere, since it only ever depends on the query text and the document,
+/// both already available here. `selected` itself is still written as a
+/// real `document.requests()` index, never a position within the filtered
+/// subset: `move_selection` is applied to *where `selected` currently sits
+/// within the filtered list*, and the real index at that position is what
+/// gets written back — see `CollectionSession::request_filter`'s own doc
+/// comment for why `selected` must never mean anything else. An empty
+/// filtered subset (nothing matches) leaves `selected` untouched — there is
+/// nothing to move to.
 fn select(state: &mut CollectionSession, delta: isize) {
     if let Some(cursor) = &mut state.environment_overlay {
         *cursor = move_selection(*cursor, state.environments.len(), delta);
@@ -688,17 +792,57 @@ fn select(state: &mut CollectionSession, delta: isize) {
         return;
     }
 
+    let filter_query = state
+        .request_filter
+        .as_ref()
+        .map(|filter| filter.value().to_string());
+
     if let LoadState::Loaded {
         document, selected, ..
     } = &mut state.load_state
     {
-        let next = move_selection(*selected, document.requests().len(), delta);
+        let next = if let Some(query) = &filter_query {
+            let matches = matching_request_indices(document, query);
+            if matches.is_empty() {
+                return;
+            }
+            let position = matches.iter().position(|index| index == selected);
+            let next_position = move_selection(position.unwrap_or(0), matches.len(), delta);
+            matches[next_position]
+        } else {
+            move_selection(*selected, document.requests().len(), delta)
+        };
         if next != *selected {
             state.run_state = RunState::Idle;
             state.response_scroll = 0;
             state.reveal_captures = false;
         }
         *selected = next;
+    }
+}
+
+/// After the request filter's query text changes, snaps `selected` onto the
+/// filtered subset if it fell outside it — e.g. `selected` pointed at a
+/// request that no longer matches once the just-typed character narrowed
+/// the query further. Lands on the first matching index, the same
+/// "wherever `select` would otherwise start from" choice `select` itself
+/// makes when `selected` isn't found in the filtered list. Leaves `selected`
+/// untouched when nothing matches at all — there is nothing sane to snap
+/// to, and `render_request_list` shows a "no matches" message instead of a
+/// highlighted row in that case.
+fn reclamp_filtered_selection(state: &mut CollectionSession) {
+    let Some(filter) = &state.request_filter else {
+        return;
+    };
+    let query = filter.value().to_string();
+    if let LoadState::Loaded {
+        document, selected, ..
+    } = &mut state.load_state
+    {
+        let matches = matching_request_indices(document, &query);
+        if !matches.is_empty() && !matches.contains(selected) {
+            *selected = matches[0];
+        }
     }
 }
 
@@ -834,6 +978,311 @@ mod tests {
         update(&mut state, Message::SelectPrevious);
 
         assert!(matches!(state.load_state, LoadState::Loading));
+    }
+
+    // --- the `/` request filter --------------------------------------------
+
+    /// Eight distinctly-named requests, the "large example collection" the
+    /// filter's own proof requirement asks for — deliberately more than
+    /// `THREE_REQUEST_COLLECTION`'s "One"/"Two"/"Three" so a substring query
+    /// narrows a real subset rather than trivially matching everything or
+    /// nothing, and with names that share substrings across different
+    /// positions/cases (`"User"` inside both `GetUsers` and `DeleteUser`,
+    /// `"login"`/`"Login"` differing only in case) to exercise case-
+    /// insensitive substring matching for real.
+    const EIGHT_REQUEST_COLLECTION: &str = "\
+name: test
+requests:
+  - name: Login
+    method: POST
+    url: https://example.com/login
+  - name: Logout
+    method: POST
+    url: https://example.com/logout
+  - name: GetUsers
+    method: GET
+    url: https://example.com/users
+  - name: CreateUser
+    method: POST
+    url: https://example.com/users
+  - name: DeleteUser
+    method: DELETE
+    url: https://example.com/users/1
+  - name: Healthcheck
+    method: GET
+    url: https://example.com/health
+  - name: GetOrders
+    method: GET
+    url: https://example.com/orders
+  - name: CreateOrder
+    method: POST
+    url: https://example.com/orders
+";
+
+    fn type_query(state: &mut AppState, query: &str) {
+        for ch in query.chars() {
+            update(state, Message::EditInsertChar(ch));
+        }
+    }
+
+    #[test]
+    fn opening_the_filter_starts_with_an_empty_query_matching_everything() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+
+        update(&mut state, Message::OpenRequestFilter);
+
+        assert_eq!(
+            state.request_filter.as_ref().map(|filter| filter.value()),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn opening_the_filter_does_nothing_without_a_loaded_collection() {
+        let mut state = AppState::default();
+
+        update(&mut state, Message::OpenRequestFilter);
+
+        assert!(state.request_filter.is_none());
+    }
+
+    #[test]
+    fn typing_narrows_the_request_list_case_insensitively() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+
+        type_query(&mut state, "USER");
+
+        let document = match &state.load_state {
+            LoadState::Loaded { document, .. } => document,
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        let query = state.request_filter.as_ref().unwrap().value().to_string();
+        let matches = matching_request_indices(document, &query);
+        let matched_names: Vec<&str> = matches
+            .iter()
+            .map(|&index| document.requests()[index].name.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            matched_names,
+            vec!["GetUsers", "CreateUser", "DeleteUser"],
+            "an uppercase query must still match the lowercase 'user' \
+             substring inside every one of these three names"
+        );
+    }
+
+    #[test]
+    fn select_next_and_previous_cycle_only_through_filtered_matches() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+        type_query(&mut state, "user"); // matches indices 2, 3, 4
+
+        assert_eq!(selected(&state), 2, "typing must snap onto the first match");
+
+        update(&mut state, Message::SelectNext);
+        assert_eq!(selected(&state), 3);
+
+        update(&mut state, Message::SelectNext);
+        assert_eq!(selected(&state), 4);
+
+        // Wraps back to the first match, not index 5 ("Healthcheck") or any
+        // other real index that doesn't match the query.
+        update(&mut state, Message::SelectNext);
+        assert_eq!(selected(&state), 2);
+
+        update(&mut state, Message::SelectPrevious);
+        assert_eq!(
+            selected(&state),
+            4,
+            "wrapping the other direction must also land only on a match"
+        );
+    }
+
+    #[test]
+    fn closing_the_filter_restores_the_full_list_leaving_selection_unchanged() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+        type_query(&mut state, "user");
+        update(&mut state, Message::SelectNext); // now on index 3, "CreateUser"
+        assert_eq!(selected(&state), 3);
+
+        update(&mut state, Message::CloseRequestFilter);
+
+        assert!(state.request_filter.is_none());
+        assert_eq!(
+            selected(&state),
+            3,
+            "closing the filter must leave selection on the same real \
+             request the user was just looking at, not reset or remap it"
+        );
+
+        // The full list navigates normally again, no longer confined to the
+        // three that matched "user".
+        update(&mut state, Message::SelectNext);
+        assert_eq!(selected(&state), 4);
+    }
+
+    #[test]
+    fn typing_a_narrower_query_snaps_selection_off_a_request_that_no_longer_matches() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+        type_query(&mut state, "e"); // matches many; land on the first, "Login" (has no 'e'... )
+                                     // Re-derive deterministically instead of assuming which index "e"
+                                     // lands on first — the point under test is what happens on the
+                                     // *next* keystroke, not this one.
+        let after_e = selected(&state);
+        let document = match &state.load_state {
+            LoadState::Loaded { document, .. } => document,
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        let name_after_e = document.requests()[after_e].name.clone().unwrap();
+
+        // Narrow further to a query the currently-selected name does not
+        // contain, forcing a snap.
+        let narrowing_char = if name_after_e.to_lowercase().contains("ea") {
+            'x' // never present in any fixture name; guarantees a miss
+        } else {
+            'a'
+        };
+        type_query(&mut state, &narrowing_char.to_string());
+
+        let document = match &state.load_state {
+            LoadState::Loaded { document, .. } => document,
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        let query = state.request_filter.as_ref().unwrap().value().to_string();
+        let matches = matching_request_indices(document, &query);
+        assert!(
+            !matches.is_empty(),
+            "test setup: the narrowed query must still match at least one request"
+        );
+        assert!(
+            matches.contains(&selected(&state)),
+            "selection must have snapped onto a request that still matches \
+             the narrowed query, not stayed on one that fell out of it"
+        );
+    }
+
+    #[test]
+    fn a_query_matching_nothing_leaves_selection_in_place_and_navigation_is_a_no_op() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+        let before = selected(&state);
+
+        type_query(&mut state, "zzz-no-such-request");
+
+        assert_eq!(
+            selected(&state),
+            before,
+            "nothing matches, so there is nothing sane to snap to"
+        );
+
+        update(&mut state, Message::SelectNext);
+        update(&mut state, Message::SelectPrevious);
+        assert_eq!(selected(&state), before);
+    }
+
+    #[test]
+    fn backspacing_the_query_to_empty_restores_every_request_without_closing_the_filter() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+        type_query(&mut state, "user");
+
+        update(&mut state, Message::EditBackspace);
+        update(&mut state, Message::EditBackspace);
+        update(&mut state, Message::EditBackspace);
+        update(&mut state, Message::EditBackspace);
+
+        assert!(
+            state.request_filter.is_some(),
+            "an emptied query is not the same as closing the filter — only \
+             Esc (CloseRequestFilter) does that"
+        );
+        let document = match &state.load_state {
+            LoadState::Loaded { document, .. } => document,
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        };
+        assert_eq!(
+            matching_request_indices(document, ""),
+            (0..document.requests().len()).collect::<Vec<_>>(),
+            "an empty query must match every request, same as no filter at all"
+        );
+    }
+
+    #[test]
+    fn typing_into_the_filter_does_not_type_into_a_request_edit_session() {
+        // Guards against `EditInsertChar` accidentally routing to the
+        // filter while a request is genuinely being edited — `edit_mode`
+        // must win, exactly like it already does over `environment_edit`.
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::EnterEditMode);
+        update(&mut state, Message::EditInsertChar('x'));
+
+        assert!(state.request_filter.is_none());
+        assert!(state.edit_mode.is_some());
+    }
+
+    #[test]
+    fn opening_other_modals_is_refused_while_the_filter_is_open() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+
+        update(&mut state, Message::OpenEnvironmentOverlay);
+        assert!(state.environment_overlay.is_none());
+
+        update(&mut state, Message::EnterEditMode);
+        assert!(state.edit_mode.is_none());
+
+        update(&mut state, Message::OpenHistoryOverlay);
+        assert!(state.history_overlay.is_none());
+
+        assert!(
+            state.request_filter.is_some(),
+            "the filter itself must still be open throughout"
+        );
+    }
+
+    #[test]
+    fn reopening_the_filter_while_already_open_does_not_wipe_the_query() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+        type_query(&mut state, "user");
+
+        update(&mut state, Message::OpenRequestFilter);
+
+        assert_eq!(
+            state.request_filter.as_ref().map(|filter| filter.value()),
+            Some("user"),
+            "a stray second OpenRequestFilter must not reset an in-progress query"
+        );
+    }
+
+    #[test]
+    fn running_is_a_no_op_while_the_filter_matches_nothing() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        let before = selected(&state);
+        update(&mut state, Message::OpenRequestFilter);
+        type_query(&mut state, "zzz-no-such-request");
+
+        update(&mut state, Message::RunRequested);
+
+        assert!(
+            matches!(state.run_state, RunState::Idle),
+            "Enter must not run whatever `selected` was left pointing at \
+             when nothing on screen is highlighted"
+        );
+        assert_eq!(selected(&state), before);
+    }
+
+    #[test]
+    fn running_still_works_normally_while_the_filter_has_a_match() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+        type_query(&mut state, "user");
+
+        update(&mut state, Message::RunRequested);
+
+        assert!(matches!(state.run_state, RunState::InFlight));
     }
 
     #[test]

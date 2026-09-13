@@ -211,6 +211,51 @@ pub struct CollectionSession {
     /// every other modal in this crate is kept exclusive with every other
     /// (see `update()`'s own guards).
     pub history_overlay: Option<HistoryOverlay>,
+    /// `Some(query)` while the request list is being filtered by name —
+    /// entered by `Message::OpenRequestFilter` (`/`), edited live by the
+    /// same `EditInsertChar`/`EditBackspace`/`EditDelete`/`EditCursorLeft`/
+    /// `EditCursorRight` messages every other text field in this crate
+    /// uses, and closed by `Message::CloseRequestFilter` (`Esc`), which
+    /// clears it back to `None` — there is no separate "confirm" step:
+    /// unlike the open-collection prompt, the filter is applied on every
+    /// keystroke rather than committed once at the end.
+    ///
+    /// **`selected` is never reinterpreted while this is open.** It always
+    /// stays a real index into `document.requests()`, exactly as it is
+    /// while merely browsing — see `update::select`'s own doc comment on
+    /// why. Filtering only changes *which* real indices `SelectNext`/
+    /// `SelectPrevious` cycle through and `render_request_list` draws, so
+    /// closing the filter (`selected` untouched) always leaves selection on
+    /// the same real request the user was just looking at, without needing
+    /// to remember or restore anything.
+    pub request_filter: Option<TextField>,
+}
+
+/// Every index into `document.requests()` whose name contains `query`,
+/// case-insensitively — matched against the exact same display string
+/// `render_request_list` already shows for each row
+/// (`request.name.as_deref().unwrap_or("(unnamed)")`), so a filter matches
+/// what's actually on screen, unnamed requests included. An empty `query`
+/// matches everything (every byte string contains the empty substring)
+/// rather than being special-cased, which is what makes "backspace the
+/// filter text down to nothing" behave the same as no filter at all without
+/// `update::select`/`render_request_list` needing to know the difference.
+pub(crate) fn matching_request_indices(document: &Document, query: &str) -> Vec<usize> {
+    let needle = query.to_lowercase();
+    document
+        .requests()
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| {
+            request
+                .name
+                .as_deref()
+                .unwrap_or("(unnamed)")
+                .to_lowercase()
+                .contains(&needle)
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// Cap on how many past runs [`CollectionSession::run_history`] keeps per
@@ -1089,6 +1134,18 @@ pub enum Message {
     OpenCheatsheet,
     /// `Esc` or `?` again while the cheatsheet is open: closes it.
     CloseCheatsheet,
+    /// `/` while browsing (not while any other modal is open): opens the
+    /// request-list filter (`CollectionSession::request_filter`) with an
+    /// empty query — always starts fresh rather than resuming a previous
+    /// query, since `CloseRequestFilter` (`Esc`) always clears it, so there
+    /// is never a "previous query" left to resume.
+    OpenRequestFilter,
+    /// `Esc` while the request filter is open: clears
+    /// `CollectionSession::request_filter` back to `None`, restoring the
+    /// unfiltered list. `selected` is left exactly as it is — see that
+    /// field's own doc comment on why closing the filter never needs to
+    /// move it.
+    CloseRequestFilter,
 }
 
 /// What the selected request's most recent run did, if anything.

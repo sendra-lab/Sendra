@@ -14,7 +14,7 @@ use ratatui::Frame;
 use sendra_core::{Document, Environment, Request};
 
 use super::super::preview::resolve_browsing_preview;
-use super::super::state::AppState;
+use super::super::state::{matching_request_indices, AppState};
 use super::super::theme;
 use super::edit_form::render_edit_pane;
 use super::response::{render_response_panel, REDACTED_CAPTURE_VALUE};
@@ -41,18 +41,46 @@ const MAX_BODY_PREVIEW_CHARS: usize = 2000;
 /// the last item back to the first, or the first back to the last, which
 /// must re-scroll the window to the opposite end in one step. Verified, not
 /// assumed — see `collection_browser_scrolls_to_keep_selection_visible`.
+///
+/// **Filtering** (`filter_query`, `Some` while `CollectionSession::
+/// request_filter` is open) hides every request whose name doesn't match —
+/// via the exact same [`matching_request_indices`] `update::select` cycles
+/// through, so the two always agree on which requests are "in the filtered
+/// list" — without renumbering anything: each shown row still carries its
+/// real `document.requests()` index for `dirty_requests`, and `selected`
+/// itself is still the real index (see `CollectionSession::request_filter`'s
+/// own doc comment), so this function only needs to find *where in the
+/// filtered rows* that real index currently falls to highlight the right
+/// one. An empty filtered result (nothing matches) shows a plain message
+/// instead of an empty list, the same "plain prose through `theme::colorize`"
+/// convention every other empty-state message in this crate already uses
+/// (e.g. `render_environment_edit`'s own "(no variables — ctrl+n to add
+/// one)").
 pub(crate) fn render_request_list(
     frame: &mut Frame,
     area: Rect,
     document: &Document,
     selected: usize,
     dirty_requests: &HashSet<usize>,
+    filter_query: Option<&str>,
 ) {
-    let items: Vec<ListItem> = document
-        .requests()
+    let matching: Vec<usize> = match filter_query {
+        Some(query) => matching_request_indices(document, query),
+        None => (0..document.requests().len()).collect(),
+    };
+
+    if matching.is_empty() {
+        frame.render_widget(
+            Paragraph::new(theme::colorize("(no requests match this filter)")),
+            area,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = matching
         .iter()
-        .enumerate()
-        .map(|(index, request)| {
+        .map(|&index| {
+            let request = &document.requests()[index];
             let name = request.name.as_deref().unwrap_or("(unnamed)");
             // `*` for unsaved edits, matching the same marker convention as
             // an editor's modified-buffer indicator — a leading space in the
@@ -70,7 +98,11 @@ pub(crate) fn render_request_list(
 
     let list = List::new(items).highlight_style(theme::selection());
 
-    let mut list_state = ListState::default().with_selected(Some(selected));
+    let highlighted = matching
+        .iter()
+        .position(|&index| index == selected)
+        .unwrap_or(0);
+    let mut list_state = ListState::default().with_selected(Some(highlighted));
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
@@ -367,6 +399,228 @@ requests:
         assert!(
             !wrapped_to_bottom_screen.contains("Request0"),
             "the list must not still be showing the top after wrapping to the bottom:\n{wrapped_to_bottom_screen}"
+        );
+    }
+
+    // --- the `/` request filter's own visuals -------------------------------
+
+    const EIGHT_REQUEST_COLLECTION: &str = "\
+name: test
+requests:
+  - name: Login
+    method: POST
+    url: https://example.com/login
+  - name: Logout
+    method: POST
+    url: https://example.com/logout
+  - name: GetUsers
+    method: GET
+    url: https://example.com/users
+  - name: CreateUser
+    method: POST
+    url: https://example.com/users
+  - name: DeleteUser
+    method: DELETE
+    url: https://example.com/users/1
+  - name: Healthcheck
+    method: GET
+    url: https://example.com/health
+  - name: GetOrders
+    method: GET
+    url: https://example.com/orders
+  - name: CreateOrder
+    method: POST
+    url: https://example.com/orders
+";
+
+    fn type_query(state: &mut AppState, query: &str) {
+        for ch in query.chars() {
+            update(state, Message::EditInsertChar(ch));
+        }
+    }
+
+    /// Proof requirement: filtering a large example collection down to a
+    /// substring match shows only the matching requests, and the pane
+    /// itself carries a clear, unmistakable indication that it's filtered —
+    /// not merely a shorter list a screenshot alone wouldn't distinguish
+    /// from "this collection only has three requests".
+    #[test]
+    fn filtering_shows_only_matches_and_marks_the_pane_as_filtered() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+
+        let unfiltered_screen = render_screen(&state);
+        assert!(unfiltered_screen.contains("Login"));
+        assert!(unfiltered_screen.contains("Healthcheck"));
+        assert!(
+            unfiltered_screen.contains(" Requests ") || unfiltered_screen.contains("filter: \"\""),
+            "an empty query shows every request but the pane title should \
+             already say a filter is active:\n{unfiltered_screen}"
+        );
+
+        type_query(&mut state, "user");
+        let filtered_screen = render_screen(&state);
+
+        assert!(
+            filtered_screen.contains("GetUsers"),
+            "a matching request must still be shown:\n{filtered_screen}"
+        );
+        assert!(
+            filtered_screen.contains("CreateUser"),
+            "a matching request must still be shown:\n{filtered_screen}"
+        );
+        assert!(
+            filtered_screen.contains("DeleteUser"),
+            "a matching request must still be shown:\n{filtered_screen}"
+        );
+        assert!(
+            !filtered_screen.contains("Login"),
+            "a non-matching request must be hidden, not merely unselected:\n{filtered_screen}"
+        );
+        assert!(
+            !filtered_screen.contains("Healthcheck"),
+            "a non-matching request must be hidden:\n{filtered_screen}"
+        );
+        assert!(
+            filtered_screen.contains("filter: \"user\""),
+            "the pane's own title must name the active query in plain text:\n{filtered_screen}"
+        );
+        assert!(
+            filtered_screen.contains("(3/8)"),
+            "the pane's own title must say how many of the 8 real requests \
+             currently match:\n{filtered_screen}"
+        );
+    }
+
+    /// The pane border/title itself must switch to the same bold
+    /// `theme::emphasis` style every other mode-flagged pane in this crate
+    /// already uses (editing, running, a completed run's outcome) — not a
+    /// new, ad hoc style just for this feature.
+    #[test]
+    fn the_filtered_panes_title_uses_the_shared_emphasis_style_not_new_styling() {
+        use ratatui::style::Modifier;
+
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+        type_query(&mut state, "user");
+
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal builds");
+        terminal
+            .draw(|frame| crate::app::view(&state, frame))
+            .expect("rendering must not panic");
+        let buffer = terminal.backend().buffer().clone();
+
+        assert_eq!(
+            theme::emphasis().add_modifier,
+            Modifier::BOLD,
+            "sanity: this test's own notion of emphasis must track theme::emphasis()"
+        );
+        // Symbols in a ratatui buffer are one grapheme per cell, so no
+        // single cell literally contains "Requests" — find the title row by
+        // reassembling each row's text first, then check that row for the
+        // bold modifier.
+        let title_row = (buffer.area.y..buffer.area.y + buffer.area.height)
+            .find(|&y| {
+                (buffer.area.x..buffer.area.x + buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).map(|c| c.symbol()).unwrap_or(""))
+                    .collect::<String>()
+                    .contains("Requests")
+            })
+            .expect("the request list pane's title row must be on screen");
+        let row_is_bold = (buffer.area.x..buffer.area.x + buffer.area.width).any(|x| {
+            buffer
+                .cell((x, title_row))
+                .is_some_and(|cell| cell.modifier.contains(Modifier::BOLD))
+        });
+        assert!(
+            row_is_bold,
+            "the filtered pane's title row must carry theme::emphasis()'s bold modifier"
+        );
+    }
+
+    /// A query that matches nothing shows a plain message instead of an
+    /// empty pane — the same "plain prose, no ad hoc styling" convention
+    /// every other empty-state message in this crate already uses.
+    #[test]
+    fn a_filter_matching_nothing_shows_a_placeholder_instead_of_an_empty_list() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+        type_query(&mut state, "zzz-no-such-request");
+
+        let screen = render_screen(&state);
+        assert!(
+            screen.contains("no requests match"),
+            "an empty filtered list must say so, not render blank:\n{screen}"
+        );
+    }
+
+    /// Selection/navigation on the filtered list, proven at the screen
+    /// level: `SelectNext` must move the highlight between the filtered
+    /// rows actually on screen, not silently reach past them into a
+    /// non-matching request.
+    #[test]
+    fn navigating_the_filtered_list_moves_only_between_visible_matches() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+        type_query(&mut state, "user"); // GetUsers, CreateUser, DeleteUser
+        assert_eq!(
+            document_name(&state, selected(&state)),
+            "GetUsers",
+            "typing must have snapped selection onto the first match"
+        );
+
+        update(&mut state, Message::SelectNext);
+        assert_eq!(document_name(&state, selected(&state)), "CreateUser");
+
+        update(&mut state, Message::SelectNext);
+        assert_eq!(document_name(&state, selected(&state)), "DeleteUser");
+
+        // Wraps back to the first match — never advances onto "Healthcheck"
+        // (the next real index, 5, which does not match "user").
+        update(&mut state, Message::SelectNext);
+        assert_eq!(document_name(&state, selected(&state)), "GetUsers");
+    }
+
+    fn document_name(state: &AppState, index: usize) -> String {
+        match &state.load_state {
+            crate::app::LoadState::Loaded { document, .. } => {
+                document.requests()[index].name.clone().unwrap()
+            }
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+    }
+
+    /// Clearing the filter (`Esc`) restores every request and leaves
+    /// selection exactly where the user was looking — proven at the screen
+    /// level, not just against `AppState` fields.
+    #[test]
+    fn clearing_the_filter_restores_the_full_list_with_sane_selection() {
+        let mut state = loaded_state(EIGHT_REQUEST_COLLECTION);
+        update(&mut state, Message::OpenRequestFilter);
+        type_query(&mut state, "user");
+        update(&mut state, Message::SelectNext); // now on "CreateUser"
+        assert_eq!(document_name(&state, selected(&state)), "CreateUser");
+
+        update(&mut state, Message::CloseRequestFilter);
+
+        let screen = render_screen(&state);
+        assert!(
+            screen.contains("Login"),
+            "every request must be back:\n{screen}"
+        );
+        assert!(
+            screen.contains("Healthcheck"),
+            "every request must be back:\n{screen}"
+        );
+        assert!(
+            screen.contains(" Requests "),
+            "the pane title must go back to its plain, unfiltered form:\n{screen}"
+        );
+        assert_eq!(
+            document_name(&state, selected(&state)),
+            "CreateUser",
+            "selection must still be on the same real request after clearing the filter"
         );
     }
 

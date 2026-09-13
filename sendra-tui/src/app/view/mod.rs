@@ -21,7 +21,8 @@ use sendra_core::{Document, Environment};
 
 use super::preview;
 use super::state::{
-    AppState, CollectionSession, ConfirmPrompt, LoadState, NamedEnvironment, RunState,
+    matching_request_indices, AppState, CollectionSession, ConfirmPrompt, LoadState,
+    NamedEnvironment, RunState, TextField,
 };
 use super::theme;
 
@@ -96,13 +97,20 @@ pub fn view(state: &AppState, frame: &mut Frame) {
                 .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
                 .split(main_row);
 
-            let list_inner = bordered_pane(frame, panes[0], " Requests ", theme::muted());
+            let (list_title, list_style) = request_list_pane_title(state, document);
+            let list_inner = bordered_pane(
+                frame,
+                panes[0],
+                Span::styled(list_title, list_style),
+                list_style,
+            );
             render_request_list(
                 frame,
                 list_inner,
                 document,
                 *selected,
                 &state.dirty_requests,
+                state.request_filter.as_ref().map(TextField::value),
             );
 
             let (detail_title, detail_style) = detail_pane_style(state);
@@ -208,6 +216,32 @@ fn detail_pane_style(state: &AppState) -> (&'static str, Style) {
         }
     } else {
         (" Preview ", theme::muted())
+    }
+}
+
+/// The title and border color [`view`] gives the request list pane — plain
+/// " Requests " in [`theme::muted`] while browsing, matching every other
+/// unfiltered pane in this crate; once `CollectionSession::request_filter`
+/// is open, the title instead names the live query and how many of the
+/// document's requests currently match it, in [`theme::emphasis`] (bold),
+/// the same "this pane is in a distinct mode right now" signal
+/// [`detail_pane_style`] already gives editing/running/response panes their
+/// own border color for. Bullet 2 of this feature's own spec ("clear visual
+/// indication the list is filtered") is satisfied by this alone — no new
+/// styling primitive, just the two `theme::*` styles every other pane
+/// already switches between.
+fn request_list_pane_title(state: &AppState, document: &Document) -> (String, Style) {
+    match &state.request_filter {
+        Some(filter) => {
+            let query = filter.value();
+            let matches = matching_request_indices(document, query).len();
+            let total = document.requests().len();
+            (
+                format!(" Requests — filter: \"{query}\" ({matches}/{total}) "),
+                theme::emphasis(),
+            )
+        }
+        None => (" Requests ".to_string(), theme::muted()),
     }
 }
 
