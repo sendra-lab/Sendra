@@ -7,6 +7,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::super::state::{ConfirmPrompt, OpenCollectionPromptState};
+use super::super::theme;
 use super::{format_error, modal_frame};
 
 /// The one confirmation-prompt component every destructive action in this
@@ -33,7 +34,10 @@ pub(crate) fn render_confirm_prompt(frame: &mut Frame, heading: &str, prompt: &C
         text.push_str("\n\n");
         text.push_str(&format_error("Failed", error));
     }
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
+    frame.render_widget(
+        Paragraph::new(theme::colorize(&text)).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 /// The "open another collection" path-input prompt — a minimal, single-field
@@ -55,5 +59,8 @@ pub(crate) fn render_open_collection_prompt(frame: &mut Frame, prompt: &OpenColl
         text.push_str("\n\n");
         text.push_str(&format_error("Failed to open", error));
     }
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
+    frame.render_widget(
+        Paragraph::new(theme::colorize(&text)).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
