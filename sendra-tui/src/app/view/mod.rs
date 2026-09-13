@@ -30,11 +30,13 @@ mod edit_form;
 mod environment;
 mod modals;
 mod response;
+mod welcome;
 
 use browser::{render_detail_pane, render_request_list};
 use environment::render_environment_overlay;
 use modals::{render_confirm_prompt, render_open_collection_prompt};
 use response::render_history_overlay;
+use welcome::render_welcome;
 
 pub fn view(state: &AppState, frame: &mut Frame) {
     // A header row is reserved above everything else, in every `LoadState`
@@ -75,8 +77,8 @@ pub fn view(state: &AppState, frame: &mut Frame) {
 
     match &state.load_state {
         LoadState::Loading => render_message(frame, main_row, "Loading collection..."),
-        LoadState::NoPathProvided => {
-            render_message(frame, main_row, "No collection path provided.");
+        LoadState::NoPathProvided { discovered, cursor } => {
+            render_welcome(frame, main_row, discovered, *cursor);
         }
         LoadState::Failed(error) => {
             render_error(frame, main_row, "Failed to load collection", error);
@@ -252,7 +254,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 pub(super) fn collection_label(session: &CollectionSession) -> String {
     match &session.load_state {
         LoadState::Loading => "loading…".to_string(),
-        LoadState::NoPathProvided => "(none)".to_string(),
+        LoadState::NoPathProvided { .. } => "(none)".to_string(),
         LoadState::Failed(_) => "(failed)".to_string(),
         LoadState::Loaded { document, path, .. } => match &**document {
             Document::Single(request) => request
@@ -406,7 +408,13 @@ fn status_bar_line(text: &str) -> Line<'static> {
 ///    the environment overlay and quit are the only two keys that do
 ///    anything, and both keep working, which is the whole point of this
 ///    context existing — a failed collection load must not read as a dead
-///    end.
+///    end. `NoPathProvided` with a non-empty `discovered` list gets its own,
+///    richer variant of this context instead (checked first, just above):
+///    the welcome screen's discovery picker adds nav (`↑/↓`) and confirm
+///    (`enter`/`r`, reusing `RunRequested` — see
+///    `update::collection::confirm_discovered_selection`'s own doc comment
+///    on why) on top of the same `e env  o open  q quit` this context always
+///    offers.
 /// 5. **A run is in flight** (`RunState::InFlight`) — `update()`'s own guard
 ///    at the top of the function refuses every navigation/overlay/run
 ///    message while this holds, so `q` (never blocked — see that guard's own
@@ -517,6 +525,18 @@ pub(super) fn status_help_text(state: &AppState) -> String {
             "Editing{dirty}{invalid}  |  tab/shift+tab switch field  ctrl+n add header  \
              ctrl+d delete header  ctrl+s save  esc cancel  q quit"
         );
+    }
+
+    // The welcome screen's discovery picker has its own nav/confirm keys —
+    // checked ahead of the generic "nothing loaded" fallback below, which
+    // this state would otherwise also match.
+    if let LoadState::NoPathProvided { discovered, .. } = &state.load_state {
+        if !discovered.is_empty() {
+            return format!(
+                "↑/↓ choose  enter/r open  o type a path  e env{}  q quit",
+                tab_hint(state)
+            );
+        }
     }
 
     if !matches!(state.load_state, LoadState::Loaded { .. }) {

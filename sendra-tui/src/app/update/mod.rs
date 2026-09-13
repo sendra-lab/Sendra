@@ -355,14 +355,22 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
             }
         }
         Message::RunRequested => {
-            // A no-op with nothing loaded or nothing selected — there is no
-            // request to run.
-            if request_edit::request_is_selected(state) {
-                state.run_state = RunState::InFlight;
-                // A fresh run's text starts at the top, and its captures
-                // start masked again, regardless of a previous run's state.
-                state.response_scroll = 0;
-                state.reveal_captures = false;
+            // While the welcome screen's discovery picker has a candidate
+            // highlighted, Enter/`r` open it instead — see
+            // `collection::confirm_discovered_selection`'s own doc comment.
+            // Falls through to the ordinary run/no-op handling below only
+            // when that wasn't the case.
+            if !collection::confirm_discovered_selection(state) {
+                // A no-op with nothing loaded or nothing selected — there is
+                // no request to run.
+                if request_edit::request_is_selected(state) {
+                    state.run_state = RunState::InFlight;
+                    // A fresh run's text starts at the top, and its captures
+                    // start masked again, regardless of a previous run's
+                    // state.
+                    state.response_scroll = 0;
+                    state.reveal_captures = false;
+                }
             }
         }
         // Scrolling/reveal route to whichever response panel is actually on
@@ -641,7 +649,8 @@ fn viewed_history_entry_mut(state: &mut CollectionSession) -> Option<&mut Histor
 
 /// Routes `SelectNext`/`SelectPrevious` to the overlay's cursor when it is
 /// open, otherwise to the collection browser's selection. The history
-/// browser's own list is a third such list.
+/// browser's own list and the welcome screen's discovery picker are two more
+/// such lists.
 fn select(state: &mut CollectionSession, delta: isize) {
     if let Some(cursor) = &mut state.environment_overlay {
         *cursor = move_selection(*cursor, state.environments.len(), delta);
@@ -652,6 +661,13 @@ fn select(state: &mut CollectionSession, delta: isize) {
     if let Some(overlay) = &mut state.history_overlay {
         if overlay.viewing.is_none() {
             overlay.cursor = move_selection(overlay.cursor, history_len, delta);
+        }
+        return;
+    }
+
+    if let LoadState::NoPathProvided { discovered, cursor } = &mut state.load_state {
+        if !discovered.is_empty() {
+            *cursor = move_selection(*cursor, discovered.len(), delta);
         }
         return;
     }
@@ -732,7 +748,7 @@ mod tests {
 
         update(&mut state, Message::NoCollectionPath);
 
-        assert!(matches!(state.load_state, LoadState::NoPathProvided));
+        assert!(matches!(state.load_state, LoadState::NoPathProvided { .. }));
     }
 
     #[test]

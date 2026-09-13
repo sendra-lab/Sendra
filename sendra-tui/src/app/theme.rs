@@ -91,6 +91,17 @@ pub(crate) fn in_progress() -> Style {
     Style::new().fg(Color::Cyan)
 }
 
+/// The app's own mark — the character-art rendition of the Sendra logo the
+/// welcome screen draws (`app::logo`). The same `Color::Green` [`success`]
+/// already uses, but named and kept separate from it deliberately: the logo
+/// is the app's fixed identity color, not a verdict on anything, and the two
+/// are only accidentally the same shade today — changing `success`'s color
+/// later (a colorblind-friendlier palette, say) should not silently recolor
+/// the logo along with it.
+pub(crate) fn brand() -> Style {
+    Style::new().fg(Color::Green)
+}
+
 /// The selected row in every list this crate draws (the request list, the
 /// environment picker, the run-history list) and the active tab in the tab
 /// bar — `Modifier::REVERSED`, not a background color, so it reads
