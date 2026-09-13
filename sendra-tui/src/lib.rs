@@ -170,7 +170,7 @@ fn install_panic_hook() {
 /// Unwinds its own partial progress on failure, rather than relying on the
 /// caller: `run` calls this with `?`, which on a mid-setup error propagates
 /// immediately, before `run`'s own `restore_terminal()` (guarding
-/// `event_loop`) is ever reached — so raw mode and the alternate screen have
+/// `event_loop`) is ever reached, so raw mode and the alternate screen have
 /// to be left exactly as this function found them on every `Err` path, not
 /// just the first one.
 fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
