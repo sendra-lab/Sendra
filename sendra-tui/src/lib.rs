@@ -1,3 +1,8 @@
+//! Sendra's terminal UI, as a library — `run` is the one entry point, called
+//! by `sendra-cli`'s `sendra tui` subcommand (and by a bare `sendra` with no
+//! subcommand at all; see that crate's `cli.rs`). Everything else here is
+//! private: argument parsing lives with the caller now, not in this crate.
+
 mod app;
 mod oauth_login;
 mod run_request;
@@ -9,7 +14,6 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -24,13 +28,6 @@ use app::{
     active_environment, update, view, AppState, AuthEdit, LoadState, Message, NamedEnvironment,
     OAuthLoginState, RunState,
 };
-
-#[derive(Parser)]
-#[command(name = "sendra-tui")]
-struct Cli {
-    /// Collection or request YAML file to load.
-    path: Option<PathBuf>,
-}
 
 /// Where a resolved request's `body_file`/multipart paths resolve against:
 /// the directory containing the collection's own YAML file, not the
@@ -724,7 +721,7 @@ fn oauth_auth_for_login(state: &AppState) -> Result<sendra_core::OAuthAuth, Stri
         .ok_or_else(|| "auth.oauth is not set".to_string())
 }
 
-fn run(
+fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     load_message: Message,
     environments: Vec<NamedEnvironment>,
@@ -913,11 +910,15 @@ fn require_interactive_stdout() {
     std::process::exit(1);
 }
 
-fn main() -> io::Result<()> {
+/// Launches the terminal UI, optionally preloading `path` as its collection
+/// or request file. Blocking: returns only once the user quits (or a fatal
+/// I/O error occurs), same as any other full-screen terminal program — the
+/// caller (`sendra-cli`'s `sendra tui`, or a bare `sendra`) awaits nothing
+/// concurrently with it.
+pub fn run(path: Option<PathBuf>) -> io::Result<()> {
     require_interactive_stdout();
     install_panic_hook();
 
-    let cli = Cli::parse();
     let start_dir = std::env::current_dir()?;
 
     // Loading is plain sendra-core I/O — no terminal touched yet — and its
@@ -926,7 +927,7 @@ fn main() -> io::Result<()> {
     // than being special-cased. With no path given, there is nothing to load
     // and no file to guess at — that goes through the same path as a real
     // load outcome, rather than being decided before the architecture sees it.
-    let load_message = match cli.path {
+    let load_message = match path {
         Some(path) => Message::CollectionLoaded {
             base_dir: base_dir(&path).to_path_buf(),
             result: Box::new(Document::from_path(&path)),
@@ -937,7 +938,7 @@ fn main() -> io::Result<()> {
     let (environments, environment_errors) = load_environments(&start_dir);
 
     let mut terminal = init_terminal()?;
-    let result = run(
+    let result = event_loop(
         &mut terminal,
         load_message,
         environments,
@@ -2841,13 +2842,11 @@ mod tests {
 /// sendra-cli resolves for the same real project directory — not a manual
 /// spot-check, an actual test against a real fixture on disk.
 ///
-/// **Why this lives here, and not under `tests/`:** sendra-tui has no
-/// `lib.rs` (see `Cargo.toml` — `[[bin]]` only), so an integration test
-/// under `tests/` cannot reach `discover_environment_names`,
-/// `load_environments`, or `base_dir` at all — they are private to this
-/// binary crate. This module is compiled inside `main.rs` itself specifically
-/// so it can call sendra-tui's *real* resolution functions, not
-/// reimplemented lookalikes of them.
+/// **Why this lives here, and not under `tests/`:** `discover_environment_names`,
+/// `load_environments`, and `base_dir` are private to this crate, so an
+/// integration test under `tests/` cannot reach them — only a test module
+/// compiled inside the crate itself can call sendra-tui's *real* resolution
+/// functions, not reimplemented lookalikes of them.
 ///
 /// **Why the "CLI side" calls `sendra_core` directly instead of spawning the
 /// `sendra` binary:** `sendra-cli`'s own `prepare`/`environment_for`

@@ -1,16 +1,17 @@
 [package]
 name = "sendra-tui"
-description = "Terminal UI for Sendra."
+description = "Terminal UI for Sendra — a library crate, launched by sendra-cli's `sendra tui` subcommand (and by a bare `sendra`)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "sendra-tui"
-path = "src/main.rs"
-
 [dependencies]
-clap = { workspace = true }
+# Pulled into every `sendra` install by default now that sendra-cli depends
+# on this crate unconditionally (no feature flag gating it) — the deliberate
+# tradeoff behind merging the CLI and TUI into one binary: whoever only ever
+# runs `sendra run`/`sendra test` still builds and ships these two, and the
+# ~1MB/~15s they cost (measured on this workspace; see the packaging report)
+# rather than a CLI-only build pulling in neither.
 crossterm = "0.29.0"
 ratatui = { version = "0.30.2", default-features = false, features = [
   "crossterm",
