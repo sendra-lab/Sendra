@@ -167,11 +167,20 @@ fn install_panic_hook() {
     }));
 }
 
+/// Unwinds its own partial progress on failure, rather than relying on the
+/// caller: `run` calls this with `?`, which on a mid-setup error propagates
+/// immediately, before `run`'s own `restore_terminal()` (guarding
+/// `event_loop`) is ever reached, so raw mode and the alternate screen have
+/// to be left exactly as this function found them on every `Err` path, not
+/// just the first one.
 fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    Terminal::new(CrosstermBackend::new(stdout))
+    if let Err(err) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(err);
+    }
+    Terminal::new(CrosstermBackend::new(stdout)).inspect_err(|_| restore_terminal())
 }
 
 /// The only place allowed to touch crossterm event types directly — translates

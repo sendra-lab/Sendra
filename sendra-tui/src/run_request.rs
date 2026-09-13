@@ -181,7 +181,7 @@ fn run_catching_panics(f: impl FnOnce() -> RunOutcome + std::panic::UnwindSafe) 
 /// genuinely is one, while the explicit `&*payload` deref downcasts
 /// correctly. Verified with a minimal repro outside this crate before
 /// settling on this signature, not assumed.
-fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
     let payload: &(dyn std::any::Any + Send) = &**payload;
     if let Some(message) = payload.downcast_ref::<&str>() {
         (*message).to_string()

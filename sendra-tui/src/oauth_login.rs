@@ -57,15 +57,41 @@ pub enum LoginOutcome {
 /// message, and every path through [`run_login`] below reaches its one
 /// `on_complete` call rather than leaving the caller's waiting state stuck
 /// forever.
+///
+/// **Always calls `on_complete` exactly once, even if `run_login` panics** —
+/// wrapped in `catch_unwind` the same way [`crate::run_request::spawn`]
+/// wraps `execute`, so a bug anywhere in the login pipeline cannot unwind
+/// this thread out from under `on_complete` and leave the caller's
+/// `OAuthLoginState` stuck at `WaitingForBrowser` forever.
 pub fn spawn(
     oauth: OAuthAuth,
     cache: Arc<OAuthTokenCache>,
     on_complete: impl FnOnce(LoginOutcome) + Send + 'static,
 ) {
     std::thread::spawn(move || {
-        let outcome = run_login(&oauth, &cache);
+        let outcome =
+            login_catching_panics(std::panic::AssertUnwindSafe(|| run_login(&oauth, &cache)));
         on_complete(outcome);
     });
+}
+
+/// Runs `f`, catching any panic and turning it into `LoginOutcome::Failed`
+/// instead of letting it unwind past this point — the mechanism [`spawn`]
+/// relies on to guarantee `on_complete` always runs exactly once, panic or
+/// not. Factored out from `spawn` itself, the same way
+/// [`crate::run_request::run_catching_panics`] is, so this recovery
+/// behavior is directly unit-testable with a closure that deliberately
+/// panics, rather than only reachable by getting a real bug to misfire
+/// somewhere inside `run_login`'s real network/browser pipeline.
+fn login_catching_panics(
+    f: impl FnOnce() -> LoginOutcome + std::panic::UnwindSafe,
+) -> LoginOutcome {
+    std::panic::catch_unwind(f).unwrap_or_else(|payload| {
+        LoginOutcome::Failed(format!(
+            "the login thread panicked: {}",
+            crate::run_request::panic_payload_message(&payload)
+        ))
+    })
 }
 
 /// The flow itself: PKCE pair and CSRF `state` generated fresh for this one
@@ -289,6 +315,25 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::net::TcpStream;
+
+    /// Proof requirement for `spawn`'s doc comment: a panic anywhere in
+    /// `run_login` must still produce a `LoginOutcome` rather than unwinding
+    /// past `spawn`'s thread closure, the same guarantee
+    /// `run_request::spawn` already has (and is tested for) — see that
+    /// crate's `a_panic_on_the_run_thread_still_completes_instead_of_hanging_forever`.
+    #[test]
+    fn a_panic_in_run_login_still_produces_a_failed_outcome_instead_of_hanging_forever() {
+        let outcome = login_catching_panics(|| panic!("simulated bug in the login pipeline"));
+        match outcome {
+            LoginOutcome::Failed(message) => {
+                assert!(
+                    message.contains("simulated bug in the login pipeline"),
+                    "the panic message must survive into the outcome: {message}"
+                );
+            }
+            LoginOutcome::Success => panic!("a panic must never read as a successful login"),
+        }
+    }
 
     #[test]
     fn redirect_bind_addr_resolves_loopback_host_and_port() {

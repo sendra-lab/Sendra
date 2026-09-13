@@ -3,9 +3,10 @@
 `sendra tui` opens a full-screen terminal app for browsing and running the
 requests in a collection (or a single request file), instead of one shell
 invocation per request. It reuses `sendra-core` directly — the same request
-model, YAML loading, environment resolution, scripting, capture and HTTP
-execution `run`/`test` use — so a collection behaves identically whether you
-send it from the TUI or from the command line.
+model, YAML loading, environment resolution, capture and HTTP execution
+`run`/`test` use — with one exception: `pre_request`/`post_request` scripts
+are not run from the TUI (see below). Everything else behaves identically
+whether you send it from the TUI or from the command line.
 
 ## Installing and launching
 
@@ -84,6 +85,13 @@ side and a detail/response pane on the other.
 A request's status, once it has run, shows in the detail pane alongside its
 headers and body. Requests that have never been run yet just show their
 resolved request preview.
+
+A request's `pre_request`/`post_request` scripts, if it has any, are **not**
+run when sent from the TUI — only `sendra run`/`sendra test` run them. Every
+other part of the send pipeline (environment substitution, config header
+merging, auth/query/body resolution, assertions, capture) is identical
+either way; this is the one honest gap, not a silent one. See
+[Scripting](scripting.md).
 
 ## Editing a request
 
