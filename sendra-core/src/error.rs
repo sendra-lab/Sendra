@@ -352,4 +352,15 @@ pub enum SendraError {
     /// request that shares it.
     #[error("could not acquire an OAuth token from `{token_url}`: {reason}")]
     OAuthAcquisition { token_url: String, reason: String },
+
+    /// Could not build an `authorization_code` login's authorization URL:
+    /// `auth.oauth.authorization_url` did not parse as a URL. Raised by
+    /// [`crate::oauth::build_authorization_url`], the one step of the
+    /// interactive login flow that runs before any browser or network call —
+    /// see [`crate::oauth`]'s module docs.
+    #[error("could not build an authorization URL from `{authorization_url}`: {reason}")]
+    OAuthAuthorizationUrl {
+        authorization_url: String,
+        reason: String,
+    },
 }

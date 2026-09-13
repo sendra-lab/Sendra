@@ -8,13 +8,14 @@
 
 use std::path::PathBuf;
 
-use sendra_core::{Collection, Document, Request, SendraError};
+use sendra_core::{Collection, Document, OAuthGrantType, Request, SendraError};
 
 use crate::app::state::{
-    non_empty, validate_assertion_value_text, validate_method_text, BodyEdit, CollectionSession,
-    ConfirmPrompt, DeleteConfirm, EditField, EditState, LoadState, PendingNewRequest, RunState,
-    TextField,
+    non_empty, validate_assertion_value_text, validate_method_text, AuthEdit, BodyEdit,
+    CollectionSession, ConfirmPrompt, DeleteConfirm, EditField, EditState, LoadState,
+    OAuthLoginState, PendingNewRequest, RunState, TextField,
 };
+use crate::oauth_login::LoginOutcome;
 
 use super::{reindex_dirty_after_delete, reindex_history_after_delete};
 
@@ -30,6 +31,57 @@ pub(crate) fn handle_enter_edit_mode(state: &mut CollectionSession) {
     {
         if let Some(request) = selected_request(state) {
             state.edit_mode = Some(EditState::new(request));
+        }
+    }
+}
+
+/// `Message::StartOAuthLogin`. A no-op unless the open edit session's `auth`
+/// is `AuthEdit::OAuth` with `grant_type: authorization_code` and no login
+/// is already in flight — see that message's own doc comment for why. Sets
+/// `login` to `WaitingForBrowser` and nothing else: this is the reducer, so
+/// it never opens a browser or touches the network itself (see
+/// `main::run`'s post-`update()` check, which is what notices this
+/// transition and actually calls `oauth_login::spawn`). Does not set
+/// `edit.dirty` — unlike `edit_state_mutate`, starting a login changes no
+/// field that would need saving.
+pub(crate) fn handle_start_oauth_login(state: &mut CollectionSession) {
+    let Some(edit) = &mut state.edit_mode else {
+        return;
+    };
+    if let AuthEdit::OAuth {
+        grant_type: OAuthGrantType::AuthorizationCode,
+        authorization_code,
+        ..
+    } = &mut edit.auth
+    {
+        if !matches!(authorization_code.login, OAuthLoginState::WaitingForBrowser) {
+            authorization_code.login = OAuthLoginState::WaitingForBrowser;
+        }
+    }
+}
+
+/// `Message::OAuthLoginCompleted`. Applies `outcome` to the matching edit
+/// session's `login` state — but only if one is still there to apply it to:
+/// see that message's own doc comment for the ways it might not be
+/// (cancelled edit, switched auth type, a second login started since). Never
+/// touches `edit.dirty`: a login's own success/failure is not a field change
+/// that needs saving, even though the acquired token itself (held in
+/// `AppState::oauth_cache`, not here) is now real and usable.
+pub(crate) fn handle_oauth_login_completed(state: &mut CollectionSession, outcome: LoginOutcome) {
+    let Some(edit) = &mut state.edit_mode else {
+        return;
+    };
+    if let AuthEdit::OAuth {
+        grant_type: OAuthGrantType::AuthorizationCode,
+        authorization_code,
+        ..
+    } = &mut edit.auth
+    {
+        if matches!(authorization_code.login, OAuthLoginState::WaitingForBrowser) {
+            authorization_code.login = match outcome {
+                LoginOutcome::Success => OAuthLoginState::Succeeded,
+                LoginOutcome::Failed(reason) => OAuthLoginState::Failed(reason),
+            };
         }
     }
 }

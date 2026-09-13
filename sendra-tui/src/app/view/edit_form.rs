@@ -12,10 +12,10 @@ use sendra_core::{ApiKeyLocation, Environment, OAuthGrantType, Request};
 use super::super::preview;
 use super::super::state::{
     AssertionRow, AuthEdit, AuthField, BodyEdit, CaptureKind, CaptureRow, EditField, EditState,
-    HeaderRow, JsonOperator,
+    HeaderRow, JsonOperator, OAuthLoginState,
 };
 use super::super::theme;
-use super::format_error;
+use super::{format_error, SPINNER_FRAMES};
 
 /// Edit mode's own half of the detail pane: `name`, `method` and `url` as
 /// live, cursor-addressable text fields, then a `Headers:` section listing every
@@ -52,6 +52,7 @@ pub(crate) fn render_edit_pane(
     edit: &EditState,
     base_request: &Request,
     environment: &Environment,
+    spinner_tick: usize,
 ) {
     let name_marker = if edit.focus == EditField::Name {
         "▶"
@@ -155,6 +156,24 @@ pub(crate) fn render_edit_pane(
                 auth_field_display(&edit.auth, field)
             ));
         }
+    }
+
+    // Only ever shown for `AuthEdit::OAuth { grant_type: AuthorizationCode,
+    // .. }` — the one auth shape with a login to attempt at all. Uses the
+    // exact `SPINNER_FRAMES`/`spinner_tick` a running request's own status
+    // bar cycles, so a login in progress reads as "something is running"
+    // the same visual way a run does, rather than a second, unrelated
+    // spinner alphabet — see `view::SPINNER_FRAMES`'s own doc comment.
+    if let AuthEdit::OAuth {
+        grant_type: OAuthGrantType::AuthorizationCode,
+        authorization_code,
+        ..
+    } = &edit.auth
+    {
+        lines.push(oauth_login_status_line(
+            &authorization_code.login,
+            spinner_tick,
+        ));
     }
 
     lines.push(String::new());
@@ -380,6 +399,8 @@ fn auth_field_label(field: AuthField) -> &'static str {
         AuthField::OAuthScope => "Scope: ",
         AuthField::OAuthUsername => "Username: ",
         AuthField::OAuthPassword => "Password: ",
+        AuthField::OAuthAuthorizationUrl => "Authorization URL: ",
+        AuthField::OAuthRedirectUri => "Redirect URI: ",
     }
 }
 
@@ -416,6 +437,18 @@ fn auth_field_display(auth: &AuthEdit, field: AuthField) -> String {
         (AuthEdit::OAuth { password, .. }, AuthField::OAuthPassword) => {
             password.value().to_string()
         }
+        (
+            AuthEdit::OAuth {
+                authorization_code, ..
+            },
+            AuthField::OAuthAuthorizationUrl,
+        ) => authorization_code.authorization_url.value().to_string(),
+        (
+            AuthEdit::OAuth {
+                authorization_code, ..
+            },
+            AuthField::OAuthRedirectUri,
+        ) => authorization_code.redirect_uri.value().to_string(),
         _ => unreachable!(
             "auth_field_display is only ever called for a field in this AuthEdit's own \
              field_order — see EditState::auth_field_order"
@@ -444,6 +477,18 @@ fn auth_field_cursor_chars(auth: &AuthEdit, field: AuthField) -> usize {
         (AuthEdit::OAuth { scope, .. }, AuthField::OAuthScope) => scope.cursor_chars(),
         (AuthEdit::OAuth { username, .. }, AuthField::OAuthUsername) => username.cursor_chars(),
         (AuthEdit::OAuth { password, .. }, AuthField::OAuthPassword) => password.cursor_chars(),
+        (
+            AuthEdit::OAuth {
+                authorization_code, ..
+            },
+            AuthField::OAuthAuthorizationUrl,
+        ) => authorization_code.authorization_url.cursor_chars(),
+        (
+            AuthEdit::OAuth {
+                authorization_code, ..
+            },
+            AuthField::OAuthRedirectUri,
+        ) => authorization_code.redirect_uri.cursor_chars(),
         _ => 0,
     }
 }
@@ -455,10 +500,33 @@ fn api_key_location_str(location: ApiKeyLocation) -> &'static str {
     }
 }
 
+/// One line under an `authorization_code` OAuth block's fields, reporting
+/// `login`'s current state — idle (with the reminder that Ctrl+L starts
+/// one), waiting (with a cycling spinner glyph, exactly like a running
+/// request's own status line), or the outcome of the most recent attempt.
+/// `format_error`'s own two-line "heading, then reason" shape is deliberately
+/// not reused here: unlike a failed save, this is a single always-present
+/// status line whose text itself changes with the state, not an error
+/// appearing under an otherwise-static field.
+fn oauth_login_status_line(login: &OAuthLoginState, spinner_tick: usize) -> String {
+    match login {
+        OAuthLoginState::Idle => "  Login: not started (Ctrl+L to log in)".to_string(),
+        OAuthLoginState::WaitingForBrowser => {
+            let frame = SPINNER_FRAMES[spinner_tick % SPINNER_FRAMES.len()];
+            format!("  Login: {frame} waiting for the browser login to complete...")
+        }
+        OAuthLoginState::Succeeded => {
+            "  Login: ✓ succeeded — the acquired token is ready for this session".to_string()
+        }
+        OAuthLoginState::Failed(reason) => format!("  Login: ✗ failed — {reason}"),
+    }
+}
+
 fn oauth_grant_type_str(grant_type: OAuthGrantType) -> &'static str {
     match grant_type {
         OAuthGrantType::ClientCredentials => "client_credentials",
         OAuthGrantType::Password => "password",
+        OAuthGrantType::AuthorizationCode => "authorization_code",
     }
 }
 

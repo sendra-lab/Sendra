@@ -29,6 +29,7 @@ mod update;
 mod view;
 
 pub use state::{AppState, LoadState, Message, NamedEnvironment, RunState};
+pub(crate) use state::{AuthEdit, OAuthLoginState};
 pub use update::update;
 pub use view::{active_environment, view};
 

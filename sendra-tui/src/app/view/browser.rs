@@ -139,7 +139,7 @@ pub(crate) fn render_detail_pane(
     // are what is authoritative right now, not whatever the last resolved
     // preview or response showed.
     if let Some(edit) = &state.edit_mode {
-        render_edit_pane(frame, area, edit, request, &environment);
+        render_edit_pane(frame, area, edit, request, &environment, state.spinner_tick);
         return;
     }
 

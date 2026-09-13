@@ -27,7 +27,7 @@ mod environment_edit;
 pub(crate) use edit::{
     non_empty, validate_assertion_value_text, validate_method_text, AssertionRow, AuthEdit,
     AuthField, BodyEdit, CaptureKind, CaptureRow, EditField, EditState, HeaderRow, JsonOperator,
-    TextField,
+    OAuthLoginState, TextField,
 };
 pub(crate) use environment_edit::{EnvVarField, EnvironmentEditState};
 
@@ -594,6 +594,28 @@ pub struct AppState {
     /// its own to keep in sync, which is why it's a plain `bool` rather than
     /// an `Option<T>` like every other modal flag on this struct.
     pub cheatsheet_open: bool,
+    /// Shared across every open tab and every run for the life of this
+    /// process — never rebuilt per run the way [`crate::run_request::spawn`]
+    /// used to build its own [`sendra_core::OAuthTokenCache`] before this
+    /// field existed. Two things need that shared lifetime: an
+    /// `authorization_code` login (`oauth_login::spawn`) writes its acquired
+    /// token here so every later send of a request sharing that `oauth:`
+    /// config reuses it automatically through the ordinary
+    /// `Request::resolve_oauth` path, completely unchanged; and, as a side
+    /// effect, `client_credentials`/`password` tokens now also survive
+    /// between separate runs in the same session instead of being
+    /// reacquired every time, which only ever reduces token-endpoint traffic
+    /// since [`sendra_core::oauth`]'s own expiry handling still governs when
+    /// a cached token stops being reused.
+    ///
+    /// `Arc` because a login's background thread
+    /// (`oauth_login::spawn`) needs its own handle to write into, alongside
+    /// whichever run thread reads it next.
+    ///
+    /// **Never persisted.** Same as the cache always was — see
+    /// [`sendra_core::oauth`]'s module doc comment — this lives only as long
+    /// as the `sendra-tui` process itself.
+    pub oauth_cache: std::sync::Arc<sendra_core::OAuthTokenCache>,
 }
 
 /// What `Message::CloseCollectionRequested` opens and
@@ -640,6 +662,7 @@ impl Default for AppState {
             close_confirm: None,
             quit_confirm: None,
             cheatsheet_open: false,
+            oauth_cache: std::sync::Arc::new(sendra_core::OAuthTokenCache::new()),
         }
     }
 }
@@ -809,6 +832,34 @@ pub enum Message {
     RunCompleted {
         collection_id: u64,
         outcome: RunOutcome,
+    },
+    /// Ctrl+L while editing an OAuth auth block whose `grant_type` is
+    /// `authorization_code` — starts an interactive login. A no-op — see
+    /// `update()`'s own handling — for every other case: no edit session
+    /// open, editing a different auth shape, or a login already
+    /// `OAuthLoginState::WaitingForBrowser`. `update()` itself only ever
+    /// flips `login` to `WaitingForBrowser`; it never opens a browser or
+    /// touches the network (the same "the reducer performs no I/O" rule
+    /// `RunRequested`/`ConfirmOpenCollectionPath` already follow) —
+    /// `main::run` is what notices that transition and actually calls
+    /// `oauth_login::spawn`, exactly the way it notices `RunRequested`
+    /// moving `run_state` to `InFlight` and calls `run_request::spawn`.
+    StartOAuthLogin,
+    /// `oauth_login::spawn`'s background thread finished — success or
+    /// failure alike. Tagged with `collection_id` and looked up via
+    /// `AppState::session_by_id_mut` for exactly the reason
+    /// `Message::RunCompleted` already is: the user is free to switch or
+    /// close tabs while a login's browser tab is still open. Applied only
+    /// if that session still has an edit session open on an
+    /// `authorization_code` OAuth block currently
+    /// `OAuthLoginState::WaitingForBrowser` — if the user cancelled the
+    /// edit, switched auth types, or started a second login in the
+    /// meantime, this result belongs to an attempt nothing is waiting on
+    /// anymore and is simply dropped, the same way a stale `RunCompleted`
+    /// for a closed tab is.
+    OAuthLoginCompleted {
+        collection_id: u64,
+        outcome: crate::oauth_login::LoginOutcome,
     },
     /// `h` while browsing: opens the run-history browser
     /// (`CollectionSession::history_overlay`) for the currently selected

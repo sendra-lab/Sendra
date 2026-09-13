@@ -1,10 +1,12 @@
 mod app;
+mod oauth_login;
 mod run_request;
 
 use std::io::{self, IsTerminal, Stdout};
 use std::panic;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
@@ -16,10 +18,11 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use sendra_core::environment::find_environment;
-use sendra_core::{Document, Environment, SendraError};
+use sendra_core::{Document, Environment, OAuthGrantType, SendraError};
 
 use app::{
-    active_environment, update, view, AppState, LoadState, Message, NamedEnvironment, RunState,
+    active_environment, update, view, AppState, AuthEdit, LoadState, Message, NamedEnvironment,
+    OAuthLoginState, RunState,
 };
 
 #[derive(Parser)]
@@ -537,6 +540,17 @@ fn translate_event(
                     KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         Message::DeleteCaptureRow
                     }
+                    // Ctrl+L: start an interactive `authorization_code`
+                    // login — only meaningful while editing an OAuth auth
+                    // block whose grant is `authorization_code` (see
+                    // `update()`'s own handling of this message, which
+                    // no-ops for every other case), but always translated
+                    // here rather than gated on the current field, the same
+                    // way Ctrl+N/Ctrl+D above are offered regardless of
+                    // which field has focus.
+                    KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::StartOAuthLogin
+                    }
                     KeyCode::Tab => Message::EditFocusNext,
                     KeyCode::BackTab => Message::EditFocusPrev,
                     KeyCode::Backspace => Message::EditBackspace,
@@ -645,6 +659,71 @@ fn selected_run(state: &AppState) -> Option<(sendra_core::Request, Environment, 
     Some((request, environment, base_dir.clone()))
 }
 
+/// Whether the active session's open edit session currently has an
+/// `authorization_code` OAuth login in `WaitingForBrowser` — checked both
+/// right before and right after `update()` so the login-spawn block below
+/// can tell "just started waiting" (spawn it) from "was already waiting"
+/// (a second `StartOAuthLogin` while one is already in flight, a no-op) —
+/// the exact same before/after comparison `was_already_running` makes for
+/// `RunState::InFlight` just above.
+fn oauth_login_waiting(state: &AppState) -> bool {
+    matches!(
+        &state.edit_mode,
+        Some(edit) if matches!(
+            &edit.auth,
+            AuthEdit::OAuth {
+                grant_type: OAuthGrantType::AuthorizationCode,
+                authorization_code,
+                ..
+            } if authorization_code.login == OAuthLoginState::WaitingForBrowser
+        )
+    )
+}
+
+/// Builds the exact `OAuthAuth` a real send of the currently-edited request
+/// would resolve `auth.oauth` to — `EditState::to_request` layered onto the
+/// selected request's own other fields, then substituted against the active
+/// environment through the same `Environment::apply` every real run and the
+/// live preview already call, never a second, hand-rolled substitution path.
+///
+/// This is deliberately not "whatever `AuthEdit::OAuth`'s raw fields say":
+/// using the substituted result guarantees the `OAuthAuth`
+/// `OAuthTokenCache::insert_token` is about to key its entry on (via
+/// `oauth_login::spawn`) is *identical* to the one a later
+/// `Request::resolve_oauth` will look up — the login and every later send
+/// resolving `token_url`/`client_id`/etc. through the same `{{var}}`
+/// templates and landing on the same cache key, not two different
+/// unsubstituted-vs-substituted views of the same config that could
+/// silently miss each other.
+fn oauth_auth_for_login(state: &AppState) -> Result<sendra_core::OAuthAuth, String> {
+    let LoadState::Loaded {
+        document, selected, ..
+    } = &state.load_state
+    else {
+        return Err("no collection is loaded".to_string());
+    };
+    let base_request = document
+        .requests()
+        .get(*selected)
+        .ok_or_else(|| "no request is selected".to_string())?
+        .clone();
+    let edit = state
+        .edit_mode
+        .as_ref()
+        .ok_or_else(|| "no request is being edited".to_string())?;
+    let candidate = edit.to_request(&base_request);
+    let environment = active_environment(state)
+        .map(|named| named.environment.clone())
+        .unwrap_or_default();
+    let substituted = environment
+        .apply(&candidate)
+        .map_err(|err| err.to_string())?;
+    substituted
+        .auth
+        .and_then(|auth| auth.oauth)
+        .ok_or_else(|| "auth.oauth is not set".to_string())
+}
+
 fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     load_message: Message,
@@ -729,6 +808,8 @@ fn run(
         };
         let is_run_request = matches!(msg, Message::RunRequested);
         let was_already_running = matches!(state.run_state, RunState::InFlight);
+        let is_start_oauth_login = matches!(msg, Message::StartOAuthLogin);
+        let was_already_waiting_for_login = oauth_login_waiting(&state);
         update(&mut state, msg);
 
         // Spawn exactly when this message is the one that just moved
@@ -750,12 +831,51 @@ fn run(
                 // variant's own doc comment.
                 let collection_id = state.active().id;
                 let tx = run_tx.clone();
-                run_request::spawn(request, environment, base_dir, move |result| {
+                let oauth_cache = Arc::clone(&state.oauth_cache);
+                run_request::spawn(request, environment, base_dir, oauth_cache, move |result| {
                     let _ = tx.send(Message::RunCompleted {
                         collection_id,
                         outcome: result,
                     });
                 });
+            }
+        }
+
+        // Same shape as the run-spawn block above, for a login instead of a
+        // send: spawn exactly when this message just moved the open edit
+        // session's OAuth login to `WaitingForBrowser` for the first time.
+        // `update()` itself never opens a browser or touches the network —
+        // see `Message::StartOAuthLogin`'s own doc comment — so this is the
+        // one place that actually does, exactly the way `run_request::spawn`
+        // above is the one place a `RunRequested` actually sends anything.
+        if is_start_oauth_login && !was_already_waiting_for_login && oauth_login_waiting(&state) {
+            let collection_id = state.active().id;
+            let tx = run_tx.clone();
+            match oauth_auth_for_login(&state) {
+                Ok(oauth) => {
+                    let oauth_cache = Arc::clone(&state.oauth_cache);
+                    oauth_login::spawn(oauth, oauth_cache, move |outcome| {
+                        let _ = tx.send(Message::OAuthLoginCompleted {
+                            collection_id,
+                            outcome,
+                        });
+                    });
+                }
+                // Nothing to open a browser to — a config problem discovered
+                // before any I/O, not a login attempt that ran and failed.
+                // Routed back through `update()` synchronously, the same
+                // `Message::OAuthLoginCompleted` a real attempt would
+                // eventually send, so the edit pane's login status line
+                // reports it exactly the same way.
+                Err(reason) => {
+                    update(
+                        &mut state,
+                        Message::OAuthLoginCompleted {
+                            collection_id,
+                            outcome: oauth_login::LoginOutcome::Failed(reason),
+                        },
+                    );
+                }
             }
         }
 

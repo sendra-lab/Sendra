@@ -24,6 +24,7 @@
 //! keypress instead of a command line.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use sendra_core::config::global_config_path;
 use sendra_core::{
@@ -122,6 +123,7 @@ pub fn spawn(
     request: Request,
     environment: Environment,
     base_dir: PathBuf,
+    oauth_cache: Arc<OAuthTokenCache>,
     on_complete: impl FnOnce(RunOutcome) + Send + 'static,
 ) {
     std::thread::spawn(move || {
@@ -130,7 +132,9 @@ pub fn spawn(
                 .enable_all()
                 .build()
             {
-                Ok(runtime) => runtime.block_on(execute(request, environment, base_dir)),
+                Ok(runtime) => {
+                    runtime.block_on(execute(request, environment, base_dir, oauth_cache))
+                }
                 // See `RunError::RuntimeUnavailable`: reported through the
                 // same `RunOutcome` a network failure would be, not
                 // panicked — the run ends up as a failed history entry
@@ -195,8 +199,13 @@ fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 /// pay for), then the actual send via [`sendra_core::send`], then — only on
 /// a successful send — assertions and captures against the response that
 /// came back.
-async fn execute(request: Request, environment: Environment, base_dir: PathBuf) -> RunOutcome {
-    match execute_inner(request, environment, base_dir).await {
+async fn execute(
+    request: Request,
+    environment: Environment,
+    base_dir: PathBuf,
+    oauth_cache: Arc<OAuthTokenCache>,
+) -> RunOutcome {
+    match execute_inner(request, environment, base_dir, &oauth_cache).await {
         Ok((response, assertions, capture)) => RunOutcome {
             result: Ok(response),
             assertions,
@@ -226,15 +235,15 @@ async fn execute_inner(
     request: Request,
     environment: Environment,
     base_dir: PathBuf,
+    oauth_cache: &OAuthTokenCache,
 ) -> Result<(Response, AssertionReport, CaptureReport), RunError> {
     let start_dir = std::env::current_dir().map_err(SendraError::CurrentDir)?;
     let config = resolve_config(&start_dir)?;
     let client = sendra_core::build_client(&config)?;
-    let oauth_cache = OAuthTokenCache::new();
 
     let resolved = environment
         .apply(&request)?
-        .resolve_oauth(&client, &oauth_cache)
+        .resolve_oauth(&client, oauth_cache)
         .await?
         .resolve_auth()?
         .resolve_query()?
@@ -313,6 +322,7 @@ mod tests {
             request,
             Environment::default(),
             PathBuf::from("."),
+            Arc::new(OAuthTokenCache::new()),
             move |result| {
                 let _ = tx.send(result);
             },
@@ -397,6 +407,7 @@ mod tests {
             req,
             Environment::default(),
             PathBuf::from("."),
+            Arc::new(OAuthTokenCache::new()),
             move |result| {
                 // The exact pattern `main::run` uses: discard the Result,
                 // never unwrap it. If this panicked instead, the run thread

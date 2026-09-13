@@ -380,7 +380,11 @@ impl Environment {
                         grant_type: oauth.grant_type,
                         token_url: self.expand_templates(&oauth.token_url)?,
                         client_id: self.expand_templates(&oauth.client_id)?,
-                        client_secret: self.expand_templates(&oauth.client_secret)?,
+                        client_secret: oauth
+                            .client_secret
+                            .as_deref()
+                            .map(|value| self.expand_templates(value))
+                            .transpose()?,
                         scope: oauth
                             .scope
                             .as_deref()
@@ -393,6 +397,16 @@ impl Environment {
                             .transpose()?,
                         password: oauth
                             .password
+                            .as_deref()
+                            .map(|value| self.expand_templates(value))
+                            .transpose()?,
+                        authorization_url: oauth
+                            .authorization_url
+                            .as_deref()
+                            .map(|value| self.expand_templates(value))
+                            .transpose()?,
+                        redirect_uri: oauth
+                            .redirect_uri
                             .as_deref()
                             .map(|value| self.expand_templates(value))
                             .transpose()?,

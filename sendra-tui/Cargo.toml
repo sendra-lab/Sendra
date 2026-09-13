@@ -16,6 +16,21 @@ ratatui = { version = "0.30.2", default-features = false, features = [
   "crossterm",
 ] }
 sendra-core = { path = "../sendra-core" }
+# `reqwest::Url` only — parsing/building the authorization URL and the local
+# callback's own URL (`oauth_login`), reusing the exact same URL type
+# sendra-core's own `resolve_query`/`sendra_core::oauth` already build on,
+# rather than a second URL-handling crate. Already the workspace's resolved
+# version and features (see the root `Cargo.toml`'s own comment on why
+# those), just declared here too since this crate calls into it directly.
+reqwest = { workspace = true }
+# Opens the user's default browser to the provider's authorization URL for an
+# interactive `authorization_code` login (`oauth_login::spawn`) — the one
+# piece of this flow with no reasonable hand-rolled substitute, since "open
+# whatever the OS considers the default browser" is inherently
+# platform-specific (`xdg-open`/`open`/`start`). The de facto standard crate
+# for exactly this, actively maintained, with no further dependencies this
+# workspace doesn't already pull in transitively.
+open = "5"
 # Pretty-prints a JSON response body in the response panel, the same
 # `Content-Type` sniff and `to_string_pretty` sendra-cli's own
 # `body_for_display` (`sendra-cli/src/output/human.rs`) uses, reimplemented

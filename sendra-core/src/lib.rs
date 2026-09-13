@@ -27,7 +27,10 @@ pub use error::SendraError;
 pub use http::client::{build_client, HttpClient};
 pub use http::response::{RedirectHop, Response};
 pub use http::{send, send_prepared};
-pub use oauth::OAuthTokenCache;
+pub use oauth::{
+    build_authorization_url, exchange_authorization_code, generate_pkce, generate_state,
+    OAuthTokenCache, PkcePair,
+};
 pub use request::auth::{ApiKeyAuth, ApiKeyLocation, Auth, BasicAuth, OAuthAuth, OAuthGrantType};
 pub use request::multipart::MultipartPart;
 pub use request::{Method, Request, RetryConfig};

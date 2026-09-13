@@ -453,6 +453,37 @@ fn oauth_password_grant_missing_username_is_rejected() {
     assert!(stderr.contains("username"), "got {stderr}");
 }
 
+/// `grant_type: authorization_code` needs a human in a browser — nothing
+/// the headless CLI can do. Proof requirement: this must fail cleanly and
+/// quickly with a clear error, never hang waiting for input that can never
+/// arrive and never silently skip auth — see `sendra_core::oauth`'s module
+/// doc comment for why only the TUI can drive this grant at all.
+#[test]
+fn authorization_code_grant_cannot_acquire_automatically_via_the_cli() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    std::fs::write(
+        dir.path().join("req.yaml"),
+        "method: GET\nurl: https://example.com\nauth:\n  oauth:\n    grant_type: authorization_code\n    token_url: https://example.com/token\n    client_id: my-client\n    authorization_url: https://example.com/authorize\n    redirect_uri: http://127.0.0.1:8899/callback\n",
+    )
+    .unwrap();
+
+    let start = std::time::Instant::now();
+    let output = sendra(dir.path(), &["run", "req.yaml"]);
+    let elapsed = start.elapsed();
+
+    assert_failure(&output);
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "must fail immediately, not hang waiting for a login that can never happen headlessly: \
+         took {elapsed:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("interactive") || stderr.contains("authorization_code"),
+        "got {stderr}"
+    );
+}
+
 #[test]
 fn repeat_shares_one_acquired_token_across_every_pass() {
     let server = OAuthServer::start(ok_token_response(r#"{"access_token": "repeat-token"}"#));

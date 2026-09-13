@@ -487,20 +487,38 @@
       "additionalProperties": false
     },
     "OAuthAuth": {
-      "description": "[`Auth::oauth`]: acquire a bearer token from an OAuth token endpoint\nbefore the request is sent, under either of two grants.\n\n```text\nauth:\n  oauth:\n    grant_type: client_credentials   # or: password\n    token_url: https://auth.example.com/token\n    client_id: {{client_id}}\n    client_secret: {{client_secret}}\n    scope: read write                 # optional\n    # required only for grant_type: password\n    username: {{username}}\n    password: {{password}}\n```\n\nOnly these two grants — neither `authorization_code` (it needs a browser\nredirect and a local callback listener, a different problem for a\nheadless CLI) nor `refresh_token` (no cheaper once expiry-checking\nexists, deferred) — see [`crate::oauth`]'s module docs for both.\n\n[`crate::Request::resolve_oauth`] acquires the token — through\n[`crate::oauth::OAuthTokenCache`], reusing one already acquired for the\nsame `token_url`/`client_id`/`grant_type`/`scope` within this run rather\nthan re-authenticating per request — and hands it to the exact same\n`Authorization: Bearer` code path [`Auth::bearer`] already resolves to;\nsee [`crate::Request::resolve_auth`].",
+      "description": "[`Auth::oauth`]: acquire a bearer token from an OAuth token endpoint\nbefore the request is sent, under one of three grants.\n\n```text\nauth:\n  oauth:\n    grant_type: client_credentials   # or: password, authorization_code\n    token_url: https://auth.example.com/token\n    client_id: {{client_id}}\n    client_secret: {{client_secret}}\n    scope: read write                 # optional\n    # required only for grant_type: password\n    username: {{username}}\n    password: {{password}}\n    # required only for grant_type: authorization_code\n    authorization_url: https://auth.example.com/authorize\n    redirect_uri: http://127.0.0.1:8899/callback\n```\n\n`client_credentials` and `password` are acquired automatically —\n[`crate::Request::resolve_oauth`] fetches (or reuses a cached) token\nbefore every send with no human involved. `authorization_code` cannot\nwork that way: it needs a human to approve access in a browser, so\n`resolve_oauth` refuses to attempt it automatically and instead reports a\nclear error directing the caller to log in interactively first. The TUI\nis the one caller that can do that — see [`crate::oauth`]'s module docs\nfor the interactive flow and why `client_secret` is optional only for\nthis grant (a desktop client cannot keep a secret confidential, so PKCE\nstands in for it; see [RFC 8252 §8.1/§8.5]).\n\n[`crate::Request::resolve_oauth`] acquires the token — through\n[`crate::oauth::OAuthTokenCache`], reusing one already acquired for the\nsame `token_url`/`client_id`/`grant_type`/`scope` within this run rather\nthan re-authenticating per request — and hands it to the exact same\n`Authorization: Bearer` code path [`Auth::bearer`] already resolves to;\nsee [`crate::Request::resolve_auth`].\n\n[RFC 8252 §8.1/§8.5]: https://www.rfc-editor.org/rfc/rfc8252#section-8.1",
       "type": "object",
       "properties": {
+        "authorization_url": {
+          "description": "The provider's authorization endpoint — where the browser is sent to\nlet the user approve access. Required when\n[`grant_type`](Self::grant_type) is\n[`OAuthGrantType::AuthorizationCode`]; unused by the other two grants,\nwhich never open a browser. See [`validate_grant_fields`](Self::validate_grant_fields).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "client_id": {
           "type": "string"
         },
         "client_secret": {
-          "type": "string"
+          "description": "Required for [`OAuthGrantType::ClientCredentials`] and\n[`OAuthGrantType::Password`]; optional for\n[`OAuthGrantType::AuthorizationCode`], whose native/desktop clients\ntypically have none — see [`validate_grant_fields`](Self::validate_grant_fields).",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "grant_type": {
           "$ref": "#/$defs/OAuthGrantType"
         },
         "password": {
           "description": "Required when [`grant_type`](Self::grant_type) is\n[`OAuthGrantType::Password`] — see [`validate_grant_fields`](Self::validate_grant_fields).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "redirect_uri": {
+          "description": "Where the provider redirects back with the authorization code — must\nmatch what is registered with the provider. Required when\n[`grant_type`](Self::grant_type) is\n[`OAuthGrantType::AuthorizationCode`]; the TUI's local callback\nlistener binds to this exact address. See\n[`validate_grant_fields`](Self::validate_grant_fields).",
           "type": [
             "string",
             "null"
@@ -527,16 +545,16 @@
       "required": [
         "grant_type",
         "token_url",
-        "client_id",
-        "client_secret"
+        "client_id"
       ]
     },
     "OAuthGrantType": {
-      "description": "[`OAuthAuth::grant_type`]: which of the two supported OAuth grants to\nuse. See [`crate::oauth`]'s module docs for why only these two.",
+      "description": "[`OAuthAuth::grant_type`]: which of the three supported OAuth grants to\nuse. See [`crate::oauth`]'s module docs for how `authorization_code`\ndiffers from the other two.",
       "type": "string",
       "enum": [
         "client_credentials",
-        "password"
+        "password",
+        "authorization_code"
       ]
     },
     "RetryConfig": {

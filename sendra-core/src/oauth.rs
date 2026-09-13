@@ -1,17 +1,42 @@
-//! OAuth token acquisition for `auth.oauth`'s two supported grants —
-//! `client_credentials` and `password` — and [`OAuthTokenCache`], the
-//! in-run, in-memory cache that lets many requests sharing one `oauth:`
-//! config reuse one token instead of re-authenticating per request.
+//! OAuth token acquisition for `auth.oauth`'s three supported grants —
+//! `client_credentials`, `password`, and `authorization_code` — and
+//! [`OAuthTokenCache`], the in-run, in-memory cache that lets many requests
+//! sharing one `oauth:` config reuse one token instead of re-authenticating
+//! per request.
 //!
-//! **Only `client_credentials` and `password`.** `authorization_code` needs
-//! a browser redirect and a local callback listener — a fundamentally
-//! different problem for a headless CLI than making an HTTP call, and one a
-//! future TUI could plausibly take on (it could open a browser and run a
-//! local callback server) in a way a CLI cannot reasonably attempt at all.
-//! `refresh_token` is not implemented either: once expiry-checking exists
-//! here, no fast-follow issue is worth its own scope for the marginal
-//! request `refresh_token` would save over just re-running the same grant,
-//! so it is deferred rather than treated as a real gap.
+//! **`client_credentials` and `password` acquire automatically.**
+//! [`acquire_token`] makes the token request itself, with no human
+//! involved — the shape [`crate::Request::resolve_oauth`] calls before every
+//! send.
+//!
+//! **`authorization_code` cannot acquire automatically.** It needs a human
+//! to approve access in a browser and a local callback listener to catch
+//! the resulting code — a fundamentally different problem from making an
+//! HTTP call, and not something a headless send can do on its own.
+//! [`acquire_token`] refuses this grant outright (see its doc comment)
+//! rather than pretend it can proceed; instead, three building blocks let a
+//! front end — sendra-tui, concretely — drive the flow itself:
+//! [`generate_pkce`] (a fresh verifier/challenge pair — see [RFC 7636]),
+//! [`build_authorization_url`] (the URL to open a browser to), and
+//! [`exchange_authorization_code`] (trading the code the callback caught for
+//! a token). Once that exchange succeeds, [`OAuthTokenCache::insert_token`]
+//! puts the result in the exact same cache [`acquire_token`] reads, so every
+//! later request sharing this `oauth:` config — via the ordinary
+//! `resolve_oauth` path, completely unchanged — reuses it instead of asking
+//! the human to log in again.
+//!
+//! PKCE is used unconditionally for `authorization_code`, not offered as a
+//! config toggle: [RFC 8252 §8.1] (OAuth for native apps) treats it as
+//! required for exactly this kind of client, since a desktop/TUI app cannot
+//! keep a `client_secret` confidential the way a server-side client can, and
+//! is equally exposed to authorization-code interception on the loopback
+//! redirect either way.
+//!
+//! `refresh_token` is not implemented: once expiry-checking exists here, no
+//! fast-follow issue is worth its own scope for the marginal request
+//! `refresh_token` would save over just re-running the same grant (or, for
+//! `authorization_code`, logging in again), so it is deferred rather than
+//! treated as a real gap.
 //!
 //! **No cross-invocation persistence.** [`OAuthTokenCache`] lives only as
 //! long as the process that built it — never written to disk — the same
@@ -19,13 +44,21 @@
 //! the cookie jar: new statefulness is opt-in and scoped to one run, not
 //! silently carried between separate `sendra` invocations. A cached token on
 //! disk would need the same protection `${VAR}` passthrough was designed
-//! around, for a feature nothing has asked for yet.
+//! around, for a feature nothing has asked for yet. This holds just as much
+//! for a token acquired interactively through `authorization_code`: it lives
+//! only in this cache, for this run, and is never written anywhere.
+//!
+//! [RFC 7636]: https://www.rfc-editor.org/rfc/rfc7636
+//! [RFC 8252 §8.1]: https://www.rfc-editor.org/rfc/rfc8252#section-8.1
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::http::client::HttpClient;
 use crate::http::send_prepared;
@@ -145,6 +178,55 @@ impl Default for OAuthTokenCache {
     }
 }
 
+impl std::fmt::Debug for OAuthTokenCache {
+    /// Deliberately never prints a cached access token — only how many
+    /// entries exist. `sendra-tui`'s `AppState` derives `Debug` (used only
+    /// for `assert_eq!`/panic messages in its own tests, never logged), and
+    /// this cache is one of its fields; a token leaking into a debug print
+    /// anywhere would defeat the whole "never persisted, never written
+    /// anywhere but this in-memory cache" guarantee the module doc comment
+    /// makes.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self
+            .entries
+            .lock()
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        f.debug_struct("OAuthTokenCache")
+            .field("entries", &count)
+            .finish()
+    }
+}
+
+impl OAuthTokenCache {
+    /// Records a token acquired outside the ordinary [`acquire_token`] path —
+    /// the one case that needs this is an `authorization_code` login
+    /// completed interactively (see the module doc comment), whose caller
+    /// exchanged a code for a token itself via [`exchange_authorization_code`]
+    /// and now wants every later request sharing this exact `oauth:` config
+    /// to reuse it instead of asking the human to log in again.
+    ///
+    /// Keyed and stored exactly like a token [`acquire_token`] acquired
+    /// itself — same [`CacheKey`], same expiry-margin handling — so from
+    /// `acquire_token`'s perspective afterward there is no difference
+    /// between a token it fetched and one handed to it this way.
+    pub fn insert_token(&self, auth: &OAuthAuth, access_token: String, expires_in: Option<u64>) {
+        let key = CacheKey::from(auth);
+        let expires_at = expires_in.map(|secs| Instant::now() + Duration::from_secs(secs));
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("the cache mutex is never held across a panic");
+        entries.insert(
+            key,
+            CacheEntry::Token {
+                access_token,
+                expires_at,
+            },
+        );
+    }
+}
+
 /// A token endpoint's JSON response — only the fields Sendra reads. Every
 /// other field a server includes (`refresh_token`, `id_token`, `token_type`,
 /// ...) is ignored: v1 implements neither `refresh_token` nor OIDC ID
@@ -162,6 +244,16 @@ struct TokenResponse {
 /// [`crate::Request::resolve_oauth`] is the only caller, and hands the plain
 /// bearer token string this returns to the exact same code path
 /// [`crate::Request::resolve_auth`] already uses for `auth.bearer`.
+///
+/// **`grant_type: authorization_code` never reaches the token endpoint from
+/// here.** A cache hit is served exactly like any other grant's, since a
+/// token acquired interactively via [`exchange_authorization_code`] and
+/// stored with [`OAuthTokenCache::insert_token`] is indistinguishable from
+/// one acquired automatically once cached. On a cache miss, though, there is
+/// no `code` to send and no way to obtain one without a browser and a human
+/// — see the module doc comment — so this returns
+/// [`SendraError::OAuthAcquisition`] naming that directly, instead of
+/// attempting a token request that could not possibly succeed.
 ///
 /// Reuses [`crate::http::send_prepared`] to make the token request itself —
 /// through the same shared [`HttpClient`] every other request in the run
@@ -236,6 +328,21 @@ pub async fn acquire_token(
         // one.
     }
 
+    if auth.grant_type == OAuthGrantType::AuthorizationCode {
+        let reason = "grant_type: authorization_code requires an interactive browser login — \
+                       trigger it from the auth editor, then re-run this request"
+            .to_string();
+        let mut entries = cache
+            .entries
+            .lock()
+            .expect("the cache mutex is never held across a panic");
+        entries.insert(key, CacheEntry::Failed(reason.clone()));
+        return Err(SendraError::OAuthAcquisition {
+            token_url: auth.token_url.clone(),
+            reason,
+        });
+    }
+
     match acquire_fresh(auth, client).await {
         Ok((access_token, expires_in)) => {
             let expires_at = expires_in.map(|secs| Instant::now() + Duration::from_secs(secs));
@@ -279,8 +386,10 @@ async fn acquire_fresh(
             auth.grant_type.as_str().to_string(),
         ),
         ("client_id".to_string(), auth.client_id.clone()),
-        ("client_secret".to_string(), auth.client_secret.clone()),
     ];
+    if let Some(client_secret) = &auth.client_secret {
+        form.push(("client_secret".to_string(), client_secret.clone()));
+    }
     if let Some(scope) = &auth.scope {
         form.push(("scope".to_string(), scope.clone()));
     }
@@ -294,6 +403,72 @@ async fn acquire_fresh(
             auth.password.clone().unwrap_or_default(),
         ));
     }
+    post_token_form(auth, client, form).await
+}
+
+/// A code exchanged for [`exchange_authorization_code`], obtained interactively
+/// (see the module doc comment) rather than from `auth.oauth` itself, so it
+/// cannot travel through [`OAuthAuth`] the way every other grant's fields do.
+///
+/// Trades `code` (plus the PKCE `code_verifier` matching the `code_challenge`
+/// [`build_authorization_url`] sent) for a token, via the standard
+/// `authorization_code` token request (RFC 6749 §4.1.3): `POST
+/// auth.token_url` with `grant_type=authorization_code`, `code`,
+/// `redirect_uri`, `client_id`, `code_verifier`, and `client_secret` when
+/// `auth` has one — reusing [`send_prepared`] through the same shared
+/// [`HttpClient`] every other request in the run sends through, exactly like
+/// [`acquire_fresh`] does for the other two grants.
+///
+/// This is a standalone entry point, not folded into [`acquire_token`]: it is
+/// driven by a front end that already has a `code` in hand from its own
+/// browser/callback-listener flow, not by the automatic "acquire whatever
+/// this `oauth:` config needs" path every other grant uses. Once this
+/// succeeds, the caller is expected to hand the result to
+/// [`OAuthTokenCache::insert_token`] so later automatic resolution reuses it
+/// — see the module doc comment.
+///
+/// Errors exactly like [`acquire_token`] does: a non-2xx response or an
+/// unparseable body is [`SendraError::OAuthAcquisition`] naming
+/// `auth.token_url` and why; so is a network/timeout failure reaching it.
+pub async fn exchange_authorization_code(
+    auth: &OAuthAuth,
+    client: &HttpClient,
+    code: &str,
+    code_verifier: &str,
+) -> Result<(String, Option<u64>), SendraError> {
+    let redirect_uri = auth.redirect_uri.clone().unwrap_or_default();
+    let mut form: Vec<(String, String)> = vec![
+        (
+            "grant_type".to_string(),
+            OAuthGrantType::AuthorizationCode.as_str().to_string(),
+        ),
+        ("code".to_string(), code.to_string()),
+        ("redirect_uri".to_string(), redirect_uri),
+        ("client_id".to_string(), auth.client_id.clone()),
+        ("code_verifier".to_string(), code_verifier.to_string()),
+    ];
+    if let Some(client_secret) = &auth.client_secret {
+        form.push(("client_secret".to_string(), client_secret.clone()));
+    }
+
+    post_token_form(auth, client, form)
+        .await
+        .map_err(|reason| SendraError::OAuthAcquisition {
+            token_url: auth.token_url.clone(),
+            reason,
+        })
+}
+
+/// The wire mechanics shared by [`acquire_fresh`] and
+/// [`exchange_authorization_code`]: `POST auth.token_url` with `form` as
+/// `application/x-www-form-urlencoded`, then parse the response as
+/// [`TokenResponse`] — everything past "which fields does this grant send"
+/// is identical between every grant, so it lives here once.
+async fn post_token_form(
+    auth: &OAuthAuth,
+    client: &HttpClient,
+    form: Vec<(String, String)>,
+) -> Result<(String, Option<u64>), String> {
     let body = serde_urlencoded::to_string(&form)
         .expect("a Vec<(String, String)> always encodes as x-www-form-urlencoded pairs");
 
@@ -342,6 +517,94 @@ async fn acquire_fresh(
     Ok((parsed.access_token, parsed.expires_in))
 }
 
+/// A fresh PKCE verifier/challenge pair for one `authorization_code` login
+/// attempt (RFC 7636) — see the module doc comment for why this is used
+/// unconditionally rather than offered as config.
+///
+/// `verifier` is 32 bytes (256 bits) of randomness — two
+/// [`uuid::Uuid::new_v4`] values concatenated, reusing the dependency this
+/// workspace already pulls in for `uuid()` rather than adding `rand` for the
+/// entropy source alone — base64url-encoded without padding, which RFC
+/// 7636's `code_verifier` charset (unreserved URL characters) accepts
+/// directly and yields exactly 43 characters, the shortest length the RFC
+/// allows. `challenge` is `BASE64URL-ENCODE(SHA256(verifier))`, the `S256`
+/// method [`build_authorization_url`] declares — the method RFC 7636 §4.2
+/// requires clients to use "if the client is capable of doing so", which a
+/// TUI, unlike some constrained embedded clients, always is.
+pub struct PkcePair {
+    pub verifier: String,
+    pub challenge: String,
+}
+
+pub fn generate_pkce() -> PkcePair {
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let verifier = URL_SAFE_NO_PAD.encode(bytes);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    PkcePair {
+        verifier,
+        challenge,
+    }
+}
+
+/// A fresh CSRF `state` value for one `authorization_code` login attempt
+/// (RFC 6749 §10.12) — checked against the callback's own `state` parameter
+/// by whichever front end ran [`build_authorization_url`], not by anything
+/// in this module, since holding onto the value being checked against is
+/// specific to how that front end tracks a pending login.
+pub fn generate_state() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// The URL to open a browser to for one `authorization_code` login attempt:
+/// `auth.authorization_url` with `response_type=code`, `client_id`,
+/// `redirect_uri`, `code_challenge`/`code_challenge_method=S256` (from
+/// [`generate_pkce`]), `state` (from [`generate_state`]), and `scope` when
+/// `auth` has one, appended as query parameters — the standard shape an
+/// OAuth 2.0 authorization request takes (RFC 6749 §4.1.1) plus PKCE's two
+/// parameters (RFC 7636 §4.3).
+///
+/// Uses [`reqwest::Url`]'s query-pair API — already a dependency, and the
+/// same one [`crate::Request::resolve_query`] uses — rather than string
+/// concatenation, so `redirect_uri` and `scope` are percent-encoded
+/// correctly regardless of what characters they contain.
+///
+/// Errors with [`SendraError::OAuthAuthorizationUrl`] if
+/// `auth.authorization_url` does not parse as a URL — the one failure mode
+/// possible before any browser or network is involved.
+pub fn build_authorization_url(
+    auth: &OAuthAuth,
+    state: &str,
+    code_challenge: &str,
+) -> Result<String, SendraError> {
+    let authorization_url = auth.authorization_url.clone().unwrap_or_default();
+    let mut url = reqwest::Url::parse(&authorization_url).map_err(|source| {
+        SendraError::OAuthAuthorizationUrl {
+            authorization_url: authorization_url.clone(),
+            reason: source.to_string(),
+        }
+    })?;
+
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("response_type", "code");
+        pairs.append_pair("client_id", &auth.client_id);
+        pairs.append_pair(
+            "redirect_uri",
+            auth.redirect_uri.as_deref().unwrap_or_default(),
+        );
+        pairs.append_pair("code_challenge", code_challenge);
+        pairs.append_pair("code_challenge_method", "S256");
+        pairs.append_pair("state", state);
+        if let Some(scope) = &auth.scope {
+            pairs.append_pair("scope", scope);
+        }
+    }
+
+    Ok(url.into())
+}
+
 /// Keeps an acquisition-failure message from embedding an entire
 /// (possibly huge, possibly HTML) response body.
 fn truncate(body: &str) -> String {
@@ -368,10 +631,12 @@ mod tests {
             grant_type: OAuthGrantType::ClientCredentials,
             token_url: token_url.to_string(),
             client_id: "client-id".to_string(),
-            client_secret: "client-secret".to_string(),
+            client_secret: Some("client-secret".to_string()),
             scope: None,
             username: None,
             password: None,
+            authorization_url: None,
+            redirect_uri: None,
         }
     }
 
@@ -638,5 +903,180 @@ mod tests {
             2,
             "two different scopes must not share one cache entry"
         );
+    }
+
+    // --- authorization_code: cannot auto-acquire ---------------------------
+
+    fn authorization_code_auth(token_url: &str) -> OAuthAuth {
+        OAuthAuth {
+            grant_type: OAuthGrantType::AuthorizationCode,
+            token_url: token_url.to_string(),
+            client_id: "client-id".to_string(),
+            client_secret: None,
+            scope: None,
+            username: None,
+            password: None,
+            authorization_url: Some("https://auth.example.com/authorize".to_string()),
+            redirect_uri: Some("http://127.0.0.1:8899/callback".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn authorization_code_never_reaches_the_token_endpoint_via_acquire_token() {
+        let server = TokenServer::start(token_response(r#"{"access_token": "unused"}"#));
+        let auth = authorization_code_auth(&server.token_url());
+        let client = client();
+        let cache = OAuthTokenCache::new();
+
+        let err = acquire_token(&auth, &client, &cache)
+            .await
+            .expect_err("no code is available for an automatic acquisition");
+        match err {
+            SendraError::OAuthAcquisition { reason, .. } => {
+                assert!(reason.contains("interactive"), "got {reason}");
+            }
+            other => panic!("expected OAuthAcquisition, got {other:?}"),
+        }
+        assert_eq!(
+            server.hits(),
+            0,
+            "acquire_token must never hit the token endpoint for authorization_code — there is \
+             no code to send"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_inserted_via_insert_token_is_served_by_acquire_token_afterward() {
+        let server = TokenServer::start(token_response(r#"{"access_token": "unused"}"#));
+        let auth = authorization_code_auth(&server.token_url());
+        let cache = OAuthTokenCache::new();
+
+        // Simulates the interactive login flow's own conclusion: exchange
+        // happened elsewhere (`exchange_authorization_code`), and the result
+        // is written straight into the cache — never through `acquire_fresh`.
+        cache.insert_token(&auth, "interactively-acquired".to_string(), Some(3600));
+
+        let client = client();
+        let token = acquire_token(&auth, &client, &cache)
+            .await
+            .expect("a token inserted via insert_token must be served like any other");
+        assert_eq!(token, "interactively-acquired");
+        assert_eq!(
+            server.hits(),
+            0,
+            "serving an inserted token must never itself hit the token endpoint"
+        );
+    }
+
+    // --- PKCE / authorization URL / code exchange ---------------------------
+
+    #[test]
+    fn generate_pkce_produces_a_verifier_and_a_matching_s256_challenge() {
+        let pkce = generate_pkce();
+
+        assert_eq!(
+            pkce.verifier.len(),
+            43,
+            "32 bytes base64url-no-pad encodes to exactly 43 characters"
+        );
+        assert!(
+            pkce.verifier
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "the verifier must use only RFC 7636's unreserved base64url characters: {}",
+            pkce.verifier
+        );
+
+        let expected_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(pkce.verifier.as_bytes()));
+        assert_eq!(pkce.challenge, expected_challenge);
+    }
+
+    #[test]
+    fn generate_pkce_never_repeats_across_calls() {
+        let a = generate_pkce();
+        let b = generate_pkce();
+        assert_ne!(a.verifier, b.verifier);
+        assert_ne!(a.challenge, b.challenge);
+    }
+
+    #[test]
+    fn generate_state_never_repeats_across_calls() {
+        assert_ne!(generate_state(), generate_state());
+    }
+
+    #[test]
+    fn build_authorization_url_includes_every_required_parameter() {
+        let mut auth = authorization_code_auth("https://auth.example.com/token");
+        auth.scope = Some("read write".to_string());
+
+        let url = build_authorization_url(&auth, "csrf-state", "the-challenge")
+            .expect("a valid authorization_url must build");
+        let parsed = reqwest::Url::parse(&url).expect("the result is itself a valid URL");
+
+        let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(pairs.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(
+            pairs.get("client_id").map(String::as_str),
+            Some("client-id")
+        );
+        assert_eq!(
+            pairs.get("redirect_uri").map(String::as_str),
+            Some("http://127.0.0.1:8899/callback")
+        );
+        assert_eq!(
+            pairs.get("code_challenge").map(String::as_str),
+            Some("the-challenge")
+        );
+        assert_eq!(
+            pairs.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(pairs.get("state").map(String::as_str), Some("csrf-state"));
+        assert_eq!(pairs.get("scope").map(String::as_str), Some("read write"));
+    }
+
+    #[test]
+    fn build_authorization_url_rejects_an_unparseable_authorization_url() {
+        let mut auth = authorization_code_auth("https://auth.example.com/token");
+        auth.authorization_url = Some("not a url".to_string());
+
+        let err = build_authorization_url(&auth, "state", "challenge").expect_err(
+            "an unparseable authorization_url must be rejected before any network call",
+        );
+        assert!(matches!(err, SendraError::OAuthAuthorizationUrl { .. }));
+    }
+
+    #[tokio::test]
+    async fn exchange_authorization_code_acquires_a_token() {
+        let server = TokenServer::start(token_response(r#"{"access_token": "exchanged"}"#));
+        let auth = authorization_code_auth(&server.token_url());
+        let client = client();
+
+        let (token, expires_in) =
+            exchange_authorization_code(&auth, &client, "the-code", "the-verifier")
+                .await
+                .expect("the mock token endpoint answers");
+        assert_eq!(token, "exchanged");
+        assert_eq!(expires_in, None);
+    }
+
+    #[tokio::test]
+    async fn exchange_authorization_code_surfaces_a_non_2xx_response_as_a_typed_error() {
+        let server = TokenServer::start(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 20\r\n\r\n{\"error\":\"invalid\"}\r\n"
+                .to_vec(),
+        );
+        let auth = authorization_code_auth(&server.token_url());
+        let client = client();
+
+        let err = exchange_authorization_code(&auth, &client, "the-code", "the-verifier")
+            .await
+            .expect_err("a 400 must not be treated as success");
+        match err {
+            SendraError::OAuthAcquisition { reason, .. } => {
+                assert!(reason.contains("400"), "got {reason}");
+            }
+            other => panic!("expected OAuthAcquisition, got {other:?}"),
+        }
     }
 }
