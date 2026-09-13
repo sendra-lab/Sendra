@@ -26,6 +26,7 @@ use super::state::{
 use super::theme;
 
 mod browser;
+mod cheatsheet;
 mod edit_form;
 mod environment;
 mod modals;
@@ -33,6 +34,7 @@ mod response;
 mod welcome;
 
 use browser::{render_detail_pane, render_request_list};
+use cheatsheet::render_cheatsheet;
 use environment::render_environment_overlay;
 use modals::{render_confirm_prompt, render_open_collection_prompt};
 use response::render_history_overlay;
@@ -150,6 +152,14 @@ pub fn view(state: &AppState, frame: &mut Frame) {
     // only the ordinary panes underneath.
     if let Some(prompt) = &state.quit_confirm {
         render_confirm_prompt(frame, "Quit sendra-tui", prompt);
+    }
+
+    // Drawn last of all: the cheatsheet can be summoned over *anything* else
+    // on screen (see `AppState::cheatsheet_open`'s own doc comment and
+    // `main::translate_event`'s matching priority), so it has to sit
+    // visually on top of even `quit_confirm` above.
+    if state.cheatsheet_open {
+        render_cheatsheet(frame);
     }
 }
 

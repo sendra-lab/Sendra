@@ -64,6 +64,19 @@ fn move_selection(selected: usize, len: usize, delta: isize) -> usize {
 /// they always do everywhere else in this crate.
 pub fn update(state: &mut AppState, msg: Message) {
     match msg {
+        // Checked before even `Quit`/`quit_confirm` below: the cheatsheet
+        // can be summoned over literally anything else in this crate (see
+        // `AppState::cheatsheet_open`'s own doc comment), and closing it
+        // again must work no matter what, if anything, turns out to be
+        // sitting underneath it.
+        Message::OpenCheatsheet => {
+            state.cheatsheet_open = true;
+            return;
+        }
+        Message::CloseCheatsheet => {
+            state.cheatsheet_open = false;
+            return;
+        }
         Message::Quit => {
             // Already confirming — the quit key pressed again (`q` or
             // Ctrl+C, whichever) confirms it, the same low-friction "ask
@@ -204,6 +217,7 @@ pub fn update(state: &mut AppState, msg: Message) {
     if state.open_collection_prompt.is_some()
         || state.close_confirm.is_some()
         || state.quit_confirm.is_some()
+        || state.cheatsheet_open
     {
         return;
     }
@@ -568,7 +582,9 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
         | Message::CloseCollectionRequested
         | Message::ConfirmCloseCollection
         | Message::CancelCloseCollection
-        | Message::RunCompleted { .. } => {}
+        | Message::RunCompleted { .. }
+        | Message::OpenCheatsheet
+        | Message::CloseCheatsheet => {}
     }
 }
 

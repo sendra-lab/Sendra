@@ -542,6 +542,13 @@ pub struct AppState {
     /// quitting with nothing at stake anywhere exits immediately, with no
     /// prompt — the instant every tab reports clean.
     pub quit_confirm: Option<ConfirmPrompt>,
+    /// `true` while the keybinding cheatsheet (`?`) is on screen — genuinely
+    /// process-wide rather than per-tab, since the bindings it lists don't
+    /// vary by which collection happens to be active. Drawn on top of even
+    /// `quit_confirm` (see `view()`'s own z-order), but carries no state of
+    /// its own to keep in sync, which is why it's a plain `bool` rather than
+    /// an `Option<T>` like every other modal flag on this struct.
+    pub cheatsheet_open: bool,
 }
 
 /// What `Message::CloseCollectionRequested` opens and
@@ -587,6 +594,7 @@ impl Default for AppState {
             open_collection_prompt: None,
             close_confirm: None,
             quit_confirm: None,
+            cheatsheet_open: false,
         }
     }
 }
@@ -1072,6 +1080,15 @@ pub enum Message {
     /// catch-all `Message::Tick` arm in `next_message`, which would
     /// incorrectly advance the spinner on a resize alone.
     Resize,
+    /// `?`, from anywhere that isn't itself accepting typed text (see
+    /// `main::translate_event`'s own guard) — opens the keybinding
+    /// cheatsheet (`AppState::cheatsheet_open`). Sits above every other
+    /// mode/modal the same way `quit_confirm` does, since it exists to
+    /// answer "what can I press right now" regardless of what that turns
+    /// out to be.
+    OpenCheatsheet,
+    /// `Esc` or `?` again while the cheatsheet is open: closes it.
+    CloseCheatsheet,
 }
 
 /// What the selected request's most recent run did, if anything.
