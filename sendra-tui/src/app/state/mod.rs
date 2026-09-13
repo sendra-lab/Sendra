@@ -157,8 +157,8 @@ pub struct CollectionSession {
     /// overlay and an in-flight run, the same way those are already
     /// exclusive with each other. Deliberately a minimal, single-purpose
     /// confirmation rather than a shared overlay component: a unified
-    /// confirmation used by every destructive action in this batch is a
-    /// later, separate concern.
+    /// confirmation used by every destructive action is a later, separate
+    /// concern.
     pub delete_confirm: Option<DeleteConfirm>,
     /// `Some(EnvironmentEditState)` while the environment overlay is showing
     /// an in-progress edit of one environment's variables, `None` while the
@@ -519,11 +519,11 @@ impl CollectionSession {
 /// every other field `CollectionSession` carries resolve through
 /// `AppState::active`/`active_mut` to whichever session is currently on
 /// screen — exactly the field access every `render_*` function and every
-/// session-scoped `Message` arm already wrote before this issue, unchanged.
-/// That is deliberate: the entire reducer/view surface this crate had before
-/// multi-collection support is *about one collection*, and after this split
-/// it is still about exactly one collection — the active one — with no
-/// change to what it reads or writes. The only code that ever needs to look
+/// session-scoped `Message` arm already wrote before multi-collection
+/// support existed, unchanged. That is deliberate: the entire reducer/view
+/// surface this crate had before multi-collection support is *about one
+/// collection*, and after this split it is still about exactly one
+/// collection — the active one — with no change to what it reads or writes. The only code that ever needs to look
 /// past the active session is genuinely tab-aware: opening, closing, listing,
 /// or switching between tabs (see `update()`'s own top-level dispatch, which
 /// handles those messages itself, directly against `state.collections`,
@@ -648,8 +648,8 @@ impl Default for AppState {
     /// empty"), not an empty `Vec`, which is what a derived `Default` would
     /// give it — `CollectionSession::default()`'s own `#[derive(Default)]`
     /// is exactly the empty-but-valid starting point (`LoadState::Loading`,
-    /// nothing else set) `main::run` already fed straight into `update()`
-    /// via `Message::CollectionLoaded`/`NoCollectionPath` before this issue,
+    /// nothing else set) the event loop already feeds straight into
+    /// `update()` via `Message::CollectionLoaded`/`NoCollectionPath`,
     /// unchanged.
     fn default() -> Self {
         Self {

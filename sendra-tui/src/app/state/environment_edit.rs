@@ -56,12 +56,12 @@ pub struct EnvironmentEditState {
     /// request's header row already is.
     pub rows: Vec<HeaderRow>,
     /// Which row (and which half of it) has focus — `None` only when `rows`
-    /// is empty, since there is then nothing to focus at all. This is the
-    /// zero-variables case this issue's own investigation covers: an
-    /// environment can genuinely have no variables (see this module's own
-    /// `Environment` doc comment on why that is not an error), and this
-    /// type has to represent "editing an environment with nothing in it yet"
-    /// cleanly rather than pretend a row exists to focus.
+    /// is empty, since there is then nothing to focus at all. This covers
+    /// the zero-variables case: an environment can genuinely have no
+    /// variables (see this module's own `Environment` doc comment on why
+    /// that is not an error), and this type has to represent "editing an
+    /// environment with nothing in it yet" cleanly rather than pretend a
+    /// row exists to focus.
     pub focus: Option<EnvVarField>,
     /// `Some(...)` while a delete confirmation is pending for one of `rows`
     /// — the actual removal happens only on
@@ -70,9 +70,8 @@ pub struct EnvironmentEditState {
     /// `rows` at all. Built on the same shared [`ConfirmPrompt`] every other
     /// destructive-action confirmation in this crate uses, rendered as a
     /// real modal on top of this screen (`view::render_confirm_prompt`)
-    /// rather than the inline row annotation this used to be — see this
-    /// issue's own scoping notes on why a unified confirmation component
-    /// covers this case too now.
+    /// rather than the inline row annotation this used to be — the shared
+    /// confirmation component covers this case too.
     pub pending_delete: Option<PendingEnvVarDelete>,
     /// `Some(message)` right after `Message::SaveEnvironmentEdit` refused to
     /// save — either live validation (an empty or duplicated variable name —

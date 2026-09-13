@@ -51,7 +51,7 @@ pub fn view(state: &AppState, frame: &mut Frame) {
     // The tab bar only ever takes a row away from the rest of the screen
     // once there is something to switch between — a single open collection
     // renders exactly as it always has otherwise, rather than every screen
-    // growing a permanent one-tab bar nobody needed before that issue.
+    // growing a permanent one-tab bar nobody needs.
     let show_tabs = state.collections.len() > 1;
     let mut constraints = vec![Constraint::Length(1)];
     if show_tabs {

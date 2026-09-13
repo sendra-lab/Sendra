@@ -195,7 +195,7 @@ every request in the run that falls back to it acquires one token between
 them, exactly as if they had all written the same `oauth:` block themselves.
 
 There is no equivalent at the config-file level (`.sendra/config.yaml`):
-config is deliberately environment-agnostic tool-wide settings (issue 3's
-original design), while an auth scheme is inherently tied to which
-environment it authenticates against — the same reasoning that puts
-`base_url` in an environment file rather than in config.
+config is deliberately environment-agnostic tool-wide settings, while an
+auth scheme is inherently tied to which environment it authenticates
+against — the same reasoning that puts `base_url` in an environment file
+rather than in config.

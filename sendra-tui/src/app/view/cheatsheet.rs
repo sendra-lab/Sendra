@@ -249,8 +249,8 @@ mod tests {
     /// The actual drift guard: every `KeyCode` the real keymap in
     /// `main::translate_event`/`next_message` binds must be mentioned
     /// somewhere in the cheatsheet text — a key that exists in code but is
-    /// missing here would fail this test, exactly the "bug in this issue's
-    /// list, not an acceptable gap" this module's own doc comment promises.
+    /// missing here would fail this test, exactly the "a bug, not an
+    /// acceptable gap" this module's own doc comment promises.
     #[test]
     fn every_real_keybinding_is_mentioned_somewhere_in_the_cheatsheet() {
         let text = cheatsheet_text();

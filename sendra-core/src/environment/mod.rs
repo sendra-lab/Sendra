@@ -74,8 +74,8 @@
 //! while `Environment` additionally carries `source`, the per-run `captured`
 //! store, and (in tests) a stand-in OS environment — none of which come from
 //! the file itself. There is still no merging or layering here: one
-//! environment file, read once, is the whole story, the same non-goal for v1
-//! as always. `EnvironmentFile` exists for `schemars` to derive a real schema
+//! environment file, read once, is the whole story. `EnvironmentFile` exists
+//! for `schemars` to derive a real schema
 //! from (see `xtask`), not because a second environment file could combine
 //! with a first.
 
@@ -468,10 +468,10 @@ impl Environment {
 ///
 /// A variable value that is a *sequence or a mapping* is a parse error, and
 /// that is the rule keeping environments flat: `staging:` with variables
-/// nested underneath fails to load rather than half-working, which is what
-/// "no inheritance in v1" has to mean in practice. `auth:` is exempt from
-/// this — it is a mapping on purpose — but only `auth` is; any other nested
-/// key is still rejected exactly as before.
+/// nested underneath fails to load rather than half-working — there is no
+/// environment inheritance. `auth:` is exempt from this — it is a mapping
+/// on purpose — but only `auth` is; any other nested key is still rejected
+/// exactly as before.
 ///
 /// `Deserialize` is hand-written rather than `#[derive(Deserialize)]` with
 /// `#[serde(flatten)]` on `variables`: `flatten` deserializes the whole
@@ -916,7 +916,7 @@ mod tests {
 
     #[test]
     fn a_nested_environment_file_is_rejected() {
-        // Flat files only for v1; "staging extends base" is a non-goal, and a
+        // Flat files only; "staging extends base" is a non-goal, and a
         // parse error is a better answer than half-supporting it.
         let err = Environment::from_yaml_str("staging:\n  base_url: https://x\n")
             .expect_err("environments do not nest");
