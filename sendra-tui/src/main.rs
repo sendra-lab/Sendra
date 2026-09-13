@@ -225,6 +225,7 @@ fn next_message(
     history_viewing_open: bool,
     quit_confirm_open: bool,
     cheatsheet_open: bool,
+    request_filter_open: bool,
 ) -> io::Result<Message> {
     if !event::poll(Duration::from_millis(100))? {
         return Ok(Message::Tick);
@@ -244,6 +245,7 @@ fn next_message(
         history_viewing_open,
         quit_confirm_open,
         cheatsheet_open,
+        request_filter_open,
     ))
 }
 
@@ -272,6 +274,7 @@ fn translate_event(
     history_viewing_open: bool,
     quit_confirm_open: bool,
     cheatsheet_open: bool,
+    request_filter_open: bool,
 ) -> Message {
     match event {
         Event::Resize(_, _) => Message::Resize,
@@ -280,8 +283,9 @@ fn translate_event(
                 key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
             // Bare `q` quits everywhere *except* while editing: edit mode's
             // text fields (a request's own, an environment's variable
-            // name/value rows, or the open-collection prompt's own path) can
-            // hold a method, URL, value or path that is entirely likely to
+            // name/value rows, the open-collection prompt's own path, or
+            // the request filter's own query) can hold a method, URL,
+            // value, path, or request name that is entirely likely to
             // contain the letter `q` (`?query=...`, a directory literally
             // named `q`) — quitting the whole app on that keystroke would
             // make such a value unable to be typed at all. Ctrl+C stays a
@@ -301,7 +305,8 @@ fn translate_event(
                 || (key.code == KeyCode::Char('q')
                     && !edit_mode_open
                     && !environment_edit_open
-                    && !open_collection_prompt_open);
+                    && !open_collection_prompt_open
+                    && !request_filter_open);
             if is_quit {
                 return Message::Quit;
             }
@@ -318,16 +323,18 @@ fn translate_event(
                     _ => Message::Tick,
                 };
             }
-            // `?` opens it from anywhere *except* the three contexts that
+            // `?` opens it from anywhere *except* the four contexts that
             // accept literal typed text (a request/environment-variable
-            // field, or the open-collection prompt's own path) — those need
-            // `?` to stay an ordinary character (e.g. a URL's `?query=...`)
-            // rather than being stolen here, the same reasoning `is_quit`
-            // above already applies to bare `q`.
+            // field, the open-collection prompt's own path, or the request
+            // filter's own query) — those need `?` to stay an ordinary
+            // character (e.g. a URL's `?query=...`) rather than being
+            // stolen here, the same reasoning `is_quit` above already
+            // applies to bare `q`.
             if key.code == KeyCode::Char('?')
                 && !edit_mode_open
                 && !environment_edit_open
                 && !open_collection_prompt_open
+                && !request_filter_open
             {
                 return Message::OpenCheatsheet;
             }
@@ -558,6 +565,32 @@ fn translate_event(
                 };
             }
 
+            // The request filter's own key set — checked ahead of the
+            // ordinary browsing keymap below for the same reason edit
+            // mode's own branch above is: every letter it would otherwise
+            // bind (`e`, `i`, `n`, `d`, `o`, `j`, `k`, `r`, `c`, ...) needs
+            // to type into the query instead. `Up`/`Down` (not `j`/`k`,
+            // which are letters someone might filter by) move through the
+            // *filtered* list live, and `Enter` runs the currently
+            // highlighted match — the same "Enter/r run" browsing already
+            // offers, minus the `r` alias, which needs to stay typeable.
+            if request_filter_open {
+                return match key.code {
+                    KeyCode::Esc => Message::CloseRequestFilter,
+                    KeyCode::Enter => Message::RunRequested,
+                    KeyCode::Down => Message::SelectNext,
+                    KeyCode::Up => Message::SelectPrevious,
+                    KeyCode::Backspace => Message::EditBackspace,
+                    KeyCode::Delete => Message::EditDelete,
+                    KeyCode::Left => Message::EditCursorLeft,
+                    KeyCode::Right => Message::EditCursorRight,
+                    KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Message::EditInsertChar(ch)
+                    }
+                    _ => Message::Tick,
+                };
+            }
+
             match key.code {
                 KeyCode::Char('e') => Message::OpenEnvironmentOverlay,
                 KeyCode::Char('h') => Message::OpenHistoryOverlay,
@@ -565,6 +598,7 @@ fn translate_event(
                 KeyCode::Char('n') => Message::AddRequest,
                 KeyCode::Char('d') => Message::RequestDelete,
                 KeyCode::Char('o') => Message::OpenCollectionPrompt,
+                KeyCode::Char('/') => Message::OpenRequestFilter,
                 KeyCode::Char(']') => Message::NextCollection,
                 KeyCode::Char('[') => Message::PreviousCollection,
                 KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -663,6 +697,7 @@ fn run(
                 .is_some_and(|overlay| overlay.viewing.is_some()),
             state.quit_confirm.is_some(),
             state.cheatsheet_open,
+            state.request_filter.is_some(),
         )?;
         // `Message::ConfirmOpenCollectionPath` is never handed to `update()`
         // as-is — see that variant's own doc comment on why the reducer
@@ -824,9 +859,11 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
             false,
             false,
             false,
@@ -864,12 +901,14 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -905,6 +944,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -912,6 +952,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -945,6 +986,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -954,6 +996,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -987,6 +1030,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -997,6 +1041,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1015,6 +1060,7 @@ mod tests {
         // conflated the two would make an ordinary keystroke exit the app.
         let message = translate_event(
             press(KeyCode::Char('c')),
+            false,
             false,
             false,
             false,
@@ -1052,6 +1098,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
 
         assert!(
@@ -1064,6 +1111,7 @@ mod tests {
     fn resize_events_translate_to_the_resize_message() {
         let message = translate_event(
             Event::Resize(40, 20),
+            false,
             false,
             false,
             false,
@@ -1102,6 +1150,7 @@ mod tests {
             false,
             false,
             cheatsheet_open,
+            false,
         )
     }
 
@@ -1173,6 +1222,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(matches!(while_editing, Message::EditInsertChar('?')));
 
@@ -1190,6 +1240,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(matches!(
             while_editing_environment,
@@ -1199,6 +1250,7 @@ mod tests {
         let while_open_collection_prompt = translate_event(
             press(KeyCode::Char('?')),
             true,
+            false,
             false,
             false,
             false,
@@ -1237,6 +1289,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(matches!(overlay_open, Message::OpenCheatsheet));
 
@@ -1251,6 +1304,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1271,6 +1325,7 @@ mod tests {
             false,
             true,
             false,
+            false,
         );
         assert!(matches!(quit_confirm_open, Message::OpenCheatsheet));
 
@@ -1288,8 +1343,136 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(matches!(delete_confirm_open, Message::OpenCheatsheet));
+    }
+
+    // --- the `/` request filter ---------------------------------------------
+
+    /// `translate_event` with every context flag `false` except
+    /// `request_filter_open` — this section's own "ordinary browsing"
+    /// baseline, the same idea as `translate_browsing` above but toggling
+    /// the filter's own flag instead of the cheatsheet's.
+    fn translate_with_filter(event: Event, request_filter_open: bool) -> Message {
+        translate_event(
+            event,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            request_filter_open,
+        )
+    }
+
+    #[test]
+    fn slash_opens_the_request_filter_while_browsing() {
+        let message = translate_with_filter(press(KeyCode::Char('/')), false);
+        assert!(matches!(message, Message::OpenRequestFilter));
+    }
+
+    #[test]
+    fn esc_closes_the_request_filter() {
+        let message = translate_with_filter(press(KeyCode::Esc), true);
+        assert!(matches!(message, Message::CloseRequestFilter));
+    }
+
+    /// While the filter is open, ordinary letters — including ones that are
+    /// otherwise single-key browsing shortcuts (`e`, `i`, `n`, `d`, `o`,
+    /// `r`, `c`) — must type into the query instead of firing that
+    /// shortcut, the same "typing wins" rule edit mode's own keymap already
+    /// applies to its own fields.
+    #[test]
+    fn letters_that_double_as_browsing_keys_type_into_the_filter_query() {
+        for ch in ['e', 'i', 'n', 'd', 'o', 'r', 'c', 'j', 'k', 'q'] {
+            let message = translate_with_filter(press(KeyCode::Char(ch)), true);
+            assert!(
+                matches!(message, Message::EditInsertChar(inserted) if inserted == ch),
+                "{ch:?} must type into the filter query, got {message:?}"
+            );
+        }
+    }
+
+    /// `/` itself, typed a second time while already open, is just another
+    /// character for the query (e.g. filtering by a literal `/` in a
+    /// request name) — it must not try to re-open the filter.
+    #[test]
+    fn slash_types_a_literal_character_once_the_filter_is_already_open() {
+        let message = translate_with_filter(press(KeyCode::Char('/')), true);
+        assert!(matches!(message, Message::EditInsertChar('/')));
+    }
+
+    #[test]
+    fn up_and_down_navigate_the_filtered_list_but_j_and_k_do_not() {
+        let down = translate_with_filter(press(KeyCode::Down), true);
+        assert!(matches!(down, Message::SelectNext));
+
+        let up = translate_with_filter(press(KeyCode::Up), true);
+        assert!(matches!(up, Message::SelectPrevious));
+
+        // `j`/`k` are letters someone might filter by (e.g. a request named
+        // "jwt-refresh"), so — unlike ordinary browsing — they must type
+        // into the query rather than navigate.
+        let j = translate_with_filter(press(KeyCode::Char('j')), true);
+        assert!(matches!(j, Message::EditInsertChar('j')));
+        let k = translate_with_filter(press(KeyCode::Char('k')), true);
+        assert!(matches!(k, Message::EditInsertChar('k')));
+    }
+
+    #[test]
+    fn enter_runs_the_highlighted_request_while_filtering() {
+        let message = translate_with_filter(press(KeyCode::Enter), true);
+        assert!(matches!(message, Message::RunRequested));
+    }
+
+    #[test]
+    fn backspace_delete_and_cursor_keys_edit_the_filter_query() {
+        assert!(matches!(
+            translate_with_filter(press(KeyCode::Backspace), true),
+            Message::EditBackspace
+        ));
+        assert!(matches!(
+            translate_with_filter(press(KeyCode::Delete), true),
+            Message::EditDelete
+        ));
+        assert!(matches!(
+            translate_with_filter(press(KeyCode::Left), true),
+            Message::EditCursorLeft
+        ));
+        assert!(matches!(
+            translate_with_filter(press(KeyCode::Right), true),
+            Message::EditCursorRight
+        ));
+    }
+
+    /// `q`/Ctrl+C must not quit while the filter is open — a filtered-for
+    /// request name is entirely likely to contain the letter `q`, the same
+    /// reasoning `is_quit`'s own doc comment already gives for edit mode.
+    #[test]
+    fn q_types_a_literal_character_while_filtering_but_ctrl_c_still_quits() {
+        let from_q = translate_with_filter(press(KeyCode::Char('q')), true);
+        assert!(matches!(from_q, Message::EditInsertChar('q')));
+
+        let from_ctrl_c =
+            translate_with_filter(press_with(KeyCode::Char('c'), KeyModifiers::CONTROL), true);
+        assert!(matches!(from_ctrl_c, Message::Quit));
+    }
+
+    /// `?` must type into the filter query rather than open the cheatsheet
+    /// — the same reasoning already applied to edit mode, environment
+    /// editing, and the open-collection prompt.
+    #[test]
+    fn question_mark_types_a_literal_character_while_filtering_instead_of_opening_the_cheatsheet() {
+        let message = translate_with_filter(press(KeyCode::Char('?')), true);
+        assert!(matches!(message, Message::EditInsertChar('?')));
     }
 
     // --- edit mode's own key set -------------------------------------------
@@ -1310,6 +1493,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let save = translate_event(
             press_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
@@ -1320,6 +1504,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1357,6 +1542,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             );
             assert!(
                 matches!(message, Message::Tick),
@@ -1387,6 +1573,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             );
             assert!(
                 matches!(message, Message::EditInsertChar(c) if c == ch),
@@ -1412,6 +1599,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditFocusNext
         ));
@@ -1425,6 +1613,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1448,6 +1637,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditBackspace
         ));
@@ -1461,6 +1651,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1484,6 +1675,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditCursorLeft
         ));
@@ -1497,6 +1689,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1524,6 +1717,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditInsertChar('\n')
         ));
@@ -1542,6 +1736,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditCursorUp
         ));
@@ -1556,6 +1751,7 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1581,6 +1777,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
@@ -1591,6 +1788,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1618,6 +1816,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('x'), KeyModifiers::CONTROL),
@@ -1628,6 +1827,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1655,6 +1855,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('k'), KeyModifiers::CONTROL),
@@ -1665,6 +1866,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1698,6 +1900,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(matches!(message, Message::Tick));
     }
@@ -1706,6 +1909,7 @@ mod tests {
     fn i_enters_edit_mode_outside_the_overlay_and_outside_edit_mode() {
         let message = translate_event(
             press(KeyCode::Char('i')),
+            false,
             false,
             false,
             false,
@@ -1738,6 +1942,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(matches!(message, Message::AddRequest));
     }
@@ -1758,6 +1963,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(matches!(message, Message::RequestDelete));
     }
@@ -1766,6 +1972,7 @@ mod tests {
     fn h_opens_the_history_overlay_outside_the_overlay_and_outside_edit_mode() {
         let message = translate_event(
             press(KeyCode::Char('h')),
+            false,
             false,
             false,
             false,
@@ -1800,6 +2007,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(matches!(esc, Message::CloseHistoryOverlay));
 
@@ -1817,6 +2025,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(matches!(enter, Message::ViewHistoryEntry));
 
@@ -1831,6 +2040,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1852,6 +2062,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             );
             assert!(matches!(message, Message::SelectNext));
         }
@@ -1867,6 +2078,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -1889,6 +2101,7 @@ mod tests {
             false,
             true,
             true,
+            false,
             false,
             false,
         );
@@ -1916,6 +2129,7 @@ mod tests {
                 true,
                 false,
                 false,
+                false,
             );
             assert_eq!(
                 std::mem::discriminant(&message),
@@ -1940,6 +2154,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -1952,6 +2167,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1979,6 +2195,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             );
             assert!(
                 matches!(message, Message::ConfirmDelete),
@@ -1994,6 +2211,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -2019,6 +2237,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -2053,6 +2272,7 @@ mod tests {
                 false,
                 true,
                 false,
+                false,
             );
             assert!(
                 matches!(message, Message::ConfirmQuit),
@@ -2073,6 +2293,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
             );
             assert!(
@@ -2098,6 +2319,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
             );
             assert!(
@@ -2129,6 +2351,7 @@ mod tests {
             false,
             true,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -2144,6 +2367,7 @@ mod tests {
             false,
             true,
             false,
+            false,
         );
         assert!(matches!(from_q, Message::Quit));
         assert!(matches!(from_ctrl_c, Message::Quit));
@@ -2158,6 +2382,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -2187,6 +2412,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let save = translate_event(
             press_with(KeyCode::Char('s'), KeyModifiers::CONTROL),
@@ -2194,6 +2420,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -2224,6 +2451,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let delete = translate_event(
             press_with(KeyCode::Char('d'), KeyModifiers::CONTROL),
@@ -2231,6 +2459,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -2262,6 +2491,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditFocusNext
         ));
@@ -2272,6 +2502,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -2298,6 +2529,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditBackspace
         ));
@@ -2316,6 +2548,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             ),
             Message::EditDelete
         ));
@@ -2326,6 +2559,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -2355,6 +2589,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let from_ctrl_c = translate_event(
             press_with(KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -2362,6 +2597,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -2392,6 +2628,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             );
             assert!(
                 matches!(message, Message::ConfirmDeleteEnvVarRow),
@@ -2406,6 +2643,7 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -2434,6 +2672,7 @@ mod tests {
                 false,
                 true,
                 true,
+                false,
                 false,
                 false,
                 false,

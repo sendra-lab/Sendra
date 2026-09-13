@@ -37,10 +37,20 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "e             open the environment picker",
             "h             open the run-history browser",
             "o             open another collection",
+            "/             filter the request list by name",
             "] / [         next / previous collection tab",
             "Ctrl+w        close the current collection tab",
             "PgUp/PgDn/Home/End   scroll the response panel",
             "c             reveal / hide captured values",
+        ],
+    ),
+    (
+        "Filtering the request list (after pressing /):",
+        &[
+            "(type)        narrow the list to matching names, live",
+            "↑/↓           move selection within the filtered list",
+            "Enter         run the highlighted (filtered) request",
+            "Esc           clear the filter and show every request again",
         ],
     ),
     (
