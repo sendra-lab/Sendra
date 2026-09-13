@@ -30,6 +30,9 @@ request with Sendra yet — this is the lookup material for once you have.
   editor at `schema/*.schema.json` for autocomplete and inline validation.
 - [Development](reference/development.md) — building, testing and linting
   this repository.
+- [The interactive TUI](reference/tui.md) — `sendra tui`: browsing and
+  running requests, every editable field, multi-collection tabs, run
+  history, environments, search/filter, and the full keybinding reference.
 
 For the reasoning behind a design decision rather than the shape of it, see
 [docs/decisions/](decisions/README.md).
