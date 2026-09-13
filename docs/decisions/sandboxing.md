@@ -30,6 +30,6 @@ the ones that explain the throw.
 That choice belongs to each front end, not to the library. `sendra-core` has no
 `println!` or `eprintln!` anywhere in it — running a script returns the lines it
 printed alongside its verdict, and `sendra-cli` decides they are stderr.
-`sendra-tui` reuses the same crate and puts them somewhere a redrawn frame does
-not wipe out, without the library ever writing over either front end's own
-interface.
+`sendra-tui` does not run `pre_request`/`post_request` scripts at all — see
+[The interactive TUI](../reference/tui.md) — so this choice does not arise
+there.
