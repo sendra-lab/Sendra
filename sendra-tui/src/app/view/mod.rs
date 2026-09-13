@@ -236,18 +236,26 @@ fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 /// `"  |  "` separator — already how every status-bearing line in
 /// `status_help_text` divides "what happened" from "what you can press
 /// next" — is what this splits on. The left half is colored by what it
-/// says (`"Failed"` → [`theme::fail`], `"Done"` → [`theme::success`], a
-/// spinner frame → [`theme::in_progress`], anything else — a confirmation
-/// question, an "Editing" label — → [`theme::emphasis`], since those are
-/// attention-worthy without being a pass/fail verdict); the right half
-/// (the keybindings themselves) is always [`theme::muted`]. A line with no
-/// separator at all (the plain browsing/overlay keymaps, which carry no
-/// status) is muted in full.
+/// says: `"y/enter confirm  n/esc cancel"` on the right half marks one of
+/// [`confirm_status_line`]'s four destructive confirmations (delete,
+/// close-tab, quit) → [`theme::fail`], the same red
+/// [`modals::render_confirm_prompt`] gives the identical question in the
+/// modal itself, so the two agree rather than one being red and the other
+/// merely bold; otherwise `"Failed"` → [`theme::fail`], `"Done"` →
+/// [`theme::success`], a spinner frame → [`theme::in_progress`], anything
+/// else (an "Editing" label, "Open collection") → [`theme::emphasis`],
+/// attention-worthy without being a pass/fail verdict or a destructive
+/// question. The right half (the keybindings themselves) is always
+/// [`theme::muted`]. A line with no separator at all (the plain
+/// browsing/overlay keymaps, which carry no status) is muted in full.
 fn status_bar_line(text: &str) -> Line<'static> {
     let Some((left, right)) = text.split_once("  |  ") else {
         return Line::styled(text.to_string(), theme::muted());
     };
-    let left_style = if left.contains("Failed") || left.contains("failed") {
+    let left_style = if right.contains("y/enter confirm  n/esc cancel")
+        || left.contains("Failed")
+        || left.contains("failed")
+    {
         theme::fail()
     } else if left.contains("Done") {
         theme::success()

@@ -468,4 +468,47 @@ mod screen_consistency_tests {
             "the response panel's own error heading must be colored the same fail"
         );
     }
+
+    /// Every destructive confirmation this crate asks (deleting a request,
+    /// quitting with unsaved work — `modals::render_confirm_prompt`'s other
+    /// two call sites, closing a tab and deleting an environment variable,
+    /// share the exact same rendering path so are not re-checked here) must
+    /// show its question in [`fail`] red, in both places it appears: the
+    /// modal itself and the status bar's own one-line echo of it. Neither
+    /// carries a `✓`/`✗`/`⚠` of its own for `theme::colorize` to key off —
+    /// this is exactly the gap a plain-prose confirmation question would
+    /// otherwise fall through uncolored.
+    #[test]
+    fn destructive_confirmations_are_colored_fail_in_the_modal_and_the_status_bar() {
+        let mut delete_state = loaded_state(VALID_COLLECTION);
+        update(&mut delete_state, Message::RequestDelete);
+        let delete_buffer = render(&delete_state);
+        // "│Delete" (the bordered modal line), not the bare question text —
+        // the same question also appears, unbordered, on the status bar row
+        // below, so a needle that matches both would defeat the point of
+        // checking each one separately.
+        let modal_row = find_row_containing(&delete_buffer, "│Delete '");
+        assert!(
+            row_has(&delete_buffer, modal_row, |cell| cell.fg
+                == fail().fg.unwrap()),
+            "the delete-confirmation modal's own question must be colored fail"
+        );
+        let status_row = find_row_containing(&delete_buffer, "y/enter confirm");
+        assert!(
+            row_has(&delete_buffer, status_row, |cell| cell.fg
+                == fail().fg.unwrap()),
+            "the status bar's echo of that same question must be colored fail too"
+        );
+
+        let mut quit_state = loaded_state(VALID_COLLECTION);
+        update(&mut quit_state, Message::EnterEditMode);
+        update(&mut quit_state, Message::Quit);
+        let quit_buffer = render(&quit_state);
+        let quit_modal_row = find_row_containing(&quit_buffer, "│Quit with unsaved changes");
+        assert!(
+            row_has(&quit_buffer, quit_modal_row, |cell| cell.fg
+                == fail().fg.unwrap()),
+            "the quit-with-unsaved-changes modal's question must be colored fail too"
+        );
+    }
 }
