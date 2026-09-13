@@ -44,8 +44,9 @@ pub(crate) mod test_support {
 
     use crate::run_request::RunOutcome;
 
-    use super::state::{AppState, LoadState, Message, NamedEnvironment};
+    use super::state::{AppState, CollectionSession, LoadState, Message, NamedEnvironment};
     use super::update::update;
+    use super::view::view;
 
     pub(crate) const VALID_COLLECTION: &str = "\
 name: test
@@ -210,5 +211,184 @@ requests:
         for _ in 0..n {
             update(state, Message::EditBackspace);
         }
+    }
+
+    /// Builds a `state` whose `LoadState::Loaded` really points at `path` on
+    /// disk (unlike `loaded_state`'s own shared scratch file, this lets a
+    /// test control exactly what's on disk before and after `SaveEdit`) —
+    /// shared by every test that needs to inspect real bytes on a real
+    /// filesystem rather than just the in-memory `Document`.
+    pub(crate) fn state_loaded_from(path: &std::path::Path) -> AppState {
+        let mut state = AppState::default();
+        let document = Document::from_path(path).expect("the fixture file must parse");
+        update(
+            &mut state,
+            Message::CollectionLoaded {
+                base_dir: path.parent().unwrap().to_path_buf(),
+                path: path.to_path_buf(),
+                result: Box::new(Ok(document)),
+            },
+        );
+        state
+    }
+
+    /// The whole `Document` behind `state`'s active session — what tests
+    /// about `Document::Single`/`Document::Collection`'s own shape need,
+    /// rather than one request out of it.
+    pub(crate) fn saved_document(state: &CollectionSession) -> &Document {
+        match &state.load_state {
+            LoadState::Loaded { document, .. } => document,
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+    }
+
+    /// Opens a brand-new collection as a real tab — exactly the
+    /// `Message::CollectionOpened` shape `main::run`'s own loop builds after
+    /// intercepting `Message::ConfirmOpenCollectionPath` (see that variant's
+    /// own doc comment), parsed from `yaml` and written to a real file in its
+    /// own temp directory so `Message::SaveEdit` has somewhere genuine to
+    /// land for this tab too — the same "real disk, not just an in-memory
+    /// `Document`" bar every other save/delete/environment-edit test already
+    /// holds itself to. Returns the id `AppState::open_session` assigned it,
+    /// the `TempDir` guard (kept alive by the caller — see
+    /// `state_with_saved_environment`'s own doc comment on why dropping it
+    /// early would be fatal), and the file's path.
+    pub(crate) fn open_second_collection(
+        state: &mut AppState,
+        yaml: &str,
+    ) -> (u64, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("second.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let document = Document::from_path(&path).expect("valid test YAML");
+        update(
+            state,
+            Message::CollectionOpened {
+                base_dir: dir.path().to_path_buf(),
+                path,
+                result: Box::new(Ok(document)),
+                environments: Vec::new(),
+                environment_errors: Vec::new(),
+            },
+        );
+        (state.active().id, dir, state_path(state))
+    }
+
+    /// The real, on-disk path of the currently active session — what
+    /// `open_second_collection` hands back so a test can later reload that
+    /// exact file with a fresh `Document::from_path`.
+    pub(crate) fn state_path(state: &AppState) -> PathBuf {
+        match &state.load_state {
+            LoadState::Loaded { path, .. } => path.clone(),
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+    }
+
+    /// Every visible cell of a rendered `Buffer`, row by row, as plain text —
+    /// what every screen-rendering test asserts against instead of poking
+    /// ratatui's own `Buffer`/`Cell` types directly.
+    pub(crate) fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Renders `state` through the real `view()` into a `TestBackend` and
+    /// returns the resulting screen as plain text — shared by every test
+    /// across `browser`/`edit_form`/`environment`/`response`'s own test
+    /// modules that needs to assert on what actually reaches the screen,
+    /// not just on `AppState` fields. Tall enough that the edit pane's auth
+    /// section and its "Resolved auth" preview line are never clipped by
+    /// the pane's own height.
+    pub(crate) fn render_screen(state: &AppState) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+        terminal
+            .draw(|frame| view(state, frame))
+            .expect("rendering must not panic");
+        buffer_to_string(terminal.backend().buffer())
+    }
+
+    /// A minimal, fixed-shape `Response` for formatting tests — status
+    /// `201 Created`, `headers`/`body` as given, shared by every response
+    /// formatting test that needs a real `Response` to format rather than
+    /// one hand-built per test.
+    pub(crate) fn response_with(headers: &[(&str, &str)], body: &str) -> Response {
+        Response {
+            status: 201,
+            status_text: "Created".to_string(),
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            body: body.to_string(),
+            elapsed: std::time::Duration::from_millis(42),
+            redirects: Vec::new(),
+        }
+    }
+
+    /// Evaluates `yaml`'s `assertions:` block against `response`, via the
+    /// real `Assertions::evaluate` — shared by every test that checks
+    /// formatting of a real `AssertionReport` rather than a hand-built one.
+    pub(crate) fn evaluate_assertions(yaml: &str, response: &Response) -> AssertionReport {
+        let request = Document::from_yaml_str(yaml)
+            .expect("valid test request")
+            .requests()[0]
+            .clone();
+        request
+            .assertions
+            .expect("the test YAML declares an `assertions:` block")
+            .evaluate(response)
+    }
+
+    /// Same as [`evaluate_assertions`] for a `capture:` block, via the real
+    /// `Captures::evaluate`.
+    pub(crate) fn evaluate_capture(yaml: &str, response: &Response) -> CaptureReport {
+        let request = Document::from_yaml_str(yaml)
+            .expect("valid test request")
+            .requests()[0]
+            .clone();
+        request
+            .capture
+            .expect("the test YAML declares a `capture:` block")
+            .evaluate(response, &Environment::default())
+    }
+
+    /// A loaded collection whose one request substitutes `{{base_url}}`,
+    /// paired with a real environment file on disk that defines it —
+    /// everything `preview::resolve_browsing_preview`'s real pipeline needs
+    /// to resolve a live URL, and everything `Message::SaveEnvironmentEdit`
+    /// needs to persist an edit to. Shared by `view`'s own `environment` and
+    /// `mod` test modules, both of which need a real, saved environment to
+    /// edit rather than `state_with_environments`'s sourceless ones.
+    pub(crate) fn loaded_state_with_saved_environment(
+        variable_value: &str,
+    ) -> (AppState, tempfile::TempDir, PathBuf) {
+        let mut state = loaded_state(
+            "name: test\nrequests:\n  - name: One\n    method: GET\n    \
+             url: 'https://example.com/{{base_url}}'\n",
+        );
+
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = sendra_core::environment::environment_path(dir.path(), "staging");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("base_url: {variable_value}\n")).unwrap();
+        let environment = Environment::from_path(&path).expect("the fixture file must parse");
+
+        state.environments = vec![NamedEnvironment {
+            name: "staging".to_string(),
+            environment,
+        }];
+        state.active_environment = Some(0);
+
+        (state, dir, path)
     }
 }
