@@ -58,7 +58,16 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Run {
+        // No subcommand at all: launch the TUI with nothing preloaded, the
+        // same as `sendra tui` with no path. Decided deliberately, not left
+        // as a "maybe later" — see `Command::Tui`'s own doc comment and
+        // `Cli::command`'s. A `sendra` with a typo'd subcommand name still
+        // hits clap's ordinary usage error, since that never reaches `None`.
+        None => run_tui(None),
+
+        Some(Command::Tui { path }) => run_tui(path),
+
+        Some(Command::Run {
             path,
             request,
             env,
@@ -78,7 +87,7 @@ async fn main() -> ExitCode {
             output,
             quiet,
             verbose,
-        } => {
+        }) => {
             if verbose && quiet {
                 reject_verbose_with_quiet();
             }
@@ -114,7 +123,7 @@ async fn main() -> ExitCode {
             .into()
         }
 
-        Command::Test {
+        Some(Command::Test {
             path,
             request,
             env,
@@ -134,7 +143,7 @@ async fn main() -> ExitCode {
             output,
             quiet,
             verbose,
-        } => {
+        }) => {
             if allow_error_status {
                 reject_allow_error_status();
             }
@@ -169,12 +178,36 @@ async fn main() -> ExitCode {
             .into()
         }
 
-        Command::Init => init().into(),
+        Some(Command::Init) => init().into(),
 
-        Command::Schema { output } => schema(output).into(),
+        Some(Command::Schema { output }) => schema(output).into(),
 
-        Command::Import { target } => match target {
+        Some(Command::Import { target }) => match target {
             ImportTarget::Curl { command, output } => import_curl(command, output).into(),
         },
+    }
+}
+
+/// Runs `sendra tui`, in-process — `sendra-tui::run` is a blocking, synchronous
+/// full-screen event loop, not itself `async`; calling it from inside this
+/// `async fn main` just occupies the current-thread runtime's one thread for
+/// as long as the TUI session lasts, exactly the way `sendra tui` occupying
+/// the whole process would on its own. Nothing else needs that thread
+/// concurrently — the TUI's own HTTP sends and OAuth logins each spin up
+/// their own dedicated OS thread and runtime (`run_request::spawn`,
+/// `oauth_login::spawn`), independent of this one, the same way they always
+/// have.
+///
+/// A plain `eprintln!` + `ExitCode::FAILURE` on I/O failure, not `Exit`'s
+/// codes: those are `run`/`test`'s documented contract with scripts checking
+/// `$?` (0/1/3/4), and a TUI session ending — cleanly or via a startup I/O
+/// error — is not one of the outcomes that contract describes.
+fn run_tui(path: Option<std::path::PathBuf>) -> ExitCode {
+    match sendra_tui::run(path) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            ExitCode::FAILURE
+        }
     }
 }

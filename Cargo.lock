@@ -1931,6 +1931,7 @@ dependencies = [
  "roxmltree",
  "rustls",
  "sendra-core",
+ "sendra-tui",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1969,7 +1970,6 @@ dependencies = [
 name = "sendra-tui"
 version = "0.1.0"
 dependencies = [
- "clap",
  "crossterm",
  "open",
  "ratatui",

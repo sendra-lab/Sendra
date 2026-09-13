@@ -543,23 +543,22 @@ impl EditField {
 /// rest of the edit session even if what gets typed would also fit a
 /// different shape (see `Editable`'s own doc comment).
 ///
-/// **Scoping decision for this issue**: only a request with no body, a
-/// plain `body:`, or a `json:` body gets a real editor here — the three
-/// remaining shapes (`body_file`, `form`, `multipart`) are shown read-only
-/// (`Unsupported`, surfaced by `render_edit_pane` as plain text, never a
-/// text area) rather than partially or fully editable. This is a deliberate
-/// line, not a gap that slipped through: `body_file` names a file on disk
-/// that some other tool may already have open, editing it from inside
-/// sendra-tui would mean either silently overwriting that file on save (a
-/// surprising side effect for a "request" edit) or inventing a separate
-/// "detach from the file" step this issue was never asked to design; `form`
-/// and `multipart` are structured (name/value pairs, and file parts for the
-/// latter) and would need their own list-of-rows editor in the shape of
-/// `HeaderRow`'s, which is a real feature in its own right, not a natural
-/// fit for a raw text area. Both are honest gaps to revisit as their own
-/// issues, not silently dropped: `Unsupported`'s `description` is exactly
-/// what tells the user, in the pane itself, that this body exists but isn't
-/// editable here.
+/// **Deliberate scoping**: only a request with no body, a plain `body:`, or
+/// a `json:` body gets a real editor here — the three remaining shapes
+/// (`body_file`, `form`, `multipart`) are shown read-only (`Unsupported`,
+/// surfaced by `render_edit_pane` as plain text, never a text area) rather
+/// than partially or fully editable. This is a deliberate line, not a gap
+/// that slipped through: `body_file` names a file on disk that some other
+/// tool may already have open, editing it from inside sendra-tui would mean
+/// either silently overwriting that file on save (a surprising side effect
+/// for a "request" edit) or inventing a separate "detach from the file" step
+/// that is out of scope here; `form` and `multipart` are structured
+/// (name/value pairs, and file parts for the latter) and would need their
+/// own list-of-rows editor in the shape of `HeaderRow`'s, which is a real
+/// feature in its own right, not a natural fit for a raw text area. Both are
+/// honest gaps to revisit later, not silently dropped: `Unsupported`'s
+/// `description` is exactly what tells the user, in the pane itself, that
+/// this body exists but isn't editable here.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BodyEdit {
     // `Editable`/`Unsupported` documented below; `Default` is implemented
@@ -647,8 +646,8 @@ impl BodyEdit {
 /// shaped by whichever of `bearer`/`basic`/`api_key`/`oauth` the request
 /// actually has. `None` covers a request with no `auth:` block at all; this
 /// edit session never introduces one where there wasn't one already (no
-/// "pick an auth type" step exists here — see this issue's own scoping
-/// notes). Seeded once by `AuthEdit::new` and converted back by `to_auth` —
+/// "pick an auth type" step exists here — deliberately out of scope).
+/// Seeded once by `AuthEdit::new` and converted back by `to_auth` —
 /// the same round-trip `BodyEdit`/`HeaderRow` already go through for their
 /// own fields.
 ///
@@ -1135,25 +1134,24 @@ impl JsonOperator {
 /// a row's `negate` flag decides which of the two it belongs in (see
 /// `EditState::to_assertions`).
 ///
-/// **Scoping decision for this issue.** `sendra_core::Assertions` is not one
-/// homogeneous list — it is seven different kinds of check (`status`,
-/// `status_in`, `headers`, `body_contains`, `body_matches`,
-/// `elapsed_ms_under`, `json`), each its own field, plus a `not:` wrapper
-/// duplicating the same seven for negation. Only `json:` (JSON-path +
-/// operator + expected value) is genuinely list-shaped the way
-/// `Request::headers` is — the other six are singular optional values, each
-/// of which would need its own single-field editor in the shape of
-/// `AuthEdit`'s Bearer/Basic fields, and `not:` would double every one of
-/// them again. This issue's row-based add/edit/delete UI covers `json:`
-/// (and, through each row's `negate` flag, `not: {json: {...}}`) end to
-/// end; `status`/`status_in`/`headers`/`body_contains`/`body_matches`/
+/// **Deliberate scoping.** `sendra_core::Assertions` is not one homogeneous
+/// list — it is seven different kinds of check (`status`, `status_in`,
+/// `headers`, `body_contains`, `body_matches`, `elapsed_ms_under`, `json`),
+/// each its own field, plus a `not:` wrapper duplicating the same seven for
+/// negation. Only `json:` (JSON-path + operator + expected value) is
+/// genuinely list-shaped the way `Request::headers` is — the other six are
+/// singular optional values, each of which would need its own single-field
+/// editor in the shape of `AuthEdit`'s Bearer/Basic fields, and `not:` would
+/// double every one of them again. This row-based add/edit/delete UI covers
+/// `json:` (and, through each row's `negate` flag, `not: {json: {...}}`) end
+/// to end; `status`/`status_in`/`headers`/`body_contains`/`body_matches`/
 /// `elapsed_ms_under`, and every other kind under `not:`, are left
 /// completely untouched by this editor (see `EditState::to_assertions`,
 /// which round-trips them from the original request verbatim) — an honest
-/// gap to revisit as its own issue, not a silent one: nothing here claims to
-/// offer editing for them, the same "say what isn't covered, in the pane
-/// itself" bar `BodyEdit`'s `body_file`/`form`/`multipart` note and
-/// `AuthEdit`'s OAuth note already set.
+/// gap to revisit later, not a silent one: nothing here claims to offer
+/// editing for them, the same "say what isn't covered, in the pane itself"
+/// bar `BodyEdit`'s `body_file`/`form`/`multipart` note and `AuthEdit`'s
+/// OAuth note already set.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AssertionRow {
     pub path: TextField,
@@ -1406,9 +1404,8 @@ pub struct EditState {
     /// by typing — it is an environment problem, not a bad value — so
     /// `edit_mutate` never touches it; it clears only when a save attempt
     /// actually succeeds (`Message::SaveEdit`'s own arm) or the whole edit is
-    /// cancelled (dropped along with the rest of `EditState`). Reusing
-    /// `format_error`'s inline rendering (see `render_edit_pane`) is what
-    /// "issue 11's render_error/format_error path" means here: the same
+    /// cancelled (dropped along with the rest of `EditState`). Reuses
+    /// `format_error`'s inline rendering (see `render_edit_pane`) — the same
     /// `⚠ heading\nerror` shape a failed run or a failed collection load
     /// already use, not a new error-display convention just for this.
     pub save_error: Option<String>,

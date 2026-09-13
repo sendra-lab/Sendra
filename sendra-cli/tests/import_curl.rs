@@ -4,9 +4,9 @@
 //! stdin vs. the positional argument, `-o`/`--output`, the unsupported-flag
 //! and invocation-note reporting on stderr, a malformed command — the way
 //! every other CLI-level test file in this crate does (see
-//! [`mtls`](mtls.rs)). The last two are the feature's real proof, per the
-//! issue this was built against: a realistic curl command is run for real,
-//! against a server that records exactly what it received, and the file
+//! [`mtls`](mtls.rs)). The last two are the feature's real proof: a
+//! realistic curl command is run for real, against a server that records
+//! exactly what it received, and the file
 //! `sendra import curl` generates from that same command is run against a
 //! second instance of the same server — proving the generated file produces
 //! the same wire behavior as curl itself, not just YAML that "looks right".

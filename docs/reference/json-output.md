@@ -139,6 +139,6 @@ does not parse, a `--env` naming an environment that is not there: these fail
 before the first request, so there is no document to write. The error is on
 stderr and the exit code is `1`, as it is without the flag.
 
-**No stability promise yet.** This is v1 and Sendra has no external consumers;
-the shape above is the one to script against today, and it will grow keys before
-it is frozen.
+**No stability promise yet.** Sendra has no external consumers of this format
+yet; the shape above is the one to script against today, and it will grow keys
+before it is frozen.

@@ -32,11 +32,10 @@
 //! is equally exposed to authorization-code interception on the loopback
 //! redirect either way.
 //!
-//! `refresh_token` is not implemented: once expiry-checking exists here, no
-//! fast-follow issue is worth its own scope for the marginal request
-//! `refresh_token` would save over just re-running the same grant (or, for
-//! `authorization_code`, logging in again), so it is deferred rather than
-//! treated as a real gap.
+//! `refresh_token` is not implemented: once expiry-checking exists here, it
+//! is not worth its own scope for the marginal request `refresh_token` would
+//! save over just re-running the same grant (or, for `authorization_code`,
+//! logging in again), so it is deferred rather than treated as a real gap.
 //!
 //! **No cross-invocation persistence.** [`OAuthTokenCache`] lives only as
 //! long as the process that built it — never written to disk — the same
@@ -229,7 +228,7 @@ impl OAuthTokenCache {
 
 /// A token endpoint's JSON response — only the fields Sendra reads. Every
 /// other field a server includes (`refresh_token`, `id_token`, `token_type`,
-/// ...) is ignored: v1 implements neither `refresh_token` nor OIDC ID
+/// ...) is ignored: Sendra implements neither `refresh_token` nor OIDC ID
 /// tokens, and the bearer form this becomes needs nothing else. See the
 /// module doc comment.
 #[derive(Deserialize)]

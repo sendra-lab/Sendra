@@ -79,7 +79,7 @@ pub struct HttpClient {
 /// redirect policy, whether TLS certificates are verified, which proxy (if
 /// any) requests go through, which client certificate (if any) to present
 /// for mutual TLS, and whether cookies received are stored and resent
-/// automatically — and nothing else about the client is configurable in v1;
+/// automatically — and nothing else about the client is configurable;
 /// reqwest's own pool defaults are what a command-line tool wants.
 ///
 /// **Cookies are opt-in.** [`Config::cookie_jar`] defaults to `false`,

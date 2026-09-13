@@ -47,8 +47,8 @@ returns typed errors (`SendraError`) rather than formatted messages.
 
 ## Install
 
-No packaged release yet — Sendra is pre-v1 and there is no binary to download.
-For now, build it from source:
+No packaged release yet — there is no binary to download. For now, build it
+from source:
 
 ```sh
 git clone https://github.com/sendra-lab/Sendra.git

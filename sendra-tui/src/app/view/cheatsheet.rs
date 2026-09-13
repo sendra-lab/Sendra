@@ -176,7 +176,7 @@ mod tests {
     use crate::app::test_support::*;
     use crate::app::update::update;
 
-    /// The real, non-test body of `main::translate_event` (and the
+    /// The real, non-test body of `lib::translate_event` (and the
     /// `next_message` wrapper right above it) — sliced out of the crate's
     /// own source by the same two markers every time, so this audit reads
     /// whatever that function currently says rather than a copy that could
@@ -185,19 +185,19 @@ mod tests {
     /// bindings (see e.g. `control_letter_combinations_other_than_ctrl_s_n_d_a_x_p_k_do_nothing_while_editing`'s
     /// own `KeyCode::Char('b')`, deliberately not a real binding).
     fn real_keymap_source() -> &'static str {
-        const MAIN_RS: &str = include_str!("../../main.rs");
-        let start = MAIN_RS
+        const LIB_RS: &str = include_str!("../../lib.rs");
+        let start = LIB_RS
             .find("fn next_message(")
-            .expect("main.rs must still define next_message");
+            .expect("lib.rs must still define next_message");
         // Not `"#[cfg(test)]\nmod tests {"` — this crate's checked-in
-        // `main.rs` uses CRLF line endings, so a literal `\n` between the
+        // `lib.rs` uses CRLF line endings, so a literal `\n` between the
         // two lines would never match; `"mod tests {"` alone is unique in
         // the file (`resolution_parity_tests` further down has a different
         // name) and needs no line-ending assumption at all.
-        let end = MAIN_RS
+        let end = LIB_RS
             .find("mod tests {")
-            .expect("main.rs must still have its own #[cfg(test)] mod tests");
-        &MAIN_RS[start..end]
+            .expect("lib.rs must still have its own #[cfg(test)] mod tests");
+        &LIB_RS[start..end]
     }
 
     /// Every distinct `KeyCode::Char('x')` literal the real keymap binds —
@@ -249,8 +249,8 @@ mod tests {
     /// The actual drift guard: every `KeyCode` the real keymap in
     /// `main::translate_event`/`next_message` binds must be mentioned
     /// somewhere in the cheatsheet text — a key that exists in code but is
-    /// missing here would fail this test, exactly the "bug in this issue's
-    /// list, not an acceptable gap" this module's own doc comment promises.
+    /// missing here would fail this test, exactly the "a bug, not an
+    /// acceptable gap" this module's own doc comment promises.
     #[test]
     fn every_real_keybinding_is_mentioned_somewhere_in_the_cheatsheet() {
         let text = cheatsheet_text();

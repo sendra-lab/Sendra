@@ -86,11 +86,17 @@ pub(crate) enum OutputMode {
 #[command(
     name = "sendra",
     version,
-    about = "Terminal-native HTTP client — send requests defined in YAML files."
+    about = "Terminal-native HTTP client — send requests defined in YAML files. \
+             Run with no subcommand to launch the interactive TUI."
 )]
 pub(crate) struct Cli {
+    /// Omitting the subcommand entirely launches the TUI — see `Command::Tui`
+    /// and `main`'s own handling of `None`. Every other subcommand still
+    /// requires typing its name; this only covers the zero-argument case, so
+    /// a stray `sendra some-typo` is still clap's ordinary "unrecognized
+    /// subcommand" error rather than being swallowed into opening the TUI.
     #[command(subcommand)]
-    pub(crate) command: Command,
+    pub(crate) command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -610,6 +616,23 @@ pub(crate) enum Command {
         #[command(subcommand)]
         target: ImportTarget,
     },
+
+    /// Launch the interactive terminal UI.
+    ///
+    /// Browses and runs the requests in a collection (or a single request
+    /// file) from a full-screen terminal app, rather than one invocation per
+    /// request — see `docs/` for what it offers beyond `run`/`test`.
+    /// Requires an interactive terminal on stdout; refuses immediately, with
+    /// a plain error, if stdout has been redirected or piped.
+    ///
+    /// A bare `sendra`, with no subcommand at all, is equivalent to
+    /// `sendra tui` with no path — see `main`'s own handling of
+    /// `Cli::command: None`.
+    Tui {
+        /// Collection or request YAML file to load on start. Omit it to
+        /// start with nothing loaded, the same as a bare `sendra`.
+        path: Option<PathBuf>,
+    },
 }
 
 /// What `sendra import` can convert. Its own enum, nested under `Command`,
@@ -672,9 +695,9 @@ mod tests {
             .expect("the flag must parse, so `main` can refuse it with an explanation");
 
         match cli.command {
-            Command::Test {
+            Some(Command::Test {
                 allow_error_status, ..
-            } => assert!(
+            }) => assert!(
                 allow_error_status,
                 "the flag must reach `main` to be refused"
             ),
@@ -715,7 +738,7 @@ mod tests {
             .expect("path and --env are the whole surface when no name is given");
 
         match cli.command {
-            Command::Test {
+            Some(Command::Test {
                 path,
                 request,
                 env,
@@ -735,7 +758,7 @@ mod tests {
                 output,
                 quiet,
                 verbose,
-            } => {
+            }) => {
                 assert_eq!(path, PathBuf::from("collection.yaml"));
                 assert_eq!(request, None, "no request name was passed");
                 assert_eq!(env.as_deref(), Some("staging"));
@@ -764,7 +787,7 @@ mod tests {
         let cli = Cli::try_parse_from(["sendra", "test", "collection.yaml", "--json"])
             .expect("`--json` is offered by `test` as well as by `run`");
         assert!(
-            matches!(cli.command, Command::Test { json: true, .. }),
+            matches!(cli.command, Some(Command::Test { json: true, .. })),
             "`--json` must reach `main`"
         );
 
@@ -773,7 +796,7 @@ mod tests {
         let cli = Cli::try_parse_from(["sendra", "test", "collection.yaml", "One request"])
             .expect("`test` now takes a request name, like `run`");
         assert!(
-            matches!(cli.command, Command::Test { request: Some(ref name), .. } if name == "One request"),
+            matches!(cli.command, Some(Command::Test { request: Some(ref name), .. }) if name == "One request"),
             "the request name must reach `main`"
         );
     }
@@ -787,10 +810,10 @@ mod tests {
         assert!(
             matches!(
                 cli.command,
-                Command::Run {
+                Some(Command::Run {
                     show_captures: false,
                     ..
-                }
+                })
             ),
             "captures are redacted by default under `run`"
         );
@@ -799,20 +822,20 @@ mod tests {
             .expect("`--show-captures` is offered by `run`");
         assert!(matches!(
             cli.command,
-            Command::Run {
+            Some(Command::Run {
                 show_captures: true,
                 ..
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--show-captures"])
             .expect("`--show-captures` is offered by `test`");
         assert!(matches!(
             cli.command,
-            Command::Test {
+            Some(Command::Test {
                 show_captures: true,
                 ..
-            }
+            })
         ));
     }
 
@@ -822,13 +845,16 @@ mod tests {
     fn junit_is_optional_and_offered_by_test_only() {
         let cli =
             Cli::try_parse_from(["sendra", "test", "req.yaml"]).expect("`--junit` is optional");
-        assert!(matches!(cli.command, Command::Test { junit: None, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Test { junit: None, .. })
+        ));
 
         let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--junit", "report.xml"])
             .expect("`--junit` takes a path");
         assert!(matches!(
             cli.command,
-            Command::Test { junit: Some(ref path), .. } if path == &PathBuf::from("report.xml")
+            Some(Command::Test { junit: Some(ref path), .. }) if path == &PathBuf::from("report.xml")
         ));
 
         // `run` produces no verdict, so it has nothing for a JUnit report to
@@ -853,7 +879,7 @@ mod tests {
         .expect("`-H`/`--header` are the same flag, and repeat");
 
         match cli.command {
-            Command::Run { header, .. } => assert_eq!(
+            Some(Command::Run { header, .. }) => assert_eq!(
                 header,
                 vec![
                     ("X-Trace-Id".to_string(), "abc".to_string()),
@@ -868,7 +894,7 @@ mod tests {
             .expect("`-H` is offered by `test` too");
         assert!(matches!(
             cli.command,
-            Command::Test { header, .. } if header == vec![("X-Trace-Id".to_string(), "abc".to_string())]
+            Some(Command::Test { header, .. }) if header == vec![("X-Trace-Id".to_string(), "abc".to_string())]
         ));
     }
 
@@ -877,7 +903,7 @@ mod tests {
         let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "-H", "X-Trace-Id:   abc  "])
             .expect("a trailing/leading space around the value is not an error");
         match cli.command {
-            Command::Run { header, .. } => {
+            Some(Command::Run { header, .. }) => {
                 assert_eq!(header, vec![("X-Trace-Id".to_string(), "abc".to_string())]);
             }
             _ => panic!("`sendra run` should have parsed as `Command::Run`"),
@@ -927,7 +953,7 @@ mod tests {
         .expect("`--var` repeats");
 
         match cli.command {
-            Command::Run { var, .. } => assert_eq!(
+            Some(Command::Run { var, .. }) => assert_eq!(
                 var,
                 vec![
                     ("base_url".to_string(), "https://example.com".to_string()),
@@ -941,7 +967,7 @@ mod tests {
             .expect("`--var` is offered by `test` too");
         assert!(matches!(
             cli.command,
-            Command::Test { var, .. } if var == vec![("token".to_string(), "abc123".to_string())]
+            Some(Command::Test { var, .. }) if var == vec![("token".to_string(), "abc123".to_string())]
         ));
     }
 
@@ -952,7 +978,7 @@ mod tests {
         let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--var", "q=a=b"])
             .expect("only the first `=` splits name from value");
         match cli.command {
-            Command::Run { var, .. } => {
+            Some(Command::Run { var, .. }) => {
                 assert_eq!(var, vec![("q".to_string(), "a=b".to_string())]);
             }
             _ => panic!("`sendra run` should have parsed as `Command::Run`"),
@@ -974,11 +1000,17 @@ mod tests {
     #[test]
     fn dry_run_defaults_to_false_and_is_offered_only_by_run() {
         let cli = Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`run` takes a path");
-        assert!(matches!(cli.command, Command::Run { dry_run: false, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run { dry_run: false, .. })
+        ));
 
         let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--dry-run"])
             .expect("`--dry-run` is offered by `run`");
-        assert!(matches!(cli.command, Command::Run { dry_run: true, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run { dry_run: true, .. })
+        ));
 
         // `test` never offers it: a "dry test" has no response to check
         // expectations against, so the flag is `run`-only. Clap's ordinary
@@ -995,11 +1027,17 @@ mod tests {
     fn output_defaults_to_none_and_is_offered_by_both_subcommands() {
         let cli =
             Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`-o` is optional on `run`");
-        assert!(matches!(cli.command, Command::Run { output: None, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run { output: None, .. })
+        ));
 
         let cli = Cli::try_parse_from(["sendra", "test", "req.yaml"])
             .expect("`-o` is optional on `test`");
-        assert!(matches!(cli.command, Command::Test { output: None, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Test { output: None, .. })
+        ));
 
         for (flag, mode) in [
             ("-o", OutputMode::Full),
@@ -1020,14 +1058,14 @@ mod tests {
                 .unwrap_or_else(|err| panic!("`{flag} {value}` should parse on `run`: {err}"));
             assert!(matches!(
                 cli.command,
-                Command::Run { output: Some(got), .. } if got == mode
+                Some(Command::Run { output: Some(got), .. }) if got == mode
             ));
 
             let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", flag, value])
                 .unwrap_or_else(|err| panic!("`{flag} {value}` should parse on `test`: {err}"));
             assert!(matches!(
                 cli.command,
-                Command::Test { output: Some(got), .. } if got == mode
+                Some(Command::Test { output: Some(got), .. }) if got == mode
             ));
         }
     }
@@ -1047,15 +1085,24 @@ mod tests {
     #[test]
     fn quiet_defaults_to_false_and_is_offered_by_both_subcommands() {
         let cli = Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`-q` is optional");
-        assert!(matches!(cli.command, Command::Run { quiet: false, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run { quiet: false, .. })
+        ));
 
         let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "-q"])
             .expect("`-q` is offered by `run`");
-        assert!(matches!(cli.command, Command::Run { quiet: true, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run { quiet: true, .. })
+        ));
 
         let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--quiet"])
             .expect("`--quiet` is offered by `test`");
-        assert!(matches!(cli.command, Command::Test { quiet: true, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Test { quiet: true, .. })
+        ));
     }
 
     // --- `-v`/`--verbose` ----------------------------------------------------
@@ -1063,15 +1110,24 @@ mod tests {
     #[test]
     fn verbose_defaults_to_false_and_is_offered_by_both_subcommands() {
         let cli = Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`-v` is optional");
-        assert!(matches!(cli.command, Command::Run { verbose: false, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run { verbose: false, .. })
+        ));
 
         let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "-v"])
             .expect("`-v` is offered by `run`");
-        assert!(matches!(cli.command, Command::Run { verbose: true, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run { verbose: true, .. })
+        ));
 
         let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--verbose"])
             .expect("`--verbose` is offered by `test`");
-        assert!(matches!(cli.command, Command::Test { verbose: true, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Test { verbose: true, .. })
+        ));
     }
 
     // --- `--timeout` -----------------------------------------------------
@@ -1080,26 +1136,29 @@ mod tests {
     fn timeout_is_an_optional_number_of_seconds_offered_by_both_subcommands() {
         let cli =
             Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`--timeout` is optional");
-        assert!(matches!(cli.command, Command::Run { timeout: None, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run { timeout: None, .. })
+        ));
 
         let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--timeout", "5"])
             .expect("`--timeout` takes a number of seconds");
         assert!(matches!(
             cli.command,
-            Command::Run {
+            Some(Command::Run {
                 timeout: Some(5),
                 ..
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--timeout", "5"])
             .expect("`--timeout` is offered by `test` too");
         assert!(matches!(
             cli.command,
-            Command::Test {
+            Some(Command::Test {
                 timeout: Some(5),
                 ..
-            }
+            })
         ));
 
         assert!(
@@ -1115,19 +1174,19 @@ mod tests {
     fn repeat_defaults_to_one_and_is_offered_by_both_subcommands() {
         let cli =
             Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`--repeat` is optional");
-        assert!(matches!(cli.command, Command::Run { repeat: 1, .. }));
+        assert!(matches!(cli.command, Some(Command::Run { repeat: 1, .. })));
 
         let cli = Cli::try_parse_from(["sendra", "test", "req.yaml"])
             .expect("`--repeat` is optional on `test`");
-        assert!(matches!(cli.command, Command::Test { repeat: 1, .. }));
+        assert!(matches!(cli.command, Some(Command::Test { repeat: 1, .. })));
 
         let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--repeat", "3"])
             .expect("`--repeat` takes a count");
-        assert!(matches!(cli.command, Command::Run { repeat: 3, .. }));
+        assert!(matches!(cli.command, Some(Command::Run { repeat: 3, .. })));
 
         let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--repeat", "5"])
             .expect("`--repeat` is offered by `test` too");
-        assert!(matches!(cli.command, Command::Test { repeat: 5, .. }));
+        assert!(matches!(cli.command, Some(Command::Test { repeat: 5, .. })));
     }
 
     #[test]
@@ -1155,19 +1214,25 @@ mod tests {
             Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`--insecure` is optional");
         assert!(matches!(
             cli.command,
-            Command::Run {
+            Some(Command::Run {
                 insecure: false,
                 ..
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--insecure"])
             .expect("`--insecure` is offered by `run`");
-        assert!(matches!(cli.command, Command::Run { insecure: true, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run { insecure: true, .. })
+        ));
 
         let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--insecure"])
             .expect("`--insecure` is offered by `test`");
-        assert!(matches!(cli.command, Command::Test { insecure: true, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Test { insecure: true, .. })
+        ));
     }
 
     // --- `--cookie-jar` ------------------------------------------------------
@@ -1178,30 +1243,30 @@ mod tests {
             Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`--cookie-jar` is optional");
         assert!(matches!(
             cli.command,
-            Command::Run {
+            Some(Command::Run {
                 cookie_jar: false,
                 ..
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--cookie-jar"])
             .expect("`--cookie-jar` is offered by `run`");
         assert!(matches!(
             cli.command,
-            Command::Run {
+            Some(Command::Run {
                 cookie_jar: true,
                 ..
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["sendra", "test", "req.yaml", "--cookie-jar"])
             .expect("`--cookie-jar` is offered by `test`");
         assert!(matches!(
             cli.command,
-            Command::Test {
+            Some(Command::Test {
                 cookie_jar: true,
                 ..
-            }
+            })
         ));
     }
 
@@ -1211,7 +1276,10 @@ mod tests {
     fn proxy_defaults_to_none_and_is_offered_by_both_subcommands() {
         let cli =
             Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("`--proxy` is optional");
-        assert!(matches!(cli.command, Command::Run { proxy: None, .. }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run { proxy: None, .. })
+        ));
 
         let cli = Cli::try_parse_from([
             "sendra",
@@ -1223,7 +1291,7 @@ mod tests {
         .expect("`--proxy` takes a URL");
         assert!(matches!(
             cli.command,
-            Command::Run { proxy: Some(ref url), .. } if url == "http://proxy.example.com:8080"
+            Some(Command::Run { proxy: Some(ref url), .. }) if url == "http://proxy.example.com:8080"
         ));
 
         let cli = Cli::try_parse_from([
@@ -1236,7 +1304,7 @@ mod tests {
         .expect("`--proxy` is offered by `test` too");
         assert!(matches!(
             cli.command,
-            Command::Test { proxy: Some(ref url), .. } if url == "http://proxy.example.com:8080"
+            Some(Command::Test { proxy: Some(ref url), .. }) if url == "http://proxy.example.com:8080"
         ));
     }
 
@@ -1248,11 +1316,11 @@ mod tests {
             Cli::try_parse_from(["sendra", "run", "req.yaml"]).expect("both flags are optional");
         assert!(matches!(
             cli.command,
-            Command::Run {
+            Some(Command::Run {
                 client_cert: None,
                 client_key: None,
                 ..
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from([
@@ -1267,11 +1335,11 @@ mod tests {
         .expect("`--client-cert`/`--client-key` take a path each");
         assert!(matches!(
             cli.command,
-            Command::Run {
+            Some(Command::Run {
                 client_cert: Some(ref cert),
                 client_key: Some(ref key),
                 ..
-            } if cert == &PathBuf::from("client.pem") && key == &PathBuf::from("client-key.pem")
+            }) if cert == &PathBuf::from("client.pem") && key == &PathBuf::from("client-key.pem")
         ));
 
         let cli = Cli::try_parse_from([
@@ -1286,11 +1354,11 @@ mod tests {
         .expect("`--client-cert`/`--client-key` are offered by `test` too");
         assert!(matches!(
             cli.command,
-            Command::Test {
+            Some(Command::Test {
                 client_cert: Some(ref cert),
                 client_key: Some(ref key),
                 ..
-            } if cert == &PathBuf::from("client.pem") && key == &PathBuf::from("client-key.pem")
+            }) if cert == &PathBuf::from("client.pem") && key == &PathBuf::from("client-key.pem")
         ));
     }
 
@@ -1303,22 +1371,22 @@ mod tests {
             .expect("`--client-cert` alone must parse");
         assert!(matches!(
             cli.command,
-            Command::Run {
+            Some(Command::Run {
                 client_cert: Some(ref cert),
                 client_key: None,
                 ..
-            } if cert == &PathBuf::from("c.pem")
+            }) if cert == &PathBuf::from("c.pem")
         ));
 
         let cli = Cli::try_parse_from(["sendra", "run", "req.yaml", "--client-key", "k.pem"])
             .expect("`--client-key` alone must parse");
         assert!(matches!(
             cli.command,
-            Command::Run {
+            Some(Command::Run {
                 client_cert: None,
                 client_key: Some(ref key),
                 ..
-            } if key == &PathBuf::from("k.pem")
+            }) if key == &PathBuf::from("k.pem")
         ));
     }
 
@@ -1336,8 +1404,33 @@ mod tests {
         .expect("credentials embedded in the URL are not rejected here");
         assert!(matches!(
             cli.command,
-            Command::Run { proxy: Some(ref url), .. }
+            Some(Command::Run { proxy: Some(ref url), .. })
                 if url == "http://user:pass@proxy.example.com:8080"
+        ));
+    }
+
+    // --- `sendra tui`, and a bare `sendra` with no subcommand at all -------
+
+    #[test]
+    fn a_bare_invocation_parses_with_no_subcommand_at_all() {
+        // No subcommand, no error — `main` reads this `None` as "launch the
+        // TUI with nothing preloaded". If this ever became a usage error
+        // again, `main`'s bare-invocation branch would go dead code with no
+        // test catching it.
+        let cli = Cli::try_parse_from(["sendra"]).expect("a bare `sendra` must parse");
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn tui_takes_an_optional_path() {
+        let cli = Cli::try_parse_from(["sendra", "tui"]).expect("`tui` takes no required args");
+        assert!(matches!(cli.command, Some(Command::Tui { path: None })));
+
+        let cli = Cli::try_parse_from(["sendra", "tui", "collection.yaml"])
+            .expect("`tui` takes an optional path");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Tui { path: Some(ref path) }) if path == &PathBuf::from("collection.yaml")
         ));
     }
 }

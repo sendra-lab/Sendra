@@ -680,13 +680,12 @@ mod tests {
         assert!(matches!(state.run_state, RunState::Idle));
     }
 
-    /// The environment-scoping investigation this issue asked for,
-    /// demonstrated live: a newly opened collection discovers its *own*
-    /// environments (passed in on `Message::CollectionOpened`, exactly as
-    /// `main::run`'s loop resolves them from that collection's own
-    /// `base_dir` — see that variant's own doc comment) rather than
-    /// inheriting whatever the first collection had. Picking an active
-    /// environment in one tab must not touch the other's.
+    /// Each tab's environments are scoped to it: a newly opened collection
+    /// discovers its *own* environments (passed in on
+    /// `Message::CollectionOpened`, exactly as the event loop resolves them
+    /// from that collection's own `base_dir` — see that variant's own doc
+    /// comment) rather than inheriting whatever the first collection had.
+    /// Picking an active environment in one tab must not touch the other's.
     #[test]
     fn each_tabs_environments_and_active_environment_are_independent() {
         let mut state = loaded_state(THREE_REQUEST_COLLECTION);
@@ -757,8 +756,8 @@ mod tests {
     }
 
     /// The real parse error must still surface — discovering a file is not
-    /// the same as vouching for its contents (see V1 issue 11's own error
-    /// handling, which this must not paper over).
+    /// the same as vouching for its contents, which this must not paper
+    /// over.
     #[test]
     fn confirming_a_discovered_malformed_collection_shows_the_real_error() {
         let dir = tempfile::tempdir().expect("a temp dir for this test");

@@ -11,6 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 sendra-core = { path = "../sendra-core" }
+# `sendra tui` (and a bare `sendra`, with no subcommand at all — see
+# `cli.rs`) launch sendra-tui's event loop in-process. Merged into this one
+# binary deliberately: installing `sendra` gets you both the CLI and the TUI,
+# not a CLI-only build that leaves the TUI a separate install away. See the
+# note on `sendra-tui/Cargo.toml` for what that costs in dependencies.
+sendra-tui = { path = "../sendra-tui" }
 clap = { workspace = true }
 owo-colors = { workspace = true }
 # `--json` output is built from view structs defined in `output/json.rs`, so

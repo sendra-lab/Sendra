@@ -1,15 +1,19 @@
-//! Proves `sendra-tui`'s clean-exit audit  holds for stdout being
+//! Proves `sendra tui`'s clean-exit audit holds for stdout being
 //! piped/redirected: it must fail fast with one clear, human-readable line
-//! on stderr — `main::require_interactive_stdout`, checked *before*
-//! `init_terminal` ever calls `enable_raw_mode`/`EnterAlternateScreen` — not
-//! hang waiting for terminal input, not crash with a raw crossterm/OS error,
-//! and not silently write ANSI escape sequences into the pipe.
+//! on stderr — `sendra_tui::run`'s own `require_interactive_stdout` check,
+//! run before `init_terminal` ever calls
+//! `enable_raw_mode`/`EnterAlternateScreen` — not hang waiting for terminal
+//! input, not crash with a raw crossterm/OS error, and not silently write
+//! ANSI escape sequences into the pipe.
 //!
-//! Spawns the real compiled binary (the same `env!("CARGO_BIN_EXE_<name>")`
-//! pattern `sendra-cli`'s own integration tests use — see
-//! `sendra-cli/tests/cli_overrides.rs`) with its stdout piped back to this
-//! test process, exactly what `sendra-tui > output.txt` or
-//! `sendra-tui | cat` does to the child's stdout: it stops being a terminal.
+//! Spawns the real compiled `sendra` binary (the same `env!("CARGO_BIN_EXE_
+//! sendra")` pattern this crate's other integration tests use — see
+//! `cli_overrides.rs`) with its stdout piped back to this test process,
+//! exactly what `sendra tui > output.txt` or `sendra tui | cat` does to the
+//! child's stdout: it stops being a terminal. Since sendra-tui merged into
+//! this one binary (see the workspace `Cargo.toml`), this test moved here
+//! from what used to be sendra-tui's own standalone binary crate — the
+//! behavior under test is unchanged, only which binary exposes it.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -17,10 +21,11 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn piped_stdout_fails_fast_with_a_clear_message_instead_of_a_raw_mode_crash() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_sendra-tui"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sendra"))
+        .arg("tui")
         // Piped, not inherited: this is what makes stdout stop being a
         // terminal from the child's point of view, the exact condition
-        // `sendra-tui > output.txt` / `sendra-tui | cat` produce.
+        // `sendra tui > output.txt` / `sendra tui | cat` produce.
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // No terminal input either, so a bug that *didn't* catch this case
@@ -29,7 +34,7 @@ fn piped_stdout_fails_fast_with_a_clear_message_instead_of_a_raw_mode_crash() {
         // exactly the timeout this test asserts against below.
         .stdin(Stdio::null())
         .spawn()
-        .expect("the compiled sendra-tui binary must launch");
+        .expect("the compiled sendra binary must launch");
 
     let start = Instant::now();
     let status = loop {
@@ -41,7 +46,7 @@ fn piped_stdout_fails_fast_with_a_clear_message_instead_of_a_raw_mode_crash() {
         }
         assert!(
             start.elapsed() < Duration::from_secs(10),
-            "sendra-tui must exit immediately when stdout is piped, not hang — \
+            "sendra tui must exit immediately when stdout is piped, not hang — \
              it may have fallen through to raw-mode/terminal setup instead of \
              refusing up front"
         );

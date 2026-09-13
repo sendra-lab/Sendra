@@ -39,8 +39,7 @@ use super::{format_error, SPINNER_FRAMES};
 /// visual rows that the row/column math below does not know about — the
 /// real cursor can land a little off for such a line. Solving that would
 /// mean switching to unwrapped rendering with horizontal scroll for every
-/// field, a change orthogonal to what this issue asked for; not attempted
-/// here.
+/// field — a larger, orthogonal change not attempted here.
 ///
 /// `base_request`/`environment` are only needed for the "Resolved auth"
 /// line — see `describe_resolved_auth`, which is the one place this
@@ -712,8 +711,8 @@ fn capture_value_prefix(index: usize, name_value: &str, kind: CaptureKind) -> St
 /// environment default take over, and this preview shows that happening
 /// live, not just asserted.
 ///
-/// **OAuth is skipped here deliberately** — the one place this issue's OAuth
-/// scoping decision (see `AuthEdit`'s own doc comment) is visible in the UI
+/// **OAuth is skipped here deliberately** — the one place `AuthEdit`'s OAuth
+/// scoping decision (see its own doc comment) is visible in the UI
 /// itself: acquiring a real token means a real network call
 /// (`Request::resolve_oauth`), which has no place in drawing a frame, and
 /// `resolve_auth` alone returns a typed error for an unresolved
@@ -907,7 +906,7 @@ requests:
 
     #[test]
     fn edit_pane_marks_oauth_as_read_only_in_the_resolved_auth_preview() {
-        // This is the one place this issue's OAuth scoping decision is
+        // This is the one place AuthEdit's OAuth scoping decision is
         // visible in the UI itself: the config fields above are editable,
         // but the live "Resolved auth" preview must say plainly that no
         // token was actually acquired here, rather than silently showing

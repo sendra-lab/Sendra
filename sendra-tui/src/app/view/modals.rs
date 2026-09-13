@@ -17,8 +17,8 @@ use super::{format_error, modal_frame};
 /// [`format_error`] already gives every *error* one shared rendering instead
 /// of each feature formatting its own. `heading` is the only thing that
 /// varies per call site (`"Delete request"`, `"Close collection"`, ...);
-/// everything else — the modal chrome (`modal_frame`, itself already unified
-/// — see this issue's own audit notes), the "y/Enter confirm, n/Esc cancel"
+/// everything else — the modal chrome (`modal_frame`, itself already
+/// unified), the "y/Enter confirm, n/Esc cancel"
 /// wording, `prompt.message`, and `prompt.error` shown inline through the
 /// same [`format_error`] every other error in the crate goes through — comes
 /// from [`ConfirmPrompt`] and is built exactly once, here.

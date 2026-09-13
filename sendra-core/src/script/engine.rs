@@ -480,10 +480,10 @@ request.headers["X-B"] = b;"#,
 
     #[test]
     fn none_of_the_new_functions_provide_a_filesystem_network_or_process_wedge() {
-        // The check the issue asked for directly: try to misuse each new
-        // function as if its string argument were a resource identifier
-        // rather than plain data, and confirm the result is exactly the pure
-        // computation over the literal argument bytes — nothing more.
+        // A direct security check: try to misuse each new function as if its
+        // string argument were a resource identifier rather than plain data,
+        // and confirm the result is exactly the pure computation over the
+        // literal argument bytes — nothing more.
         //
         // `base64_decode` given a path: `/etc/passwd` is not valid base64, so
         // if this ever produced `Ok`, that would mean the argument was

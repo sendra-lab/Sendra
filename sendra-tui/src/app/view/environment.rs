@@ -128,8 +128,8 @@ pub(crate) fn render_environment_overlay(frame: &mut Frame, state: &AppState, cu
 /// (`EnvironmentEditState::pending_delete`) is drawn as a real modal on top
 /// of this screen, through the same [`render_confirm_prompt`] every other
 /// destructive-action confirmation in this crate uses (see `view()`'s own
-/// call site) — not called out inline the way it used to be, before this
-/// issue's unified confirmation component covered this case too.
+/// call site) — not called out inline the way it used to be, before the
+/// unified confirmation component covered this case too.
 fn render_environment_edit(frame: &mut Frame, state: &AppState, env_edit: &EnvironmentEditState) {
     let name = state
         .environments

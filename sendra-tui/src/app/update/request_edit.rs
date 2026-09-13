@@ -2860,9 +2860,9 @@ requests:
         assert!(running.edit_mode.is_none());
     }
 
-    /// Proof requirement, end to end: add a request, fill in its fields
-    /// through the exact same editors issues 18-24 already built (method,
-    /// URL, a header), save, and reload the collection with a brand-new
+    /// End to end: add a request, fill in its fields through the exact same
+    /// editors already built (method, URL, a header), save, and reload the
+    /// collection with a brand-new
     /// `Document::from_path` — not anything still sitting in `state` — to
     /// confirm the new request genuinely reached disk with the fields it was
     /// given.
@@ -3042,7 +3042,6 @@ requests:
         assert_eq!(reloaded.requests()[0].name.as_deref(), Some("Two"));
     }
 
-    /// The investigation this issue asked for, demonstrated live:
     /// `Document::Single` cannot hold zero requests (there is no `Document`
     /// variant for an empty file — see `can_delete`'s own doc comment), so
     /// deletion is disabled outright rather than attempted and failed later.
