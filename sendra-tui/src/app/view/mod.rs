@@ -364,7 +364,7 @@ pub(super) fn status_help_text(state: &AppState) -> String {
             };
             format!("PgUp/PgDn/Home/End scroll{reveal}  esc back  q quit")
         } else {
-            "↑/↓ nav  enter view  esc close  q quit".to_string()
+            "↑/↓ nav  enter view  space expand  esc close  q quit".to_string()
         };
     }
 

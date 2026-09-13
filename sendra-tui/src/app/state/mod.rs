@@ -192,6 +192,17 @@ pub struct CollectionSession {
     /// The deleted request's own history is dropped outright: there is no
     /// longer a request left for it to be about.
     pub run_history: HashMap<usize, Vec<RunHistoryEntry>>,
+    /// How many of each request's own history entries have been evicted by
+    /// the [`RUN_HISTORY_CAP`] trim in `update::push_history_entry` over the
+    /// life of this session — not itself part of `run_history`, since an
+    /// evicted entry carries no data worth keeping, only the fact that it
+    /// existed. Surfaced by the history overlay ("N older runs were
+    /// dropped") so hitting the cap is never silent. Reindexed on delete
+    /// exactly like `run_history` itself (`update::reindex_history_after_delete`
+    /// covers both in one pass), and, like `run_history`, dropped outright
+    /// for a deleted request rather than carried forward to whichever index
+    /// takes its place.
+    pub run_history_dropped: HashMap<usize, usize>,
     /// `Some(...)` while the run-history browser is open for the currently
     /// selected request — a sibling of `environment_overlay`: opened and
     /// closed by `Message::OpenHistoryOverlay`/`Message::CloseHistoryOverlay`,
@@ -203,14 +214,21 @@ pub struct CollectionSession {
 }
 
 /// Cap on how many past runs [`CollectionSession::run_history`] keeps per
-/// request. Chosen generously for what browsing actually needs — nobody
-/// scrolls back through more than a handful of past runs while debugging a
-/// single request — while still bounding the real memory cost this issue was
-/// asked to consider: nothing in sendra-core caps a response body's size, and
-/// a long session that re-sends the same request many times would otherwise
-/// let those bodies accumulate in memory without limit. Once a request's
-/// history grows past this, its oldest entry is dropped to make room for the
-/// newest — see `update::push_history_entry`.
+/// request, revisited and kept at 20: still generous for what browsing
+/// actually needs (nobody scrolls back through more than a handful of past
+/// runs while debugging a single request) while still bounding the real
+/// memory cost of a long session that re-sends the same request many
+/// times — nothing in sendra-core caps a response body's size, so that
+/// history would otherwise accumulate in memory without limit. A
+/// per-session, user-configurable cap was considered and rejected: nothing
+/// in this crate persists settings across a process's lifetime, so a
+/// configurable value would either need a new persistence mechanism just for
+/// this one number or reset every restart anyway, for a knob real usage
+/// doesn't show a need for. Once a request's history grows past this, its
+/// oldest entries are dropped to make room for the newest — see
+/// `update::push_history_entry`, which also counts every entry the trim
+/// drops into `CollectionSession::run_history_dropped` so the history
+/// overlay can say so rather than discarding data silently.
 pub const RUN_HISTORY_CAP: usize = 20;
 
 /// One past run of a request, kept in [`CollectionSession::run_history`] for
@@ -263,6 +281,15 @@ pub struct HistoryOverlay {
     /// "never auto-revealed" rule `CollectionSession::reveal_captures` itself
     /// follows for a fresh run.
     pub view_reveal_captures: bool,
+    /// Indices (into the same entry list `cursor`/`viewing` index into) of
+    /// entries currently shown expanded in the list — a quick, in-place
+    /// "status code plus a short assertion/capture summary" glance that
+    /// stops short of `viewing`'s full response-panel switch. Toggled by
+    /// `Message::ToggleHistoryEntryExpanded`, independent of `cursor` so more
+    /// than one row can be left open at once while browsing. Not reset when
+    /// `cursor` moves — only `Message::CloseHistoryOverlay` (via a fresh
+    /// `HistoryOverlay::default()` next time the overlay opens) clears it.
+    pub expanded: HashSet<usize>,
 }
 
 /// The one shared shape behind every yes/no confirmation in this crate —
@@ -383,6 +410,18 @@ impl CollectionSession {
             .get(selected)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// How many of the selected request's own history entries have been
+    /// evicted by the [`RUN_HISTORY_CAP`] trim so far this session — `0`
+    /// when nothing has ever been dropped, the ordinary case. See
+    /// `CollectionSession::run_history_dropped`'s own doc comment for why
+    /// this is tracked at all.
+    pub fn selected_history_dropped(&self) -> usize {
+        let LoadState::Loaded { selected, .. } = &self.load_state else {
+            return 0;
+        };
+        self.run_history_dropped.get(selected).copied().unwrap_or(0)
     }
 
     /// The current run's outcome — always the selected request's own most
@@ -726,6 +765,14 @@ pub enum Message {
     /// `HistoryOverlay::viewing` cleared. The exact reverse of
     /// `ViewHistoryEntry`.
     CloseHistoryEntryView,
+    /// Space on the history browser's list: toggles whether the entry at
+    /// `HistoryOverlay::cursor` shows its inline expanded detail (status
+    /// code, assertion/capture summary) in place, without leaving the list —
+    /// a lighter-weight look than `ViewHistoryEntry`'s full response-panel
+    /// switch, for when a glance is all that's needed. A no-op when the list
+    /// is empty; a no-op while `HistoryOverlay::viewing` is `Some`, since
+    /// there's no list row to toggle in that view.
+    ToggleHistoryEntryExpanded,
     /// `o` while browsing: opens the "open another collection" path-input
     /// prompt (`AppState::open_collection_prompt`). A no-op while any other
     /// modal (edit mode, an overlay, a confirmation) is already open,
