@@ -8,13 +8,14 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use sendra_core::{Document, Environment, Request};
 
 use super::super::preview::resolve_browsing_preview;
 use super::super::state::AppState;
+use super::super::theme;
 use super::edit_form::render_edit_pane;
 use super::response::{render_response_panel, REDACTED_CAPTURE_VALUE};
 use super::{active_environment, format_error};
@@ -57,16 +58,17 @@ pub(crate) fn render_request_list(
             // an editor's modified-buffer indicator — a leading space in the
             // ordinary case keeps every row's method column aligned rather
             // than shifting only dirty rows one character right.
-            let marker = if dirty_requests.contains(&index) {
-                "*"
+            let rest = format!("{} {name}", request.method);
+            let line = if dirty_requests.contains(&index) {
+                Line::from(vec![Span::styled("*", theme::warning()), Span::raw(rest)])
             } else {
-                " "
+                Line::from(format!(" {rest}"))
             };
-            ListItem::new(format!("{marker}{} {name}", request.method))
+            ListItem::new(line)
         })
         .collect();
 
-    let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let list = List::new(items).highlight_style(theme::selection());
 
     let mut list_state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, area, &mut list_state);
@@ -149,7 +151,10 @@ pub(crate) fn render_detail_pane(
         },
     };
 
-    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
+    frame.render_widget(
+        Paragraph::new(theme::colorize(&text)).wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 /// The read-only request preview `render_detail_pane` shows while browsing

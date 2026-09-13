@@ -10,7 +10,8 @@
 //! shared confirmation prompt and the open-collection prompt.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 use sendra_core::{Document, Environment};
@@ -19,6 +20,7 @@ use super::preview;
 use super::state::{
     AppState, CollectionSession, ConfirmPrompt, LoadState, NamedEnvironment, RunState,
 };
+use super::theme;
 
 mod browser;
 mod edit_form;
@@ -143,7 +145,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, state: &AppState) {
         }
         let label = format!(" {}:{} ", index + 1, collection_label(session));
         let style = if index == state.active_collection {
-            Style::new().add_modifier(Modifier::REVERSED)
+            theme::selection()
         } else {
             Style::default()
         };
@@ -200,7 +202,7 @@ pub(crate) fn format_error(heading: &str, error: &impl std::fmt::Display) -> Str
 /// widget of their own.
 fn render_error(frame: &mut Frame, area: Rect, heading: &str, error: &impl std::fmt::Display) {
     frame.render_widget(
-        Paragraph::new(format_error(heading, error)).wrap(Wrap { trim: false }),
+        Paragraph::new(theme::colorize(&format_error(heading, error))).wrap(Wrap { trim: false }),
         area,
     );
 }
@@ -215,14 +217,58 @@ const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '�
 ///
 /// Built entirely from [`status_help_text`], which is also what the tests
 /// below exercise directly: this function's only job is handing that string
-/// to a `Paragraph`.
+/// to a `Paragraph`, styled through [`status_bar_line`].
 ///
 /// [`status_help_text`] checks `delete_confirm` first, ahead of every other
 /// context documented there — the delete confirmation prompt is modal and
 /// drawn on top of everything else, the same reason the environment overlay
 /// is checked ahead of edit mode.
 fn render_status_bar(frame: &mut Frame, area: Rect, state: &AppState) {
-    frame.render_widget(Paragraph::new(status_help_text(state)), area);
+    frame.render_widget(
+        Paragraph::new(status_bar_line(&status_help_text(state))),
+        area,
+    );
+}
+
+/// Colors [`status_help_text`]'s own output for `render_status_bar` without
+/// `status_help_text` itself (or any of its ~30 existing tests, which check
+/// its literal string) knowing anything about `Style`: the bar's own
+/// `"  |  "` separator — already how every status-bearing line in
+/// `status_help_text` divides "what happened" from "what you can press
+/// next" — is what this splits on. The left half is colored by what it
+/// says: `"y/enter confirm  n/esc cancel"` on the right half marks one of
+/// [`confirm_status_line`]'s four destructive confirmations (delete,
+/// close-tab, quit) → [`theme::fail`], the same red
+/// [`modals::render_confirm_prompt`] gives the identical question in the
+/// modal itself, so the two agree rather than one being red and the other
+/// merely bold; otherwise `"Failed"` → [`theme::fail`], `"Done"` →
+/// [`theme::success`], a spinner frame → [`theme::in_progress`], anything
+/// else (an "Editing" label, "Open collection") → [`theme::emphasis`],
+/// attention-worthy without being a pass/fail verdict or a destructive
+/// question. The right half (the keybindings themselves) is always
+/// [`theme::muted`]. A line with no separator at all (the plain
+/// browsing/overlay keymaps, which carry no status) is muted in full.
+fn status_bar_line(text: &str) -> Line<'static> {
+    let Some((left, right)) = text.split_once("  |  ") else {
+        return Line::styled(text.to_string(), theme::muted());
+    };
+    let left_style = if right.contains("y/enter confirm  n/esc cancel")
+        || left.contains("Failed")
+        || left.contains("failed")
+    {
+        theme::fail()
+    } else if left.contains("Done") {
+        theme::success()
+    } else if SPINNER_FRAMES.iter().any(|frame| left.starts_with(*frame)) {
+        theme::in_progress()
+    } else {
+        theme::emphasis()
+    };
+    Line::from(vec![
+        Span::styled(left.to_string(), left_style),
+        Span::raw("  |  "),
+        Span::styled(right.to_string(), theme::muted()),
+    ])
 }
 
 /// The bottom bar's full text — status where there is one, then the
@@ -559,7 +605,10 @@ pub(crate) fn modal_frame(
     let area = centered_rect(percent_x, percent_y, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Block::default().borders(Borders::ALL).title(title.into()),
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(theme::muted())
+            .title(title.into()),
         area,
     );
     inset(area)

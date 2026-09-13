@@ -14,6 +14,7 @@ use super::super::state::{
     AssertionRow, AuthEdit, AuthField, BodyEdit, CaptureKind, CaptureRow, EditField, EditState,
     HeaderRow, JsonOperator,
 };
+use super::super::theme;
 use super::format_error;
 
 /// Edit mode's own half of the detail pane: `name`, `method` and `url` as
@@ -207,10 +208,15 @@ pub(crate) fn render_edit_pane(
             .to_string(),
     );
 
-    frame.render_widget(
-        Paragraph::new(lines.join("\n")).wrap(Wrap { trim: false }),
-        area,
-    );
+    // The keybinding-reminder footer (the last line pushed above) is muted
+    // the same way every other pane's own footer/hint text is — patched in
+    // after `theme::colorize` since it is plain text with none of that
+    // function's own markers, not a status this pane is reporting.
+    let mut styled = theme::colorize(&lines.join("\n"));
+    if let Some(footer) = styled.lines.last_mut() {
+        footer.style = theme::muted();
+    }
+    frame.render_widget(Paragraph::new(styled).wrap(Wrap { trim: false }), area);
 
     // Column offset: `▶ Name:   ` / `▶ Method: ` / `▶ URL:    ` are the same
     // width (10 cells) by construction — `"Name:   "`, `"Method: "` and

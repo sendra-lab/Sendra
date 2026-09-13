@@ -5,7 +5,6 @@
 //! which renders a past entry through this exact same response panel.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
@@ -14,6 +13,7 @@ use sendra_core::{AssertionReport, CaptureReport, Response};
 use crate::run_request::RunOutcome;
 
 use super::super::state::{AppState, HistoryOverlay, RunHistoryEntry, RUN_HISTORY_CAP};
+use super::super::theme;
 use super::{format_error, modal_frame};
 
 /// The completed-run half of the detail pane: a real response's status,
@@ -58,7 +58,19 @@ pub(crate) fn render_response_panel(
     let max_scroll = total.saturating_sub(content_height.max(1));
     let scroll = scroll.min(max_scroll);
 
-    let paragraph = Paragraph::new(text.clone()).scroll((scroll.min(u16::MAX as usize) as u16, 0));
+    // The status line (the text's own first line — see `format_response`)
+    // is colored success/fail straight from the real `outcome.result`
+    // already in hand, not by scanning it back out of the rendered text —
+    // it carries no `✓`/`✗`/`⚠` of its own for `theme::colorize` to key
+    // off (those markers belong to the assertions/captures sections under
+    // it, and `colorize` still handles those).
+    let mut styled = theme::colorize(&text);
+    if outcome.result.is_ok() {
+        if let Some(status_line) = styled.lines.first_mut() {
+            status_line.style = theme::success();
+        }
+    }
+    let paragraph = Paragraph::new(styled).scroll((scroll.min(u16::MAX as usize) as u16, 0));
     frame.render_widget(paragraph, rows[0]);
 
     let last_visible = (scroll + content_height).min(total);
@@ -74,10 +86,7 @@ pub(crate) fn render_response_panel(
         scroll.saturating_add(1).min(total.max(1)),
         last_visible,
     );
-    frame.render_widget(
-        Paragraph::new(footer).style(Style::new().add_modifier(Modifier::DIM)),
-        rows[1],
-    );
+    frame.render_widget(Paragraph::new(footer).style(theme::muted()), rows[1]);
 }
 
 /// The text `render_response_panel` shows: on success, the response laid out
@@ -332,23 +341,31 @@ pub(crate) fn render_history_overlay(
             } else {
                 ">"
             };
-            let heading = Line::from(format!(
-                "{marker} {} ago  —  {summary}",
-                format_elapsed(entry.completed_at)
-            ));
+            // Colored success/fail from the real `outcome.result` directly,
+            // the same reasoning `render_response_panel`'s own status line
+            // uses — this summary carries no `✓`/`✗` of its own for
+            // `theme::colorize` to key off.
+            let heading_style = if entry.outcome.result.is_ok() {
+                theme::success()
+            } else {
+                theme::fail()
+            };
+            let heading = Line::styled(
+                format!(
+                    "{marker} {} ago  —  {summary}",
+                    format_elapsed(entry.completed_at)
+                ),
+                heading_style,
+            );
             if !overlay.expanded.contains(&index) {
                 return ListItem::new(heading);
             }
             let mut lines = vec![heading];
-            lines.extend(
-                format_history_entry_detail(entry)
-                    .into_iter()
-                    .map(Line::from),
-            );
+            lines.extend(theme::colorize(&format_history_entry_detail(entry).join("\n")).lines);
             ListItem::new(Text::from(lines))
         })
         .collect();
-    let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let list = List::new(items).highlight_style(theme::selection());
     let mut list_state = ListState::default()
         .with_selected(Some(overlay.cursor.min(entries.len().saturating_sub(1))));
 
@@ -368,7 +385,7 @@ pub(crate) fn render_history_overlay(
         Paragraph::new(format!(
             "{dropped} older {run_word} dropped (history capped at {RUN_HISTORY_CAP} per request)"
         ))
-        .style(Style::new().add_modifier(Modifier::DIM)),
+        .style(theme::muted()),
         rows[1],
     );
 }

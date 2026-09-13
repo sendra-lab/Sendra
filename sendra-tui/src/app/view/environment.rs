@@ -3,11 +3,12 @@
 //! shows instead, while one is open).
 
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::super::state::{AppState, EnvVarField, EnvironmentEditState};
+use super::super::theme;
 use super::{format_error, modal_frame};
 
 pub(crate) fn render_environment_overlay(frame: &mut Frame, state: &AppState, cursor: usize) {
@@ -60,7 +61,10 @@ pub(crate) fn render_environment_overlay(frame: &mut Frame, state: &AppState, cu
             })
             .collect::<Vec<_>>()
             .join("\n");
-        frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), error_area);
+        frame.render_widget(
+            Paragraph::new(theme::colorize(&text)).wrap(Wrap { trim: false }),
+            error_area,
+        );
     }
 
     if state.environments.is_empty() {
@@ -83,15 +87,18 @@ pub(crate) fn render_environment_overlay(frame: &mut Frame, state: &AppState, cu
         .iter()
         .enumerate()
         .map(|(index, named)| {
-            let marker = if Some(index) == state.active_environment {
-                "* "
+            let line = if Some(index) == state.active_environment {
+                Line::from(vec![
+                    Span::styled("* ", theme::emphasis()),
+                    Span::raw(named.name.clone()),
+                ])
             } else {
-                "  "
+                Line::from(format!("  {}", named.name))
             };
-            ListItem::new(format!("{marker}{}", named.name))
+            ListItem::new(line)
         })
         .collect();
-    let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let list = List::new(items).highlight_style(theme::selection());
     let mut list_state = ListState::default().with_selected(Some(cursor));
     frame.render_stateful_widget(list, panes[0], &mut list_state);
 
@@ -107,7 +114,7 @@ pub(crate) fn render_environment_overlay(frame: &mut Frame, state: &AppState, cu
         }
     }
     frame.render_widget(
-        Paragraph::new(lines.join("\n")).wrap(Wrap { trim: false }),
+        Paragraph::new(theme::colorize(&lines.join("\n"))).wrap(Wrap { trim: false }),
         panes[1],
     );
 }
@@ -165,7 +172,7 @@ fn render_environment_edit(frame: &mut Frame, state: &AppState, env_edit: &Envir
     }
 
     frame.render_widget(
-        Paragraph::new(lines.join("\n")).wrap(Wrap { trim: false }),
+        Paragraph::new(theme::colorize(&lines.join("\n"))).wrap(Wrap { trim: false }),
         inner,
     );
 }

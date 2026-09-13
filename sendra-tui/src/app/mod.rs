@@ -4,10 +4,12 @@
 //! - [`update`]: `update()`, the one function allowed to mutate `AppState`.
 //! - [`view`]: `view()` and every `render_*`/`format_*` function under it.
 //!
-//! Plus [`preview`], a small fourth module holding the sendra-core call
-//! sequences (substitution, auth/query/body resolution) `view`'s read-only
-//! browsing preview and auth-masking build on — domain computation `view`
-//! needs but should not itself contain; see that module's own doc comment.
+//! Plus two small cross-cutting modules neither layer above should itself
+//! contain: [`preview`], the sendra-core call sequences (substitution,
+//! auth/query/body resolution) `view`'s read-only browsing preview and
+//! auth-masking build on, and [`theme`], the one palette every color/style
+//! choice `view`'s render functions make comes from — see that module's own
+//! doc comment for why it lives here rather than inside `view/` itself.
 //!
 //! This is a pure reorganization of what used to be one `app.rs` file along
 //! boundaries the module already had (state/model, reducer, rendering) —
@@ -17,6 +19,7 @@
 
 mod preview;
 mod state;
+mod theme;
 mod update;
 mod view;
 
