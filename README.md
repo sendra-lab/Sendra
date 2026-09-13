@@ -13,17 +13,19 @@ a file can declare what it expects the response to look like — which
 `sendra test` then passes or fails your build on. A request can also carry
 inline scripts that run just before it is sent and just after it comes back,
 with no Node.js or other runtime to install: the interpreter is in the binary.
-An interactive TUI is planned and deliberately absent for now.
+An interactive terminal UI ships in the same binary, for browsing and running
+requests without one shell invocation per request — see
+[Learn more](#learn-more) below.
 
 ## Layout
 
 ```
 sendra/
   sendra-core/     library: request/response types, YAML loading, config, environments, scripting, capture, HTTP execution
-  sendra-cli/      binary `sendra`: argument parsing, output, exit codes, `run` and `test`
+  sendra-cli/      binary `sendra`: argument parsing, output, exit codes, `run`, `test` and `tui`
     main.rs          `main()`, and the module declarations
     cli.rs           the clap definitions: subcommands, arguments, `--help` text
-    run.rs           the pipeline both subcommands share, and the two handlers
+    run.rs           the pipeline `run`/`test` share, and the two handlers
     output/          everything printed to the terminal
       mod.rs           `Reporter`, `Format`, `Detail`: which rendering a run gets
       human.rs         the terminal rendering: response, assertions, summary
@@ -32,6 +34,7 @@ sendra/
     exit.rs          `Exit`, `Outcome`, `Summary`: exit-code policy, no I/O
     test_support.rs  fixtures shared by more than one module's tests
     tests/           integration tests that run the built binary and read its output
+  sendra-tui/      the interactive TUI, launched in-process by `sendra tui`/bare `sendra`
   examples/        sample request and collection files
   .sendra/         this repo's own project config and environments
   schema/          generated JSON Schemas for editor tooling — see docs/reference/json-schema.md
@@ -41,9 +44,9 @@ sendra/
     decisions/       the design rationale behind choices that could have gone another way
 ```
 
-`sendra-core` knows nothing about clap or terminal output. A `sendra-tui` crate
-will sit alongside `sendra-cli` later and reuse `sendra-core` directly, so core
-returns typed errors (`SendraError`) rather than formatted messages.
+`sendra-core` knows nothing about clap, terminal output, or ratatui. Both
+`sendra-cli` and `sendra-tui` build on it directly, so core returns typed
+errors (`SendraError`) rather than formatted messages.
 
 ## Install
 
@@ -55,7 +58,11 @@ git clone https://github.com/sendra-lab/Sendra.git
 cd sendra
 cargo build --workspace --release
 ./target/release/sendra run examples/get-request.yaml
+./target/release/sendra tui examples/collection.yaml
 ```
+
+Building the workspace produces one binary, `sendra`, that carries `run`,
+`test` and `tui` alike — there is no separate TUI install.
 
 Or run it straight through Cargo without a separate build step, which is what
 the rest of this tour does:
@@ -178,7 +185,8 @@ calls — lives in `docs/`, not in this file:
 - **[docs/reference.md](docs/reference.md)** — the full schema and behavior
   reference: request/collection shape, config, environments, assertions
   (including the operator sub-language), capture, scripting, every CLI flag,
-  `--json` output, exit codes, and editor/JSON Schema support.
+  `--json` output, exit codes, editor/JSON Schema support, and the
+  interactive TUI (`sendra tui`).
 - **[docs/decisions/](docs/decisions/README.md)** — the design rationale
   behind choices that could reasonably have gone another way: why `sendra
   test` ignores a status nobody asserted, how the exit codes are split and

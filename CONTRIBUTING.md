@@ -29,9 +29,10 @@ locally first.
 ## Code conventions
 
 - `sendra-core` has no terminal I/O of any kind (no `println!`/`eprintln!`,
-  no `clap`, no color formatting). It returns data; `sendra-cli` decides
-  what to do with it. This split is what lets a future TUI reuse the core
-  engine — please don't add a shortcut that breaks it.
+  no `clap`, no color formatting, no ratatui). It returns data; `sendra-cli`
+  and `sendra-tui` each decide what to do with it. This split is what lets
+  both reuse the same core engine — please don't add a shortcut that breaks
+  it.
 - Unknown fields in any YAML schema are rejected (`deny_unknown_fields`),
   not silently ignored. New schema fields should follow the same rule.
 - Errors are typed (`SendraError`/`thiserror`), not stringly-typed or
