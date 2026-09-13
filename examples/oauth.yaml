@@ -6,31 +6,45 @@
 # every request below share one token instead of re-authenticating per
 # request, and the retry-vs-fail-fast rule for a broken config.
 #
-# Only `client_credentials` and `password` are supported — no
-# `authorization_code` (it needs a browser redirect and a local callback
-# listener, a different problem for a headless CLI) and no `refresh_token`
-# (deferred; see the module docs).
+# Three grants are supported: `client_credentials`, `password`, and
+# `authorization_code`. `refresh_token` is not (deferred; see the module
+# docs).
 #
-# There is no public `client_credentials`/`password` demo server the way
-# httpbin.org serves `/bearer` and `/basic-auth/<user>/<pass>`, so this file
-# points at variables rather than a real host. Run it against your own OAuth
-# provider (or a local mock — `sendra-cli`'s own test suite spins one up for
-# exactly this, see `tests/oauth.rs`) with an environment file supplying
-# them:
+# `client_credentials` and `password` acquire automatically — sendra-cli (and
+# a normal request send from the TUI) fetches the token itself, no human
+# involved. `authorization_code` cannot: it needs a human to approve access
+# in a browser, which a headless CLI run structurally cannot do — running
+# this file's `Authorization code login` request with `sendra-cli` fails
+# fast with a clear error rather than hanging. It only works from
+# sendra-tui, which can open a browser and run a local callback listener:
+# open this file there, edit that request's `auth:`, and press Ctrl+L on the
+# `grant_type: authorization_code` field to log in interactively. See
+# `sendra_core::oauth`'s module docs for the full flow (PKCE, the local
+# callback listener, the timeout) and why only a TUI can drive it.
+#
+# There is no public `client_credentials`/`password`/`authorization_code`
+# demo server the way httpbin.org serves `/bearer` and
+# `/basic-auth/<user>/<pass>`, so this file points at variables rather than a
+# real host. Run it against your own OAuth provider (or a local mock —
+# `sendra-cli`'s own test suite spins one up for exactly this, see
+# `tests/oauth.rs`) with an environment file supplying them:
 #
 #   token_url: https://auth.example.com/oauth/token
 #   client_id: my-client-id
 #   client_secret: ${OAUTH_CLIENT_SECRET}
 #   username: my-username
 #   password: ${OAUTH_PASSWORD}
+#   authorization_url: https://auth.example.com/oauth/authorize
+#   redirect_uri: http://127.0.0.1:8899/callback
 #   api_base_url: https://api.example.com
 #
 #   OAUTH_CLIENT_SECRET=... OAUTH_PASSWORD=... \
 #     cargo run -p sendra-cli -- run examples/oauth.yaml --env <name>
 #
-# The two requests below use different `client_id`/`grant_type` values on
-# purpose — sharing one would only prove the same token was reused, which
-# `Client credentials, called twice` already covers on its own.
+# The two `client_credentials` requests below use the same `client_id`/
+# `grant_type`/`scope` on purpose — proving the second reuses the token the
+# first already acquired rather than re-authenticating, the whole point of
+# the in-run cache.
 name: OAuth-authenticated requests
 requests:
   - name: Client credentials
@@ -69,3 +83,21 @@ requests:
         client_secret: '{{client_secret}}'
         username: '{{username}}'
         password: '{{password}}'
+
+  - name: Authorization code login
+    method: GET
+    url: '{{api_base_url}}/profile'
+    # No `client_secret`: an `authorization_code` login from sendra-tui is a
+    # native/desktop client, which cannot keep a secret confidential — PKCE
+    # (generated fresh for every login attempt) stands in for it instead, per
+    # RFC 8252 §8.1. `authorization_url` (where the browser goes) and
+    # `redirect_uri` (where sendra-tui's local callback listener catches the
+    # code — must match what is registered with the provider) are required
+    # for this grant and unused by the other two.
+    auth:
+      oauth:
+        grant_type: authorization_code
+        token_url: '{{token_url}}'
+        client_id: '{{client_id}}'
+        authorization_url: '{{authorization_url}}'
+        redirect_uri: '{{redirect_uri}}'

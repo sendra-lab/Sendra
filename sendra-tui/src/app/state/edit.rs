@@ -226,6 +226,14 @@ pub enum AuthField {
     OAuthScope,
     OAuthUsername,
     OAuthPassword,
+    /// Only reachable when `AuthEdit::OAuth`'s `grant_type` is
+    /// [`OAuthGrantType::AuthorizationCode`] — see
+    /// `AuthEdit::field_order`'s own OAuth arm.
+    OAuthAuthorizationUrl,
+    /// Only reachable when `AuthEdit::OAuth`'s `grant_type` is
+    /// [`OAuthGrantType::AuthorizationCode`] — see
+    /// `AuthEdit::field_order`'s own OAuth arm.
+    OAuthRedirectUri,
 }
 
 /// Which of edit mode's fields `Message::EditFocusNext`/`EditFocusPrev`
@@ -679,7 +687,64 @@ pub enum AuthEdit {
         scope: TextField,
         username: TextField,
         password: TextField,
+        /// The three fields/state only `grant_type: authorization_code`
+        /// uses, boxed together — see [`AuthorizationCodeEdit`]'s own doc
+        /// comment for why this one group is behind a `Box` and nothing
+        /// else in this variant is.
+        authorization_code: Box<AuthorizationCodeEdit>,
     },
+}
+
+/// [`AuthEdit::OAuth`]'s `authorization_code`-only fields: the two extra
+/// text fields that grant needs (`authorization_url`, `redirect_uri`, see
+/// their own doc comments below) plus [`OAuthLoginState`], the login-attempt
+/// state `Message::StartOAuthLogin`/`OAuthLoginCompleted` drive.
+///
+/// **Boxed, unlike every other field on `AuthEdit::OAuth`.** Without this,
+/// `OAuth`'s nine-`TextField`-plus-enum payload makes it by far the largest
+/// `AuthEdit` variant — clippy's `large_enum_variant` flags exactly this:
+/// every `AuthEdit` value, even a `Bearer` with one `TextField`, would pay
+/// for the largest variant's stack space. Grouping the three
+/// `authorization_code`-only fields behind one `Box` shrinks `OAuth` back
+/// down near the other variants' size, at the cost of one extra pointer
+/// indirection to reach fields that, unlike `token_url`/`client_id`/etc.,
+/// only one of the three grants ever touches anyway.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AuthorizationCodeEdit {
+    /// Edited (and reachable via `field_order`) only when `grant_type` is
+    /// [`OAuthGrantType::AuthorizationCode`] — kept populated regardless of
+    /// the current `grant_type`, though, the same way `username`/`password`
+    /// stay populated under `client_credentials`/`authorization_code` too,
+    /// so switching `grant_type` back and forth never loses what was typed
+    /// here.
+    pub authorization_url: TextField,
+    /// See [`authorization_url`](Self::authorization_url)'s note — same
+    /// reachability rule.
+    pub redirect_uri: TextField,
+    /// Login-attempt state for this OAuth block, driven by
+    /// `Message::StartOAuthLogin`/`OAuthLoginCompleted` — see
+    /// [`OAuthLoginState`]. Not part of `AuthEdit::to_auth`'s output: this
+    /// is transient UI state about *attempting* a login, never itself
+    /// written into the saved request.
+    pub login: OAuthLoginState,
+}
+
+/// One `AuthEdit::OAuth` block's interactive-login state — set by
+/// `Message::StartOAuthLogin` and resolved by the matching
+/// `Message::OAuthLoginCompleted` that `main::run` sends once
+/// `oauth_login::spawn`'s background thread finishes. Reset to `Idle`
+/// every time `EnterEditMode` builds a fresh `AuthEdit` (see `AuthEdit::new`),
+/// the same way `run_state`/`response_scroll` reset on a fresh run — a
+/// login's result belongs to one attempt, not to the field forever.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum OAuthLoginState {
+    #[default]
+    Idle,
+    /// The browser has been opened (or an attempt was made to) and the
+    /// local callback listener is waiting — see `oauth_login::run_login`.
+    WaitingForBrowser,
+    Succeeded,
+    Failed(String),
 }
 
 impl AuthEdit {
@@ -715,10 +780,17 @@ impl AuthEdit {
                 grant_type: oauth.grant_type,
                 token_url: TextField::new(oauth.token_url.clone()),
                 client_id: TextField::new(oauth.client_id.clone()),
-                client_secret: TextField::new(oauth.client_secret.clone()),
+                client_secret: TextField::new(oauth.client_secret.clone().unwrap_or_default()),
                 scope: TextField::new(oauth.scope.clone().unwrap_or_default()),
                 username: TextField::new(oauth.username.clone().unwrap_or_default()),
                 password: TextField::new(oauth.password.clone().unwrap_or_default()),
+                authorization_code: Box::new(AuthorizationCodeEdit {
+                    authorization_url: TextField::new(
+                        oauth.authorization_url.clone().unwrap_or_default(),
+                    ),
+                    redirect_uri: TextField::new(oauth.redirect_uri.clone().unwrap_or_default()),
+                    login: OAuthLoginState::default(),
+                }),
             };
         }
         AuthEdit::None
@@ -768,6 +840,7 @@ impl AuthEdit {
                 scope,
                 username,
                 password,
+                authorization_code,
             } => Some(Auth {
                 bearer: None,
                 basic: None,
@@ -776,10 +849,12 @@ impl AuthEdit {
                     grant_type: *grant_type,
                     token_url: token_url.value().to_string(),
                     client_id: client_id.value().to_string(),
-                    client_secret: client_secret.value().to_string(),
+                    client_secret: non_empty(client_secret.value()),
                     scope: non_empty(scope.value()),
                     username: non_empty(username.value()),
                     password: non_empty(password.value()),
+                    authorization_url: non_empty(authorization_code.authorization_url.value()),
+                    redirect_uri: non_empty(authorization_code.redirect_uri.value()),
                 }),
             }),
         }
@@ -799,7 +874,16 @@ impl AuthEdit {
                 AuthField::ApiKeyValue,
                 AuthField::ApiKeyLocation,
             ],
-            AuthEdit::OAuth { .. } => &[
+            // `username`/`password` stay reachable only for `Password`, and
+            // `authorization_url`/`redirect_uri` only for
+            // `AuthorizationCode` — the same "only what this grant actually
+            // uses" rule `validate_grant_fields` enforces in sendra-core,
+            // mirrored here so Tab-cycling never lands on a field this
+            // grant ignores.
+            AuthEdit::OAuth {
+                grant_type: OAuthGrantType::Password,
+                ..
+            } => &[
                 AuthField::OAuthGrantType,
                 AuthField::OAuthTokenUrl,
                 AuthField::OAuthClientId,
@@ -807,6 +891,28 @@ impl AuthEdit {
                 AuthField::OAuthScope,
                 AuthField::OAuthUsername,
                 AuthField::OAuthPassword,
+            ],
+            AuthEdit::OAuth {
+                grant_type: OAuthGrantType::AuthorizationCode,
+                ..
+            } => &[
+                AuthField::OAuthGrantType,
+                AuthField::OAuthTokenUrl,
+                AuthField::OAuthClientId,
+                AuthField::OAuthClientSecret,
+                AuthField::OAuthScope,
+                AuthField::OAuthAuthorizationUrl,
+                AuthField::OAuthRedirectUri,
+            ],
+            AuthEdit::OAuth {
+                grant_type: OAuthGrantType::ClientCredentials,
+                ..
+            } => &[
+                AuthField::OAuthGrantType,
+                AuthField::OAuthTokenUrl,
+                AuthField::OAuthClientId,
+                AuthField::OAuthClientSecret,
+                AuthField::OAuthScope,
             ],
         }
     }
@@ -832,6 +938,18 @@ impl AuthEdit {
             (AuthEdit::OAuth { scope, .. }, AuthField::OAuthScope) => Some(scope),
             (AuthEdit::OAuth { username, .. }, AuthField::OAuthUsername) => Some(username),
             (AuthEdit::OAuth { password, .. }, AuthField::OAuthPassword) => Some(password),
+            (
+                AuthEdit::OAuth {
+                    authorization_code, ..
+                },
+                AuthField::OAuthAuthorizationUrl,
+            ) => Some(&mut authorization_code.authorization_url),
+            (
+                AuthEdit::OAuth {
+                    authorization_code, ..
+                },
+                AuthField::OAuthRedirectUri,
+            ) => Some(&mut authorization_code.redirect_uri),
             _ => unreachable!(
                 "focus is never Auth(field) for a field outside this AuthEdit's own \
                  field_order — see EditField::next/prev"
@@ -858,7 +976,8 @@ impl AuthEdit {
             (AuthEdit::OAuth { grant_type, .. }, AuthField::OAuthGrantType) => {
                 *grant_type = match grant_type {
                     OAuthGrantType::ClientCredentials => OAuthGrantType::Password,
-                    OAuthGrantType::Password => OAuthGrantType::ClientCredentials,
+                    OAuthGrantType::Password => OAuthGrantType::AuthorizationCode,
+                    OAuthGrantType::AuthorizationCode => OAuthGrantType::ClientCredentials,
                 };
                 true
             }
@@ -2587,6 +2706,7 @@ mod tests {
                 scope,
                 username,
                 password,
+                authorization_code,
             } => {
                 assert_eq!(*grant_type, OAuthGrantType::Password);
                 assert_eq!(token_url.value(), "https://auth.example.com/token");
@@ -2595,7 +2715,94 @@ mod tests {
                 assert_eq!(scope.value(), "read write");
                 assert_eq!(username.value(), "ada");
                 assert_eq!(password.value(), "hunter2");
+                assert_eq!(authorization_code.authorization_url.value(), "");
+                assert_eq!(authorization_code.redirect_uri.value(), "");
+                assert_eq!(authorization_code.login, OAuthLoginState::Idle);
             }
+            other => panic!("expected AuthEdit::OAuth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_edit_new_seeds_authorization_code_fields() {
+        let request = request_with_auth(
+            "  oauth:\n    grant_type: authorization_code\n    \
+             token_url: https://auth.example.com/token\n    client_id: my-client\n    \
+             authorization_url: https://auth.example.com/authorize\n    \
+             redirect_uri: http://127.0.0.1:8899/callback\n",
+        );
+
+        let edit = EditState::new(&request);
+
+        match &edit.auth {
+            AuthEdit::OAuth {
+                grant_type,
+                client_secret,
+                authorization_code,
+                ..
+            } => {
+                assert_eq!(*grant_type, OAuthGrantType::AuthorizationCode);
+                assert_eq!(
+                    client_secret.value(),
+                    "",
+                    "a public client has no client_secret"
+                );
+                assert_eq!(
+                    authorization_code.authorization_url.value(),
+                    "https://auth.example.com/authorize"
+                );
+                assert_eq!(
+                    authorization_code.redirect_uri.value(),
+                    "http://127.0.0.1:8899/callback"
+                );
+            }
+            other => panic!("expected AuthEdit::OAuth, got {other:?}"),
+        }
+        assert_eq!(
+            edit.auth_field_order(),
+            &[
+                AuthField::OAuthGrantType,
+                AuthField::OAuthTokenUrl,
+                AuthField::OAuthClientId,
+                AuthField::OAuthClientSecret,
+                AuthField::OAuthScope,
+                AuthField::OAuthAuthorizationUrl,
+                AuthField::OAuthRedirectUri,
+            ]
+        );
+    }
+
+    #[test]
+    fn oauth_grant_type_toggle_cycles_through_all_three_grants() {
+        let request = request_with_auth(
+            "  oauth:\n    grant_type: client_credentials\n    \
+             token_url: https://auth.example.com/token\n    client_id: my-client\n    \
+             client_secret: my-secret\n",
+        );
+        let mut edit = EditState::new(&request);
+        edit.focus = EditField::Auth(AuthField::OAuthGrantType);
+
+        let mut grants = vec![grant_type_of(&edit)];
+        for _ in 0..3 {
+            assert!(edit.toggle_focused(true));
+            grants.push(grant_type_of(&edit));
+        }
+
+        assert_eq!(
+            grants,
+            vec![
+                OAuthGrantType::ClientCredentials,
+                OAuthGrantType::Password,
+                OAuthGrantType::AuthorizationCode,
+                OAuthGrantType::ClientCredentials,
+            ],
+            "three forward toggles must visit every grant exactly once and return to the start"
+        );
+    }
+
+    fn grant_type_of(edit: &EditState) -> OAuthGrantType {
+        match &edit.auth {
+            AuthEdit::OAuth { grant_type, .. } => *grant_type,
             other => panic!("expected AuthEdit::OAuth, got {other:?}"),
         }
     }
@@ -2651,7 +2858,7 @@ mod tests {
     }
 
     #[test]
-    fn toggling_oauth_grant_type_flips_between_the_two_grants() {
+    fn toggling_oauth_grant_type_cycles_through_all_three_grants() {
         let request = request_with_auth(
             "  oauth:\n    grant_type: client_credentials\n    \
              token_url: https://auth.example.com/token\n    client_id: my-client\n    \
@@ -2665,6 +2872,13 @@ mod tests {
         assert_eq!(
             auth.oauth.as_ref().unwrap().grant_type,
             OAuthGrantType::Password
+        );
+
+        assert!(edit.toggle_focused(true));
+        let auth = edit.auth.to_auth().unwrap();
+        assert_eq!(
+            auth.oauth.as_ref().unwrap().grant_type,
+            OAuthGrantType::AuthorizationCode
         );
 
         assert!(edit.toggle_focused(true));

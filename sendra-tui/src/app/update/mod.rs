@@ -172,6 +172,15 @@ pub fn update(state: &mut AppState, msg: Message) {
             }
             return;
         }
+        Message::OAuthLoginCompleted {
+            collection_id,
+            outcome,
+        } => {
+            if let Some(session) = state.session_by_id_mut(collection_id) {
+                request_edit::handle_oauth_login_completed(session, outcome);
+            }
+            return;
+        }
         _ => {}
     }
 
@@ -510,6 +519,7 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
         Message::SaveEdit => request_edit::handle_save_edit(state),
         Message::CancelEdit => request_edit::handle_cancel_edit(state),
         Message::RequestDelete => request_edit::handle_request_delete(state),
+        Message::StartOAuthLogin => request_edit::handle_start_oauth_login(state),
         Message::CancelDelete => request_edit::handle_cancel_delete(state),
         Message::ConfirmDelete => request_edit::handle_confirm_delete(state),
         Message::EditFocusNext => {
@@ -673,6 +683,7 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
         | Message::ConfirmCloseCollection
         | Message::CancelCloseCollection
         | Message::RunCompleted { .. }
+        | Message::OAuthLoginCompleted { .. }
         | Message::OpenCheatsheet
         | Message::CloseCheatsheet => {}
     }

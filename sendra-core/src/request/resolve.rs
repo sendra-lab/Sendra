@@ -942,7 +942,7 @@ requests:
             .expect("oauth survives substitution");
         assert_eq!(oauth.token_url, "https://auth.example.com/token");
         assert_eq!(oauth.client_id, "id-value");
-        assert_eq!(oauth.client_secret, "secret-value");
+        assert_eq!(oauth.client_secret.as_deref(), Some("secret-value"));
         assert_eq!(oauth.username.as_deref(), Some("ada"));
         assert_eq!(oauth.password.as_deref(), Some("s3cr3t"));
         assert_eq!(oauth.scope.as_deref(), Some("read write"));

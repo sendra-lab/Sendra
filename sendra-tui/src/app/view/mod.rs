@@ -346,8 +346,12 @@ fn render_error(frame: &mut Frame, area: Rect, heading: &str, error: &impl std::
 }
 
 /// Cycled by `spinner_tick` while a run is in flight — an ordinary braille
-/// spinner, no library, since ratatui ships no widget for one.
-const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+/// spinner, no library, since ratatui ships no widget for one. `pub(crate)`
+/// so `edit_form::render_edit_pane` can cycle the exact same glyphs for an
+/// in-flight `authorization_code` login, rather than inventing a second
+/// spinner alphabet for what is visually the same "something is running"
+/// state.
+pub(crate) const SPINNER_FRAMES: [char; 8] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
 
 /// The one-line status/help bar under the panes: a status summary (in
 /// flight, or what the last run did) where there is one, and — always — the

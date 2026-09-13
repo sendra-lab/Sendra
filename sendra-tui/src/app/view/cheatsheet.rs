@@ -73,6 +73,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "Ctrl+n / Ctrl+d      add / delete a header row",
             "Ctrl+a / Ctrl+x      add / delete an assertion row",
             "Ctrl+p / Ctrl+k      add / delete a capture row",
+            "Ctrl+l               log in (auth.oauth grant_type: authorization_code only)",
             "Ctrl+s               save",
             "Esc                  cancel",
             "(any other character)   type into the focused field",

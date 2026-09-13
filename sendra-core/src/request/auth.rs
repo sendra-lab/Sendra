@@ -180,12 +180,12 @@ pub enum ApiKeyLocation {
 }
 
 /// [`Auth::oauth`]: acquire a bearer token from an OAuth token endpoint
-/// before the request is sent, under either of two grants.
+/// before the request is sent, under one of three grants.
 ///
 /// ```text
 /// auth:
 ///   oauth:
-///     grant_type: client_credentials   # or: password
+///     grant_type: client_credentials   # or: password, authorization_code
 ///     token_url: https://auth.example.com/token
 ///     client_id: {{client_id}}
 ///     client_secret: {{client_secret}}
@@ -193,12 +193,21 @@ pub enum ApiKeyLocation {
 ///     # required only for grant_type: password
 ///     username: {{username}}
 ///     password: {{password}}
+///     # required only for grant_type: authorization_code
+///     authorization_url: https://auth.example.com/authorize
+///     redirect_uri: http://127.0.0.1:8899/callback
 /// ```
 ///
-/// Only these two grants — neither `authorization_code` (it needs a browser
-/// redirect and a local callback listener, a different problem for a
-/// headless CLI) nor `refresh_token` (no cheaper once expiry-checking
-/// exists, deferred) — see [`crate::oauth`]'s module docs for both.
+/// `client_credentials` and `password` are acquired automatically —
+/// [`crate::Request::resolve_oauth`] fetches (or reuses a cached) token
+/// before every send with no human involved. `authorization_code` cannot
+/// work that way: it needs a human to approve access in a browser, so
+/// `resolve_oauth` refuses to attempt it automatically and instead reports a
+/// clear error directing the caller to log in interactively first. The TUI
+/// is the one caller that can do that — see [`crate::oauth`]'s module docs
+/// for the interactive flow and why `client_secret` is optional only for
+/// this grant (a desktop client cannot keep a secret confidential, so PKCE
+/// stands in for it; see [RFC 8252 §8.1/§8.5]).
 ///
 /// [`crate::Request::resolve_oauth`] acquires the token — through
 /// [`crate::oauth::OAuthTokenCache`], reusing one already acquired for the
@@ -206,6 +215,8 @@ pub enum ApiKeyLocation {
 /// than re-authenticating per request — and hands it to the exact same
 /// `Authorization: Bearer` code path [`Auth::bearer`] already resolves to;
 /// see [`crate::Request::resolve_auth`].
+///
+/// [RFC 8252 §8.1/§8.5]: https://www.rfc-editor.org/rfc/rfc8252#section-8.1
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -213,7 +224,12 @@ pub struct OAuthAuth {
     pub grant_type: OAuthGrantType,
     pub token_url: String,
     pub client_id: String,
-    pub client_secret: String,
+    /// Required for [`OAuthGrantType::ClientCredentials`] and
+    /// [`OAuthGrantType::Password`]; optional for
+    /// [`OAuthGrantType::AuthorizationCode`], whose native/desktop clients
+    /// typically have none — see [`validate_grant_fields`](Self::validate_grant_fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     /// Required when [`grant_type`](Self::grant_type) is
@@ -224,46 +240,164 @@ pub struct OAuthAuth {
     /// [`OAuthGrantType::Password`] — see [`validate_grant_fields`](Self::validate_grant_fields).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// The provider's authorization endpoint — where the browser is sent to
+    /// let the user approve access. Required when
+    /// [`grant_type`](Self::grant_type) is
+    /// [`OAuthGrantType::AuthorizationCode`]; unused by the other two grants,
+    /// which never open a browser. See [`validate_grant_fields`](Self::validate_grant_fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_url: Option<String>,
+    /// Where the provider redirects back with the authorization code — must
+    /// match what is registered with the provider. Required when
+    /// [`grant_type`](Self::grant_type) is
+    /// [`OAuthGrantType::AuthorizationCode`]; the TUI's local callback
+    /// listener binds to this exact address. See
+    /// [`validate_grant_fields`](Self::validate_grant_fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
 }
 
 impl OAuthAuth {
     /// `grant_type: password` requires both `username` and `password`;
-    /// `grant_type: client_credentials` needs neither. Checked wherever
-    /// [`Auth::validate_exclusivity`] already is — a request's own `auth:`
-    /// block and an environment's default — for the same typed-error rigor
-    /// every other schema rule in this project gets, rather than
-    /// discovering the gap only once a token request is attempted.
+    /// `grant_type: client_credentials` requires `client_secret`;
+    /// `grant_type: authorization_code` requires `authorization_url` and
+    /// `redirect_uri` (`client_secret` stays optional — see the type's own
+    /// doc comment). Checked wherever [`Auth::validate_exclusivity`] already
+    /// is — a request's own `auth:` block and an environment's default —
+    /// for the same typed-error rigor every other schema rule in this
+    /// project gets, rather than discovering the gap only once a token
+    /// request is attempted.
     pub(crate) fn validate_grant_fields(&self) -> Result<(), String> {
-        if self.grant_type == OAuthGrantType::Password
-            && (self.username.is_none() || self.password.is_none())
-        {
-            return Err(
+        match self.grant_type {
+            OAuthGrantType::Password if self.username.is_none() || self.password.is_none() => Err(
                 "`auth.oauth` with `grant_type: password` requires both `username` and \
-                 `password` to be set"
+                     `password` to be set"
                     .to_string(),
-            );
+            ),
+            OAuthGrantType::ClientCredentials if self.client_secret.is_none() => Err(
+                "`auth.oauth` with `grant_type: client_credentials` requires `client_secret` to \
+                 be set"
+                    .to_string(),
+            ),
+            OAuthGrantType::AuthorizationCode
+                if self.authorization_url.is_none() || self.redirect_uri.is_none() =>
+            {
+                Err(
+                    "`auth.oauth` with `grant_type: authorization_code` requires both \
+                     `authorization_url` and `redirect_uri` to be set"
+                        .to_string(),
+                )
+            }
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
-/// [`OAuthAuth::grant_type`]: which of the two supported OAuth grants to
-/// use. See [`crate::oauth`]'s module docs for why only these two.
+/// [`OAuthAuth::grant_type`]: which of the three supported OAuth grants to
+/// use. See [`crate::oauth`]'s module docs for how `authorization_code`
+/// differs from the other two.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OAuthGrantType {
     ClientCredentials,
     Password,
+    AuthorizationCode,
 }
 
 impl OAuthGrantType {
     /// The exact `grant_type` value OAuth's token request wire format
-    /// expects — see [RFC 6749 §4.3.2/§4.4.2].
+    /// expects — see [RFC 6749 §4.3.2/§4.4.2/§4.1.3].
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             OAuthGrantType::ClientCredentials => "client_credentials",
             OAuthGrantType::Password => "password",
+            OAuthGrantType::AuthorizationCode => "authorization_code",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base(grant_type: OAuthGrantType) -> OAuthAuth {
+        OAuthAuth {
+            grant_type,
+            token_url: "https://auth.example.com/token".to_string(),
+            client_id: "client".to_string(),
+            client_secret: None,
+            scope: None,
+            username: None,
+            password: None,
+            authorization_url: None,
+            redirect_uri: None,
+        }
+    }
+
+    #[test]
+    fn client_credentials_requires_a_client_secret() {
+        let err = base(OAuthGrantType::ClientCredentials)
+            .validate_grant_fields()
+            .expect_err("no client_secret must be rejected");
+        assert!(err.contains("client_secret"), "got {err}");
+
+        let ok = OAuthAuth {
+            client_secret: Some("s".to_string()),
+            ..base(OAuthGrantType::ClientCredentials)
+        };
+        assert!(ok.validate_grant_fields().is_ok());
+    }
+
+    #[test]
+    fn password_requires_username_and_password() {
+        let err = base(OAuthGrantType::Password)
+            .validate_grant_fields()
+            .expect_err("no username/password must be rejected");
+        assert!(
+            err.contains("username") && err.contains("password"),
+            "got {err}"
+        );
+
+        let ok = OAuthAuth {
+            username: Some("ada".to_string()),
+            password: Some("hunter2".to_string()),
+            ..base(OAuthGrantType::Password)
+        };
+        assert!(ok.validate_grant_fields().is_ok());
+    }
+
+    #[test]
+    fn authorization_code_requires_authorization_url_and_redirect_uri_but_not_client_secret() {
+        let err = base(OAuthGrantType::AuthorizationCode)
+            .validate_grant_fields()
+            .expect_err("no authorization_url/redirect_uri must be rejected");
+        assert!(
+            err.contains("authorization_url") && err.contains("redirect_uri"),
+            "got {err}"
+        );
+
+        let ok = OAuthAuth {
+            authorization_url: Some("https://auth.example.com/authorize".to_string()),
+            redirect_uri: Some("http://127.0.0.1:8899/callback".to_string()),
+            // client_secret deliberately left None — a public client is a
+            // valid authorization_code config, unlike the other two grants.
+            ..base(OAuthGrantType::AuthorizationCode)
+        };
+        assert!(
+            ok.validate_grant_fields().is_ok(),
+            "authorization_code must not require client_secret"
+        );
+    }
+
+    #[test]
+    fn authorization_code_missing_only_redirect_uri_is_still_rejected() {
+        let err = OAuthAuth {
+            authorization_url: Some("https://auth.example.com/authorize".to_string()),
+            ..base(OAuthGrantType::AuthorizationCode)
+        }
+        .validate_grant_fields()
+        .expect_err("redirect_uri alone missing must still be rejected");
+        assert!(err.contains("redirect_uri"), "got {err}");
     }
 }
