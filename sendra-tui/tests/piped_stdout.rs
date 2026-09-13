@@ -1,4 +1,4 @@
-//! Proves `sendra-tui`'s clean-exit audit (issue 13) holds for stdout being
+//! Proves `sendra-tui`'s clean-exit audit  holds for stdout being
 //! piped/redirected: it must fail fast with one clear, human-readable line
 //! on stderr — `main::require_interactive_stdout`, checked *before*
 //! `init_terminal` ever calls `enable_raw_mode`/`EnterAlternateScreen` — not
