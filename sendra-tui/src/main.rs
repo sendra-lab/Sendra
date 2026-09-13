@@ -433,6 +433,7 @@ fn translate_event(
                 return match key.code {
                     KeyCode::Esc => Message::CloseHistoryOverlay,
                     KeyCode::Enter => Message::ViewHistoryEntry,
+                    KeyCode::Char(' ') => Message::ToggleHistoryEntryExpanded,
                     KeyCode::Down | KeyCode::Char('j') => Message::SelectNext,
                     KeyCode::Up | KeyCode::Char('k') => Message::SelectPrevious,
                     _ => Message::Tick,
@@ -1538,6 +1539,22 @@ mod tests {
             false,
         );
         assert!(matches!(enter, Message::ViewHistoryEntry));
+
+        let space = translate_event(
+            press(KeyCode::Char(' ')),
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+        assert!(matches!(space, Message::ToggleHistoryEntryExpanded));
 
         for code in [KeyCode::Down, KeyCode::Char('j')] {
             let message = translate_event(

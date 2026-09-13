@@ -206,6 +206,10 @@ pub(crate) fn handle_confirm_delete(state: &mut CollectionSession) {
                 state.dirty_requests = reindex_dirty_after_delete(&state.dirty_requests, index);
                 state.run_history =
                     reindex_history_after_delete(std::mem::take(&mut state.run_history), index);
+                state.run_history_dropped = reindex_history_after_delete(
+                    std::mem::take(&mut state.run_history_dropped),
+                    index,
+                );
                 state.delete_confirm = None;
                 // A different (or no longer any) request is now selected,
                 // the same reset `select()` already applies when the

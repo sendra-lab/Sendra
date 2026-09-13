@@ -6,13 +6,14 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Text};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use sendra_core::{AssertionReport, CaptureReport, Response};
 
 use crate::run_request::RunOutcome;
 
-use super::super::state::{AppState, HistoryOverlay};
+use super::super::state::{AppState, HistoryOverlay, RunHistoryEntry, RUN_HISTORY_CAP};
 use super::{format_error, modal_frame};
 
 /// The completed-run half of the detail pane: a real response's status,
@@ -292,7 +293,12 @@ pub(crate) fn render_history_overlay(
         return;
     }
 
-    let inner = modal_frame(frame, 70, 70, "Run history — Enter to view, Esc to close");
+    let inner = modal_frame(
+        frame,
+        70,
+        70,
+        "Run history — Enter to view, Space to expand, Esc to close",
+    );
 
     if entries.is_empty() {
         frame.render_widget(
@@ -304,7 +310,8 @@ pub(crate) fn render_history_overlay(
 
     let items: Vec<ListItem> = entries
         .iter()
-        .map(|entry| {
+        .enumerate()
+        .map(|(index, entry)| {
             let summary = match &entry.outcome.result {
                 Ok(response) => {
                     let assertions = if entry.outcome.assertions.is_empty() {
@@ -320,16 +327,82 @@ pub(crate) fn render_history_overlay(
                 }
                 Err(error) => format!("failed — {error}"),
             };
-            ListItem::new(format!(
-                "{} ago  —  {summary}",
+            let marker = if overlay.expanded.contains(&index) {
+                "v"
+            } else {
+                ">"
+            };
+            let heading = Line::from(format!(
+                "{marker} {} ago  —  {summary}",
                 format_elapsed(entry.completed_at)
-            ))
+            ));
+            if !overlay.expanded.contains(&index) {
+                return ListItem::new(heading);
+            }
+            let mut lines = vec![heading];
+            lines.extend(
+                format_history_entry_detail(entry)
+                    .into_iter()
+                    .map(Line::from),
+            );
+            ListItem::new(Text::from(lines))
         })
         .collect();
     let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut list_state = ListState::default()
         .with_selected(Some(overlay.cursor.min(entries.len().saturating_sub(1))));
-    frame.render_stateful_widget(list, inner, &mut list_state);
+
+    let dropped = state.selected_history_dropped();
+    if dropped == 0 {
+        frame.render_stateful_widget(list, inner, &mut list_state);
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    frame.render_stateful_widget(list, rows[0], &mut list_state);
+    let run_word = if dropped == 1 { "run" } else { "runs" };
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{dropped} older {run_word} dropped (history capped at {RUN_HISTORY_CAP} per request)"
+        ))
+        .style(Style::new().add_modifier(Modifier::DIM)),
+        rows[1],
+    );
+}
+
+/// The lines shown, indented, beneath a history-list row that
+/// `Message::ToggleHistoryEntryExpanded` has expanded — genuinely more than
+/// the one-line summary above it (which only ever shows a status code and a
+/// pass/fail count), without switching into `ViewHistoryEntry`'s full
+/// response panel: the status line (code, text, elapsed time — the same
+/// triple `format_response`'s own first line carries), then the full
+/// `format_assertions`/`format_capture_section` breakdown for a successful
+/// run, or the real error for a failed one. Captures are never revealed here
+/// regardless of `HistoryOverlay::view_reveal_captures` — that flag is about
+/// `viewing`'s own response panel, not this inline glance, and a value
+/// sitting unrevealed in the full view should not leak out through a
+/// lighter-weight one.
+fn format_history_entry_detail(entry: &RunHistoryEntry) -> Vec<String> {
+    let body = match &entry.outcome.result {
+        Ok(response) => {
+            let mut text = format!(
+                "{} {}  {} ms",
+                response.status,
+                response.status_text,
+                response.elapsed.as_millis()
+            );
+            text.push('\n');
+            text.push_str(&format_assertions(&entry.outcome.assertions));
+            text.push('\n');
+            text.push_str(&format_capture_section(&entry.outcome.capture, false));
+            text
+        }
+        Err(error) => format_error("Request failed", error),
+    };
+    body.lines().map(|line| format!("    {line}")).collect()
 }
 
 /// A short, human "N ago" rendering of `when` relative to now — `"just now"`
@@ -892,6 +965,126 @@ mod tests {
         assert!(
             screen.contains(&format!("of {total_lines}")),
             "the footer must report the real total even after the area shrank:\n{screen}"
+        );
+    }
+
+    /// Proof that expanding a history-list row shows genuinely more detail
+    /// than the collapsed summary, in place, without switching into
+    /// `ViewHistoryEntry`'s full response panel — and that collapsing it
+    /// again removes that detail. The collapsed row only ever shows a status
+    /// code and a pass/fail count (see the list-building code in
+    /// `render_history_overlay`); the expanded row must additionally show
+    /// the per-assertion breakdown `format_assertions` produces, which the
+    /// collapsed summary never does.
+    #[test]
+    fn expanding_a_history_row_shows_more_detail_than_the_collapsed_summary() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut state = loaded_state(VALID_COLLECTION);
+        let response = response_with(&[], "");
+        let assertions = evaluate_assertions(
+            "method: GET\nurl: https://example.com\nassertions:\n  status: 201\n",
+            &response,
+        );
+        let outcome = RunOutcome {
+            result: Ok(response),
+            assertions,
+            capture: CaptureReport::default(),
+        };
+
+        update(&mut state, Message::RunRequested);
+        let collection_id = state.active().id;
+        update(
+            &mut state,
+            Message::RunCompleted {
+                collection_id,
+                outcome,
+            },
+        );
+        update(&mut state, Message::OpenHistoryOverlay);
+
+        // Rendered through `render_history_overlay` directly, not the full
+        // `view` — the live response panel behind the modal shows this same
+        // outcome's assertion text too, which would make a whole-screen scan
+        // pass even if the *overlay itself* never rendered any detail at all.
+        let render = |state: &AppState| {
+            let backend = TestBackend::new(100, 20);
+            let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+            let overlay = state.history_overlay.clone().expect("just opened");
+            terminal
+                .draw(|frame| render_history_overlay(frame, state, &overlay))
+                .expect("rendering must not panic");
+            buffer_to_string(terminal.backend().buffer())
+        };
+
+        let collapsed = render(&state);
+        assert!(
+            !collapsed.contains("status is 201"),
+            "the collapsed row must not already show the per-assertion detail:\n{collapsed}"
+        );
+
+        update(&mut state, Message::ToggleHistoryEntryExpanded);
+        let expanded = render(&state);
+        assert!(
+            expanded.contains("status is 201"),
+            "expanding the row must show the real assertion detail in place:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("1 passed"),
+            "expanding the row must show the pass/fail breakdown:\n{expanded}"
+        );
+
+        update(&mut state, Message::ToggleHistoryEntryExpanded);
+        let recollapsed = render(&state);
+        assert!(
+            !recollapsed.contains("status is 201"),
+            "toggling again must collapse the row back down:\n{recollapsed}"
+        );
+    }
+
+    /// Proof of the `RUN_HISTORY_CAP` eviction decision demonstrated live:
+    /// running one request past the cap drops its oldest entry and the
+    /// overlay says so ("N older runs were dropped") rather than discarding
+    /// it silently.
+    #[test]
+    fn history_overlay_shows_the_dropped_count_once_the_cap_is_exceeded() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut state = loaded_state(VALID_COLLECTION);
+        let collection_id = state.active().id;
+        for _ in 0..=RUN_HISTORY_CAP {
+            update(&mut state, Message::RunRequested);
+            let outcome = RunOutcome {
+                result: Ok(response_with(&[], "")),
+                assertions: AssertionReport::default(),
+                capture: CaptureReport::default(),
+            };
+            update(
+                &mut state,
+                Message::RunCompleted {
+                    collection_id,
+                    outcome,
+                },
+            );
+        }
+        update(&mut state, Message::OpenHistoryOverlay);
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).expect("a test terminal builds");
+        terminal
+            .draw(|frame| view(&state, frame))
+            .expect("rendering must not panic");
+        let screen = buffer_to_string(terminal.backend().buffer());
+
+        assert!(
+            screen.contains("1 older run dropped"),
+            "exactly one run was evicted by the cap and the overlay must say so:\n{screen}"
+        );
+        assert!(
+            screen.contains(&format!("capped at {RUN_HISTORY_CAP} per request")),
+            "the notice must name the real cap, not a hardcoded number:\n{screen}"
         );
     }
 }

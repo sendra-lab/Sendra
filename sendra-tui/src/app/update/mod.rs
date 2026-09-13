@@ -417,6 +417,17 @@ fn update_session(state: &mut CollectionSession, msg: Message) {
                 overlay.viewing = None;
             }
         }
+        Message::ToggleHistoryEntryExpanded => {
+            let history_len = state.selected_history().len();
+            if let Some(overlay) = &mut state.history_overlay {
+                if overlay.viewing.is_none() && overlay.cursor < history_len {
+                    let cursor = overlay.cursor;
+                    if !overlay.expanded.remove(&cursor) {
+                        overlay.expanded.insert(cursor);
+                    }
+                }
+            }
+        }
         Message::AddRequest => request_edit::handle_add_request(state),
         Message::EnterEditMode => request_edit::handle_enter_edit_mode(state),
         Message::SaveEdit => request_edit::handle_save_edit(state),
@@ -572,20 +583,22 @@ pub(crate) fn reindex_dirty_after_delete(
         .collect()
 }
 
-/// `run_history` with every key shifted to still name the same request after
-/// deleting the one at `deleted_index` — the exact same reindexing
-/// `reindex_dirty_after_delete` already does for `dirty_requests`, applied to
-/// a `HashMap<usize, Vec<RunHistoryEntry>>` instead of a `HashSet<usize>`.
-pub(crate) fn reindex_history_after_delete(
-    history: HashMap<usize, Vec<RunHistoryEntry>>,
+/// `run_history` (or `run_history_dropped`) with every key shifted to still
+/// name the same request after deleting the one at `deleted_index` — the
+/// exact same reindexing `reindex_dirty_after_delete` already does for
+/// `dirty_requests`, generic over the map's value type so it covers both
+/// `HashMap<usize, Vec<RunHistoryEntry>>` and `HashMap<usize, usize>` without
+/// duplicating the index arithmetic.
+pub(crate) fn reindex_history_after_delete<V>(
+    history: HashMap<usize, V>,
     deleted_index: usize,
-) -> HashMap<usize, Vec<RunHistoryEntry>> {
+) -> HashMap<usize, V> {
     history
         .into_iter()
-        .filter_map(|(index, entries)| match index.cmp(&deleted_index) {
-            std::cmp::Ordering::Less => Some((index, entries)),
+        .filter_map(|(index, value)| match index.cmp(&deleted_index) {
+            std::cmp::Ordering::Less => Some((index, value)),
             std::cmp::Ordering::Equal => None,
-            std::cmp::Ordering::Greater => Some((index - 1, entries)),
+            std::cmp::Ordering::Greater => Some((index - 1, value)),
         })
         .collect()
 }
@@ -593,12 +606,15 @@ pub(crate) fn reindex_history_after_delete(
 /// Records `outcome` as the selected request's newest history entry, then
 /// trims that request's history back down to `RUN_HISTORY_CAP` if it grew
 /// past it — the one place `Message::RunCompleted` writes into
-/// `CollectionSession::run_history`.
+/// `CollectionSession::run_history`. Every entry the trim drops is counted
+/// into `run_history_dropped` for that same request, so the overlay can say
+/// "N older runs were dropped" instead of the cap silently discarding data.
 fn push_history_entry(session: &mut CollectionSession, outcome: crate::run_request::RunOutcome) {
     let LoadState::Loaded { selected, .. } = &session.load_state else {
         return;
     };
-    let entries = session.run_history.entry(*selected).or_default();
+    let selected = *selected;
+    let entries = session.run_history.entry(selected).or_default();
     entries.insert(
         0,
         RunHistoryEntry {
@@ -606,7 +622,11 @@ fn push_history_entry(session: &mut CollectionSession, outcome: crate::run_reque
             outcome,
         },
     );
-    entries.truncate(RUN_HISTORY_CAP);
+    if entries.len() > RUN_HISTORY_CAP {
+        let dropped = entries.len() - RUN_HISTORY_CAP;
+        entries.truncate(RUN_HISTORY_CAP);
+        *session.run_history_dropped.entry(selected).or_default() += dropped;
+    }
 }
 
 /// `state.history_overlay`'s own `view_scroll`/`view_reveal_captures`, but
@@ -906,11 +926,10 @@ mod tests {
         );
     }
 
-    /// Proof requirement: running past `RUN_HISTORY_CAP` drops the oldest
-    /// entry rather than growing without bound — the cap this issue was
-    /// asked to pick and justify (see `RUN_HISTORY_CAP`'s own doc comment:
+    /// Running past `RUN_HISTORY_CAP` drops the oldest entry rather than
+    /// growing without bound — see `RUN_HISTORY_CAP`'s own doc comment:
     /// generous for what browsing needs, bounded against unbounded response
-    /// bodies accumulating over a long session).
+    /// bodies accumulating over a long session.
     #[test]
     fn history_past_the_cap_drops_the_oldest_entry() {
         let mut state = loaded_state(VALID_COLLECTION);
@@ -944,6 +963,90 @@ mod tests {
             "run 0 (the very first, now the oldest past the cap) must have been \
              dropped to make room, leaving run 1 as the oldest surviving entry"
         );
+        assert_eq!(
+            state.selected_history_dropped(),
+            1,
+            "exactly one entry (run 0) was evicted by the trim, and that must be \
+             counted rather than discarded silently"
+        );
+    }
+
+    /// A second run past the cap evicts a second entry — `run_history_dropped`
+    /// accumulates across trims rather than only ever recording the first one.
+    #[test]
+    fn history_dropped_count_accumulates_across_multiple_trims() {
+        let mut state = loaded_state(VALID_COLLECTION);
+
+        for status in 0..=(RUN_HISTORY_CAP as u16) + 1 {
+            run_to_completion(&mut state, status);
+        }
+
+        assert_eq!(
+            state.selected_history_dropped(),
+            2,
+            "two runs (0 and 1) have now been evicted by the trim"
+        );
+    }
+
+    /// `Message::ToggleHistoryEntryExpanded` toggles the entry at the
+    /// overlay's own `cursor` in place, independent of which entry is
+    /// selected before or after — the inline glance `render_history_overlay`
+    /// shows without switching into `ViewHistoryEntry`'s full response panel.
+    #[test]
+    fn toggle_history_entry_expanded_toggles_the_entry_at_cursor() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        run_to_completion(&mut state, 200);
+        run_to_completion(&mut state, 500);
+        update(&mut state, Message::OpenHistoryOverlay);
+
+        update(&mut state, Message::ToggleHistoryEntryExpanded);
+        assert!(state
+            .history_overlay
+            .as_ref()
+            .unwrap()
+            .expanded
+            .contains(&0));
+
+        update(&mut state, Message::SelectNext);
+        update(&mut state, Message::ToggleHistoryEntryExpanded);
+        assert!(state
+            .history_overlay
+            .as_ref()
+            .unwrap()
+            .expanded
+            .contains(&1));
+        assert!(
+            state
+                .history_overlay
+                .as_ref()
+                .unwrap()
+                .expanded
+                .contains(&0),
+            "expanding a second row must not collapse the first"
+        );
+
+        update(&mut state, Message::ToggleHistoryEntryExpanded);
+        assert!(
+            !state
+                .history_overlay
+                .as_ref()
+                .unwrap()
+                .expanded
+                .contains(&1),
+            "toggling an already-expanded row collapses it"
+        );
+    }
+
+    #[test]
+    fn toggle_history_entry_expanded_is_a_no_op_while_viewing_an_entry() {
+        let mut state = loaded_state(VALID_COLLECTION);
+        run_to_completion(&mut state, 200);
+        update(&mut state, Message::OpenHistoryOverlay);
+        update(&mut state, Message::ViewHistoryEntry);
+
+        update(&mut state, Message::ToggleHistoryEntryExpanded);
+
+        assert!(state.history_overlay.as_ref().unwrap().expanded.is_empty());
     }
 
     #[test]
