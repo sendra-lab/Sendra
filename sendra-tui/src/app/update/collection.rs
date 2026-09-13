@@ -6,6 +6,9 @@
 //! `CollectionLoaded`/`EnvironmentsLoaded` that load the very first
 //! collection into an already-open session.
 
+use std::path::{Path, PathBuf};
+
+use crate::app::discovery::discover_collections;
 use crate::app::state::{
     AppState, CloseConfirm, CollectionSession, ConfirmPrompt, LoadState, OpenCollectionPromptState,
 };
@@ -133,7 +136,7 @@ pub(crate) fn close_session_by_id(state: &mut AppState, id: u64) {
     } else {
         state.collections[0] = CollectionSession {
             id,
-            load_state: LoadState::NoPathProvided,
+            load_state: no_path_provided(),
             ..CollectionSession::default()
         };
     }
@@ -141,7 +144,75 @@ pub(crate) fn close_session_by_id(state: &mut AppState, id: u64) {
 
 /// `Message::NoCollectionPath` (session-scoped).
 pub(crate) fn handle_no_collection_path(state: &mut CollectionSession) {
-    state.load_state = LoadState::NoPathProvided;
+    state.load_state = no_path_provided();
+}
+
+/// A fresh `LoadState::NoPathProvided`, re-running discovery against the
+/// real current directory every time — both `handle_no_collection_path`
+/// (startup with no path given) and `close_session_by_id`'s "closed the last
+/// tab" reset go through this rather than each calling
+/// `discover_collections` separately, so there is exactly one place that
+/// decides what "nothing loaded, here's what's nearby" actually means.
+/// `std::env::current_dir()` failing (the process's cwd deleted out from
+/// under it, say) falls back to an empty candidate list — the plain welcome
+/// message — rather than propagating an error over something this minor.
+fn no_path_provided() -> LoadState {
+    let discovered = std::env::current_dir()
+        .map(|dir| discover_collections(&dir))
+        .unwrap_or_default();
+    LoadState::NoPathProvided {
+        discovered,
+        cursor: 0,
+    }
+}
+
+/// `Message::RunRequested`, repurposed as "open the discovery picker's
+/// highlighted candidate" while `LoadState::NoPathProvided` has any to offer
+/// — see that variant's own doc comment on why discovery lives here, inside
+/// `update()`, instead of being threaded in from `main.rs`. The same
+/// constraint applies to *confirming* a pick: `main::translate_event` cannot
+/// be taught a new key for it without editing `main.rs`, so this reuses
+/// Enter/`r`, which already mean "confirm/act" everywhere else in this app
+/// (running a request, confirming an environment selection, confirming a
+/// delete) — a natural extension of what those keys already mean, for the
+/// one `LoadState` where an actual run is structurally impossible anyway
+/// (`request_edit::request_is_selected` is always `false` with nothing
+/// loaded). Returns `true` when it actually consumed the message this way,
+/// so `update_session`'s own `RunRequested` arm skips its ordinary handling
+/// below it.
+///
+/// Loads the picked file through exactly the same `Document::from_path` +
+/// `handle_collection_loaded` pair `Message::CollectionLoaded` itself uses
+/// for the very first collection — reused, not duplicated — so a malformed
+/// file picked from the discovery list surfaces the identical real
+/// `SendraError` a bad path typed into the open-collection prompt would.
+/// Environments are left exactly as they already are: `main::run` already
+/// loaded them from this same current directory at startup (see
+/// `main::load_environments`'s own call site), regardless of whether a path
+/// was given, so there is nothing left to reload here.
+pub(crate) fn confirm_discovered_selection(state: &mut CollectionSession) -> bool {
+    let LoadState::NoPathProvided { discovered, cursor } = &state.load_state else {
+        return false;
+    };
+    let Some(path) = discovered.get(*cursor).cloned() else {
+        return false;
+    };
+    let base_dir = base_dir_of(&path);
+    let result = sendra_core::Document::from_path(&path);
+    handle_collection_loaded(state, base_dir, path, Box::new(result));
+    true
+}
+
+/// Mirrors `main::base_dir` exactly (see that function's own doc comment on
+/// why `body_file`/multipart paths resolve against a collection's own
+/// directory) — duplicated rather than shared across the crate/binary
+/// boundary, the same tradeoff that function's own doc comment already
+/// makes for `sendra-cli`'s copy of the same three lines.
+fn base_dir_of(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// `Message::CollectionLoaded` (session-scoped) — loading the very first
@@ -537,7 +608,7 @@ mod tests {
             1,
             "the Vec must never become empty"
         );
-        assert!(matches!(state.load_state, LoadState::NoPathProvided));
+        assert!(matches!(state.load_state, LoadState::NoPathProvided { .. }));
         assert_eq!(state.active_collection, 0);
     }
 
@@ -652,5 +723,104 @@ mod tests {
         assert_eq!(state.environments.len(), 2);
         assert_eq!(state.active_environment, Some(0));
         assert_eq!(state.environments[0].name, "prod");
+    }
+
+    // --- the welcome screen's discovery picker ------------------------------
+
+    fn state_with_discovered(paths: Vec<PathBuf>) -> AppState {
+        let mut state = AppState::default();
+        state.load_state = LoadState::NoPathProvided {
+            discovered: paths,
+            cursor: 0,
+        };
+        state
+    }
+
+    #[test]
+    fn confirming_a_discovered_valid_collection_loads_it() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("found.yaml");
+        std::fs::write(&path, VALID_COLLECTION).unwrap();
+        let mut state = state_with_discovered(vec![path.clone()]);
+
+        update(&mut state, Message::RunRequested);
+
+        match &state.load_state {
+            LoadState::Loaded {
+                document, path: p, ..
+            } => {
+                assert_eq!(document.requests().len(), 2);
+                assert_eq!(p, &path);
+            }
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+    }
+
+    /// The real parse error must still surface — discovering a file is not
+    /// the same as vouching for its contents (see V1 issue 11's own error
+    /// handling, which this must not paper over).
+    #[test]
+    fn confirming_a_discovered_malformed_collection_shows_the_real_error() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let path = dir.path().join("broken.yaml");
+        std::fs::write(&path, MALFORMED_YAML).unwrap();
+        let mut state = state_with_discovered(vec![path]);
+
+        update(&mut state, Message::RunRequested);
+
+        assert!(
+            matches!(state.load_state, LoadState::Failed(_)),
+            "a malformed discovered file must surface the real load error, \
+             not be silently skipped or shown as an empty list entry"
+        );
+    }
+
+    #[test]
+    fn confirming_moves_the_cursor_first_then_opens_the_highlighted_entry() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let first = dir.path().join("a.yaml");
+        let second = dir.path().join("b.yaml");
+        std::fs::write(&first, VALID_COLLECTION).unwrap();
+        std::fs::write(&second, THREE_REQUEST_COLLECTION).unwrap();
+        let mut state = state_with_discovered(vec![first, second.clone()]);
+
+        update(&mut state, Message::SelectNext);
+        update(&mut state, Message::RunRequested);
+
+        match &state.load_state {
+            LoadState::Loaded { path, .. } => assert_eq!(path, &second),
+            other => panic!("expected LoadState::Loaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_requested_is_a_harmless_no_op_when_nothing_was_discovered() {
+        let mut state = state_with_discovered(Vec::new());
+
+        update(&mut state, Message::RunRequested);
+
+        assert!(matches!(state.load_state, LoadState::NoPathProvided { .. }));
+    }
+
+    #[test]
+    fn selecting_up_and_down_wraps_through_the_discovered_list() {
+        let dir = tempfile::tempdir().expect("a temp dir for this test");
+        let paths: Vec<PathBuf> = ["a.yaml", "b.yaml", "c.yaml"]
+            .iter()
+            .map(|name| dir.path().join(name))
+            .collect();
+        let mut state = state_with_discovered(paths);
+
+        update(&mut state, Message::SelectPrevious);
+
+        match &state.load_state {
+            LoadState::NoPathProvided { cursor, .. } => {
+                assert_eq!(
+                    *cursor, 2,
+                    "moving previous from 0 must wrap to the last entry"
+                )
+            }
+            other => panic!("expected LoadState::NoPathProvided, got {other:?}"),
+        }
     }
 }

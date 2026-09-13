@@ -4,12 +4,15 @@
 //! - [`update`]: `update()`, the one function allowed to mutate `AppState`.
 //! - [`view`]: `view()` and every `render_*`/`format_*` function under it.
 //!
-//! Plus two small cross-cutting modules neither layer above should itself
+//! Plus four small cross-cutting modules neither layer above should itself
 //! contain: [`preview`], the sendra-core call sequences (substitution,
 //! auth/query/body resolution) `view`'s read-only browsing preview and
-//! auth-masking build on, and [`theme`], the one palette every color/style
+//! auth-masking build on; [`theme`], the one palette every color/style
 //! choice `view`'s render functions make comes from — see that module's own
-//! doc comment for why it lives here rather than inside `view/` itself.
+//! doc comment for why it lives here rather than inside `view/` itself;
+//! [`discovery`], finding candidate collection files near the current
+//! directory for the welcome screen's picker; and [`logo`], decoding the
+//! embedded logo PNG into colored half-block text that same screen draws.
 //!
 //! This is a pure reorganization of what used to be one `app.rs` file along
 //! boundaries the module already had (state/model, reducer, rendering) —
@@ -17,6 +20,8 @@
 //! it still reaches everything it needs through `crate::app::{...}`, exactly
 //! the names re-exported below.
 
+mod discovery;
+mod logo;
 mod preview;
 mod state;
 mod theme;

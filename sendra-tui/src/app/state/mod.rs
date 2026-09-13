@@ -645,7 +645,25 @@ impl std::ops::DerefMut for AppState {
 pub enum LoadState {
     #[default]
     Loading,
-    NoPathProvided,
+    /// No collection path was given on the command line — `discovered` is
+    /// whatever `.yaml`/`.yml` files `update::collection::handle_no_collection_path`
+    /// found sitting directly in the current directory at that moment (see
+    /// `app::discovery::discover_collections`), computed once, right there,
+    /// rather than passed in from `main.rs`: `Message::NoCollectionPath`
+    /// itself stays the same plain unit variant `main.rs`'s own call site
+    /// already constructs, so this crate's welcome screen/discovery picker
+    /// could be added without changing that file at all.
+    ///
+    /// `cursor` is the discovery picker's own selection when `discovered`
+    /// isn't empty — a sibling of `environment_overlay`'s cursor field one
+    /// level up, kept inside this variant rather than as a separate
+    /// `Option<usize>` on `CollectionSession` because it is meaningless in
+    /// every other `LoadState`, the same reasoning `HistoryOverlay::cursor`
+    /// already follows for its own list.
+    NoPathProvided {
+        discovered: Vec<PathBuf>,
+        cursor: usize,
+    },
     Loaded {
         document: Box<Document>,
         selected: usize,
