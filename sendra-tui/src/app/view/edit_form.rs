@@ -1238,7 +1238,10 @@ requests:
         use ratatui::Terminal;
 
         let render = |state: &AppState| {
-            let backend = TestBackend::new(60, 10);
+            // 13, not 10: the header bar above the panes and the detail
+            // pane's own border (top+bottom) now claim 3 rows that used to
+            // be part of the edit form's own content area.
+            let backend = TestBackend::new(60, 13);
             let mut terminal = Terminal::new(backend).expect("a test terminal builds");
             terminal
                 .draw(|frame| view(state, frame))
@@ -1286,10 +1289,11 @@ requests:
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
-        // 17, not 15: the edit pane gained a `Name:` field and its own
+        // 20, not 17: the edit pane gained a `Name:` field and its own
         // spacer line above `Method:`, so every fixed section below it sits
-        // two rows further down than before.
-        let backend = TestBackend::new(80, 17);
+        // two rows further down than before; the header bar and the detail
+        // pane's own top/bottom border claim 3 more rows on top of that.
+        let backend = TestBackend::new(80, 20);
         let mut terminal = Terminal::new(backend).expect("a test terminal builds");
         terminal
             .draw(|frame| view(state, frame))
@@ -1346,8 +1350,11 @@ requests:
             .lines()
             .find(|line| line.contains("Key: Accept"))
             .expect("the Accept row must be on screen");
+        // The marker sits immediately before `[0] Key:` — checked as a
+        // substring, not by trimming the line's start, since the detail
+        // pane's own left border is now the first character of every row.
         assert!(
-            key_line.trim_start().starts_with('▶'),
+            key_line.contains("▶[0] Key: Accept"),
             "the key side must carry the focus marker:\n{key_line}"
         );
 
@@ -1358,7 +1365,7 @@ requests:
             .find(|line| line.contains("Key: Accept"))
             .expect("the Accept row must be on screen");
         assert!(
-            !value_line.trim_start().starts_with('▶'),
+            !value_line.contains("▶[0] Key:"),
             "focus moved off the key side, so it must no longer carry the marker:\n{value_line}"
         );
         assert!(
@@ -1518,10 +1525,11 @@ requests:
 
         let screen = render_state(&state);
 
+        // Checked as a substring, not by trimming the line's start, since
+        // the detail pane's own left border is now the first character of
+        // every row.
         assert!(
-            screen
-                .lines()
-                .any(|line| line.contains("Body (raw)") && line.trim_start().starts_with('▶')),
+            screen.lines().any(|line| line.contains("▶ Body (raw)")),
             "the Body heading must carry the focus marker:\n{screen}"
         );
     }

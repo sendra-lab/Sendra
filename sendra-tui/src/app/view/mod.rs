@@ -1,13 +1,16 @@
 //! The view half of sendra-tui's Elm-style architecture: `view()` itself,
-//! the tab bar, the status bar, and the `modal_frame`/`centered_rect`/`inset`
-//! helpers every overlay in [`environment`]/[`response`]/[`modals`] builds
-//! on. Nothing here ever mutates `AppState` — see `super::update` for the
-//! one function that does. Split into submodules along the same lines the
-//! detail pane naturally divides: [`browser`] for the request list and the
-//! read-only preview pane, [`edit_form`] for the request edit form,
-//! [`environment`] for the environment overlay/edit, [`response`] for a
-//! run's response panel (live or from history), and [`modals`] for the
-//! shared confirmation prompt and the open-collection prompt.
+//! the header bar, the tab bar, the status bar, and the shared chrome
+//! helpers everything else in this crate builds on — `modal_frame`/
+//! `centered_rect`/`inset` for every overlay in
+//! [`environment`]/[`response`]/[`modals`], and `bordered_pane` for the
+//! request list, the detail pane, and a bare loading/error message. Nothing
+//! here ever mutates `AppState` — see `super::update` for the one function
+//! that does. Split into submodules along the same lines the detail pane
+//! naturally divides: [`browser`] for the request list and the read-only
+//! preview pane, [`edit_form`] for the request edit form, [`environment`]
+//! for the environment overlay/edit, [`response`] for a run's response
+//! panel (live or from history), and [`modals`] for the shared confirmation
+//! prompt and the open-collection prompt.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
@@ -34,37 +37,40 @@ use modals::{render_confirm_prompt, render_open_collection_prompt};
 use response::render_history_overlay;
 
 pub fn view(state: &AppState, frame: &mut Frame) {
+    // A header row is reserved above everything else, in every `LoadState`
+    // — the app's own name, the active tab's collection, and the active
+    // environment are what orient a person the instant a frame draws,
+    // before there is even a request list to look at, so this is never
+    // conditional the way the tab bar below is.
+    //
     // The tab bar only ever takes a row away from the rest of the screen
     // once there is something to switch between — a single open collection
-    // renders exactly as it always has, byte-for-byte the same layout every
-    // existing single-collection test already checks, rather than every
-    // screen growing a permanent one-tab bar nobody needed before this
-    // issue.
+    // renders exactly as it always has otherwise, rather than every screen
+    // growing a permanent one-tab bar nobody needed before that issue.
     let show_tabs = state.collections.len() > 1;
-    let constraints = if show_tabs {
-        vec![
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ]
-    } else {
-        vec![Constraint::Min(0), Constraint::Length(1)]
-    };
+    let mut constraints = vec![Constraint::Length(1)];
+    if show_tabs {
+        constraints.push(Constraint::Length(1));
+    }
     // The bottom row is reserved in every `LoadState`, not only `Loaded` —
     // an error state must not dead-end the app, and the help bar showing
     // which keys still work (at minimum quit, per `status_help_text`) is
     // exactly what makes that visible rather than assumed. See that
     // function's own doc comment for how it reads `load_state` to keep this
     // honest instead of always claiming nav/run apply.
+    constraints.push(Constraint::Min(0));
+    constraints.push(Constraint::Length(1));
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(frame.area());
+
+    render_header_bar(frame, rows[0], state);
     let (main_row, status_row) = if show_tabs {
-        render_tab_bar(frame, rows[0], state);
-        (rows[1], rows[2])
+        render_tab_bar(frame, rows[1], state);
+        (rows[2], rows[3])
     } else {
-        (rows[0], rows[1])
+        (rows[1], rows[2])
     };
 
     match &state.load_state {
@@ -86,8 +92,23 @@ pub fn view(state: &AppState, frame: &mut Frame) {
                 .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
                 .split(main_row);
 
-            render_request_list(frame, panes[0], document, *selected, &state.dirty_requests);
-            render_detail_pane(frame, panes[1], document, *selected, base_dir, state);
+            let list_inner = bordered_pane(frame, panes[0], " Requests ", theme::muted());
+            render_request_list(
+                frame,
+                list_inner,
+                document,
+                *selected,
+                &state.dirty_requests,
+            );
+
+            let (detail_title, detail_style) = detail_pane_style(state);
+            let detail_inner = bordered_pane(
+                frame,
+                panes[1],
+                Span::styled(detail_title, detail_style),
+                detail_style,
+            );
+            render_detail_pane(frame, detail_inner, document, *selected, base_dir, state);
         }
     }
 
@@ -128,6 +149,75 @@ pub fn view(state: &AppState, frame: &mut Frame) {
     if let Some(prompt) = &state.quit_confirm {
         render_confirm_prompt(frame, "Quit sendra-tui", prompt);
     }
+}
+
+/// The one-line header above everything else this app ever draws — the
+/// app's own name (the same "sendra-tui" the quit confirmation already
+/// names itself), the active tab's collection (via [`collection_label`], the
+/// same lookup the tab bar itself uses), and the active environment (via
+/// [`active_environment`], the same lookup a run resolves against) — so a
+/// glance at the very top of the screen always answers "which collection,
+/// which environment" without having to find the (conditional, easy to miss
+/// with only one tab open) tab bar first.
+fn render_header_bar(frame: &mut Frame, area: Rect, state: &AppState) {
+    let collection_name = collection_label(state.active());
+    let environment_name = active_environment(state)
+        .map(|named| named.name.as_str())
+        .unwrap_or("none");
+
+    let spans = vec![
+        Span::styled(" sendra-tui ", theme::emphasis()),
+        Span::styled("│ ", theme::muted()),
+        Span::raw(format!("{collection_name}  ")),
+        Span::styled("│ ", theme::muted()),
+        Span::raw(format!("Env: {environment_name} ")),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The title and border color [`view`] gives the detail pane — the same
+/// idle/editing/running/success/failure distinction [`status_bar_line`]
+/// already colors the bottom bar's text with, surfaced here as the pane's
+/// own chrome too, so which of the four states the app is in is visible at
+/// the pane itself, not only in a one-line summary underneath it. Checked in
+/// the same priority order `render_detail_pane` itself dispatches in:
+/// edit mode first (it takes over the whole pane), then a run in flight,
+/// then a completed run's real outcome, then the ordinary preview.
+fn detail_pane_style(state: &AppState) -> (&'static str, Style) {
+    if state.edit_mode.is_some() {
+        (" Editing ", theme::emphasis())
+    } else if matches!(state.run_state, RunState::InFlight) {
+        (" Running ", theme::in_progress())
+    } else if let Some(outcome) = state.current_run() {
+        if outcome.result.is_ok() {
+            (" Response ", theme::success())
+        } else {
+            (" Response ", theme::fail())
+        }
+    } else {
+        (" Preview ", theme::muted())
+    }
+}
+
+/// A bordered pane with `title`, styled `style` — the one border shape this
+/// crate now draws around every pane and message screen `view()` builds
+/// outside a modal (modals already share [`modal_frame`]'s own muted
+/// border), so a request list, a detail pane, and a bare loading/error
+/// message all read as the same kind of box rather than three ad hoc looks.
+/// Returns the inner `Rect` the caller draws its actual content into.
+fn bordered_pane(
+    frame: &mut Frame,
+    area: Rect,
+    title: impl Into<Line<'static>>,
+    style: Style,
+) -> Rect {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(style)
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
 }
 
 /// One label per open collection, `id` (its 1-based position, not
@@ -180,7 +270,8 @@ pub(super) fn collection_label(session: &CollectionSession) -> String {
 }
 
 fn render_message(frame: &mut Frame, area: Rect, text: &str) {
-    frame.render_widget(Paragraph::new(text.to_string()), area);
+    let inner = bordered_pane(frame, area, " sendra-tui ", theme::muted());
+    frame.render_widget(Paragraph::new(text.to_string()), inner);
 }
 
 /// One error, formatted the same way everywhere sendra-tui shows one: a
@@ -201,9 +292,10 @@ pub(crate) fn format_error(heading: &str, error: &impl std::fmt::Display) -> Str
 /// the response panel) use instead, since those need the string, not a
 /// widget of their own.
 fn render_error(frame: &mut Frame, area: Rect, heading: &str, error: &impl std::fmt::Display) {
+    let inner = bordered_pane(frame, area, " sendra-tui ", theme::fail());
     frame.render_widget(
         Paragraph::new(theme::colorize(&format_error(heading, error))).wrap(Wrap { trim: false }),
-        area,
+        inner,
     );
 }
 
@@ -1054,19 +1146,24 @@ mod tests {
             .expect("initial draw must not panic");
 
         // Shrink drastically — down to a sliver of a terminal — and redraw.
-        terminal.backend_mut().resize(20, 6);
+        // 26x8, not 20x6: the header bar, the detail pane's own left/right
+        // border, and its top/bottom border now all eat into what used to
+        // be the response panel's whole content area, so a terminal this
+        // small needs a little more room than before to keep the footer's
+        // line-range readable at all.
+        terminal.backend_mut().resize(26, 8);
         terminal
             .draw(|frame| view(&state, frame))
             .expect("drawing after a drastic shrink must not panic");
         let shrunk = terminal.backend().buffer();
         assert_eq!(
             shrunk.area,
-            Rect::new(0, 0, 20, 6),
+            Rect::new(0, 0, 26, 8),
             "the buffer must track the new, smaller size exactly — no leftover \
              cells from the previous 100x30 frame"
         );
         let shrunk_screen = buffer_to_string(shrunk);
-        // At 20 columns wide the footer's `of {total}` tail is clipped off
+        // At this width the footer's `of {total}` tail is clipped off
         // screen, so what actually proves the clamp worked is the line
         // range itself ending at (not past) the real total.
         assert!(
