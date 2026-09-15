@@ -4,19 +4,24 @@ description = "Terminal-native HTTP client. Sends requests defined in YAML files
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository = "https://github.com/sendra-lab/Sendra"
+readme = "../README.md"
+keywords = ["cli", "http", "testing", "yaml", "terminal"]
+categories = ["command-line-utilities", "web-programming::http-client"]
 
 [[bin]]
 name = "sendra"
 path = "src/main.rs"
 
 [dependencies]
-sendra-core = { path = "../sendra-core" }
+sendra-core = { path = "../sendra-core", version = "0.1.0" }
 # `sendra tui` (and a bare `sendra`, with no subcommand at all — see
 # `cli.rs`) launch sendra-tui's event loop in-process. Merged into this one
 # binary deliberately: installing `sendra` gets you both the CLI and the TUI,
 # not a CLI-only build that leaves the TUI a separate install away. See the
 # note on `sendra-tui/Cargo.toml` for what that costs in dependencies.
-sendra-tui = { path = "../sendra-tui" }
+sendra-tui = { path = "../sendra-tui", version = "0.1.0" }
 clap = { workspace = true }
 owo-colors = { workspace = true }
 # `--json` output is built from view structs defined in `output/json.rs`, so

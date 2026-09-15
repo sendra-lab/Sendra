@@ -1,0 +1,35 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# Lets .github/workflows/release.yml differ from what `dist generate` would
+# produce, without `dist` refusing to run — needed because that file also
+# carries a hand-written `publish-crates-io` job dist doesn't know about.
+allow-dirty = ["ci"]
+# The installers to generate for each app
+installers = ["shell", "powershell", "npm", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-unknown-linux-musl",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "x86_64-pc-windows-msvc",
+]
+# The npm package to create, hosting a copy of the binary for npm/pnpm/bun installs
+npm-package = "sendra"
+# The Homebrew tap to push the generated formula to 
+tap = "sendra-lab/homebrew-tap"
+# Which jobs to run as part of the release process. Publishing to npm
+# requires an `NPM_TOKEN` secret (an npmjs.com automation token); publishing
+# the Homebrew formula requires a `HOMEBREW_TAP_TOKEN` secret (a GitHub PAT
+# with write access to the tap repo). Both must be added to this repo's
+# Actions secrets before a real release will succeed.
+publish-jobs = ["homebrew", "npm"]

@@ -4,6 +4,11 @@ description = "Terminal UI for Sendra — a library crate, launched by sendra-cl
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository = "https://github.com/sendra-lab/Sendra"
+readme = "../README.md"
+keywords = ["tui", "terminal", "http", "cli"]
+categories = ["command-line-interface"]
 
 [dependencies]
 # Pulled into every `sendra` install by default now that sendra-cli depends
@@ -16,7 +21,7 @@ crossterm = "0.29.0"
 ratatui = { version = "0.30.2", default-features = false, features = [
   "crossterm",
 ] }
-sendra-core = { path = "../sendra-core" }
+sendra-core = { path = "../sendra-core", version = "0.1.0" }
 # `reqwest::Url` only — parsing/building the authorization URL and the local
 # callback's own URL (`oauth_login`), reusing the exact same URL type
 # sendra-core's own `resolve_query`/`sendra_core::oauth` already build on,

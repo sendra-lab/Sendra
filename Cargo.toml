@@ -6,6 +6,7 @@ members = ["sendra-core", "sendra-cli", "sendra-tui", "xtask"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+homepage = "https://github.com/sendra-lab/Sendra"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -82,3 +83,8 @@ uuid = { version = "1", features = ["v4"] }
 # the note on that feature and on the `xtask` crate for why this stays out of
 # sendra-core's default dependency footprint.
 schemars = "1"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

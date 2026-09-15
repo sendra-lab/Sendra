@@ -4,6 +4,11 @@ description = "Core request/response model, YAML loading and HTTP execution for 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+homepage.workspace = true
+repository = "https://github.com/sendra-lab/Sendra"
+readme = "../README.md"
+keywords = ["http", "yaml", "testing", "api-client"]
+categories = ["web-programming::http-client", "development-tools::testing"]
 
 [dependencies]
 serde = { workspace = true }
