@@ -1,7 +1,7 @@
 //! `sendra schema`: materialize the JSON Schema files for editor tooling.
 //!
-//! `schema/*.schema.json` (request/collection/config/environment — see
-//! `docs/reference/json-schema.md`) are generated from
+//! `schema/*.schema.json` at the workspace root (request/collection/config/
+//! environment — see `docs/reference/json-schema.md`) are generated from
 //! `sendra-core`'s types by `xtask` and committed to the source repository.
 //! That is enough for someone who has cloned the repo, but the actual
 //! audience for editor tooling is anyone who has *installed* `sendra` —
@@ -10,14 +10,19 @@
 //! one thing an installed-binary user actually has: the binary itself. No
 //! network access, no docs site, no repository required.
 //!
-//! Because it is `include_str!` of the exact same committed files `xtask`
-//! writes — not a hand-copied duplicate — there is no separate "embedded
-//! copy" that could drift from `schema/*.schema.json`: it is the same bytes,
-//! read once at compile time instead of at generation time. The regression
-//! test at the bottom of this file guards the one way that could stop being
+//! The `include_str!`s below read `./schema/*.schema.json` — a vendored
+//! copy inside this crate's own directory, not the workspace-root
+//! `schema/`. A `cargo publish` tarball can only ever contain files inside
+//! the crate being published, so `sendra-cli` cannot reach `../../schema`
+//! once packaged (this is exactly the bug this vendored copy fixes: the
+//! packaged tarball failed cargo's own verify step). `xtask` writes this
+//! vendored copy alongside the canonical one and its `check` command
+//! guards both against drift from the Rust types **and** against drift
+//! between the two copies — see `xtask/src/main.rs`. The regression test at
+//! the bottom of this file guards the remaining way this could stop being
 //! true (someone later replacing an `include_str!` with a literal or a
-//! different path), by comparing the compiled-in bytes against the file on
-//! disk independently, at test time.
+//! different path), by comparing the compiled-in bytes against the local
+//! vendored file on disk independently, at test time.
 
 use std::path::{Path, PathBuf};
 
@@ -34,19 +39,19 @@ struct SchemaFile {
 const SCHEMA_FILES: &[SchemaFile] = &[
     SchemaFile {
         name: "request.schema.json",
-        content: include_str!("../../schema/request.schema.json"),
+        content: include_str!("../schema/request.schema.json"),
     },
     SchemaFile {
         name: "collection.schema.json",
-        content: include_str!("../../schema/collection.schema.json"),
+        content: include_str!("../schema/collection.schema.json"),
     },
     SchemaFile {
         name: "config.schema.json",
-        content: include_str!("../../schema/config.schema.json"),
+        content: include_str!("../schema/config.schema.json"),
     },
     SchemaFile {
         name: "environment.schema.json",
-        content: include_str!("../../schema/environment.schema.json"),
+        content: include_str!("../schema/environment.schema.json"),
     },
 ];
 
@@ -135,16 +140,22 @@ mod tests {
     }
 
     /// Guards the thing that would otherwise let the embedded copy drift
-    /// silently from `schema/*.schema.json`: this reads each file from disk
-    /// independently, at test time, rather than through the same
-    /// `include_str!` the embedded constant already went through — so a
-    /// future change that hardcodes a literal, or points `include_str!` at
-    /// the wrong path, shows up here instead of shipping unnoticed.
+    /// silently from this crate's own vendored `schema/*.schema.json`: this
+    /// reads each file from disk independently, at test time, rather than
+    /// through the same `include_str!` the embedded constant already went
+    /// through — so a future change that hardcodes a literal, or points
+    /// `include_str!` at the wrong path, shows up here instead of shipping
+    /// unnoticed. Deliberately checked against this crate's own directory,
+    /// not the workspace-root `schema/`: that keeps this test meaningful
+    /// even when run against a standalone `cargo publish` tarball, which
+    /// has no workspace root to reach for. Drift between this vendored copy
+    /// and the workspace-root canonical one is `xtask check`'s job, not
+    /// this test's — see `xtask/src/main.rs`.
     #[test]
     fn every_embedded_schema_matches_the_committed_file_on_disk() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
         for file in SCHEMA_FILES {
-            let path = repo_root.join("schema").join(file.name);
+            let path = crate_root.join("schema").join(file.name);
             let on_disk = std::fs::read_to_string(&path)
                 .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()));
             assert_eq!(

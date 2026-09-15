@@ -2,11 +2,22 @@
 //! Rust types in `sendra-core` (behind its `schema` feature — see the note on
 //! that feature), and checks that the committed files still match.
 //!
-//! `cargo run -p xtask -- generate` writes `schema/*.schema.json`.
+//! Also writes (and checks) an identical vendored copy under
+//! `sendra-cli/schema/`: `sendra-cli/src/schema.rs` embeds these files with
+//! `include_str!` at compile time, and a `cargo publish` tarball can only
+//! ever contain files inside the crate's own directory, so `sendra-cli`
+//! needs its own copy rather than reaching up to the workspace root. `schema/`
+//! at the workspace root stays the canonical, checked-out-repo-facing
+//! location (see `docs/reference/json-schema.md`) — the vendored copy is a
+//! packaging-only duplicate kept identical by this file, not a second
+//! source of truth.
+//!
+//! `cargo run -p xtask -- generate` writes both `schema/*.schema.json` and
+//! `sendra-cli/schema/*.schema.json`.
 //! `cargo run -p xtask -- check` regenerates in memory and fails (non-zero
-//! exit, with a diff-shaped message) if a committed file would change — the
-//! anti-drift check CI runs so a schema can never silently go stale against
-//! the types it claims to describe.
+//! exit, with a diff-shaped message) if either committed copy would change —
+//! the anti-drift check CI runs so a schema can never silently go stale
+//! against the types it claims to describe, or against its own vendored copy.
 
 use std::path::{Path, PathBuf};
 
@@ -16,11 +27,21 @@ use sendra_core::config::ConfigFile;
 use sendra_core::environment::EnvironmentFile;
 use sendra_core::request::Request;
 
-fn schema_dir() -> PathBuf {
+fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask lives directly under the workspace root")
-        .join("schema")
+        .to_path_buf()
+}
+
+fn schema_dir() -> PathBuf {
+    workspace_root().join("schema")
+}
+
+/// `sendra-cli`'s own vendored copy — see the module docs above for why this
+/// duplicate exists.
+fn vendored_schema_dir() -> PathBuf {
+    workspace_root().join("sendra-cli").join("schema")
 }
 
 /// One generated file: name under `schema/`, and the schema itself.
@@ -68,26 +89,29 @@ fn render(schema: &Schema) -> String {
 }
 
 fn generate() {
-    let dir = schema_dir();
-    std::fs::create_dir_all(&dir).expect("schema/ directory should be creatable");
-    for target in targets() {
-        let path = dir.join(target.file_name);
-        std::fs::write(&path, render(&target.schema))
-            .unwrap_or_else(|err| panic!("writing {}: {err}", path.display()));
-        println!("wrote {}", path.display());
+    for dir in [schema_dir(), vendored_schema_dir()] {
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|err| panic!("{} directory should be creatable: {err}", dir.display()));
+        for target in targets() {
+            let path = dir.join(target.file_name);
+            std::fs::write(&path, render(&target.schema))
+                .unwrap_or_else(|err| panic!("writing {}: {err}", path.display()));
+            println!("wrote {}", path.display());
+        }
     }
 }
 
 fn check() -> bool {
-    let dir = schema_dir();
     let mut drifted = Vec::new();
 
-    for target in targets() {
-        let path = dir.join(target.file_name);
-        let expected = render(&target.schema);
-        let actual = std::fs::read_to_string(&path).unwrap_or_default();
-        if actual != expected {
-            drifted.push(path);
+    for dir in [schema_dir(), vendored_schema_dir()] {
+        for target in targets() {
+            let path = dir.join(target.file_name);
+            let expected = render(&target.schema);
+            let actual = std::fs::read_to_string(&path).unwrap_or_default();
+            if actual != expected {
+                drifted.push(path);
+            }
         }
     }
 
