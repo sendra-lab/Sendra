@@ -1,7 +1,7 @@
 # Design decisions
 
 The rationale behind the design choices in Sendra's schema and CLI that could
-reasonably have gone another way — an ADR-style collection, one file per
+reasonably have gone another way - an ADR-style collection, one file per
 decision. For the shape of a feature (what a field is called, what it does),
 see [docs/reference.md](../reference.md); these are the "why", not the "what".
 
