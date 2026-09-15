@@ -21,14 +21,12 @@ audience for editor tooling is anyone who has `sendra` installed. Three ways
 to get them, in order of how little they assume you have:
 
 1. **No download at all** — point your editor at the hosted, raw copy:
-   `https://raw.githubusercontent.com/sendra-lab/Sendra/<ref>/schema/request.schema.json`
-   (and similarly for the other three). `<ref>` is currently a commit SHA,
-   pinned rather than `main`, so the schema your editor validates against
-   cannot change out from under you between one session and the next —
-   **TODO: switch `<ref>` to a release tag once the package/release phase
-   ships one**; there is no tag yet to point at. Find the current SHA at
-   <https://github.com/sendra-lab/Sendra/commits/main>, or with
-   `git rev-parse HEAD` in a checkout.
+   `https://raw.githubusercontent.com/sendra-lab/Sendra/v0.1.0/schema/request.schema.json`
+   (and similarly for the other three). `<ref>` is a release tag, pinned
+   rather than `main`, so the schema your editor validates against cannot
+   change out from under you between one session and the next. Bump it to a
+   newer tag yourself to pick up schema changes from a later release; find
+   the available tags at <https://github.com/sendra-lab/Sendra/tags>.
 2. **`sendra schema`** — if you have the binary installed but not the repo,
    this writes the same four files into `./schema/` (or `--output <dir>`),
    baked into the binary at build time, so it works offline:
@@ -60,10 +58,10 @@ Or the hosted URL (option 1 — no local file needed at all):
 ```jsonc
 {
   "yaml.schemas": {
-    "https://raw.githubusercontent.com/sendra-lab/Sendra/<ref>/schema/collection.schema.json": ["**/*collection*.yaml"],
-    "https://raw.githubusercontent.com/sendra-lab/Sendra/<ref>/schema/request.schema.json": ["examples/*.yaml"],
-    "https://raw.githubusercontent.com/sendra-lab/Sendra/<ref>/schema/config.schema.json": [".sendra/config.yaml"],
-    "https://raw.githubusercontent.com/sendra-lab/Sendra/<ref>/schema/environment.schema.json": [".sendra/environments/*.yaml"]
+    "https://raw.githubusercontent.com/sendra-lab/Sendra/v0.1.0/schema/collection.schema.json": ["**/*collection*.yaml"],
+    "https://raw.githubusercontent.com/sendra-lab/Sendra/v0.1.0/schema/request.schema.json": ["examples/*.yaml"],
+    "https://raw.githubusercontent.com/sendra-lab/Sendra/v0.1.0/schema/config.schema.json": [".sendra/config.yaml"],
+    "https://raw.githubusercontent.com/sendra-lab/Sendra/v0.1.0/schema/environment.schema.json": [".sendra/environments/*.yaml"]
   }
 }
 ```
