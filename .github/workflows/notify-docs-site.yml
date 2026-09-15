@@ -1,0 +1,32 @@
+# Triggers a sendra-web (Vercel) redeploy whenever docs/ changes land on
+# main, so the published site's docs stay in sync automatically. Deliberately
+# has no review gate: any push to main touching docs/** flows straight to
+# production with no human step in between.
+#
+# Kept separate from ci.yml on purpose: it has different triggers (docs/**
+# path filter vs. every push/PR) and a different failure mode (a failed
+# deploy-hook call shouldn't be conflated with a failed build/test/lint run).
+name: Notify docs site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+
+permissions:
+  contents: read
+
+jobs:
+  trigger-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      # --fail so a non-2xx response fails the job instead of silently
+      # succeeding; -s/-S to keep normal output quiet but still show errors.
+      # The hook URL is passed as a curl --data-urlencode-free POST target
+      # via a shell variable, never echoed, so it never appears in the log.
+      - name: Trigger Vercel deploy hook
+        env:
+          VERCEL_DEPLOY_HOOK_URL: ${{ secrets.VERCEL_DEPLOY_HOOK_URL }}
+        run: |
+          curl --fail --silent --show-error -X POST "$VERCEL_DEPLOY_HOOK_URL"
