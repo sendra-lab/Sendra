@@ -50,8 +50,30 @@ errors (`SendraError`) rather than formatted messages.
 
 ## Install
 
-No packaged release yet — there is no binary to download. For now, build it
-from source:
+Prebuilt binaries are attached to the [v0.1.0 release](https://github.com/sendra-lab/Sendra/releases/tag/v0.1.0):
+
+```sh
+# macOS / Linux
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/sendra-lab/Sendra/releases/download/v0.1.0/sendra-cli-installer.sh | sh
+```
+
+```sh
+# Windows (PowerShell)
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/sendra-lab/Sendra/releases/download/v0.1.0/sendra-cli-installer.ps1 | iex"
+```
+
+Or via a package manager:
+
+```sh
+cargo install sendra-cli          # crates.io — the crate is `sendra-cli`, the binary it installs is `sendra`
+npm install @sendra-lab/sendra    # npm, pnpm or bun
+brew install sendra-lab/tap/sendra-cli   # Homebrew, via sendra-lab's own tap
+```
+
+Every path above installs one binary, `sendra`, that carries `run`, `test`
+and `tui` alike — there is no separate TUI install.
+
+Or build it from source:
 
 ```sh
 git clone https://github.com/sendra-lab/Sendra.git
@@ -60,9 +82,6 @@ cargo build --workspace --release
 ./target/release/sendra run examples/get-request.yaml
 ./target/release/sendra tui examples/collection.yaml
 ```
-
-Building the workspace produces one binary, `sendra`, that carries `run`,
-`test` and `tui` alike — there is no separate TUI install.
 
 Or run it straight through Cargo without a separate build step, which is what
 the rest of this tour does:

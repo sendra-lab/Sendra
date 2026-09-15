@@ -24,7 +24,7 @@ targets = [
   "x86_64-pc-windows-msvc",
 ]
 # The npm package to create, hosting a copy of the binary for npm/pnpm/bun installs
-npm-package = "sendra"
+npm-package = "@sendra-lab/sendra"
 # The Homebrew tap to push the generated formula to 
 tap = "sendra-lab/homebrew-tap"
 # Which jobs to run as part of the release process. Publishing to npm
