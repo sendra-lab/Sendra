@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 # The `schema` feature turns on `#[derive(JsonSchema)]` on the on-disk
-# request/collection/config types — see the note on that feature in
+# request/collection/config types,  see the note on that feature in
 # sendra-core's Cargo.toml for why it stays off by default.
 sendra-core = { path = "../sendra-core", features = ["schema"] }
 schemars = { workspace = true }
