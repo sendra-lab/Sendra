@@ -42,16 +42,16 @@ on:
   pull_request:
   push:
     tags:
-      - '**[0-9]+.[0-9]+.[0-9]+*'
+      - "**[0-9]+.[0-9]+.[0-9]+*"
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag to build/test against (no tag push happens; defaults to the current workspace version for dry runs)'
+        description: "Version tag to build/test against (no tag push happens). Defaults to an untagged pre-release version so dist has real work to plan instead of short-circuiting on an already-released version."
         type: string
         required: true
-        default: '0.1.0'
+        default: "0.1.1-dryrun.1"
       dry_run:
-        description: 'Publish to npm with --dry-run (no real publish)'
+        description: "Publish to npm with --dry-run (no real publish)"
         type: boolean
         default: true
 
@@ -454,8 +454,8 @@ jobs:
           merge-multiple: true
       - uses: actions/setup-node@v6
         with:
-          node-version: '20.x'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: "20.x"
+          registry-url: "https://registry.npmjs.org"
       # OIDC trusted publishing requires npm 11.5.1+; Node 20.x ships an
       # older bundled npm.
       - name: Upgrade npm for OIDC trusted publishing
