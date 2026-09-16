@@ -43,6 +43,17 @@ on:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to build/test against (no tag push happens; defaults to the current workspace version for dry runs)'
+        type: string
+        required: true
+        default: '0.1.0'
+      dry_run:
+        description: 'Publish to npm with --dry-run (no real publish)'
+        type: boolean
+        default: true
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -50,8 +61,8 @@ jobs:
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
-      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
+      tag: ${{ !github.event.pull_request && steps.resolve-tag.outputs.tag || '' }}
+      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', steps.resolve-tag.outputs.tag) || '' }}
       publishing: ${{ !github.event.pull_request }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -60,6 +71,18 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+      # workflow_dispatch has no tag ref to read a version from, so it
+      # supplies its own `version` input instead; every other trigger
+      # (tag push, or pull_request where this is unused downstream) keeps
+      # reading github.ref_name as before.
+      - name: Resolve tag
+        id: resolve-tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
       - name: Install dist
         # we specify bash to get pipefail; it guards against the `curl` command
         # failing. otherwise `sh` won't catch that `curl` returned non-0
@@ -77,7 +100,7 @@ jobs:
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', steps.resolve-tag.outputs.tag)) || 'plan' }} --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -405,6 +428,14 @@ jobs:
       - plan
       - host
     runs-on: "ubuntu-22.04"
+    # Job-level permissions fully replace the workflow-level block above
+    # rather than merging with it, so contents needs restating here even
+    # though this job never pushes anything. id-token:write is what lets
+    # npm publish authenticate via OIDC trusted publishing instead of
+    # NPM_TOKEN.
+    permissions:
+      contents: read
+      id-token: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLAN: ${{ needs.plan.outputs.val }}
@@ -420,13 +451,17 @@ jobs:
         with:
           node-version: '20.x'
           registry-url: 'https://registry.npmjs.org'
+      # OIDC trusted publishing requires npm 11.5.1+; Node 20.x ships an
+      # older bundled npm.
+      - name: Upgrade npm for OIDC trusted publishing
+        run: npm install -g npm@latest
       - run: |
           for release in $(echo "$PLAN" | jq --compact-output '.releases[] | select([.artifacts[] | endswith("-npm-package.tar.gz")] | any)'); do
             pkg=$(echo "$release" | jq '.artifacts[] | select(endswith("-npm-package.tar.gz"))' --raw-output)
-            npm publish --access public "./npm/${pkg}"
+            npm publish --access public "./npm/${pkg}" $DRY_RUN_FLAG
           done
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY_RUN_FLAG: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run) && '--dry-run' || '' }}
 
   announce:
     needs:
