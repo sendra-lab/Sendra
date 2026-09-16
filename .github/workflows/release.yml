@@ -46,10 +46,10 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version tag to build/test against (no tag push happens). Defaults to an untagged pre-release version so dist has real work to plan instead of short-circuiting on an already-released version."
+        description: "Version tag to build/test against (no tag push happens). dist matches this against the workspace's current Cargo.toml version, not GitHub release history, so it must equal that version (currently 0.1.0) or dist has nothing to plan."
         type: string
         required: true
-        default: "0.1.1-dryrun.1"
+        default: "0.1.0"
       dry_run:
         description: "Publish to npm with --dry-run (no real publish)"
         type: boolean
