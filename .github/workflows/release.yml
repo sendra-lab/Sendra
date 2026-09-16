@@ -315,6 +315,17 @@ jobs:
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+      # Lets sendra-web trigger its docs-versioning workflow once a real
+      # release exists. Only fires on tag-push releases, never dry-runs.
+      - name: Notify sendra-web of new release
+        if: ${{ github.event_name == 'push' }}
+        env:
+          GH_TOKEN: ${{ secrets.SENDRA_WEB_DISPATCH_TOKEN }}
+          VERSION: "${{ needs.plan.outputs.tag }}"
+        run: |
+          gh api repos/sendra-lab/sendra-web/dispatches \
+            -f event_type="sendra-release" \
+            -f "client_payload[version]=$VERSION"
 
   # Hand-maintained: cargo-dist has no native crates.io publishing support
   # (it only knows how to publish npm packages and Homebrew formulas), so
