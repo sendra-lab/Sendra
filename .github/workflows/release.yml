@@ -299,7 +299,12 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
+      # Skipped on workflow_dispatch: it reuses a version that's already
+      # tagged/released (e.g. the current 0.1.0), so `gh release create`
+      # would collide with the existing release and fail before publish-npm
+      # ever runs. Real releases only ever come from a tag push.
       - name: Create GitHub Release
+        if: ${{ github.event_name == 'push' }}
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
