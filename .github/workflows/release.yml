@@ -392,7 +392,11 @@ jobs:
       PLAN: ${{ needs.plan.outputs.val }}
       GITHUB_USER: "axo bot"
       GITHUB_EMAIL: "admin+bot@axo.dev"
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    # Skipped on workflow_dispatch: this job pushes a real commit to the
+    # external sendra-lab/homebrew-tap repo with no dry-run flag and no
+    # idempotency check (unlike publish-crates-io), so a manual dispatch
+    # run must never reach it.
+    if: ${{ github.event_name == 'push' && (!fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases) }}
     steps:
       - uses: actions/checkout@v6
         with:
