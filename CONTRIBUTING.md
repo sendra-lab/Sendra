@@ -4,11 +4,22 @@ Thanks for considering a contribution. Sendra is young and its conventions
 are still settling, so please open an issue before a large PR — it saves
 both of us rework.
 
+## Branching and pull requests
+
+`main` is the protected, stable branch — it only moves via merges from `dev`.
+`dev` is the integration branch: create your feature/fix branch from `dev`,
+and open your PR against `dev`, not `main`.
+
+```
+dev -> create feature/fix branch -> make changes -> PR into dev
+```
+
 ## Getting set up
 
 ```
 git clone https://github.com/sendra-lab/Sendra.git
 cd sendra
+git checkout dev
 cargo build --workspace
 cargo test --workspace
 ```
