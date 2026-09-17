@@ -1,13 +1,14 @@
 name: CI
 
-# Every push to main and every PR aimed at it. Feature branches are covered by
-# the pull_request trigger rather than a second push trigger, so a branch that
-# is pushed and then opened as a PR is not built twice for the same commit.
+# Every push to main and every PR aimed at main or dev. Feature branches are
+# covered by the pull_request trigger rather than a second push trigger, so a
+# branch that is pushed and then opened as a PR is not built twice for the
+# same commit.
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 permissions:
   contents: read
