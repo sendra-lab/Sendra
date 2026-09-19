@@ -1,3 +1,6 @@
+---
+description: "Why exit code 4 is separate from 3, why an unsendable request under test exits 1, and how the codes rank across a whole collection."
+---
 # Exit codes: why the numbers are split the way they are
 
 Background: the full table of codes and what each one means is in

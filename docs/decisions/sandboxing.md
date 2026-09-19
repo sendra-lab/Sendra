@@ -1,3 +1,6 @@
+---
+description: "How pre_request and post_request scripts are kept away from the filesystem and network: nothing registered, no import, no eval, an operation cap."
+---
 # Sandboxing
 
 Background: what a `pre_request`/`post_request` script can see and do is in

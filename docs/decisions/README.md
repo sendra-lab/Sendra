@@ -1,3 +1,6 @@
+---
+description: "Index of Sendra design decisions: unasserted statuses under test, how exit codes are split, script sandboxing and the precedence chain."
+---
 # Design decisions
 
 The rationale behind the design choices in Sendra's schema and CLI that could

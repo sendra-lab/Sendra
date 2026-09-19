@@ -1,3 +1,6 @@
+---
+description: "The full precedence chain for a request value: defaults, config, environment files, captures, CLI overrides, then pre_request scripts."
+---
 # Precedence, start to finish
 
 Every layer that can decide a value for a request is introduced in its own

@@ -1,3 +1,6 @@
+---
+description: "Index of the Sendra reference: request files, assertions, environments, scripting, exit codes, JSON output and the TUI, with a link to each page."
+---
 # Reference
 
 The full schema and behavior reference for Sendra, split by topic. Start at

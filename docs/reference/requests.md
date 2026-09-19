@@ -1,3 +1,6 @@
+---
+description: "The Sendra request and collection YAML format: fields, repeated headers, and authentication with bearer, basic, API key and OAuth."
+---
 # Request and collection file shape
 
 ## Request file shape

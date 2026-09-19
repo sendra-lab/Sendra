@@ -1,3 +1,6 @@
+---
+description: "The exit code table for the sendra binary: what 0, 1, 2, 3 and 4 mean under run and test, for shell scripts and CI pipelines."
+---
 # Exit codes
 
 One table for the whole binary, not one per subcommand: `run` and `test` answer

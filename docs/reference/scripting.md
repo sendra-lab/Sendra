@@ -1,3 +1,6 @@
+---
+description: "Write pre_request and post_request scripts in Rhai to change a request or check a response, with what each can see and the run order."
+---
 # Scripting
 
 A request can carry two inline scripts: `pre_request`, which runs just before it

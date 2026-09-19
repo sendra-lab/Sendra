@@ -1,3 +1,6 @@
+---
+description: "Check status, headers, body text and JSON paths with assertions in a request file, plus status_in, regex, timing, negation and comparisons."
+---
 # Assertions
 
 A request can say what it expects of the response, under an optional

@@ -1,3 +1,6 @@
+---
+description: "The --json output of sendra run and test: one JSON object per run with responses, assertion results, captures and a test summary."
+---
 # JSON output
 
 `--json` replaces the terminal output with one JSON object describing the whole
