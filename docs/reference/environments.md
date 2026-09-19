@@ -1,3 +1,6 @@
+---
+description: "Define environment files of variables, use them as {{name}} in requests, keep secrets in OS variables with ${VAR}, and set a default auth."
+---
 # Environments and variables
 
 An environment is a flat file of variables at

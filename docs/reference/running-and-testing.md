@@ -1,3 +1,6 @@
+---
+description: "Send requests and collections with sendra run, or check them with sendra test, including output format, result categories and the summary."
+---
 # Running and testing requests
 
 ## Running requests

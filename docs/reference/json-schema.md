@@ -1,3 +1,6 @@
+---
+description: "Get JSON Schema files for Sendra requests, collections, config and environments, and set up VS Code for autocomplete and validation."
+---
 # JSON Schema / editor support
 
 `schema/*.schema.json` are [JSON Schema](https://json-schema.org/) documents

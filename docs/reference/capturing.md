@@ -1,3 +1,6 @@
+---
+description: "Capture values from a JSON body, header or status with a capture block, then reuse them as variables in later requests to chain calls."
+---
 # Capturing values and chaining requests
 
 A request can pull values out of its response and hand them to the requests

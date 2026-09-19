@@ -1,3 +1,6 @@
+---
+description: "Use the sendra tui terminal app (TUI) to browse, run and edit requests, switch environments, review run history and find every keybinding."
+---
 # The interactive TUI
 
 `sendra tui` opens a full-screen terminal app for browsing and running the

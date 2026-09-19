@@ -1,3 +1,6 @@
+---
+description: "Why sendra test does not fail a run on an unasserted 404, and why a post_request script counts as a check the same way an assertion does."
+---
 # Why `test` ignores an unasserted status
 
 Background: the mechanics and the four outcome categories (`passed`, `failed`,

@@ -1,3 +1,6 @@
+---
+description: "Build, test, format and lint the Sendra Rust workspace with the five cargo commands CI runs, and why the test suite never touches the network."
+---
 # Development
 
 ```sh
