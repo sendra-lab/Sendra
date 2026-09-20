@@ -25,7 +25,7 @@ sendra test examples/scripted-request.yaml
 ```
 
 **No runtime to install.** The interpreter is linked into the `sendra` binary,
-so a scripted request works anywhere the binary does — which is the whole reason
+so a scripted request works anywhere the binary does, which is the whole reason
 for Rhai over an embedded JavaScript engine.
 
 ## What `pre_request` can see
@@ -36,7 +36,7 @@ otherwise be sent, and whatever it leaves behind is what actually goes out.
 
 | Field             | Access     | Type                             |
 | ----------------- | ---------- | --------------------------------- |
-| `request.method`  | read       | string — `"POST"`                |
+| `request.method`  | read       | string (`"POST"`)                |
 | `request.url`     | read/write | string                           |
 | `request.headers` | read/write | object map, string to string     |
 | `request.body`    | read/write | string, or `()` for no body      |
@@ -67,7 +67,7 @@ name.** The map is what makes `request.headers["X"] = …` and `.remove("X")`
 mean the obvious thing, and a list-of-pairs API would make every script that
 touches a header pay in syntax for a case that is rare in a file and rarer in a
 script. Two costs follow, and they apply only to a request that *has* a
-`pre_request` script — one without a script never goes through this conversion
+`pre_request` script: one without a script never goes through this conversion
 and keeps every occurrence:
 
 - A header repeated in the file collapses to its **last** value, since a map
@@ -85,13 +85,13 @@ Throwing in `pre_request` means the request is never sent.
 
 ## What `post_request` can see
 
-`response` is read-only — assigning to it is an error rather than a change that
+`response` is read-only: assigning to it is an error rather than a change that
 goes nowhere.
 
 | Field                  | Type                                              |
 | ---------------------- | ------------------------------------------------- |
-| `response.status`      | integer — `201`                                   |
-| `response.status_text` | string — `"Created"`                              |
+| `response.status`      | integer (`201`)                                   |
+| `response.status_text` | string (`"Created"`)                              |
 | `response.headers`     | array of `#{name, value}`                         |
 | `response.body`        | string, as it came over the wire                  |
 | `response.elapsed_ms`  | integer                                           |
@@ -107,11 +107,11 @@ if ct == () || !ct.value.contains("json") { throw "expected a JSON response"; }
 **`throw` is how a check fails**, rather than a `fail()` function Sendra would
 have had to register. It is Rhai's own, it is the idiom anyone reading Rhai docs
 will already know, and choosing it means Sendra registers *nothing at all* into
-the interpreter — see [Sandboxing](../decisions/sandboxing.md).
+the interpreter; see [Sandboxing](../decisions/sandboxing.md).
 
 The message you throw is what gets printed, verbatim. A script that fails for
-some other reason — a method that does not exist, an index off the end of an
-array — keeps the interpreter's full error with a line number instead, because
+some other reason (a method that does not exist, an index off the end of an
+array) keeps the interpreter's full error with a line number instead, because
 that is a bug in the script and the line is the point.
 
 ## Ordering
@@ -126,7 +126,7 @@ For one request, in order:
 6. `assertions` evaluated.
 
 **Script source is never substituted.** A `{{var}}` or `${VAR}` inside a script
-is not expanded — it is just those characters. Substitution is textual, and the
+is not expanded; it is just those characters. Substitution is textual, and the
 reason it is confined to values is that a value must not be able to change the
 structure of the document around it; a script is not a value, it is code, so the
 failure mode would not be a malformed URL but a variable's contents being parsed
@@ -142,13 +142,13 @@ or neither.
 A syntax error in `post_request` stops the `POST` that would have created an
 order, rather than being discovered after it. A script that does not compile is
 a broken file, and finding that out before anything goes over the wire is
-strictly better — the same argument that makes a collection with two
+strictly better, the same argument that makes a collection with two
 identically-named requests an error at parse time.
 
 That split is also how Sendra tells "your script is wrong" from "your API is
 wrong":
 
-- **A script that does not compile** — either hook — is exit `1`, counted under
+- **A script that does not compile** (either hook) is exit `1`, counted under
   `no_response`. Nothing was sent, so it is the same category as a missing
   variable or a refused connection.
 - **A `pre_request` script that throws** is exit `1` for the same reason: there

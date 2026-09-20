@@ -7,7 +7,7 @@ Background: what a `pre_request`/`post_request` script can see and do is in
 [Scripting](../reference/scripting.md).
 
 **A script cannot touch the filesystem or the network.** Sendra registers no
-functions, no types, no packages and no modules into the interpreter — the
+functions, no types, no packages and no modules into the interpreter. The
 entire Sendra-shaped surface is `request`/`response`, holding strings,
 integers and arrays. There is nothing to audit because there is nothing
 registered.
@@ -31,8 +31,8 @@ holds. A script that printed and then threw keeps its lines: they are usually
 the ones that explain the throw.
 
 That choice belongs to each front end, not to the library. `sendra-core` has no
-`println!` or `eprintln!` anywhere in it — running a script returns the lines it
+`println!` or `eprintln!` anywhere in it: running a script returns the lines it
 printed alongside its verdict, and `sendra-cli` decides they are stderr.
-`sendra-tui` does not run `pre_request`/`post_request` scripts at all — see
-[The interactive TUI](../reference/tui.md) — so this choice does not arise
+`sendra-tui` does not run `pre_request`/`post_request` scripts at all (see
+[The interactive TUI](../reference/tui.md)), so this choice does not arise
 there.
