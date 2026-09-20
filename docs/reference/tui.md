@@ -19,8 +19,8 @@ nothing separate to install. Building or installing `sendra` (see the
 
 ```sh
 sendra tui                       # start with nothing loaded
-sendra tui path/to/collection.yaml
-sendra tui path/to/request.yaml  # a single request file works too
+sendra tui requests/collection.yaml
+sendra tui requests/request.yaml  # a single request file works too
 sendra                           # bare invocation — identical to `sendra tui` with no path
 ```
 

@@ -49,8 +49,8 @@ results, `post_request` results and capture results, and reads none of them when
 deciding what to return, so a run that reports "2 failed" still exits `0`. That is permanent,
 not a stage on the way to unifying the two commands — wiring checks into `run`'s
 exit code would silently change what every existing
-`sendra run req.yaml && deploy.sh` means the moment an `assertions` block or a
-`post_request:` block is added to `req.yaml`, and `sendra test` exists so that
+`sendra run requests/req.yaml && deploy.sh` means the moment an `assertions` block or a
+`post_request:` block is added to `requests/req.yaml`, and `sendra test` exists so that
 nobody has to. See
 [Why `test` ignores an unasserted status](why-test-ignores-unasserted-status.md)
 for the whole argument, and `exit_for_response` in `sendra-cli/src/exit.rs` for

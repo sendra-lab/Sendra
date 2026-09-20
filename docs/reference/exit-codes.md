@@ -28,7 +28,7 @@ for anyone writing `case $? in` around either.
   is one of these; see [Testing](running-and-testing.md).
 - `3` — `sendra run` only: every request completed but at least one server
   answered `4xx` or `5xx`. The responses print exactly as they would otherwise;
-  only the exit code differs, so `sendra run req.yaml && deploy.sh` does not
+  only the exit code differs, so `sendra run requests/req.yaml && deploy.sh` does not
   proceed on a 404.
 - `4` — `sendra test` only: every request got a response, but at least one
   failed a check it declared: an assertion that did not hold, a `post_request`

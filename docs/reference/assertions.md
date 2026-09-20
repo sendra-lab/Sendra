@@ -47,7 +47,7 @@ feature existed — an empty report produces no output at all.
 six assertions, two of them failed, exit `0`. That is deliberate and permanent.
 `sendra run` sends requests and reports what came back; `sendra test` is the
 command whose job is to pass or fail on expectations. Doing it in `run` would
-silently change what every existing `sendra run req.yaml && deploy.sh` means the
+silently change what every existing `sendra run requests/req.yaml && deploy.sh` means the
 moment someone adds an `assertions` block to `req.yaml`.
 
 The same file under `sendra test` exits `4`, and that is the only difference

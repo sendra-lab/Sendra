@@ -1,14 +1,15 @@
 ---
 description: "The --json output of sendra run and test: one JSON object per run with responses, assertion results, captures and a test summary."
 ---
+
 # JSON output
 
 `--json` replaces the terminal output with one JSON object describing the whole
 run, on stdout. Both subcommands take it:
 
 ```sh
-sendra run collection.yaml --json | jq '.requests[] | select(.response.status >= 400)'
-sendra test collection.yaml --json > results.json
+sendra run requests/collection.yaml --json | jq '.requests[] | select(.response.status >= 400)'
+sendra test requests/collection.yaml --json > results.json
 ```
 
 **Stdout holds the document and nothing else.** The `→ label` lines and every
@@ -20,7 +21,7 @@ result, not part of deciding it: the [table](exit-codes.md) applies to both
 renderings, and a run reports the same number either way.
 
 **One object per invocation, not one per request.** A stream of objects would
-make `sendra run collection.yaml --json | jq .` a stream of documents rather
+make `sendra run requests/collection.yaml --json | jq .` a stream of documents rather
 than a document, and `test`'s summary would have nowhere to live in it. The cost
 is that nothing is printed until the run is over.
 
@@ -35,9 +36,7 @@ is that nothing is printed until the run is over.
         "status": 200,
         "status_text": "OK",
         "elapsed_ms": 412,
-        "headers": [
-          { "name": "content-type", "value": "application/json" }
-        ],
+        "headers": [{ "name": "content-type", "value": "application/json" }],
         "body": "{\"id\":7,\"name\":\"ada\"}"
       },
       "error": null,
@@ -111,7 +110,7 @@ ends with:
 
 ```json
 {
-  "requests": [ "..." ],
+  "requests": ["..."],
   "summary": {
     "total": 4,
     "passed": 2,
@@ -141,7 +140,3 @@ Two differences from the terminal output are worth stating:
 does not parse, a `--env` naming an environment that is not there: these fail
 before the first request, so there is no document to write. The error is on
 stderr and the exit code is `1`, as it is without the flag.
-
-**No stability promise yet.** Sendra has no external consumers of this format
-yet; the shape above is the one to script against today, and it will grow keys
-before it is frozen.

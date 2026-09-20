@@ -6,9 +6,9 @@ description: "Send requests and collections with sendra run, or check them with 
 ## Running requests
 
 ```sh
-sendra run req.yaml                    # the one request in the file
-sendra run collection.yaml             # every request in it, in file order
-sendra run collection.yaml "List users"  # one named request
+sendra run requests/req.yaml                    # the one request in the file
+sendra run requests/collection.yaml             # every request in it, in file order
+sendra run requests/collection.yaml "List users"  # one named request
 ```
 
 Requests in a collection are sent sequentially, in file order, and each response
@@ -51,9 +51,9 @@ question about them; see below.
 the file said it should be, and puts that answer in the exit code:
 
 ```sh
-sendra test req.yaml                 # the one request in the file
-sendra test collection.yaml          # every request in it, in file order
-sendra test collection.yaml --env ci # against .sendra/environments/ci.yaml
+sendra test requests/req.yaml                 # the one request in the file
+sendra test requests/collection.yaml          # every request in it, in file order
+sendra test requests/collection.yaml --env ci # against .sendra/environments/ci.yaml
 ```
 
 Everything about *sending* is the same as `run`: the same file shapes, the same

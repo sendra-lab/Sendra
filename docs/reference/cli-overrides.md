@@ -7,7 +7,7 @@ Flags that change one invocation without touching a file, on `sendra run` and
 `sendra test` alike:
 
 ```sh
-sendra run req.yaml -H "X-Trace-Id: abc123" --var base_url=http://localhost:8080 --timeout 5
+sendra run requests/req.yaml -H "X-Trace-Id: abc123" --var base_url=http://localhost:8080 --timeout 5
 ```
 
 | Flag                    | Repeatable | Overrides                                                        |
@@ -43,13 +43,13 @@ all dropped in favour of the `-H` value if the name matches.
 
 ```sh
 # req.yaml sets auth: bearer: original — this invocation sends Bearer overridden instead
-sendra run req.yaml -H "Authorization: Bearer overridden"
+sendra run requests/req.yaml -H "Authorization: Bearer overridden"
 ```
 
 Passing `-H` more than once for the *same* name keeps only the last value:
 
 ```sh
-sendra run req.yaml -H "X-Trace-Id: first" -H "X-Trace-Id: second"   # sends only "second"
+sendra run requests/req.yaml -H "X-Trace-Id: first" -H "X-Trace-Id: second"   # sends only "second"
 ```
 
 That is a deliberate departure from the request file's own `headers:`, which
@@ -69,8 +69,8 @@ sets a variable whether or not `--env` was passed at all, and overrides the
 same name in the file that *was* loaded when both are present:
 
 ```sh
-sendra run req.yaml --var base_url=http://localhost:8080          # no environment file needed
-sendra run req.yaml --env staging --var base_url=http://localhost # wins over staging.yaml's base_url
+sendra run requests/req.yaml --var base_url=http://localhost:8080          # no environment file needed
+sendra run requests/req.yaml --env staging --var base_url=http://localhost # wins over staging.yaml's base_url
 ```
 
 Because it is folded into the same set of names an environment file populates
@@ -80,7 +80,7 @@ collisions](capturing.md#name-collisions): a `capture` block naming a variable a
 already set is refused exactly as if the environment file had defined it.
 
 ```sh
-sendra test req.yaml --var token=cli-value   # req.yaml also has `capture: { token: $.token }`
+sendra test requests/req.yaml --var token=cli-value   # requests/req.yaml also has `capture: { token: $.token }`
 ```
 
 ```text
@@ -101,7 +101,7 @@ discoverable only by reading the file and counting positions.
 — connect, send and body read — for this invocation only:
 
 ```sh
-sendra run req.yaml --timeout 5   # gives up after 5s, whatever config.yaml says
+sendra run requests/req.yaml --timeout 5   # gives up after 5s, whatever config.yaml says
 ```
 
 **`--insecure` overrides the resolved config `insecure`, but only upward.**
@@ -110,7 +110,7 @@ config that set `insecure: true` — the same shape as `--dry-run` or any
 other bare flag here, none of which have a negating counterpart either:
 
 ```sh
-sendra run req.yaml --insecure   # against a self-signed staging host, say
+sendra run requests/req.yaml --insecure   # against a self-signed staging host, say
 ```
 
 Whenever this resolves to `true` — from `--insecure` or from `insecure: true`
@@ -125,7 +125,7 @@ over proxying for the run entirely — see
 proxy environment variables:
 
 ```sh
-sendra run req.yaml --proxy http://proxy.example.com:8080
+sendra run requests/req.yaml --proxy http://proxy.example.com:8080
 ```
 
 **`--client-cert <path>`/`--client-key <path>` override the resolved config
@@ -137,7 +137,7 @@ including why PEM is the only format accepted and why the two orthogonal
 which resolves relative to the config file's own directory:
 
 ```sh
-sendra run req.yaml --client-cert ./client.pem --client-key ./client-key.pem
+sendra run requests/req.yaml --client-cert ./client.pem --client-key ./client-key.pem
 ```
 
 A path here is not treated as sensitive the way an `-H`/`--var` value is:

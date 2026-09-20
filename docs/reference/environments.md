@@ -76,10 +76,10 @@ failure, it exits `1` either way.
 `sendra test` alike:
 
 ```sh
-sendra run req.yaml --env staging   # .sendra/environments/staging.yaml
-sendra run req.yaml --env prod      # .sendra/environments/prod.yaml
-sendra run req.yaml                 # .sendra/environments/default.yaml, if there is one
-sendra test req.yaml --env ci       # same rule, same walk-up, same errors
+sendra run requests/req.yaml --env staging   # .sendra/environments/staging.yaml
+sendra run requests/req.yaml --env prod      # .sendra/environments/prod.yaml
+sendra run requests/req.yaml                 # .sendra/environments/default.yaml, if there is one
+sendra test requests/req.yaml --env ci       # same rule, same walk-up, same errors
 ```
 
 The name is a filename, not a keyword — `staging`, `prod`, `local`, `ci` and
@@ -108,7 +108,7 @@ different from each other:
   The difference is not the file, it is what you asked for. Omitting `--env`
   asks for a default; `--env staging` asserts that `staging` exists. Sendra
   already answers a failed assertion of that shape loudly —
-  `sendra run collection.yaml Nope` is an error listing the names that do
+  `sendra run requests/collection.yaml Nope` is an error listing the names that do
   exist, while omitting the name runs everything — and this is the same
   pattern. The alternative fails in the two ways that matter: with `{{var}}` in
   the file you get an error naming the *variable*, sending you to hunt for a

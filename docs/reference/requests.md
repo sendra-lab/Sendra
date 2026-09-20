@@ -1,6 +1,7 @@
 ---
 description: "The Sendra request and collection YAML format: fields, repeated headers, and authentication with bearer, basic, API key and OAuth."
 ---
+
 # Request and collection file shape
 
 ## Request file shape
@@ -42,7 +43,7 @@ headers:
 ```
 
 Header order is preserved exactly as written, both between different names and
-among the repeats of one name. Two entries with the same name *and* the same
+among the repeats of one name. Two entries with the same name _and_ the same
 value are accepted rather than rejected: Sendra rejects ambiguity, not
 redundancy, and repeating a value is an explicit (if pointless) choice, not a
 thing it has to guess about.
@@ -137,7 +138,7 @@ auth:
   a headless CLI) and `refresh_token` (no cached token is refreshed; an
   expired one is simply reacquired the same way the first one was).
 
-A request may not set `auth` *and* an explicit header (or, for `api_key` in
+A request may not set `auth` _and_ an explicit header (or, for `api_key` in
 `query` form, query parameter) of the same name it would itself set: `auth`
 and a hand-written `Authorization`/`X-API-Key`/etc. entry are both trying to
 control the same thing, so that's rejected at parse time rather than
@@ -153,8 +154,8 @@ parameter — there is no separate `request.auth` API. See
 either grant the way httpbin.org serves `/bearer`):
 
 ```sh
-cargo run -p sendra-cli -- run examples/auth.yaml
-cargo run -p sendra-cli -- run examples/oauth.yaml --env <name>
+sendra run examples/auth.yaml
+sendra run examples/oauth.yaml --env <name>
 ```
 
 ## Collection file shape

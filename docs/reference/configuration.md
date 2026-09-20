@@ -107,7 +107,7 @@ in, looking for `.sendra/config.yaml`, the same way git looks for `.git`. So a
 config at the repository root applies from anywhere inside the repository. The
 nearest one wins; configs further up are not stacked on top of each other. The
 search starts at the working directory, not at the request file's directory, so
-`sendra run ../other-project/req.yaml` still uses *your* defaults.
+`sendra run ../other-project/requests/req.yaml` still uses *your* defaults.
 
 **Finding the global config.** `$XDG_CONFIG_HOME/sendra/config.yaml` when
 `XDG_CONFIG_HOME` is set to an absolute path, on any platform. Otherwise the
