@@ -1,12 +1,12 @@
 # Contributing to Sendra
 
 Thanks for considering a contribution. Sendra is young and its conventions
-are still settling, so please open an issue before a large PR — it saves
+are still settling, so please open an issue before a large PR. It saves
 both of us rework.
 
 ## Branching and pull requests
 
-`main` is the protected, stable branch — it only moves via merges from `dev`.
+`main` is the protected, stable branch. It only moves via merges from `dev`.
 `dev` is the integration branch: create your feature/fix branch from `dev`,
 and open your PR against `dev`, not `main`.
 
@@ -42,13 +42,13 @@ locally first.
 - `sendra-core` has no terminal I/O of any kind (no `println!`/`eprintln!`,
   no `clap`, no color formatting, no ratatui). It returns data; `sendra-cli`
   and `sendra-tui` each decide what to do with it. This split is what lets
-  both reuse the same core engine — please don't add a shortcut that breaks
+  both reuse the same core engine, so please don't add a shortcut that breaks
   it.
 - Unknown fields in any YAML schema are rejected (`deny_unknown_fields`),
   not silently ignored. New schema fields should follow the same rule.
 - Errors are typed (`SendraError`/`thiserror`), not stringly-typed or
   `anyhow`-based in `sendra-core`.
-- Tests are hermetic — no real network calls in the test suite. Use
+- Tests are hermetic: no real network calls in the test suite. Use
   `wiremock`/a stubbed transport for anything that needs to look like an
   HTTP response.
 

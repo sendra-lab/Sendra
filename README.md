@@ -9,12 +9,12 @@ That makes requests reviewable in a pull request, diffable over time, and
 shareable without exporting anything. A file holds either one request or a
 named collection of them, sent and printed, against variables from an
 environment file so the same request can point at staging or at production, and
-a file can declare what it expects the response to look like — which
+a file can declare what it expects the response to look like, which
 `sendra test` then passes or fails your build on. A request can also carry
 inline scripts that run just before it is sent and just after it comes back,
 with no Node.js or other runtime to install: the interpreter is in the binary.
 An interactive terminal UI ships in the same binary, for browsing and running
-requests without one shell invocation per request — see
+requests without one shell invocation per request; see
 [Learn more](#learn-more) below.
 
 ## Layout
@@ -37,7 +37,7 @@ sendra/
   sendra-tui/      the interactive TUI, launched in-process by `sendra tui`/bare `sendra`
   examples/        sample request and collection files
   .sendra/         this repo's own project config and environments
-  schema/          generated JSON Schemas for editor tooling — see docs/reference/json-schema.md
+  schema/          generated JSON Schemas for editor tooling; see docs/reference/json-schema.md
   xtask/           generates schema/*.schema.json from sendra-core's types; not published
   docs/
     reference.md     full schema and behavior reference, by topic
@@ -65,13 +65,13 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/sendra-lab/Sendra/
 Or via a package manager:
 
 ```sh
-cargo install sendra-cli          # crates.io — the crate is `sendra-cli`, the binary it installs is `sendra`
+cargo install sendra-cli          # crates.io; the crate is `sendra-cli`, the binary it installs is `sendra`
 npm install @sendra-lab/sendra    # npm, pnpm or bun
 brew install sendra-lab/tap/sendra-cli   # Homebrew, via sendra-lab's own tap
 ```
 
 Every path above installs one binary, `sendra`, that carries `run`, `test`
-and `tui` alike — there is no separate TUI install.
+and `tui` alike, so there is no separate TUI install.
 
 Or build it from source:
 
@@ -122,7 +122,7 @@ cargo run -p sendra-cli -- run examples/capture-chain.yaml
 ```
 
 `examples/capture-header-status.yaml` extends that into three requests to show
-the two other `capture:` sources — a response header and the status code —
+the two other `capture:` sources (a response header and the status code)
 chained alongside the original JSON-path form.
 
 ```sh
@@ -150,7 +150,7 @@ API_KEY=live-token cargo run -p sendra-cli -- run examples/environment-request.y
 API_KEY=live-token cargo run -p sendra-cli -- run examples/environment-request.yaml --env prod
 ```
 
-The request file names no host at all — only `{{base_url}}` — so the two runs
+The request file names no host at all, only `{{base_url}}`, so the two runs
 come back from `httpbin.org` and `postman-echo.com` respectively, with the
 resolved value echoed in the `X-Sendra-Base-Url` header of each response.
 
@@ -162,7 +162,7 @@ cargo run -p sendra-cli -- run examples/assertions.yaml
 ```
 
 Two of its assertions are meant to fail, so one run shows both halves of the
-output. It still exits `0` — see
+output. It still exits `0`; see
 [Assertions](docs/reference/assertions.md).
 
 `examples/test-collection.yaml` is the same idea under `sendra test`, which
@@ -173,11 +173,11 @@ cargo run -p sendra-cli -- test examples/test-collection.yaml
 ```
 
 Four requests: two that pass, one whose assertion is wrong on purpose, and one
-that asserts nothing and comes back `404`. It exits `4` — see
+that asserts nothing and comes back `404`. It exits `4`; see
 [Testing](docs/reference/running-and-testing.md).
 
-`examples/repeated-headers.yaml` sends a header more than once — a list of
-values instead of a scalar, since a YAML mapping cannot repeat a key — beside
+`examples/repeated-headers.yaml` sends a header more than once (a list of
+values instead of a scalar, since a YAML mapping cannot repeat a key) beside
 an ordinary one, against httpbin.org/headers, which echoes both back:
 
 ```sh
@@ -185,8 +185,8 @@ cargo run -p sendra-cli -- run examples/repeated-headers.yaml
 ```
 
 `examples/structured-bodies.yaml` is a collection of four requests, one for
-each structured way to specify a body — `json`, `body_file`, `form` and
-`multipart` — instead of a hand-escaped `body:` string. Each posts to
+each structured way to specify a body (`json`, `body_file`, `form` and
+`multipart`) instead of a hand-escaped `body:` string. Each posts to
 httpbin.org/post, which echoes back exactly what it received:
 
 ```sh
@@ -195,23 +195,23 @@ cargo run -p sendra-cli -- run examples/structured-bodies.yaml "JSON body"   # j
 ```
 
 That's the shortest path from zero to a working request. The rest of what
-Sendra can do — the full request/collection/config schema, every CLI flag,
+Sendra can do (the full request/collection/config schema, every CLI flag,
 `--json`'s exact shape, scripting, and the reasoning behind the harder design
-calls — lives in `docs/`, not in this file:
+calls) lives in `docs/`, not in this file:
 
 ## Learn more
 
-- **[docs/reference.md](docs/reference.md)** — the full schema and behavior
+- **[docs/reference.md](docs/reference.md)**: the full schema and behavior
   reference: request/collection shape, config, environments, assertions
   (including the operator sub-language), capture, scripting, every CLI flag,
   `--json` output, exit codes, editor/JSON Schema support, and the
   interactive TUI (`sendra tui`).
-- **[docs/decisions/](docs/decisions/README.md)** — the design rationale
+- **[docs/decisions/](docs/decisions/README.md)**: the design rationale
   behind choices that could reasonably have gone another way: why `sendra
   test` ignores a status nobody asserted, how the exit codes are split and
   ranked, the script sandboxing guarantees, and the full precedence chain
   from a hardcoded default to a CLI override.
 
-Both grew out of the same source material as this file — nothing was
+Both grew out of the same source material as this file; nothing was
 shortened or dropped, only moved to where it's easier to find once you
 already know your way around.
