@@ -5,35 +5,35 @@ description: "Index of the Sendra reference: request files, assertions, environm
 
 The full schema and behavior reference for Sendra, split by topic. Start at
 [README.md](../README.md) for a five-minute tour if you haven't sent a
-request with Sendra yet — this is the lookup material for once you have.
+request with Sendra yet. This is the lookup material for once you have.
 
-- [Request and collection file shape](reference/requests.md) — the fields a
+- [Request and collection file shape](reference/requests.md): the fields a
   request or collection file can have, repeated headers, and authentication
   (`auth: bearer`/`basic`/`api_key`).
-- [Running and testing requests](reference/running-and-testing.md) —
+- [Running and testing requests](reference/running-and-testing.md):
   `sendra run`, `sendra test`, and how a `test` run's summary counts requests.
-- [JSON output](reference/json-output.md) — the `--json` document both
+- [JSON output](reference/json-output.md): the `--json` document both
   subcommands can print, field by field.
-- [Configuration](reference/configuration.md) — `.sendra/config.yaml`:
+- [Configuration](reference/configuration.md): `.sendra/config.yaml`, with
   headers, timeout, redirects, TLS, proxy, cookie jar.
-- [Environments and variables](reference/environments.md) — `.sendra/environments/*.yaml`
+- [Environments and variables](reference/environments.md): `.sendra/environments/*.yaml`
   and `{{variable}}`/`${OS_VAR}` substitution.
-- [Assertions](reference/assertions.md) — the `assertions:` block, including
+- [Assertions](reference/assertions.md): the `assertions:` block, including
   the richer operators (`greater_than`, `matches`, `not:`, and so on).
-- [Capturing values and chaining requests](reference/capturing.md) — the
+- [Capturing values and chaining requests](reference/capturing.md): the
   `capture:` block, and how a value moves from one request's response into a
   later request's substitution.
-- [CLI overrides](reference/cli-overrides.md) — every flag that changes one
+- [CLI overrides](reference/cli-overrides.md): every flag that changes one
   invocation without editing a file: `-H`, `--var`, `--timeout`, `--insecure`,
   `--proxy`, `--client-cert`/`--client-key`, `--cookie-jar`.
-- [Scripting](reference/scripting.md) — `pre_request`/`post_request`: what
+- [Scripting](reference/scripting.md): `pre_request`/`post_request`, what
   each can see, in what order, compiled before anything is sent.
-- [Exit codes](reference/exit-codes.md) — the one table for the whole binary.
-- [JSON Schema / editor support](reference/json-schema.md) — pointing an
+- [Exit codes](reference/exit-codes.md): the one table for the whole binary.
+- [JSON Schema / editor support](reference/json-schema.md): pointing an
   editor at `schema/*.schema.json` for autocomplete and inline validation.
-- [Development](reference/development.md) — building, testing and linting
+- [Development](reference/development.md): building, testing and linting
   this repository.
-- [The interactive TUI](reference/tui.md) — `sendra tui`: browsing and
+- [The interactive TUI](reference/tui.md): `sendra tui`, for browsing and
   running requests, every editable field, multi-collection tabs, run
   history, environments, search/filter, and the full keybinding reference.
 

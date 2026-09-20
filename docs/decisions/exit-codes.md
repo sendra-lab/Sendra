@@ -16,16 +16,16 @@ failures and both are non-zero, but they are not the same failure: `4` means the
 API did not meet the expectations, `1` means Sendra could not get far enough to
 find out. In CI one says "fix your API" and the other says "fix your test
 setup", and a single generic non-zero would have thrown that away. When a run
-contains both, `1` wins — see the ranking below.
+contains both, `1` wins (see the ranking below).
 
 For a collection, these are aggregates over the whole run: the worst outcome
 wins, ranked `0` < `3` < `4` < `1`. One 4xx anywhere in a `run` exits `3`, one
 failing assertion anywhere in a `test` exits `4`, and one request that could not
-be sent at all exits `1` — "never got a response" is a bigger problem than "got
+be sent at all exits `1`. "Never got a response" is a bigger problem than "got
 a 500" or "got the wrong body", so it takes precedence. (`3` and `4` never meet:
 one is only ever produced by `run` and the other only by `test`.)
 
-The alternative — letting the last request decide — would make the exit code
+The alternative, letting the last request decide, would make the exit code
 depend on the order the file happens to list requests in, so reordering a
 collection could change whether a script proceeds. Worst-wins keeps exit `0`
 meaning the same thing for a collection as for a single request: a promise that
@@ -47,7 +47,7 @@ sendra run examples/get-request.yaml --allow-error-status
 A failed check never enters `run`'s answer: `sendra run` prints assertion
 results, `post_request` results and capture results, and reads none of them when
 deciding what to return, so a run that reports "2 failed" still exits `0`. That is permanent,
-not a stage on the way to unifying the two commands — wiring checks into `run`'s
+not a stage on the way to unifying the two commands. Wiring checks into `run`'s
 exit code would silently change what every existing
 `sendra run requests/req.yaml && deploy.sh` means the moment an `assertions` block or a
 `post_request:` block is added to `requests/req.yaml`, and `sendra test` exists so that

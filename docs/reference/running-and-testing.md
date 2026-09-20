@@ -12,15 +12,15 @@ sendra run requests/collection.yaml "List users"  # one named request
 ```
 
 Requests in a collection are sent sequentially, in file order, and each response
-is printed as it arrives. A request that fails does not stop the ones after it —
+is printed as it arrives. A request that fails does not stop the ones after it:
 you see every result, and the exit code reports the worst of them.
 
 Asking for a name that is not in the collection is an error that lists the names
 that are (`no request named X (available: ...)`), as is passing a name to a file
 that holds a single request.
 
-A response body whose `content-type` is `application/json` — or anything with a
-`+json` suffix, such as `application/problem+json` — is printed indented, with
+A response body whose `content-type` is `application/json` (or anything with a
+`+json` suffix, such as `application/problem+json`) is printed indented, with
 the server's key order preserved:
 
 ```text
@@ -39,7 +39,7 @@ content-type: application/json
 
 The `content-type` is the only thing consulted; a body that merely starts with a
 `{` is printed as it arrived. So is a body that claims to be JSON and does not
-parse — a truncated response is exactly when the raw bytes are worth seeing, so
+parse: a truncated response is exactly when the raw bytes are worth seeing, so
 it is printed rather than swallowed.
 
 `sendra test` sends the same requests the same way and answers a different
@@ -62,12 +62,12 @@ order, and the same rule that one broken request does not stop the ones after
 it. The same assertion results print under each response, in the same format.
 Three things differ:
 
-- Responses print as a status line only — no headers, no body. `test` answers a
+- Responses print as a status line only: no headers, no body. `test` answers a
   question about a whole collection, and burying that answer under four JSON
   bodies would make the summary the hardest line to find in its own output. Use
   `sendra run` when you want to look at a response.
 - A summary of the whole run prints at the end.
-- The exit code comes from the checks the file declared — its assertions and its
+- The exit code comes from the checks the file declared: its assertions and its
   `post_request` script.
 
 `examples/test-collection.yaml`, run against httpbin, prints exactly this:
@@ -123,9 +123,9 @@ The last three are printed only when they are not zero, so a clean run reads
 nothing prints a dimmed `no assertions` where its results would have gone, so
 the `without assertions` count has something to point at.
 
-For the reasoning behind these categories — why a `post_request` script counts
+For the reasoning behind these categories (why a `post_request` script counts
 as a check the same way an assertion does, and why a status nobody asserted
-does not fail a `test` run — see
+does not fail a `test` run), see
 [Why `test` ignores an unasserted status](../decisions/why-test-ignores-unasserted-status.md).
 
 **A `post_request` script that throws fails a test run** the same way a failed

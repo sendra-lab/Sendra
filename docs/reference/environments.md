@@ -29,8 +29,8 @@ nothing in the request file moves.
 
 **Quote a value that starts with `{{`.** In YAML a bare `{` opens a flow
 mapping, so `url: {{base_url}}/users` is a syntax error before Sendra sees it.
-`url: '{{base_url}}/users'` is fine. A `{{...}}` in the middle of a value —
-`url: https://x/{{id}}` — needs no quotes.
+`url: '{{base_url}}/users'` is fine. A `{{...}}` in the middle of a value
+(`url: https://x/{{id}}`) needs no quotes.
 
 **Keeping secrets out of git.** A value written as `${VAR}` is read from your OS
 environment at send time, so the file names the secret without containing it and
@@ -40,7 +40,7 @@ a shell, in CI, and under any secret manager that can export one.
 
 **Nothing resolves to an empty string.** A `{{var}}` with no such variable, or a
 `${VAR}` that is not exported, is an error naming what is missing, raised while
-that request is being built — so none of its bytes go out:
+that request is being built, so none of its bytes go out:
 
 ```
 error: no variable named `base_url` in `.sendra/environments/default.yaml` (available: api_key, host)
@@ -69,7 +69,7 @@ error: no variable named `nope` in `.sendra/environments/default.yaml` (availabl
 ```
 
 `--allow-error-status` does not suppress this. That flag forgives a *status*,
-and a request that could not be built has no status — like a DNS or connection
+and a request that could not be built has no status, like a DNS or connection
 failure, it exits `1` either way.
 
 **Which environment is loaded.** `--env <name>`, on `sendra run` and on
@@ -82,12 +82,12 @@ sendra run requests/req.yaml                 # .sendra/environments/default.yaml
 sendra test requests/req.yaml --env ci       # same rule, same walk-up, same errors
 ```
 
-The name is a filename, not a keyword — `staging`, `prod`, `local`, `ci` and
+The name is a filename, not a keyword: `staging`, `prod`, `local`, `ci` and
 `default` are all just files in `.sendra/environments/`, found by the same
 upward walk, nearest one wins.
 
 `--var name=value` sets one variable for this invocation, with or without an
-environment file at all — see [CLI overrides](cli-overrides.md).
+environment file at all; see [CLI overrides](cli-overrides.md).
 
 Two rules about environments that are not there, and they are deliberately
 different from each other:
@@ -107,9 +107,9 @@ different from each other:
 
   The difference is not the file, it is what you asked for. Omitting `--env`
   asks for a default; `--env staging` asserts that `staging` exists. Sendra
-  already answers a failed assertion of that shape loudly —
+  already answers a failed assertion of that shape loudly:
   `sendra run requests/collection.yaml Nope` is an error listing the names that do
-  exist, while omitting the name runs everything — and this is the same
+  exist, while omitting the name runs everything. This is the same
   pattern. The alternative fails in the two ways that matter: with `{{var}}` in
   the file you get an error naming the *variable*, sending you to hunt for a
   typo in your request file when the typo is on your command line; with no
@@ -119,7 +119,7 @@ different from each other:
 **What substitution touches, and what it does not.** Only `url`, `headers`,
 `body` and the values inside `assertions`. Not `method`, which is a closed set
 with no useful placeholder, and not `name`, which is what
-`sendra run <file> <name>` selects on — a label that changed with the
+`sendra run <file> <name>` selects on: a label that changed with the
 environment could not be typed on the command line. Inside `assertions`, the
 keys that select part of the response are excluded too; see
 [Assertions](assertions.md).
@@ -155,7 +155,7 @@ trip through a number on the way in, so `1.0` can never arrive as `1`.
 
 ## A default `auth:` for the whole environment
 
-`auth` is one reserved top-level key — every other key is still an ordinary
+`auth` is one reserved top-level key; every other key is still an ordinary
 variable. It carries a default [authentication](requests.md#authentication)
 block, in the exact same `bearer`/`basic`/`api_key`/`oauth` shape a request's
 own `auth:` uses, applied to every request run against this environment that
@@ -169,12 +169,12 @@ auth:
 ```
 
 ```yaml
-# req.yaml — no auth: of its own, so staging.yaml's applies
+# req.yaml: no auth: of its own, so staging.yaml's applies
 method: GET
 url: '{{base_url}}/me'
 ```
 
-**A request's own `auth:` fully replaces the environment's — never merged.**
+**A request's own `auth:` fully replaces the environment's, never merged.**
 A request that wants different credentials writes its own `auth:` block, in
 full, the same "one thing owns this setting" stance a request's `auth:`
 already takes against an explicit `Authorization` header. Setting `auth:` on
@@ -182,7 +182,7 @@ a request is therefore how to opt out of an environment's default entirely,
 not how to add to it.
 
 `{{var}}` inside the environment's own `auth:` resolves against that same
-environment's variables, exactly like `base_url` above does — so
+environment's variables, exactly like `base_url` above does, so
 `${API_TOKEN}` in the example is read from the OS environment the same way
 any other `${VAR}` reference is.
 
@@ -193,12 +193,12 @@ explicit `auth:` conflicting with a hand-written header already is: two
 things claiming ownership of one setting.
 
 An environment-level `auth.oauth` shares the same in-run token cache as a
-request-level one — see [Authentication](requests.md#authentication) — so
+request-level one, see [Authentication](requests.md#authentication), so
 every request in the run that falls back to it acquires one token between
 them, exactly as if they had all written the same `oauth:` block themselves.
 
 There is no equivalent at the config-file level (`.sendra/config.yaml`):
 config is deliberately environment-agnostic tool-wide settings, while an
 auth scheme is inherently tied to which environment it authenticates
-against — the same reasoning that puts `base_url` in an environment file
+against, the same reasoning that puts `base_url` in an environment file
 rather than in config.

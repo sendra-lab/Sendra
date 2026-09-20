@@ -6,7 +6,7 @@ description: "Get JSON Schema files for Sendra requests, collections, config and
 `schema/*.schema.json` are [JSON Schema](https://json-schema.org/) documents
 for the file shapes described in this reference, generated from
 `sendra-core`'s actual Rust types via
-[`schemars`](https://docs.rs/schemars) — not hand-written, so they cannot drift
+[`schemars`](https://docs.rs/schemars), not hand-written, so they cannot drift
 from what the code actually accepts without CI catching it (see below).
 Point an editor at them for autocomplete, inline validation and
 hover-documentation while writing a request file:
@@ -18,28 +18,28 @@ hover-documentation while writing a request file:
 | `schema/config.schema.json`      | `.sendra/config.yaml`                      |
 | `schema/environment.schema.json` | `.sendra/environments/*.yaml`              |
 
-**Getting the files.** None of this requires a clone of this repository —
-that would only work for someone building Sendra from source, and the actual
+**Getting the files.** None of this requires a clone of this repository,
+since that would only work for someone building Sendra from source, and the actual
 audience for editor tooling is anyone who has `sendra` installed. Three ways
 to get them, in order of how little they assume you have:
 
-1. **No download at all** — point your editor at the hosted, raw copy:
+1. **No download at all**: point your editor at the hosted, raw copy:
    `https://raw.githubusercontent.com/sendra-lab/Sendra/v0.1.0/schema/request.schema.json`
    (and similarly for the other three). `<ref>` is a release tag, pinned
    rather than `main`, so the schema your editor validates against cannot
    change out from under you between one session and the next. Bump it to a
    newer tag yourself to pick up schema changes from a later release; find
    the available tags at <https://github.com/sendra-lab/Sendra/tags>.
-2. **`sendra schema`** — if you have the binary installed but not the repo,
+2. **`sendra schema`**: if you have the binary installed but not the repo,
    this writes the same four files into `./schema/` (or `--output <dir>`),
    baked into the binary at build time, so it works offline:
    ```sh
    sendra schema
    ```
-   Safe to re-run after a `sendra` upgrade to pick up a newer schema — unlike
+   Safe to re-run after a `sendra` upgrade to pick up a newer schema. Unlike
    `sendra init`, it overwrites rather than refusing, since nothing under
    `schema/` is meant to hold anything of yours.
-3. **A checkout** — the committed `schema/*.schema.json` files directly, as
+3. **A checkout**: the committed `schema/*.schema.json` files directly, as
    below.
 
 **VS Code**, with the [YAML extension](https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml)
@@ -56,7 +56,7 @@ installed, add to `.vscode/settings.json`. Local paths (options 2 or 3 above):
 }
 ```
 
-Or the hosted URL (option 1 — no local file needed at all):
+Or the hosted URL (option 1, no local file needed at all):
 
 ```jsonc
 {
@@ -72,12 +72,12 @@ Or the hosted URL (option 1 — no local file needed at all):
 Order matters when globs could overlap: the YAML extension uses the last
 matching entry, so put the more specific `*collection*.yaml` glob ahead of a
 broader one that would otherwise catch it as a plain request. Adjust the globs
-to match how your own project names its files — a single-request file has no
+to match how your own project names its files: a single-request file has no
 naming convention Sendra enforces, so there is no one glob that always finds
 every request file and none other.
 
 **Known limitation: structural validation only.** JSON Schema can check field
-names, types and required-ness, and — via `oneOf`/`anyOf`/`const`/`minimum` —
+names, types and required-ness, and, via `oneOf`/`anyOf`/`const`/`minimum`,
 a few of Sendra's own business rules that happen to be expressible as pure
 structure: a `capture` entry's `status: false` is flagged (`"const": true`),
 and `follow_redirects` rejects a negative number (`"minimum": 0`). It
@@ -96,7 +96,7 @@ because those are cross-field rules, not shape rules:
 - `client_cert.cert` and `client_cert.key` are required together
 
 A file can pass editor validation and still be rejected by `sendra run`/`sendra
-test` for one of these — the schema's own `description` fields say so at each
+test` for one of these: the schema's own `description` fields say so at each
 relevant property, but an editor's squiggly-underline pass is not a substitute
 for actually running the file. This is also why `assertions.json`'s and
 `assertions.not.json`'s values show up in the schema as "any value": a JSON
@@ -105,7 +105,7 @@ path there may map to a bare value *or* an operator object
 `Assertions::evaluate`, not by anything schema-shaped.
 
 **Keeping the schema honest.** `schema/*.schema.json` are committed, generated
-files — see [`xtask/src/main.rs`](../../xtask/src/main.rs). CI runs
+files; see [`xtask/src/main.rs`](../../xtask/src/main.rs). CI runs
 `cargo run -p xtask -- check`, which regenerates every schema in memory from
 the current types and fails the build if a committed file would change, so a
 schema can never silently go stale against the Rust type it describes.
@@ -115,7 +115,7 @@ Regenerate them yourself after changing a schema-relevant type:
 cargo run -p xtask -- generate
 ```
 
-`schemars` is behind `sendra-core`'s `schema` feature, off by default — an
+`schemars` is behind `sendra-core`'s `schema` feature, off by default. An
 ordinary build of `sendra-core` or `sendra-cli` never pulls it in; only `xtask`
 enables it. `environment.schema.json` is the one file that is hand-written
 rather than derived: environment files parse straight into a

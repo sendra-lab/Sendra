@@ -17,7 +17,7 @@ capture:
 
 Every name captured this way is usable as `{{name}}` in **every request after
 this one, in file order**, through exactly the substitution an environment file
-feeds — there is one variable syntax, not two:
+feeds: there is one variable syntax, not two:
 
 ```yaml
 name: Fetch the user
@@ -33,7 +33,7 @@ sendra run examples/capture-chain.yaml    # a real capture-then-use flow
 
 **File order is real order.** A request sees the captures of every request
 before it and none of the captures of any request after it. A `{{name}}`
-referenced before the request that captures it is a `VariableNotFound` — the
+referenced before the request that captures it is a `VariableNotFound`, the
 same failure as a typo, which is what it usually is.
 
 **Nothing persists.** Captured values live for one `sendra run` or `sendra test`
@@ -46,19 +46,19 @@ substitute:
 
 | Selected               | Captures as                                    |
 | ---------------------- | ---------------------------------------------- |
-| a string               | the string, unquoted — `"ada"` becomes `ada`   |
+| a string               | the string, unquoted (`"ada"` becomes `ada`)   |
 | a number               | its value: `42` is `42`, `1.50` is `1.5`       |
 | a boolean              | `true` / `false`                               |
-| nothing                | a capture failure — the path matched no value  |
-| more than one value    | a capture failure — there is no single answer  |
-| `null`, array, object  | a capture failure — nothing to substitute      |
+| nothing                | a capture failure (the path matched no value)  |
+| more than one value    | a capture failure (there is no single answer)  |
+| `null`, array, object  | a capture failure (nothing to substitute)      |
 
 `null` has no text form that is not a guess between `""` and `null`. An array or
 an object has one, compact JSON, but the reason substitution is safe at all is
 that a substituted value cannot change the shape of what it lands in, and
 pushing `{"a":1}` into a URL is exactly that hazard.
 
-Numbers going through `serde_json` means `1.50` in a body captures as `1.5` —
+Numbers going through `serde_json` means `1.50` in a body captures as `1.5`:
 the value, not the spelling. That differs from an environment file, where
 `port: 8080` is the *string* `8080` and nothing is normalised. An endpoint whose
 exact digits matter should send them as a JSON string.
@@ -76,17 +76,17 @@ capture:
     status: true                 # the numeric status, as a string
 ```
 
-A `header:` capture reads from the *final* response only — the one `capture`
-always evaluates against — so with `follow_redirects` on, a `Set-Cookie` set
+A `header:` capture reads from the *final* response only, the one `capture`
+always evaluates against, so with `follow_redirects` on, a `Set-Cookie` set
 by an intermediate hop is not reachable this way; disable `follow_redirects`
 to capture it from the 3xx response itself, or, for a `Set-Cookie`
-specifically, prefer [`cookie_jar`](configuration.md) — it sits underneath
+specifically, prefer [`cookie_jar`](configuration.md), which sits underneath
 redirect-following rather than downstream of it, so it sees every hop
 without giving up automatic redirect-following to do it. A header name that
 repeats in the
 response (`Set-Cookie` is the common case) is a capture failure rather than a
 first-or-last guess, the same rule a JSON path selecting several values
-already follows — a capture binds a name to *one* value, and silently picking
+already follows: a capture binds a name to *one* value, and silently picking
 between repeats would make the same file behave differently depending on
 header order a server happens to send in.
 
@@ -107,7 +107,7 @@ capture
 
 **The captured value is not printed.** Every other block shows what it compared,
 so the omission is deliberate: a capture exists to carry a token or a session
-id, and putting those on a terminal — a CI log, most of the time — would be a
+id, and putting those on a terminal (a CI log, most of the time) would be a
 decision the file's author never made. Nothing is hidden by it: under
 `sendra run` the body it came from is printed in full just above, and `--json`
 carries the values because it already carries that same body.
@@ -115,14 +115,14 @@ carries the values because it already carries that same body.
 **A failed capture is a failed check, and the run carries on.** It counts
 exactly as a failed assertion or a `post_request` throw does: visible in the
 output, `sendra test` exits `4`, and `sendra run`'s exit code is untouched. It
-happens *after* a response arrived — the request was sent, the server answered,
-and the answer did not hold what the file said it would — which is that
+happens *after* a response arrived (the request was sent, the server answered,
+and the answer did not hold what the file said it would), which is that
 category and not "could not send".
 
 The requests after it are still sent, in keeping with every other per-request
 failure in Sendra: one request's problem does not cancel its siblings. A
 downstream request that needed the variable then fails on its own terms, with
-`VariableNotFound` naming it, and *that* is a "never got a response" — so a run
+`VariableNotFound` naming it, and *that* is a "never got a response", so a run
 whose broken capture broke a chain exits `1`, the more serious of the two, with
 the original failure reported at the request that caused it:
 
@@ -148,7 +148,7 @@ summary
 asserts nothing is counted under `without assertions`, not under `passed`: a
 capture is a dependency of the rest of the run, not an expectation about the
 response, and counting it as a pass would report a check nobody wrote. The
-asymmetry with the paragraph above is the point — a capture only enters the
+asymmetry with the paragraph above is the point: a capture only enters the
 verdict when it fails.
 
 ## Name collisions
@@ -163,7 +163,7 @@ capture
 
 Neither value silently wins, and that is the whole reason: if the capture won,
 `{{base_url}}` would mean the file's value in the requests before the capturing
-one and the captured value in the requests after it — the same name, two
+one and the captured value in the requests after it: the same name, two
 meanings, in one run, discoverable only by reading both files and counting
 positions. If the environment won, the `capture` block would be a no-op that
 still looks like it did something. Refusing says which two lines are in conflict
@@ -173,7 +173,7 @@ not be tightened. Sendra rejects duplicate request names in a collection for the
 same reason.
 
 The refused capture defines nothing, so the environment's value stands for every
-request in the run — the file keeps meaning what it says.
+request in the run. The file keeps meaning what it says.
 
 **Two captures of the same name are fine, and the later one wins.** That is not
 the same situation: both come from the same mechanism, file order fully decides
