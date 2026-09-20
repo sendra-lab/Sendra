@@ -52,6 +52,32 @@ locally first.
   `wiremock`/a stubbed transport for anything that needs to look like an
   HTTP response.
 
+## Request file paths in docs and examples
+
+Sendra doesn't require request files to live anywhere in particular, but the
+docs assume the layout a user's own project will have: request and collection
+files in a `requests/` directory.
+
+```
+sendra run requests/req.yaml
+sendra run requests/collection.yaml "List users"
+```
+
+This repository has no `requests/` directory. The sample files it ships live
+in `examples/`, so when you write or edit docs:
+
+- Use `requests/…` for generic placeholder files (`req.yaml`, `collection.yaml`)
+  in commands and prose, since that's what a reader will type in their own
+  project.
+- Use `examples/…` only when naming one of the real sample files in this
+  repository (for example `examples/get-request.yaml`), including in links and
+  in the header comments of the files under `examples/` themselves, which are
+  run from a clone of this repo.
+- Don't create a `requests/` directory here just to make a doc example
+  runnable, and don't rewrite `examples/…` paths to `requests/…`; the first
+  would add an empty convention to the repo and the second would break
+  commands people copy from a clone.
+
 ## Commit messages
 
 Explain _why_, not just _what_, especially for a design decision that
