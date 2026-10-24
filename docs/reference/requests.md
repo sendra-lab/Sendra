@@ -22,7 +22,7 @@ capture: # optional, values handed to the requests after this one (see below)
 Unknown top-level keys are rejected rather than silently ignored, so a typo in a
 field name is an error you see immediately.
 
-## Sending the same header more than once
+## Sending repeated headers
 
 HTTP allows a header name to repeat, and some APIs need it: several
 `Set-Cookie`-shaped headers, several `X-Forwarded-For` values, or any

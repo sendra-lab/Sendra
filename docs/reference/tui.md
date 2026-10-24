@@ -291,14 +291,14 @@ the quit confirmation, so "what can I press right now" always has an answer.
 The reference below mirrors that in-app cheatsheet, the same table this
 document's own keybinding sections above are drawn from.
 
-### Global: always available
+### Global keys
 
 | Key | Action |
 | --- | --- |
 | `q` / `Ctrl+C` | quit (asks first if anything is unsaved) |
 | `?` | open/close the cheatsheet |
 
-### Browsing (a collection is loaded, nothing else open)
+### Browse requests
 
 | Key | Action |
 | --- | --- |
@@ -316,7 +316,7 @@ document's own keybinding sections above are drawn from.
 | `PgUp`/`PgDn`/`Home`/`End` | scroll the response panel |
 | `c` | reveal / hide captured values |
 
-### Filtering the request list (after pressing `/`)
+### Filter requests
 
 | Key | Action |
 | --- | --- |
@@ -325,7 +325,7 @@ document's own keybinding sections above are drawn from.
 | `Enter` | run the highlighted (filtered) request |
 | `Esc` | clear the filter and show every request again |
 
-### Welcome screen (no collection path given yet)
+### Welcome screen
 
 | Key | Action |
 | --- | --- |
@@ -334,7 +334,7 @@ document's own keybinding sections above are drawn from.
 | `o` | type a collection path instead |
 | `e` | open the environment picker |
 
-### Editing a request
+### Edit requests
 
 | Key | Action |
 | --- | --- |
@@ -351,7 +351,7 @@ document's own keybinding sections above are drawn from.
 | `Esc` | cancel |
 | (any other character) | type into the focused field |
 
-### Environment picker
+### Choose an environment
 
 | Key | Action |
 | --- | --- |
@@ -360,7 +360,7 @@ document's own keybinding sections above are drawn from.
 | `i` | edit this environment's variables |
 | `Esc` | close |
 
-### Editing an environment's variables
+### Edit environment variables
 
 | Key | Action |
 | --- | --- |
@@ -373,7 +373,7 @@ document's own keybinding sections above are drawn from.
 | `Esc` | cancel |
 | (any other character) | type into the focused field |
 
-### Run-history browser
+### Browse run history
 
 | Key | Action |
 | --- | --- |
@@ -382,7 +382,7 @@ document's own keybinding sections above are drawn from.
 | `Space` | expand / collapse this entry |
 | `Esc` | close |
 
-### Viewing one history entry
+### View a run result
 
 | Key | Action |
 | --- | --- |
@@ -390,14 +390,14 @@ document's own keybinding sections above are drawn from.
 | `c` | reveal / hide captured values |
 | `Esc` | back to the history list |
 
-### Any confirmation (delete request, delete variable, close tab, quit)
+### Confirm changes
 
 | Key | Action |
 | --- | --- |
 | `y` / `Enter` | confirm |
 | `n` / `Esc` | cancel |
 
-### Open-collection prompt
+### Open a collection
 
 | Key | Action |
 | --- | --- |

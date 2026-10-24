@@ -173,7 +173,7 @@ the same situation: both come from the same mechanism, file order fully decides
 which is in force at any point, and re-logging in or reading the next page's
 cursor is a real flow that has to be expressible.
 
-## What a capture does not touch
+## Capture limitations
 
 - **The block itself is never substituted.** A `{{var}}` in a capture path or
   name stays those characters. A JSON path selects *which* part of the response

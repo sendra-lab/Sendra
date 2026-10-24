@@ -20,7 +20,7 @@ post_request: |
 so a scripted request works anywhere the binary does, which is the whole reason
 for Rhai over an embedded JavaScript engine.
 
-## What `pre_request` can see
+## Before-request scripts
 
 `request` is an object map. It arrives fully substituted and with any config
 defaults already merged in, so a script sees the request exactly as it would
@@ -75,7 +75,7 @@ ordered list, so an existing script behaves exactly as it did.
 
 Throwing in `pre_request` means the request is never sent.
 
-## What `post_request` can see
+## After-response scripts
 
 `response` is read-only: assigning to it is an error rather than a change that
 goes nowhere.
@@ -106,7 +106,7 @@ some other reason (a method that does not exist, an index off the end of an
 array) keeps the interpreter's full error with a line number instead, because
 that is a bug in the script and the line is the point.
 
-## Ordering
+## Request processing order
 
 For one request, in order:
 
@@ -129,22 +129,18 @@ as program text. A script that needs an environment value reads it off
 neither can see the other, and both are reported. A request can use either, both
 or neither.
 
-## Both scripts are compiled before the request is sent
+## Script validation before sending
 
-A syntax error in `post_request` stops the `POST` that would have created an
-order, rather than being discovered after it. A script that does not compile is
-a broken file, and finding that out before anything goes over the wire is
-strictly better, the same argument that makes a collection with two
-identically-named requests an error at parse time.
+A syntax error in either script stops the request before Sendra sends it. For
+example, if `post_request` has a syntax error, Sendra catches it before the
+`POST` reaches the server.
 
-That split is also how Sendra tells "your script is wrong" from "your API is
-wrong":
+The exit code depends on whether the request was sent and a response came back:
 
-- **A script that does not compile** (either hook) is exit `1`, counted under
-  `no_response`. Nothing was sent, so it is the same category as a missing
-  variable or a refused connection.
-- **A `pre_request` script that throws** is exit `1` for the same reason: there
-  is no response and never will be.
+- **A script has a syntax error:** exit `1`, counted as `no response`. Nothing
+  was sent, like a request with a missing variable or a connection failure.
+- **A `pre_request` script throws:** exit `1` for the same reason; there is no
+  response because Sendra did not send the request.
 - **A `post_request` script that throws** is a failed check on a response that
   did arrive, so it behaves exactly like a failed assertion: printed under the
   response, invisible to `run`'s exit code, and a failure under `test`.

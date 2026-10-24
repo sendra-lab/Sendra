@@ -49,7 +49,7 @@ If your request and collection files use overlapping patterns, make the
 collection pattern more specific so the YAML extension can choose the right
 schema. Sendra does not require a naming convention for request files.
 
-## What schema validation checks
+## Schema validation limits
 
 The schemas check document structure, including field names, value types and
 required fields. Some rules can also be expressed structurally, such as

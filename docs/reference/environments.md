@@ -158,7 +158,7 @@ Values are strings, and an unquoted scalar substitutes as exactly the text you
 wrote: `port: 8080` is `8080`, `version: 1.0` is `1.0`. Nothing takes a round
 trip through a number on the way in, so `1.0` can never arrive as `1`.
 
-## A default `auth:` for the whole environment
+## Set default authentication
 
 `auth` is one reserved top-level key; every other key is still an ordinary
 variable. It carries a default [authentication](requests.md#authentication)

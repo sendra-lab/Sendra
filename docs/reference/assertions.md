@@ -1,6 +1,6 @@
 # Assertions
 
-## Add assertions to a request
+## Add assertions
 
 A request can say what it expects of the response, under an optional
 `assertions` key:
@@ -57,7 +57,7 @@ The same file under `sendra test` exits `4`, and that is the only difference
 between the two commands worth remembering. See
 [Testing](running-and-testing.md).
 
-## Header checks
+## Check headers
 
 **Header names are matched case-insensitively, values exactly.** HTTP header
 names are case-insensitive, so which casing a server picks is not something a
@@ -68,7 +68,7 @@ request file should have to know. Values are compared whole:
 value or drop to presence-only (`content-type:` with nothing after it). A
 repeated header, `set-cookie`, passes if any of its values matches.
 
-## JSON path checks
+## Check JSON values
 
 **A JSON path must select exactly one value.** `$.users[*].id` against three
 users is a question with no single answer; it fails, saying how many it matched,
@@ -94,7 +94,7 @@ look at it would fail an assertion that is plainly true. A JSON path that does
 not parse is reported the same way, and reported first: it is wrong about every
 response there could ever be, so it is the one you have to go and fix.
 
-## Variables in assertions
+## Use variables in assertions
 
 **Assertion values are substituted; assertion keys are not.** `{{var}}` works in
 a header's expected value, in `body_contains`, and in the strings of an expected
@@ -105,7 +105,7 @@ literal: an environment is meant to change what a response is compared against
 missing variable in an assertion fails that request before it is sent, exactly
 like a missing variable in its URL.
 
-## Richer assertions: acceptable sets, patterns, timing, negation, comparisons
+## Advanced assertions
 
 Beyond exact status, exact header value, body substring and JSON equality,
 `assertions` also has:

@@ -21,7 +21,7 @@ make `sendra run requests/collection.yaml --json | jq .` a stream of documents r
 than a document, and `test`'s summary would have nowhere to live in it. The cost
 is that nothing is printed until the run is over.
 
-## `sendra run --json`
+## JSON output for `sendra run`
 
 ```json
 {
@@ -99,7 +99,7 @@ is that nothing is printed until the run is over.
   document already carries every response body verbatim, so they are text that
   is in the output twice rather than a secret this key newly exposes.
 
-## `sendra test --json`
+## JSON output for `sendra test`
 
 The same document, plus a `summary` object holding the counts the terminal run
 ends with:

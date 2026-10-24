@@ -1,6 +1,6 @@
 # CLI overrides
 
-## Available flags
+## Available overrides
 
 Flags that change one invocation without touching a file, on `sendra run` and
 `sendra test` alike:
@@ -53,13 +53,9 @@ Passing `-H` more than once for the *same* name keeps only the last value:
 sendra run requests/req.yaml -H "X-Trace-Id: first" -H "X-Trace-Id: second"   # sends only "second"
 ```
 
-That is a deliberate departure from the request file's own `headers:`, which
-does allow a name to repeat and sends every occurrence. A name typed twice on
-one command line reads as "I meant to change it, and mistyped the first try",
-the way retyping a shell variable reassigns it rather than appending to it,
-not as a deliberate multi-value header. If a genuinely repeated header is ever
-needed from the command line, that is a different, additive flag someone can
-propose; `-H` staying a plain override keeps its own rule simple.
+Request files can send the same header more than once. On the command line,
+repeating `-H` for the same header name replaces the earlier value; only the
+last value is sent.
 
 A malformed value (no `:` in `-H`, no `=` in `--var`) is refused immediately
 with exit code `2`, the same way any other bad argument is, rather than
@@ -76,11 +72,9 @@ sendra run requests/req.yaml --var base_url=http://localhost:8080          # no 
 sendra run requests/req.yaml --env staging --var base_url=http://localhost # wins over staging.yaml's base_url
 ```
 
-Because it is folded into the same set of names an environment file populates
-rather than kept as some higher, separate layer, it inherits that layer's
-rules rather than needing new ones of its own, in particular [name
-collisions](capturing.md#name-collisions): a `capture` block naming a variable a `--var`
-already set is refused exactly as if the environment file had defined it.
+Sendra treats this value like one from the environment file. If a `capture`
+block uses the same variable name, Sendra reports a name collision rather than
+silently replacing either value; see [Name collisions](capturing.md#name-collisions).
 
 ```sh
 sendra test requests/req.yaml --var token=cli-value   # requests/req.yaml also has `capture: { token: $.token }`
@@ -92,13 +86,8 @@ capture
     variable; rename the capture or the `--var`/environment entry
 ```
 
-That is not a special case written for `--var`: it falls out of `--var`
-being indistinguishable, by the time a capture's collision check runs, from a
-value the environment file itself defined. The alternative, letting a
-capture silently override a `--var`, or a `--var` silently pre-empt a capture,
-has the same problem an environment-file collision has: the same `{{name}}`
-would mean two different things at two different points in the same run,
-discoverable only by reading the file and counting positions.
+Neither value silently takes priority. This keeps `{{name}}` from referring to
+one value before a capture and a different value afterward.
 
 ## Timeout
 
@@ -112,9 +101,8 @@ sendra run requests/req.yaml --timeout 5   # gives up after 5s, whatever config.
 ## TLS verification
 
 `--insecure` overrides the resolved config `insecure`, but only upward.
-There is no `--secure` to force certificate verification back on over a
-config that set `insecure: true`, the same shape as `--dry-run` or any
-other bare flag here, none of which have a negating counterpart either:
+There is no flag to turn verification back on if a config file sets
+`insecure: true`. Change that config setting if you need verification enabled:
 
 ```sh
 sendra run requests/req.yaml --insecure   # against a self-signed staging host, say
@@ -151,13 +139,8 @@ which resolves relative to the config file's own directory:
 sendra run requests/req.yaml --client-cert ./client.pem --client-key ./client-key.pem
 ```
 
-A path here is not treated as sensitive the way an `-H`/`--var` value is:
-an error naming a missing or malformed cert/key file shows the path in
-full, the same way `--proxy`'s URL is never redacted. The path is not the
-secret (the key file's *contents* are), so there is nothing to gain by
-hiding it. Like `--proxy`, neither flag is currently echoed by
-`-v`/`--verbose`'s provenance report; only `-H`/`--var` overrides are, by
-name, for the reason given there.
+If a certificate or key file is missing or invalid, the error includes its
+path to help you locate the problem.
 
 ## Cookie jar
 

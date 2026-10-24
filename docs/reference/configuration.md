@@ -29,7 +29,7 @@ today. Unknown keys are rejected, like everywhere else in Sendra, so `timeout`
 instead of `timeout_seconds` is an error you see rather than a setting that
 quietly never applies.
 
-## TLS certificate verification
+## Certificate verification
 
 **`insecure: true` disables TLS certificate verification for every request
 this run sends.** It exists for a self-signed or otherwise untrusted
@@ -44,9 +44,9 @@ itself and the reasoning behind that.
 ## Proxy
 
 **`proxy: <url>` routes every request through an HTTP proxy**, including
-`http://user:pass@host:port` URLs. Credentials in the URL are read by the
-underlying HTTP client, nothing Sendra parses itself. Setting it, from either
-the config file or `--proxy`, takes over proxying for the run entirely: the
+URLs with credentials such as `http://user:pass@host:port`. Sendra uses those
+credentials to connect to the proxy. Setting a proxy, from either the config
+file or `--proxy`, takes over proxying for the run entirely: the
 standard `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables Sendra
 otherwise respects by default (matching curl and most other HTTP tooling) are
 not consulted once an explicit proxy is configured. No `proxy:` key and no
@@ -54,17 +54,16 @@ not consulted once an explicit proxy is configured. No `proxy:` key and no
 
 ## Client certificates
 
-**`client_cert: {cert, key}` presents a client certificate for mutual
-TLS**, the case where the *server* wants proof of who the *client* is, not
-just the other way around. Both `cert` and `key` are required together: a
-config naming only one is a parse error, and a CLI override supplying only
-`--client-cert` or only `--client-key` against a config that supplies neither
-is refused when the client is built. PEM only, not PKCS#12/`.pfx`: Sendra's
-HTTP client is built against `rustls` alone, and accepting a PKCS#12 file
-would mean shipping a second TLS backend just for that one format: `openssl
-pkcs12 -export ... ` (or an existing `.pfx`) can always be split back into a
-`cert.pem`/`key.pem` pair with `openssl pkcs12 -in bundle.pfx -clcerts
--nokeys -out client.pem` / `-nocerts -nodes -out client-key.pem`.
+**`client_cert: {cert, key}` presents a client certificate for mutual TLS.**
+Use it when the server requires proof of the client's identity. Both `cert`
+and `key` must be set; Sendra reports an error if only one is provided. The
+files must be in PEM format. To convert a PKCS#12 (`.p12` or `.pfx`) bundle with
+OpenSSL, export the certificate and key separately:
+
+```sh
+openssl pkcs12 -in bundle.pfx -clcerts -nokeys -out client.pem
+openssl pkcs12 -in bundle.pfx -nocerts -nodes -out client-key.pem
+```
 
 `cert`/`key` resolve **relative to this config file's own directory**, not
 the current working directory, the same rule a request's `body_file:` uses
@@ -74,11 +73,9 @@ which directory the command happened to be typed from. `--client-cert`/
 `--client-key`, covered in [CLI overrides](cli-overrides.md), resolve relative
 to the working directory instead, matching every other CLI-supplied path.
 
-Orthogonal to `--insecure`: a client certificate is about proving who *this
-client* is to the server, while `--insecure` is about whether *the server's*
-certificate gets checked. Nothing stops the two from applying to the same
-run: a self-signed internal endpoint that also demands a client
-certificate needs both.
+This setting is separate from `--insecure`: a client certificate proves the
+client's identity, while `--insecure` controls whether Sendra verifies the
+server's certificate. An endpoint may require both settings.
 
 ## Cookie jar
 

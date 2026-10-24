@@ -15,7 +15,7 @@ for anyone writing `case $? in` around either.
 | `3`  |   ·   |        | `run` only: every request got a response, at least one was 4xx/5xx. |
 | `4`  |       |   ·    | `test` only: every request got a response, at least one failed a check. |
 
-## What each code means
+## Exit code meanings
 
 - `0`: for `run`, every request was sent and no response status was an error
   (1xx, 2xx, 3xx). For `test`, every request got a response and every assertion
