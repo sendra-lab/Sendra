@@ -26,12 +26,12 @@ for Rhai over an embedded JavaScript engine.
 defaults already merged in, so a script sees the request exactly as it would
 otherwise be sent, and whatever it leaves behind is what actually goes out.
 
-| Field             | Access     | Type                             |
-| ----------------- | ---------- | --------------------------------- |
-| `request.method`  | read       | string (`"POST"`)                |
-| `request.url`     | read/write | string                           |
-| `request.headers` | read/write | object map, string to string     |
-| `request.body`    | read/write | string, or `()` for no body      |
+| Field             | Access     | Type                         |
+| ----------------- | ---------- | ---------------------------- |
+| `request.method`  | read       | string (`"POST"`)            |
+| `request.url`     | read/write | string                       |
+| `request.headers` | read/write | object map, string to string |
+| `request.body`    | read/write | string, or `()` for no body  |
 
 ```rhai
 request.headers["X-Signature"] = sign(request.body);
@@ -58,7 +58,7 @@ and silently stringifying leaves what a float renders as up to the interpreter.
 name.** The map is what makes `request.headers["X"] = …` and `.remove("X")`
 mean the obvious thing, and a list-of-pairs API would make every script that
 touches a header pay in syntax for a case that is rare in a file and rarer in a
-script. Two costs follow, and they apply only to a request that *has* a
+script. Two costs follow, and they apply only to a request that _has_ a
 `pre_request` script: one without a script never goes through this conversion
 and keeps every occurrence:
 
@@ -80,13 +80,13 @@ Throwing in `pre_request` means the request is never sent.
 `response` is read-only: assigning to it is an error rather than a change that
 goes nowhere.
 
-| Field                  | Type                                              |
-| ---------------------- | ------------------------------------------------- |
-| `response.status`      | integer (`201`)                                   |
-| `response.status_text` | string (`"Created"`)                              |
-| `response.headers`     | array of `#{name, value}`                         |
-| `response.body`        | string, as it came over the wire                  |
-| `response.elapsed_ms`  | integer                                           |
+| Field                  | Type                             |
+| ---------------------- | -------------------------------- |
+| `response.status`      | integer (`201`)                  |
+| `response.status_text` | string (`"Created"`)             |
+| `response.headers`     | array of `#{name, value}`        |
+| `response.body`        | string, as it came over the wire |
+| `response.elapsed_ms`  | integer                          |
 
 Headers are a list rather than a map because HTTP lets one repeat
 (`set-cookie`), and wire order is worth keeping. Lookup is a one-liner:
@@ -98,8 +98,8 @@ if ct == () || !ct.value.contains("json") { throw "expected a JSON response"; }
 
 **`throw` is how a check fails**, rather than a `fail()` function Sendra would
 have had to register. It is Rhai's own, it is the idiom anyone reading Rhai docs
-will already know, and choosing it means Sendra registers *nothing at all* into
-the interpreter; see [Sandboxing](../decisions/sandboxing.md).
+will already know, and choosing it means Sendra registers _nothing at all_ into
+the interpreter; see [Sandboxing](https://sendra.oyibe.dev/blog/sandboxing-sendra-scripts/).
 
 The message you throw is what gets printed, verbatim. A script that fails for
 some other reason (a method that does not exist, an index off the end of an
@@ -146,7 +146,7 @@ The exit code depends on whether the request was sent and a response came back:
   response, invisible to `run`'s exit code, and a failure under `test`.
 
 `print` and `debug` inside a script go to stderr; see
-[Sandboxing](../decisions/sandboxing.md) for the reasoning, and for the
+[Sandboxing](https://sendra.oyibe.dev/blog/sandboxing-sendra-scripts/) for the reasoning, and for the
 guarantees around what a script can and cannot reach.
 
 [Rhai]: https://rhai.rs

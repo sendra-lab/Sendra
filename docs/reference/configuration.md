@@ -5,10 +5,10 @@
 Defaults that apply to every request live in a config file. There are two, both
 optional:
 
-| Scope   | Location                                                                       |
-| ------- | ------------------------------------------------------------------------------ |
-| Project | `.sendra/config.yaml`, searched for from the current directory upwards          |
-| Global  | `config.yaml` in your platform's config directory (see below)                   |
+| Scope   | Location                                                               |
+| ------- | ---------------------------------------------------------------------- |
+| Project | `.sendra/config.yaml`, searched for from the current directory upwards |
+| Global  | `config.yaml` in your platform's config directory (see below)          |
 
 ```yaml
 headers: # merged into every request; a header in the request file wins
@@ -98,7 +98,7 @@ outright rather than being merged with whatever the jar holds.
 
 **Prefer this over manually capturing `Set-Cookie` for cookie-shaped values
 specifically.** [Capturing values](capturing.md)
-can only see the *final* response's headers once redirects have been
+can only see the _final_ response's headers once redirects have been
 followed, so a `Set-Cookie` set on an intermediate hop of a redirect chain is
 invisible to it. `cookie_jar` has no such limit: cookie handling sits
 underneath redirect-following, so a cookie set on any hop, not just the
@@ -113,7 +113,7 @@ in, looking for `.sendra/config.yaml`, the same way git looks for `.git`. So a
 config at the repository root applies from anywhere inside the repository. The
 nearest one wins; configs further up are not stacked on top of each other. The
 search starts at the working directory, not at the request file's directory, so
-`sendra run ../other-project/requests/req.yaml` still uses *your* defaults.
+`sendra run ../other-project/requests/req.yaml` still uses _your_ defaults.
 
 **Finding the global config.** `$XDG_CONFIG_HOME/sendra/config.yaml` when
 `XDG_CONFIG_HOME` is set to an absolute path, on any platform. Otherwise the
@@ -152,5 +152,5 @@ the request's value is the one sent.
 `--client-cert`/`--client-key` and `--cookie-jar` all override this file for
 one invocation without editing it; see
 [CLI overrides](cli-overrides.md), and
-[Precedence, start to finish](../decisions/precedence-chain.md) for where they sit
+[Precedence, start to finish](https://sendra.oyibe.dev/blog/how-sendra-resolves-request-values/) for where they sit
 relative to everything else.

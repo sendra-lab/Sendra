@@ -9,20 +9,20 @@ Flags that change one invocation without touching a file, on `sendra run` and
 sendra run requests/req.yaml -H "X-Trace-Id: abc123" --var base_url=http://localhost:8080 --timeout 5
 ```
 
-| Flag                    | Repeatable | Overrides                                                        |
-| ------------------------ | ---------- | ----------------------------------------------------------------- |
-| `-H`/`--header "Name: value"` | yes  | config headers, the request's own `headers:`, a resolved `auth:` |
-| `--var name=value`       | yes        | the active environment file's value for `name`                    |
-| `--timeout <seconds>`    | no         | the resolved config `timeout_seconds`                             |
-| `--insecure`             | no         | the resolved config `insecure` (can only turn it *on*)             |
-| `--proxy <url>`          | no         | the resolved config `proxy`                                       |
-| `--client-cert <path>`   | no         | the resolved config `client_cert.cert`                             |
-| `--client-key <path>`    | no         | the resolved config `client_cert.key`                              |
-| `--cookie-jar`           | no         | the resolved config `cookie_jar` (can only turn it *on*)            |
+| Flag                          | Repeatable | Overrides                                                        |
+| ----------------------------- | ---------- | ---------------------------------------------------------------- |
+| `-H`/`--header "Name: value"` | yes        | config headers, the request's own `headers:`, a resolved `auth:` |
+| `--var name=value`            | yes        | the active environment file's value for `name`                   |
+| `--timeout <seconds>`         | no         | the resolved config `timeout_seconds`                            |
+| `--insecure`                  | no         | the resolved config `insecure` (can only turn it _on_)           |
+| `--proxy <url>`               | no         | the resolved config `proxy`                                      |
+| `--client-cert <path>`        | no         | the resolved config `client_cert.cert`                           |
+| `--client-key <path>`         | no         | the resolved config `client_cert.key`                            |
+| `--cookie-jar`                | no         | the resolved config `cookie_jar` (can only turn it _on_)         |
 
 `-H` and `--var` are invocation-only: there is no config-file equivalent for
 either. `--timeout`, `--insecure`, `--proxy`, `--client-cert`,
-`--client-key` and `--cookie-jar` each *do* have one (`timeout_seconds`,
+`--client-key` and `--cookie-jar` each _do_ have one (`timeout_seconds`,
 `insecure`, `proxy`, `client_cert.cert`, `client_cert.key`, `cookie_jar`;
 see [Configuration](configuration.md)), and CLI wins over both config files for
 all six, the same "most specific wins" rule every override here follows.
@@ -31,13 +31,13 @@ so a `--client-cert` on the command line can pair with a `client_cert.key` a
 config file set, and vice versa. Only Sendra ending up with just one half
 of the pair, from any mix of sources, is refused. Nothing here changes how a config or
 environment file itself resolves; see
-[Precedence, start to finish](../decisions/precedence-chain.md) for how every one
+[Precedence, start to finish](../decisions/https://sendra.oyibe.dev/blog/how-sendra-resolves-request-values/) for how every one
 of these flags fits with everything else.
 
 ## Header overrides
 
 `-H`/`--header` wins every conflict a header can be in. It is compared
-case-insensitively, like every other header rule in Sendra, and it *replaces*
+case-insensitively, like every other header rule in Sendra, and it _replaces_
 rather than merges: a repeated header the request file wrote, a config
 default, and the `Authorization` header a resolved `auth:` block produced are
 all dropped in favour of the `-H` value if the name matches.
@@ -47,7 +47,7 @@ all dropped in favour of the `-H` value if the name matches.
 sendra run requests/req.yaml -H "Authorization: Bearer overridden"
 ```
 
-Passing `-H` more than once for the *same* name keeps only the last value:
+Passing `-H` more than once for the _same_ name keeps only the last value:
 
 ```sh
 sendra run requests/req.yaml -H "X-Trace-Id: first" -H "X-Trace-Id: second"   # sends only "second"
@@ -65,7 +65,7 @@ surfacing later as a confusing substitution or request-building failure.
 
 `--var` behaves exactly like part of the environment file for this run. It
 sets a variable whether or not `--env` was passed at all, and overrides the
-same name in the file that *was* loaded when both are present:
+same name in the file that _was_ loaded when both are present:
 
 ```sh
 sendra run requests/req.yaml --var base_url=http://localhost:8080          # no environment file needed
@@ -162,4 +162,4 @@ the same "each repeat is a clean run" rule already covers
 
 For how all of these fit together with config files, environment files and
 captured variables, see
-[Precedence, start to finish](../decisions/precedence-chain.md).
+[Precedence, start to finish](https://sendra.oyibe.dev/blog/how-sendra-resolves-request-values/).
