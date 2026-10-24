@@ -7,12 +7,12 @@ different questions, but they answer them to the same shell, and a number that
 means one thing under one command and something else under the other is a trap
 for anyone writing `case $? in` around either.
 
-| Code | `run` | `test` | Meaning                                                             |
-| ---- | :---: | :----: | ------------------------------------------------------------------- |
-| `0`  |   ·   |   ·    | Nothing went wrong; see below for what each command means by that.  |
-| `1`  |   ·   |   ·    | Some request never got a response.                                  |
-| `2`  |   ·   |   ·    | Bad command-line usage (from clap).                                 |
-| `3`  |   ·   |        | `run` only: every request got a response, at least one was 4xx/5xx. |
+| Code | `run` | `test` | Meaning                                                                 |
+| ---- | :---: | :----: | ----------------------------------------------------------------------- |
+| `0`  |   ·   |   ·    | Nothing went wrong; see below for what each command means by that.      |
+| `1`  |   ·   |   ·    | Some request never got a response.                                      |
+| `2`  |   ·   |   ·    | Bad command-line usage (from clap).                                     |
+| `3`  |   ·   |        | `run` only: every request got a response, at least one was 4xx/5xx.     |
 | `4`  |       |   ·    | `test` only: every request got a response, at least one failed a check. |
 
 ## Exit code meanings
@@ -40,4 +40,4 @@ Codes `5` and up are free.
 For the reasoning behind these choices (why `4` is a separate number from `3`,
 why an unsendable request under `test` exits `1` rather than `4`, and how
 these codes rank against each other for a whole collection), see
-[Exit codes](../decisions/exit-codes.md).
+[Exit codes](https://sendra.oyibe.dev/blog/why-sendra-exit-codes/).
