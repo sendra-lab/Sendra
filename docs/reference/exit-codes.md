@@ -1,6 +1,3 @@
----
-description: "The exit code table for the sendra binary: what 0, 1, 2, 3 and 4 mean under run and test, for shell scripts and CI pipelines."
----
 # Exit codes
 
 One table for the whole binary, not one per subcommand: `run` and `test` answer
@@ -28,8 +25,8 @@ for anyone writing `case $? in` around either.
   is one of these; see [Testing](running-and-testing.md).
 - `3`: `sendra run` only: every request completed but at least one server
   answered `4xx` or `5xx`. The responses print exactly as they would otherwise;
-  only the exit code differs, so `sendra run requests/req.yaml && deploy.sh` does not
-  proceed on a 404.
+  only the exit code differs, so a shell script can stop before a later step
+  when a request receives a 404.
 - `4`: `sendra test` only: every request got a response, but at least one
   failed a check it declared: an assertion that did not hold, a `post_request`
   script that threw, or a `capture` entry that produced no value.

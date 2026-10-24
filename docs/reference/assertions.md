@@ -1,6 +1,3 @@
----
-description: "Check status, headers, body text and JSON paths with assertions in a request file, plus status_in, regex, timing, negation and comparisons."
----
 # Assertions
 
 A request can say what it expects of the response, under an optional
@@ -111,7 +108,7 @@ assertions:
 ```
 
 ```sh
-sendra run examples/richer-assertions.yaml    # every one of these against httpbin
+sendra run requests/richer-assertions.yaml
 ```
 
 **`not:` wraps a whole assertions block, not one assertion.** It takes the same

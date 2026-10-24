@@ -1,6 +1,3 @@
----
-description: "Set project or global defaults in config.yaml: headers, timeout, redirects, TLS verification, proxy, client certificates and a cookie jar."
----
 # Configuration
 
 Defaults that apply to every request live in a config file. There are two, both

@@ -1,6 +1,3 @@
----
-description: "Capture values from a JSON body, header or status with a capture block, then reuse them as variables in later requests to chain calls."
----
 # Capturing values and chaining requests
 
 A request can pull values out of its response and hand them to the requests
@@ -25,10 +22,6 @@ method: GET
 url: '{{base_url}}/users/{{user_id}}'
 headers:
   Authorization: 'Bearer {{auth_token}}'
-```
-
-```sh
-sendra run examples/capture-chain.yaml    # a real capture-then-use flow
 ```
 
 **File order is real order.** A request sees the captures of every request
@@ -89,10 +82,6 @@ first-or-last guess, the same rule a JSON path selecting several values
 already follows: a capture binds a name to *one* value, and silently picking
 between repeats would make the same file behave differently depending on
 header order a server happens to send in.
-
-```sh
-sendra run examples/capture-header-status.yaml    # header and status capture, chained
-```
 
 ## When a capture does not work
 

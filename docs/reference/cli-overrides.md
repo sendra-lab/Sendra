@@ -1,6 +1,3 @@
----
-description: "Flags for sendra run and test that override files for one invocation: -H, --var, --timeout, --insecure, --proxy, client certificates, --cookie-jar."
----
 # CLI overrides
 
 Flags that change one invocation without touching a file, on `sendra run` and

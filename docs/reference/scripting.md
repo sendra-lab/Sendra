@@ -1,6 +1,3 @@
----
-description: "Write pre_request and post_request scripts in Rhai to change a request or check a response, with what each can see and the run order."
----
 # Scripting
 
 A request can carry two inline scripts: `pre_request`, which runs just before it
@@ -17,11 +14,6 @@ post_request: |
   if response.status != 201 {
     throw "expected 201, got " + response.status;
   }
-```
-
-```sh
-sendra run examples/scripted-request.yaml
-sendra test examples/scripted-request.yaml
 ```
 
 **No runtime to install.** The interpreter is linked into the `sendra` binary,
