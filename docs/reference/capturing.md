@@ -1,7 +1,6 @@
----
-description: "Capture values from a JSON body, header or status with a capture block, then reuse them as variables in later requests to chain calls."
----
 # Capturing values and chaining requests
+
+## Capture and reuse values
 
 A request can pull values out of its response and hand them to the requests
 after it, under an optional `capture` key: variable names mapped to JSON paths.
@@ -25,10 +24,6 @@ method: GET
 url: '{{base_url}}/users/{{user_id}}'
 headers:
   Authorization: 'Bearer {{auth_token}}'
-```
-
-```sh
-sendra run examples/capture-chain.yaml    # a real capture-then-use flow
 ```
 
 **File order is real order.** A request sees the captures of every request
@@ -63,6 +58,8 @@ the value, not the spelling. That differs from an environment file, where
 `port: 8080` is the *string* `8080` and nothing is normalised. An endpoint whose
 exact digits matter should send them as a JSON string.
 
+## Capture from headers and status codes
+
 **A bare string is not the only source.** It is the default, and unchanged,
 but a `capture` entry can also be an object naming a response header or the
 status code instead of a JSON path:
@@ -90,11 +87,7 @@ already follows: a capture binds a name to *one* value, and silently picking
 between repeats would make the same file behave differently depending on
 header order a server happens to send in.
 
-```sh
-sendra run examples/capture-header-status.yaml    # header and status capture, chained
-```
-
-## When a capture does not work
+## Capture failures
 
 A capture that produces no value is reported under the request that declared it,
 in the same shape as the assertions above it:
@@ -180,7 +173,7 @@ the same situation: both come from the same mechanism, file order fully decides
 which is in force at any point, and re-logging in or reading the next page's
 cursor is a real flow that has to be expressible.
 
-## What a capture does not touch
+## Capture limitations
 
 - **The block itself is never substituted.** A `{{var}}` in a capture path or
   name stays those characters. A JSON path selects *which* part of the response

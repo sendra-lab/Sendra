@@ -1,21 +1,18 @@
----
-description: "Use the sendra tui terminal app (TUI) to browse, run and edit requests, switch environments, review run history and find every keybinding."
----
 # The interactive TUI
 
 `sendra tui` opens a full-screen terminal app for browsing and running the
 requests in a collection (or a single request file), instead of one shell
-invocation per request. It reuses `sendra-core` directly (the same request
-model, YAML loading, environment resolution, capture and HTTP execution
-`run`/`test` use) with one exception: `pre_request`/`post_request` scripts
+invocation per request. It uses the same request format, environment
+resolution, capture and HTTP execution as `run` and `test`, with one exception:
+`pre_request`/`post_request` scripts
 are not run from the TUI (see below). Everything else behaves identically
 whether you send it from the TUI or from the command line.
 
 ## Installing and launching
 
-The TUI ships inside the same `sendra` binary as `run`/`test`: there is
-nothing separate to install. Building or installing `sendra` (see the
-[README](../../README.md#install)) gets you both.
+The TUI ships inside the same `sendra` binary as `run` and `test`, so there is
+nothing separate to install. Install Sendra using the instructions on the
+Introduction page.
 
 ```sh
 sendra tui                       # start with nothing loaded
@@ -33,7 +30,7 @@ redirected or piped, it refuses immediately with a plain error rather than
 drawing frames nobody can see:
 
 ```
-sendra-tui requires an interactive terminal on stdout; it looks like stdout
+Sendra requires an interactive terminal on stdout; it looks like stdout
 has been redirected or piped. Run it directly in a terminal.
 ```
 
@@ -232,7 +229,7 @@ longer a request left for it to be about.
 
 ## Environments
 
-`e` opens the environment picker: every environment `sendra-tui` found at
+`e` opens the environment picker: every environment Sendra found at
 startup (from `.sendra/environments/`), sorted by name. An environment file
 that exists but failed to load is shown as a visible in-app error rather
 than silently missing from the list.
@@ -294,14 +291,14 @@ the quit confirmation, so "what can I press right now" always has an answer.
 The reference below mirrors that in-app cheatsheet, the same table this
 document's own keybinding sections above are drawn from.
 
-### Global: always available
+### Global keys
 
 | Key | Action |
 | --- | --- |
 | `q` / `Ctrl+C` | quit (asks first if anything is unsaved) |
 | `?` | open/close the cheatsheet |
 
-### Browsing (a collection is loaded, nothing else open)
+### Browse requests
 
 | Key | Action |
 | --- | --- |
@@ -319,7 +316,7 @@ document's own keybinding sections above are drawn from.
 | `PgUp`/`PgDn`/`Home`/`End` | scroll the response panel |
 | `c` | reveal / hide captured values |
 
-### Filtering the request list (after pressing `/`)
+### Filter requests
 
 | Key | Action |
 | --- | --- |
@@ -328,7 +325,7 @@ document's own keybinding sections above are drawn from.
 | `Enter` | run the highlighted (filtered) request |
 | `Esc` | clear the filter and show every request again |
 
-### Welcome screen (no collection path given yet)
+### Welcome screen
 
 | Key | Action |
 | --- | --- |
@@ -337,7 +334,7 @@ document's own keybinding sections above are drawn from.
 | `o` | type a collection path instead |
 | `e` | open the environment picker |
 
-### Editing a request
+### Edit requests
 
 | Key | Action |
 | --- | --- |
@@ -354,7 +351,7 @@ document's own keybinding sections above are drawn from.
 | `Esc` | cancel |
 | (any other character) | type into the focused field |
 
-### Environment picker
+### Choose an environment
 
 | Key | Action |
 | --- | --- |
@@ -363,7 +360,7 @@ document's own keybinding sections above are drawn from.
 | `i` | edit this environment's variables |
 | `Esc` | close |
 
-### Editing an environment's variables
+### Edit environment variables
 
 | Key | Action |
 | --- | --- |
@@ -376,7 +373,7 @@ document's own keybinding sections above are drawn from.
 | `Esc` | cancel |
 | (any other character) | type into the focused field |
 
-### Run-history browser
+### Browse run history
 
 | Key | Action |
 | --- | --- |
@@ -385,7 +382,7 @@ document's own keybinding sections above are drawn from.
 | `Space` | expand / collapse this entry |
 | `Esc` | close |
 
-### Viewing one history entry
+### View a run result
 
 | Key | Action |
 | --- | --- |
@@ -393,14 +390,14 @@ document's own keybinding sections above are drawn from.
 | `c` | reveal / hide captured values |
 | `Esc` | back to the history list |
 
-### Any confirmation (delete request, delete variable, close tab, quit)
+### Confirm changes
 
 | Key | Action |
 | --- | --- |
 | `y` / `Enter` | confirm |
 | `n` / `Esc` | cancel |
 
-### Open-collection prompt
+### Open a collection
 
 | Key | Action |
 | --- | --- |

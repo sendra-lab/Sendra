@@ -1,7 +1,3 @@
----
-description: "The Sendra request and collection YAML format: fields, repeated headers, and authentication with bearer, basic, API key and OAuth."
----
-
 # Request and collection file shape
 
 ## Request file shape
@@ -26,7 +22,7 @@ capture: # optional, values handed to the requests after this one (see below)
 Unknown top-level keys are rejected rather than silently ignored, so a typo in a
 field name is an error you see immediately.
 
-## Sending the same header more than once
+## Sending repeated headers
 
 HTTP allows a header name to repeat, and some APIs need it: several
 `Set-Cookie`-shaped headers, several `X-Forwarded-For` values, or any
@@ -144,19 +140,8 @@ and a hand-written `Authorization`/`X-API-Key`/etc. entry are both trying to
 control the same thing, so that's rejected at parse time rather than
 silently picking one.
 
-By the time a `pre_request` script or `sendra`'s own request builder sees the
-request, `auth` has already been resolved down to a plain header or query
-parameter; there is no separate `request.auth` API. See
-[`examples/auth.yaml`](../../examples/auth.yaml) for the `bearer`/`basic`/
-`api_key` forms run against httpbin.org, and
-[`examples/oauth.yaml`](../../examples/oauth.yaml) for both `oauth` grants
-(against your own OAuth provider; there is no public demo server for
-either grant the way httpbin.org serves `/bearer`):
-
-```sh
-sendra run examples/auth.yaml
-sendra run examples/oauth.yaml --env <name>
-```
+Authentication is resolved into the header or query parameter sent with the
+request. Scripts work with the resolved request; see [Scripting](scripting.md).
 
 ## Collection file shape
 

@@ -52,7 +52,19 @@ locally first.
   `wiremock`/a stubbed transport for anything that needs to look like an
   HTTP response.
 
-## Request file paths in docs and examples
+## Public documentation
+
+Everything under `docs/` is source content for Sendra's public documentation
+site. It is user-facing documentation, not repository or contributor
+documentation. Write it for people using Sendra in their own projects; do not
+put build instructions, contribution guidance, repository layout, or links to
+implementation files there. Keep contributor and repository-specific guidance
+in this file or alongside the relevant code and workflow.
+
+Changes under `docs/` are published when they reach `main`, so review them as
+content intended for Sendra users.
+
+## Request file paths in public docs
 
 Sendra doesn't require request files to live anywhere in particular, but the
 docs assume the layout a user's own project will have: request and collection
@@ -64,15 +76,17 @@ sendra run requests/collection.yaml "List users"
 ```
 
 This repository has no `requests/` directory. The sample files it ships live
-in `examples/`, so when you write or edit docs:
+in `examples/`, so when you write or edit public docs:
 
 - Use `requests/…` for generic placeholder files (`req.yaml`, `collection.yaml`)
   in commands and prose, since that's what a reader will type in their own
   project.
-- Use `examples/…` only when naming one of the real sample files in this
-  repository (for example `examples/get-request.yaml`), including in links and
-  in the header comments of the files under `examples/` themselves, which are
-  run from a clone of this repo.
+- Avoid links to `examples/`, source files, and test fixtures in public docs;
+  those paths only exist in a repository checkout. Use a generic
+  `requests/` path or an inline example instead.
+- Keep `examples/` paths in repository-specific material, such as the root
+  README and comments in the sample files themselves. Those commands are for
+  people running Sendra from a clone of this repository.
 - Don't create a `requests/` directory here just to make a doc example
   runnable, and don't rewrite `examples/…` paths to `requests/…`; the first
   would add an empty convention to the repo and the second would break

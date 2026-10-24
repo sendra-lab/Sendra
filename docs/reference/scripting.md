@@ -1,6 +1,3 @@
----
-description: "Write pre_request and post_request scripts in Rhai to change a request or check a response, with what each can see and the run order."
----
 # Scripting
 
 A request can carry two inline scripts: `pre_request`, which runs just before it
@@ -19,27 +16,22 @@ post_request: |
   }
 ```
 
-```sh
-sendra run examples/scripted-request.yaml
-sendra test examples/scripted-request.yaml
-```
-
 **No runtime to install.** The interpreter is linked into the `sendra` binary,
 so a scripted request works anywhere the binary does, which is the whole reason
 for Rhai over an embedded JavaScript engine.
 
-## What `pre_request` can see
+## Before-request scripts
 
 `request` is an object map. It arrives fully substituted and with any config
 defaults already merged in, so a script sees the request exactly as it would
 otherwise be sent, and whatever it leaves behind is what actually goes out.
 
-| Field             | Access     | Type                             |
-| ----------------- | ---------- | --------------------------------- |
-| `request.method`  | read       | string (`"POST"`)                |
-| `request.url`     | read/write | string                           |
-| `request.headers` | read/write | object map, string to string     |
-| `request.body`    | read/write | string, or `()` for no body      |
+| Field             | Access     | Type                         |
+| ----------------- | ---------- | ---------------------------- |
+| `request.method`  | read       | string (`"POST"`)            |
+| `request.url`     | read/write | string                       |
+| `request.headers` | read/write | object map, string to string |
+| `request.body`    | read/write | string, or `()` for no body  |
 
 ```rhai
 request.headers["X-Signature"] = sign(request.body);
@@ -66,7 +58,7 @@ and silently stringifying leaves what a float renders as up to the interpreter.
 name.** The map is what makes `request.headers["X"] = …` and `.remove("X")`
 mean the obvious thing, and a list-of-pairs API would make every script that
 touches a header pay in syntax for a case that is rare in a file and rarer in a
-script. Two costs follow, and they apply only to a request that *has* a
+script. Two costs follow, and they apply only to a request that _has_ a
 `pre_request` script: one without a script never goes through this conversion
 and keeps every occurrence:
 
@@ -83,18 +75,18 @@ ordered list, so an existing script behaves exactly as it did.
 
 Throwing in `pre_request` means the request is never sent.
 
-## What `post_request` can see
+## After-response scripts
 
 `response` is read-only: assigning to it is an error rather than a change that
 goes nowhere.
 
-| Field                  | Type                                              |
-| ---------------------- | ------------------------------------------------- |
-| `response.status`      | integer (`201`)                                   |
-| `response.status_text` | string (`"Created"`)                              |
-| `response.headers`     | array of `#{name, value}`                         |
-| `response.body`        | string, as it came over the wire                  |
-| `response.elapsed_ms`  | integer                                           |
+| Field                  | Type                             |
+| ---------------------- | -------------------------------- |
+| `response.status`      | integer (`201`)                  |
+| `response.status_text` | string (`"Created"`)             |
+| `response.headers`     | array of `#{name, value}`        |
+| `response.body`        | string, as it came over the wire |
+| `response.elapsed_ms`  | integer                          |
 
 Headers are a list rather than a map because HTTP lets one repeat
 (`set-cookie`), and wire order is worth keeping. Lookup is a one-liner:
@@ -106,15 +98,15 @@ if ct == () || !ct.value.contains("json") { throw "expected a JSON response"; }
 
 **`throw` is how a check fails**, rather than a `fail()` function Sendra would
 have had to register. It is Rhai's own, it is the idiom anyone reading Rhai docs
-will already know, and choosing it means Sendra registers *nothing at all* into
-the interpreter; see [Sandboxing](../decisions/sandboxing.md).
+will already know, and choosing it means Sendra registers _nothing at all_ into
+the interpreter; see [Sandboxing](https://sendra.oyibe.dev/blog/sandboxing-sendra-scripts/).
 
 The message you throw is what gets printed, verbatim. A script that fails for
 some other reason (a method that does not exist, an index off the end of an
 array) keeps the interpreter's full error with a line number instead, because
 that is a bug in the script and the line is the point.
 
-## Ordering
+## Request processing order
 
 For one request, in order:
 
@@ -137,28 +129,24 @@ as program text. A script that needs an environment value reads it off
 neither can see the other, and both are reported. A request can use either, both
 or neither.
 
-## Both scripts are compiled before the request is sent
+## Script validation before sending
 
-A syntax error in `post_request` stops the `POST` that would have created an
-order, rather than being discovered after it. A script that does not compile is
-a broken file, and finding that out before anything goes over the wire is
-strictly better, the same argument that makes a collection with two
-identically-named requests an error at parse time.
+A syntax error in either script stops the request before Sendra sends it. For
+example, if `post_request` has a syntax error, Sendra catches it before the
+`POST` reaches the server.
 
-That split is also how Sendra tells "your script is wrong" from "your API is
-wrong":
+The exit code depends on whether the request was sent and a response came back:
 
-- **A script that does not compile** (either hook) is exit `1`, counted under
-  `no_response`. Nothing was sent, so it is the same category as a missing
-  variable or a refused connection.
-- **A `pre_request` script that throws** is exit `1` for the same reason: there
-  is no response and never will be.
+- **A script has a syntax error:** exit `1`, counted as `no response`. Nothing
+  was sent, like a request with a missing variable or a connection failure.
+- **A `pre_request` script throws:** exit `1` for the same reason; there is no
+  response because Sendra did not send the request.
 - **A `post_request` script that throws** is a failed check on a response that
   did arrive, so it behaves exactly like a failed assertion: printed under the
   response, invisible to `run`'s exit code, and a failure under `test`.
 
 `print` and `debug` inside a script go to stderr; see
-[Sandboxing](../decisions/sandboxing.md) for the reasoning, and for the
+[Sandboxing](https://sendra.oyibe.dev/blog/sandboxing-sendra-scripts/) for the reasoning, and for the
 guarantees around what a script can and cannot reach.
 
 [Rhai]: https://rhai.rs

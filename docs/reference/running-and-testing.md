@@ -1,6 +1,3 @@
----
-description: "Send requests and collections with sendra run, or check them with sendra test, including output format, result categories and the summary."
----
 # Running and testing requests
 
 ## Running requests
@@ -70,7 +67,8 @@ Three things differ:
 - The exit code comes from the checks the file declared: its assertions and its
   `post_request` script.
 
-`examples/test-collection.yaml`, run against httpbin, prints exactly this:
+For example, a collection with passing and failing checks and requests without
+assertions can produce output like this:
 
 ```text
 → Status and body

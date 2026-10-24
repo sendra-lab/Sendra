@@ -1,7 +1,6 @@
----
-description: "Define environment files of variables, use them as {{name}} in requests, keep secrets in OS variables with ${VAR}, and set a default auth."
----
 # Environments and variables
+
+## Define an environment
 
 An environment is a flat file of variables at
 `.sendra/environments/<name>.yaml`, found by the same upward walk as
@@ -38,6 +37,8 @@ can be committed like any other request file. Sendra never reads a `.env` file:
 exporting the variable is the whole mechanism, which means it works the same in
 a shell, in CI, and under any secret manager that can export one.
 
+## Missing variables
+
 **Nothing resolves to an empty string.** A `{{var}}` with no such variable, or a
 `${VAR}` that is not exported, is an error naming what is missing, raised while
 that request is being built, so none of its bytes go out:
@@ -71,6 +72,8 @@ error: no variable named `nope` in `.sendra/environments/default.yaml` (availabl
 `--allow-error-status` does not suppress this. That flag forgives a *status*,
 and a request that could not be built has no status, like a DNS or connection
 failure, it exits `1` either way.
+
+## Select an environment
 
 **Which environment is loaded.** `--env <name>`, on `sendra run` and on
 `sendra test` alike:
@@ -116,6 +119,8 @@ different from each other:
   variables in the file you get no error at all, exit `0`, and a flag that was
   silently ignored.
 
+## Variable substitution rules
+
 **What substitution touches, and what it does not.** Only `url`, `headers`,
 `body` and the values inside `assertions`. Not `method`, which is a closed set
 with no useful placeholder, and not `name`, which is what
@@ -153,7 +158,7 @@ Values are strings, and an unquoted scalar substitutes as exactly the text you
 wrote: `port: 8080` is `8080`, `version: 1.0` is `1.0`. Nothing takes a round
 trip through a number on the way in, so `1.0` can never arrive as `1`.
 
-## A default `auth:` for the whole environment
+## Set default authentication
 
 `auth` is one reserved top-level key; every other key is still an ordinary
 variable. It carries a default [authentication](requests.md#authentication)

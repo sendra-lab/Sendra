@@ -1,15 +1,14 @@
----
-description: "Set project or global defaults in config.yaml: headers, timeout, redirects, TLS verification, proxy, client certificates and a cookie jar."
----
 # Configuration
+
+## Config files and defaults
 
 Defaults that apply to every request live in a config file. There are two, both
 optional:
 
-| Scope   | Location                                                                       |
-| ------- | ------------------------------------------------------------------------------ |
-| Project | `.sendra/config.yaml`, searched for from the current directory upwards          |
-| Global  | `config.yaml` in your platform's config directory (see below)                   |
+| Scope   | Location                                                               |
+| ------- | ---------------------------------------------------------------------- |
+| Project | `.sendra/config.yaml`, searched for from the current directory upwards |
+| Global  | `config.yaml` in your platform's config directory (see below)          |
 
 ```yaml
 headers: # merged into every request; a header in the request file wins
@@ -30,6 +29,8 @@ today. Unknown keys are rejected, like everywhere else in Sendra, so `timeout`
 instead of `timeout_seconds` is an error you see rather than a setting that
 quietly never applies.
 
+## Certificate verification
+
 **`insecure: true` disables TLS certificate verification for every request
 this run sends.** It exists for a self-signed or otherwise untrusted
 endpoint (an internal staging host, say) where there is no CA chain to
@@ -40,26 +41,29 @@ prints a one-line warning to stderr before sending anything, and `-q` does
 not suppress it; see [CLI overrides](cli-overrides.md) for `--insecure`
 itself and the reasoning behind that.
 
-**`proxy: <url>` routes every request through an HTTP proxy**, `http://user:pass@host:port`
-included: credentials in the URL are read by the underlying HTTP client,
-nothing Sendra parses itself. Setting it, from either the config file or
-`--proxy`, takes over proxying for the run entirely: the standard
-`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables Sendra otherwise
-respects by default (matching curl and most other HTTP tooling) are not
-consulted once an explicit proxy is configured. No `proxy:` key and no
+## Proxy
+
+**`proxy: <url>` routes every request through an HTTP proxy**, including
+URLs with credentials such as `http://user:pass@host:port`. Sendra uses those
+credentials to connect to the proxy. Setting a proxy, from either the config
+file or `--proxy`, takes over proxying for the run entirely: the
+standard `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables Sendra
+otherwise respects by default (matching curl and most other HTTP tooling) are
+not consulted once an explicit proxy is configured. No `proxy:` key and no
 `--proxy` is the plain "follow the environment" default.
 
-**`client_cert: {cert, key}` presents a client certificate for mutual
-TLS**, the case where the *server* wants proof of who the *client* is, not
-just the other way around. Both `cert` and `key` are required together: a
-config naming only one is a parse error, and a CLI override supplying only
-`--client-cert` or only `--client-key` against a config that supplies neither
-is refused when the client is built. PEM only, not PKCS#12/`.pfx`: Sendra's
-HTTP client is built against `rustls` alone, and accepting a PKCS#12 file
-would mean shipping a second TLS backend just for that one format: `openssl
-pkcs12 -export ... ` (or an existing `.pfx`) can always be split back into a
-`cert.pem`/`key.pem` pair with `openssl pkcs12 -in bundle.pfx -clcerts
--nokeys -out client.pem` / `-nocerts -nodes -out client-key.pem`.
+## Client certificates
+
+**`client_cert: {cert, key}` presents a client certificate for mutual TLS.**
+Use it when the server requires proof of the client's identity. Both `cert`
+and `key` must be set; Sendra reports an error if only one is provided. The
+files must be in PEM format. To convert a PKCS#12 (`.p12` or `.pfx`) bundle with
+OpenSSL, export the certificate and key separately:
+
+```sh
+openssl pkcs12 -in bundle.pfx -clcerts -nokeys -out client.pem
+openssl pkcs12 -in bundle.pfx -nocerts -nodes -out client-key.pem
+```
 
 `cert`/`key` resolve **relative to this config file's own directory**, not
 the current working directory, the same rule a request's `body_file:` uses
@@ -69,11 +73,11 @@ which directory the command happened to be typed from. `--client-cert`/
 `--client-key`, covered in [CLI overrides](cli-overrides.md), resolve relative
 to the working directory instead, matching every other CLI-supplied path.
 
-Orthogonal to `--insecure`: a client certificate is about proving who *this
-client* is to the server, while `--insecure` is about whether *the server's*
-certificate gets checked. Nothing stops the two from applying to the same
-run: a self-signed internal endpoint that also demands a client
-certificate needs both.
+This setting is separate from `--insecure`: a client certificate proves the
+client's identity, while `--insecure` controls whether Sendra verifies the
+server's certificate. An endpoint may require both settings.
+
+## Cookie jar
 
 **`cookie_jar: true` stores cookies received via `Set-Cookie` and sends them
 back automatically on later requests to the same host.** It exists for
@@ -94,7 +98,7 @@ outright rather than being merged with whatever the jar holds.
 
 **Prefer this over manually capturing `Set-Cookie` for cookie-shaped values
 specifically.** [Capturing values](capturing.md)
-can only see the *final* response's headers once redirects have been
+can only see the _final_ response's headers once redirects have been
 followed, so a `Set-Cookie` set on an intermediate hop of a redirect chain is
 invisible to it. `cookie_jar` has no such limit: cookie handling sits
 underneath redirect-following, so a cookie set on any hop, not just the
@@ -102,12 +106,14 @@ final response, is captured and resent. For a login flow that redirects
 through an intermediate hop before setting its session cookie, `cookie_jar`
 is the one of the two that actually works.
 
+## Config file locations and precedence
+
 **Finding the project config.** Sendra walks up from the directory you ran it
 in, looking for `.sendra/config.yaml`, the same way git looks for `.git`. So a
 config at the repository root applies from anywhere inside the repository. The
 nearest one wins; configs further up are not stacked on top of each other. The
 search starts at the working directory, not at the request file's directory, so
-`sendra run ../other-project/requests/req.yaml` still uses *your* defaults.
+`sendra run ../other-project/requests/req.yaml` still uses _your_ defaults.
 
 **Finding the global config.** `$XDG_CONFIG_HOME/sendra/config.yaml` when
 `XDG_CONFIG_HOME` is set to an absolute path, on any platform. Otherwise the
@@ -146,5 +152,5 @@ the request's value is the one sent.
 `--client-cert`/`--client-key` and `--cookie-jar` all override this file for
 one invocation without editing it; see
 [CLI overrides](cli-overrides.md), and
-[Precedence, start to finish](../decisions/precedence-chain.md) for where they sit
+[Precedence, start to finish](https://sendra.oyibe.dev/blog/how-sendra-resolves-request-values/) for where they sit
 relative to everything else.
