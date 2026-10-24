@@ -1,5 +1,7 @@
 # Assertions
 
+## Add assertions to a request
+
 A request can say what it expects of the response, under an optional
 `assertions` key:
 
@@ -23,6 +25,8 @@ never hides the ones after it. Unknown keys are rejected, like everywhere else
 in Sendra's schema, because an assertion that is silently ignored because of a
 typo reads exactly like one that is passing.
 
+## Read assertion results
+
 Results print under the response they are about, so in a collection run each
 block sits with its own request:
 
@@ -40,6 +44,8 @@ assertions
 A request with no `assertions` block prints exactly what it printed before this
 feature existed: an empty report produces no output at all.
 
+## Assertions and exit codes
+
 **Assertions do not affect `sendra run`'s exit code.** The run above exits `0`:
 six assertions, two of them failed, exit `0`. That is deliberate and permanent.
 `sendra run` sends requests and reports what came back; `sendra test` is the
@@ -51,6 +57,8 @@ The same file under `sendra test` exits `4`, and that is the only difference
 between the two commands worth remembering. See
 [Testing](running-and-testing.md).
 
+## Header checks
+
 **Header names are matched case-insensitively, values exactly.** HTTP header
 names are case-insensitive, so which casing a server picks is not something a
 request file should have to know. Values are compared whole:
@@ -60,12 +68,16 @@ request file should have to know. Values are compared whole:
 value or drop to presence-only (`content-type:` with nothing after it). A
 repeated header, `set-cookie`, passes if any of its values matches.
 
+## JSON path checks
+
 **A JSON path must select exactly one value.** `$.users[*].id` against three
 users is a question with no single answer; it fails, saying how many it matched,
 rather than silently comparing against the first. Paths are RFC 9535 JSON path,
 evaluated by [`jsonpath-rust`](https://docs.rs/jsonpath-rust). The expected
 value is written as ordinary YAML and compared as JSON, so `42` is a number,
 `'42'` is a string, and a mapping or sequence compares whole.
+
+## Invalid JSON responses and paths
 
 **A body that is not JSON fails every JSON assertion, and nothing else.** It is
 a failed assertion with the parser's own message, not a crash and not a
@@ -81,6 +93,8 @@ to try: a JSON body served as `text/plain` is still a JSON body, and refusing to
 look at it would fail an assertion that is plainly true. A JSON path that does
 not parse is reported the same way, and reported first: it is wrong about every
 response there could ever be, so it is the one you have to go and fix.
+
+## Variables in assertions
 
 **Assertion values are substituted; assertion keys are not.** `{{var}}` works in
 a header's expected value, in `body_contains`, and in the strings of an expected

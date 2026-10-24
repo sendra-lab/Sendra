@@ -1,5 +1,7 @@
 # Environments and variables
 
+## Define an environment
+
 An environment is a flat file of variables at
 `.sendra/environments/<name>.yaml`, found by the same upward walk as
 `.sendra/config.yaml`:
@@ -35,6 +37,8 @@ can be committed like any other request file. Sendra never reads a `.env` file:
 exporting the variable is the whole mechanism, which means it works the same in
 a shell, in CI, and under any secret manager that can export one.
 
+## Missing variables
+
 **Nothing resolves to an empty string.** A `{{var}}` with no such variable, or a
 `${VAR}` that is not exported, is an error naming what is missing, raised while
 that request is being built, so none of its bytes go out:
@@ -68,6 +72,8 @@ error: no variable named `nope` in `.sendra/environments/default.yaml` (availabl
 `--allow-error-status` does not suppress this. That flag forgives a *status*,
 and a request that could not be built has no status, like a DNS or connection
 failure, it exits `1` either way.
+
+## Select an environment
 
 **Which environment is loaded.** `--env <name>`, on `sendra run` and on
 `sendra test` alike:
@@ -112,6 +118,8 @@ different from each other:
   typo in your request file when the typo is on your command line; with no
   variables in the file you get no error at all, exit `0`, and a flag that was
   silently ignored.
+
+## Variable substitution rules
 
 **What substitution touches, and what it does not.** Only `url`, `headers`,
 `body` and the values inside `assertions`. Not `method`, which is a closed set

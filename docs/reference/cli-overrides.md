@@ -1,5 +1,7 @@
 # CLI overrides
 
+## Available flags
+
 Flags that change one invocation without touching a file, on `sendra run` and
 `sendra test` alike:
 
@@ -32,7 +34,9 @@ environment file itself resolves; see
 [Precedence, start to finish](../decisions/precedence-chain.md) for how every one
 of these flags fits with everything else.
 
-**`-H`/`--header` wins every conflict a header can be in.** It is compared
+## Header overrides
+
+`-H`/`--header` wins every conflict a header can be in. It is compared
 case-insensitively, like every other header rule in Sendra, and it *replaces*
 rather than merges: a repeated header the request file wrote, a config
 default, and the `Authorization` header a resolved `auth:` block produced are
@@ -61,7 +65,9 @@ A malformed value (no `:` in `-H`, no `=` in `--var`) is refused immediately
 with exit code `2`, the same way any other bad argument is, rather than
 surfacing later as a confusing substitution or request-building failure.
 
-**`--var` behaves exactly like part of the environment file for this run.** It
+## Variable overrides
+
+`--var` behaves exactly like part of the environment file for this run. It
 sets a variable whether or not `--env` was passed at all, and overrides the
 same name in the file that *was* loaded when both are present:
 
@@ -94,14 +100,18 @@ has the same problem an environment-file collision has: the same `{{name}}`
 would mean two different things at two different points in the same run,
 discoverable only by reading the file and counting positions.
 
-**`--timeout <seconds>` overrides the resolved config timeout**, whole-request
-(connect, send and body read) for this invocation only:
+## Timeout
+
+`--timeout <seconds>` overrides the resolved config timeout for this
+invocation, covering the whole request (connect, send and body read):
 
 ```sh
 sendra run requests/req.yaml --timeout 5   # gives up after 5s, whatever config.yaml says
 ```
 
-**`--insecure` overrides the resolved config `insecure`, but only upward.**
+## TLS verification
+
+`--insecure` overrides the resolved config `insecure`, but only upward.
 There is no `--secure` to force certificate verification back on over a
 config that set `insecure: true`, the same shape as `--dry-run` or any
 other bare flag here, none of which have a negating counterpart either:
@@ -116,7 +126,9 @@ sending anything, and keeps printing it even under `-q`/`--json`: see
 [Configuration](configuration.md) for the full reasoning on why this one
 notice is not narration `-q` trims away.
 
-**`--proxy <url>` overrides the resolved config `proxy`** outright, taking
+## Proxy
+
+`--proxy <url>` overrides the resolved config `proxy` outright, taking
 over proxying for the run entirely; see
 [Configuration](configuration.md) for how that interacts with the standard
 proxy environment variables:
@@ -125,8 +137,10 @@ proxy environment variables:
 sendra run requests/req.yaml --proxy http://proxy.example.com:8080
 ```
 
-**`--client-cert <path>`/`--client-key <path>` override the resolved config
-`client_cert.cert`/`client_cert.key`**, each independently of the other; see
+## Client certificates
+
+`--client-cert <path>`/`--client-key <path>` override the resolved config
+`client_cert.cert`/`client_cert.key`, each independently of the other; see
 [Configuration](configuration.md) for the full `client_cert:` reasoning,
 including why PEM is the only format accepted and why the two orthogonal
 `insecure`/`client_cert` settings can both apply to the same run. Resolved
@@ -145,8 +159,10 @@ hiding it. Like `--proxy`, neither flag is currently echoed by
 `-v`/`--verbose`'s provenance report; only `-H`/`--var` overrides are, by
 name, for the reason given there.
 
-**`--cookie-jar` overrides the resolved config `cookie_jar`, but only
-upward**, the same one-directional shape as `--insecure`, with no
+## Cookie jar
+
+`--cookie-jar` overrides the resolved config `cookie_jar`, but only upward,
+the same one-directional shape as `--insecure`, with no
 `--no-cookie-jar` to force it back off over a config that set `cookie_jar:
 true`:
 

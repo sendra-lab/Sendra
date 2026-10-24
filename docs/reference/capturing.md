@@ -1,5 +1,7 @@
 # Capturing values and chaining requests
 
+## Capture and reuse values
+
 A request can pull values out of its response and hand them to the requests
 after it, under an optional `capture` key: variable names mapped to JSON paths.
 
@@ -56,6 +58,8 @@ the value, not the spelling. That differs from an environment file, where
 `port: 8080` is the *string* `8080` and nothing is normalised. An endpoint whose
 exact digits matter should send them as a JSON string.
 
+## Capture from headers and status codes
+
 **A bare string is not the only source.** It is the default, and unchanged,
 but a `capture` entry can also be an object naming a response header or the
 status code instead of a JSON path:
@@ -83,7 +87,7 @@ already follows: a capture binds a name to *one* value, and silently picking
 between repeats would make the same file behave differently depending on
 header order a server happens to send in.
 
-## When a capture does not work
+## Capture failures
 
 A capture that produces no value is reported under the request that declared it,
 in the same shape as the assertions above it:

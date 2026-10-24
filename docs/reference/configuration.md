@@ -1,5 +1,7 @@
 # Configuration
 
+## Config files and defaults
+
 Defaults that apply to every request live in a config file. There are two, both
 optional:
 
@@ -27,6 +29,8 @@ today. Unknown keys are rejected, like everywhere else in Sendra, so `timeout`
 instead of `timeout_seconds` is an error you see rather than a setting that
 quietly never applies.
 
+## TLS certificate verification
+
 **`insecure: true` disables TLS certificate verification for every request
 this run sends.** It exists for a self-signed or otherwise untrusted
 endpoint (an internal staging host, say) where there is no CA chain to
@@ -37,14 +41,18 @@ prints a one-line warning to stderr before sending anything, and `-q` does
 not suppress it; see [CLI overrides](cli-overrides.md) for `--insecure`
 itself and the reasoning behind that.
 
-**`proxy: <url>` routes every request through an HTTP proxy**, `http://user:pass@host:port`
-included: credentials in the URL are read by the underlying HTTP client,
-nothing Sendra parses itself. Setting it, from either the config file or
-`--proxy`, takes over proxying for the run entirely: the standard
-`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables Sendra otherwise
-respects by default (matching curl and most other HTTP tooling) are not
-consulted once an explicit proxy is configured. No `proxy:` key and no
+## Proxy
+
+**`proxy: <url>` routes every request through an HTTP proxy**, including
+`http://user:pass@host:port` URLs. Credentials in the URL are read by the
+underlying HTTP client, nothing Sendra parses itself. Setting it, from either
+the config file or `--proxy`, takes over proxying for the run entirely: the
+standard `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables Sendra
+otherwise respects by default (matching curl and most other HTTP tooling) are
+not consulted once an explicit proxy is configured. No `proxy:` key and no
 `--proxy` is the plain "follow the environment" default.
+
+## Client certificates
 
 **`client_cert: {cert, key}` presents a client certificate for mutual
 TLS**, the case where the *server* wants proof of who the *client* is, not
@@ -72,6 +80,8 @@ certificate gets checked. Nothing stops the two from applying to the same
 run: a self-signed internal endpoint that also demands a client
 certificate needs both.
 
+## Cookie jar
+
 **`cookie_jar: true` stores cookies received via `Set-Cookie` and sends them
 back automatically on later requests to the same host.** It exists for
 login-flow-style APIs that rely on a session cookie rather than a bearer
@@ -98,6 +108,8 @@ underneath redirect-following, so a cookie set on any hop, not just the
 final response, is captured and resent. For a login flow that redirects
 through an intermediate hop before setting its session cookie, `cookie_jar`
 is the one of the two that actually works.
+
+## Config file locations and precedence
 
 **Finding the project config.** Sendra walks up from the directory you ran it
 in, looking for `.sendra/config.yaml`, the same way git looks for `.git`. So a

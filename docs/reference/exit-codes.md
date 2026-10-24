@@ -1,5 +1,7 @@
 # Exit codes
 
+## Exit code table
+
 One table for the whole binary, not one per subcommand: `run` and `test` answer
 different questions, but they answer them to the same shell, and a number that
 means one thing under one command and something else under the other is a trap
@@ -12,6 +14,8 @@ for anyone writing `case $? in` around either.
 | `2`  |   ·   |   ·    | Bad command-line usage (from clap).                                 |
 | `3`  |   ·   |        | `run` only: every request got a response, at least one was 4xx/5xx. |
 | `4`  |       |   ·    | `test` only: every request got a response, at least one failed a check. |
+
+## What each code means
 
 - `0`: for `run`, every request was sent and no response status was an error
   (1xx, 2xx, 3xx). For `test`, every request got a response and every assertion
