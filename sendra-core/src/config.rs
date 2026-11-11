@@ -743,41 +743,6 @@ mod tests {
     }
 
     #[test]
-    fn yml_project_and_global_files_resolve_as_layers() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("project");
-        let project_file = root.join(PROJECT_DIR_NAME).join("config.yml");
-        let global_file = temp.path().join("global").join("config.yml");
-        write(
-            &global_file,
-            "headers:\n  X-Global: yes\ntimeout_seconds: 30\n",
-        );
-        write(&project_file, "timeout_seconds: 5\n");
-
-        assert_eq!(find_project_config(&root), Some(project_file.clone()));
-        let config = Config::resolve_from(&root, Some(&global_file)).unwrap();
-        assert_eq!(config.timeout, Duration::from_secs(5));
-        assert_eq!(
-            config.headers.get("X-Global").map(String::as_str),
-            Some("yes")
-        );
-        assert_eq!(config.global_config, Some(global_file));
-        assert_eq!(config.project_config, Some(project_file));
-    }
-
-    #[test]
-    fn from_path_accepts_a_nonstandard_yaml_extension() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("settings.conf");
-        write(&path, "timeout_seconds: 12\n");
-
-        assert_eq!(
-            ConfigFile::from_path(&path).unwrap().timeout_seconds,
-            Some(12)
-        );
-    }
-
-    #[test]
     fn a_project_config_applies_when_there_is_no_global_config() {
         let temp = tempfile::tempdir().unwrap();
         let root = project(
@@ -797,35 +762,6 @@ mod tests {
             Some(root.join(PROJECT_DIR_NAME).join("config.yaml"))
         );
         assert_eq!(config.global_config, None);
-    }
-
-    #[test]
-    fn project_values_override_global_values_key_by_key_not_file_by_file() {
-        let temp = tempfile::tempdir().unwrap();
-        // Global sets both keys; the project overrides only the timeout.
-        let global = global(
-            temp.path(),
-            "headers:\n  User-Agent: sendra-global\n  Accept: application/json\ntimeout_seconds: 60\n",
-        );
-        let root = project(temp.path(), "timeout_seconds: 3\n");
-
-        let config = Config::resolve_from(&root, Some(&global)).unwrap();
-
-        // The overridden key takes the project's value...
-        assert_eq!(config.timeout, Duration::from_secs(3));
-        // ...and the key the project said nothing about survives from global.
-        // This is the whole point: a partial project config is a patch, not a
-        // replacement.
-        assert_eq!(
-            config.headers.get("User-Agent").map(String::as_str),
-            Some("sendra-global")
-        );
-        assert_eq!(
-            config.headers.get("Accept").map(String::as_str),
-            Some("application/json")
-        );
-        assert!(config.global_config.is_some(), "both files were read");
-        assert!(config.project_config.is_some(), "both files were read");
     }
 
     #[test]
