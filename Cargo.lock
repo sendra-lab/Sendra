@@ -551,6 +551,8 @@ dependencies = [
 [[package]]
 name = "dotcfg"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5053958a1ab0a05d7da2dbfd8745cbe6eb10db1da0f6c39fc7f71ccf32e98afb"
 dependencies = [
  "etcetera",
  "home",
