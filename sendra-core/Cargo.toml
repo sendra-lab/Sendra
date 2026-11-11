@@ -32,11 +32,9 @@ thiserror = { workspace = true }
 # `auth.basic` base64-encodes `user:pass` into the `Authorization` header —
 # see the note on `Request::resolve_auth`.
 base64 = { workspace = true }
-# Locating the global config directory per platform. `dirs`, not `directories`:
-# see the note on `config::global_config_path`.
-dirs = { workspace = true }
-# Project config discovery walks up via `dotcfg` — see
-# `config::find_project_config`.
+# Project config discovery walks up via `dotcfg`, and the global config path
+# uses its native strategy — see `config::find_project_config` and
+# `config::global_config_path`.
 dotcfg = { workspace = true }
 # The `pre_request`/`post_request` scripting engine. Rust-native, so scripts
 # work with no runtime to install alongside sendra, and sandboxed by
