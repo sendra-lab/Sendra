@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use sendra_core::config::{find_project_config, global_config_path};
+use sendra_core::config::global_config_path;
 use sendra_core::environment::{find_environment, DEFAULT_ENVIRONMENT_NAME};
 use sendra_core::script::{run_post_request, run_pre_request, Scripts};
 use sendra_core::{
@@ -37,15 +37,6 @@ struct Prepared {
     oauth_cache: OAuthTokenCache,
     environment: Environment,
     document: Document,
-    /// The project config file this run actually used, or `None` — for
-    /// `-v`/`--verbose` alone. Recomputed independently of `config.sources`
-    /// (which does not distinguish project from global) via the same
-    /// [`find_project_config`] call [`Config::resolve_from`] itself makes,
-    /// against the same `start_dir`.
-    project_config: Option<PathBuf>,
-    /// The global config file this run actually used, or `None` — for
-    /// `-v`/`--verbose` alone. See [`project_config`](Self::project_config).
-    global_config: Option<PathBuf>,
 }
 
 /// Resolve the config, build the client, then resolve the environment and the
@@ -139,18 +130,11 @@ fn prepare(
         }
     };
 
-    // Recomputed independently of `Config::resolve_from`'s own internal
-    // search — see `Prepared::project_config` — rather than threading
-    // provenance out of core: `find_project_config`/`global_config_path` are
-    // already `pub`, and a second, cheap call here keeps `Config` itself
-    // free of a field that only `-v` ever reads.
-    let project_config = find_project_config(&start_dir);
-    let global_config = global_config_path().filter(|path| path.is_file());
-
     // Resolved once for the whole run: every request in a collection is sent
     // under the same defaults, and a broken config file stops the run instead
-    // of failing partway through it.
-    let mut config = match Config::resolve_from(&start_dir, global_config.as_deref()) {
+    // of failing partway through it. The resolved config carries the paths it
+    // actually used, so `-v` does not have to search for them again.
+    let mut config = match Config::resolve_from(&start_dir, global_config_path().as_deref()) {
         Ok(config) => config,
         Err(err) => {
             print_error(&err);
@@ -238,8 +222,6 @@ fn prepare(
         oauth_cache: OAuthTokenCache::new(),
         environment,
         document,
-        project_config,
-        global_config,
     })
 }
 
@@ -318,10 +300,10 @@ fn prepare(
 ///
 /// `verbose` is `-v`/`--verbose`: `main` has already refused it together
 /// with `quiet` — see `reject_verbose_with_quiet` — so the two are never
-/// both true here. When true, [`prepare`]'s provenance
-/// (`project_config`/`global_config`/`environment.source`) is printed once,
-/// via `output::print_provenance`, before the sending loop starts —
-/// stderr-only and unaffected by `json`, per its own doc comment in
+/// both true here. When true, the resolved provenance
+/// (`config.project_config`/`config.global_config`/`environment.source`) is
+/// printed once, via `output::print_provenance`, before the sending loop
+/// starts — stderr-only and unaffected by `json`, per its own doc comment in
 /// `cli.rs`.
 ///
 /// `insecure` and `proxy` are `--insecure` and `--proxy`, folded into
@@ -377,8 +359,6 @@ pub(crate) async fn run(
         oauth_cache,
         environment,
         document,
-        project_config,
-        global_config,
     } = match prepare(
         path,
         environment_name,
@@ -396,8 +376,8 @@ pub(crate) async fn run(
 
     if verbose {
         print_provenance(
-            project_config.as_deref(),
-            global_config.as_deref(),
+            config.project_config.as_deref(),
+            config.global_config.as_deref(),
             environment_name.unwrap_or(DEFAULT_ENVIRONMENT_NAME),
             environment.source.as_deref(),
             vars,
@@ -560,8 +540,6 @@ pub(crate) async fn test(
         oauth_cache,
         environment,
         document,
-        project_config,
-        global_config,
     } = match prepare(
         path,
         environment_name,
@@ -579,8 +557,8 @@ pub(crate) async fn test(
 
     if verbose {
         print_provenance(
-            project_config.as_deref(),
-            global_config.as_deref(),
+            config.project_config.as_deref(),
+            config.global_config.as_deref(),
             environment_name.unwrap_or(DEFAULT_ENVIRONMENT_NAME),
             environment.source.as_deref(),
             vars,

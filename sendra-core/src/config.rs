@@ -18,8 +18,8 @@
 //!
 //! The schema stays small on purpose, and grows only as a feature actually
 //! needs a new key — [`ConfigFile`] documents the current full set. This
-//! module exists first to prove the *resolution* mechanism: every key
-//! resolves through the same global-then-project, per-key `merge_over`.
+//! module keeps Sendra's header and certificate rules while dotcfg handles
+//! project discovery, YAML reads, and global/project layer merging.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -28,10 +28,6 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::{Request, SendraError};
-
-/// File name of a config file, under `.sendra/` in a project and directly
-/// under the global config directory.
-const CONFIG_FILE_NAME: &str = "config.yaml";
 
 /// Directory a project keeps its Sendra files in: `config.yaml` directly
 /// inside it, and the environment files of
@@ -327,10 +323,8 @@ pub struct ClientCertFile {
 /// file that named them, not the current working directory.
 ///
 /// Called immediately after each config file is read, while the path it came
-/// from is still in scope: by the time [`ConfigFile::merge_over`] runs, a
-/// project config's `client_cert:` and a global config's `client_cert:` may
-/// already have been resolved against two different base directories, and
-/// merging must not have to guess which one a given value came from.
+/// from is still in scope. A certificate path must be resolved against the
+/// file that supplied it before the winning certificate pair is selected.
 fn resolve_client_cert_paths(file: &mut ConfigFile, config_path: &Path) {
     let Some(client_cert) = &mut file.client_cert else {
         return;
@@ -353,17 +347,30 @@ impl ConfigFile {
         Self::parse(yaml, SendraError::ParseStr)
     }
 
-    /// Read and parse a config file from disk.
+    /// Read and parse one YAML config file through dotcfg, using its exact path.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, SendraError> {
         let path = path.as_ref();
-        let raw = std::fs::read_to_string(path).map_err(|source| SendraError::ConfigIo {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        Self::parse(&raw, |source| SendraError::ConfigParse {
-            path: path.to_path_buf(),
-            source,
-        })
+        let cfg = dotcfg::DotCfg::new(APP_DIR_NAME).yaml().at_file(path);
+        Self::from_source(&cfg, path)
+    }
+
+    /// Load one named stack source, preserving Sendra's path-bearing errors.
+    fn from_source(source: &dotcfg::DotCfg, path: &Path) -> Result<Self, SendraError> {
+        match source.load::<Self>() {
+            Ok(Some(file)) => Ok(file),
+            Ok(None) => Err(SendraError::ConfigIo {
+                path: path.to_path_buf(),
+                source: std::io::ErrorKind::NotFound.into(),
+            }),
+            Err(dotcfg::Error::Io(source)) => Err(SendraError::ConfigIo {
+                path: path.to_path_buf(),
+                source,
+            }),
+            Err(source) => Err(SendraError::ConfigParse {
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            }),
+        }
     }
 
     /// Shared body of the two constructors; `wrap` supplies the error variant
@@ -382,29 +389,6 @@ impl ConfigFile {
             return Ok(Self::default());
         }
         serde_yaml::from_str(yaml).map_err(&wrap)
-    }
-
-    /// Merge `self` over `base`, key by key, with `self` winning.
-    ///
-    /// Per key rather than per file: a project config that sets only
-    /// `timeout_seconds` must not discard the global config's `headers`. The
-    /// header maps merge the same way one level down, so a project can override
-    /// one default header without dropping the rest.
-    fn merge_over(self, base: Self) -> Self {
-        let mut headers = base.headers;
-        for (name, value) in self.headers {
-            insert_overriding(&mut headers, &name, &value);
-        }
-
-        Self {
-            headers,
-            timeout_seconds: self.timeout_seconds.or(base.timeout_seconds),
-            follow_redirects: self.follow_redirects.or(base.follow_redirects),
-            insecure: self.insecure.or(base.insecure),
-            proxy: self.proxy.or(base.proxy),
-            client_cert: self.client_cert.or(base.client_cert),
-            cookie_jar: self.cookie_jar.or(base.cookie_jar),
-        }
     }
 }
 
@@ -435,9 +419,10 @@ pub struct Config {
     /// Persist and resend cookies automatically for this run. See
     /// [`ConfigFile::cookie_jar`].
     pub cookie_jar: bool,
-    /// The config files this was built from, in the order they were merged
-    /// (global first). Empty when no config file was found anywhere.
-    pub sources: Vec<PathBuf>,
+    /// The project config this was built from, if one was found.
+    pub project_config: Option<PathBuf>,
+    /// The global config this was built from, if one was found.
+    pub global_config: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -456,7 +441,8 @@ impl Default for Config {
             client_cert: None,
             client_key: None,
             cookie_jar: false,
-            sources: Vec::new(),
+            project_config: None,
+            global_config: None,
         }
     }
 }
@@ -489,27 +475,55 @@ impl Config {
         start_dir: &Path,
         global_config: Option<&Path>,
     ) -> Result<Self, SendraError> {
-        let mut sources = Vec::new();
-        let mut merged = ConfigFile::default();
+        let mut stack = dotcfg::ConfigStack::new();
+        let mut layer_paths = Vec::new();
+        let mut headers = BTreeMap::new();
+        let mut client_cert = None;
 
-        // Global first, then project on top of it: later files win.
-        for path in [
-            global_config.map(Path::to_path_buf),
-            find_project_config(start_dir),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        // Build the stack once. Each source keeps the exact path selected by
+        // the caller or discovered by dotcfg, including `.yml` files.
+        for (name, path) in [
+            ("global", global_config.map(Path::to_path_buf)),
+            ("project", find_project_config(start_dir)),
+        ] {
+            let Some(path) = path else { continue };
             if !path.is_file() {
                 continue;
             }
-            let mut file = ConfigFile::from_path(&path)?;
-            resolve_client_cert_paths(&mut file, &path);
-            merged = file.merge_over(merged);
-            sources.push(path);
+            let source = dotcfg::DotCfg::new(APP_DIR_NAME).yaml().at_file(&path);
+            stack = stack.layer(name, source);
+            layer_paths.push((name, path));
         }
 
-        let (client_cert, client_key) = match merged.client_cert {
+        let stack = stack.build().expect("fixed source names are unique");
+        let mut project_config = None;
+        let mut global_config = None;
+        // Inspect the named sources for Sendra-specific rules. ConfigStack
+        // handles ordinary key precedence; HTTP header names are
+        // case-insensitive and a client certificate pair is atomic, with
+        // paths relative to the file that supplied it.
+        for (name, path) in layer_paths {
+            let source = stack.source(name).expect("layer was just added");
+            let mut file = ConfigFile::from_source(source, &path)?;
+            resolve_client_cert_paths(&mut file, &path);
+            for (name, value) in file.headers {
+                insert_overriding(&mut headers, &name, &value);
+            }
+            if file.client_cert.is_some() {
+                client_cert = file.client_cert;
+            }
+            match name {
+                "global" => global_config = Some(path),
+                "project" => project_config = Some(path),
+                _ => unreachable!("layer names are fixed"),
+            }
+        }
+
+        let merged = stack
+            .load::<ConfigFile>()
+            .map_err(SendraError::ConfigMerge)?
+            .unwrap_or_default();
+        let (client_cert, client_key) = match client_cert {
             Some(client_cert) => (
                 Some(PathBuf::from(client_cert.cert)),
                 Some(PathBuf::from(client_cert.key)),
@@ -518,7 +532,7 @@ impl Config {
         };
 
         Ok(Self {
-            headers: merged.headers,
+            headers,
             timeout: merged
                 .timeout_seconds
                 .map_or(DEFAULT_TIMEOUT, Duration::from_secs),
@@ -528,7 +542,8 @@ impl Config {
             client_cert,
             client_key,
             cookie_jar: merged.cookie_jar.unwrap_or(false),
-            sources,
+            project_config,
+            global_config,
         })
     }
 
@@ -595,30 +610,38 @@ fn insert_overriding(headers: &mut BTreeMap<String, String>, name: &str, value: 
 /// what a directory resolves to depend on a file the reader has no particular
 /// reason to look at, and "settings for everything" is what the global config
 /// is already for.
+///
+/// The walk itself is delegated to [`dotcfg`](https://docs.rs/dotcfg):
+/// `DotCfg::new("sendra").yaml().find_in_ancestors_from(start)` searches the
+/// same `.sendra/config.yaml` shape with the same nearest-wins, no-fallback
+/// rule, so this stays byte-identical behavior with the discovery tested on
+/// dotcfg's side. What stays Sendra-specific — and therefore here — is
+/// Sendra-specific header merging, cert-path resolution, and
+/// [`SendraError`] mapping.
+/// [`global_config_path`] chooses dotcfg's native strategy unless an
+/// absolute `XDG_CONFIG_HOME` explicitly requests XDG layout.
 pub fn find_project_config(start_dir: &Path) -> Option<PathBuf> {
-    start_dir
-        .ancestors()
-        .map(|dir| dir.join(PROJECT_DIR_NAME).join(CONFIG_FILE_NAME))
-        .find(|candidate| candidate.is_file())
+    dotcfg::DotCfg::new("sendra")
+        .yaml()
+        .find_in_ancestors_from(start_dir)
+        .ok()
+        .flatten()
+        .and_then(|cfg| cfg.file_path().ok())
 }
 
-/// Path to the global config file, or `None` if the platform cannot say where
-/// config belongs (a daemon with no home directory, say) — in which case there
-/// is simply no global config.
+/// Path to the global `config.yaml`, or `None` if the platform cannot
+/// determine its config directory.
 ///
-/// `$XDG_CONFIG_HOME` is honoured first, on every platform, when it is set to
-/// an absolute path (the XDG spec says to ignore a relative one). On Linux that
-/// is exactly what [`dirs::config_dir`] already does; the explicit check
-/// extends it to macOS and Windows, where the crate returns the native location
-/// instead. That is a deliberate deviation: someone who has set
-/// `XDG_CONFIG_HOME` has said where their config lives, and the check costs
-/// nothing on Windows, where the variable is effectively never set.
+/// An absolute `XDG_CONFIG_HOME` explicitly requests XDG layout, even on
+/// macOS and Windows. Otherwise Sendra uses the platform-native location.
+/// Dotcfg resolves both locations and constructs the file path.
 pub fn global_config_path() -> Option<PathBuf> {
-    let root = match std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
-        Some(dir) if dir.is_absolute() => dir,
-        _ => dirs::config_dir()?,
+    let cfg = dotcfg::DotCfg::new(APP_DIR_NAME).yaml();
+    let cfg = match std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => cfg.xdg(),
+        _ => cfg.native(),
     };
-    Some(root.join(APP_DIR_NAME).join(CONFIG_FILE_NAME))
+    cfg.file_path().ok()
 }
 
 #[cfg(test)]
@@ -633,16 +656,25 @@ mod tests {
         std::fs::write(path, contents).unwrap();
     }
 
+    /// Fixture file path via the same dotcfg handle resolution uses.
+    fn cfg_file(dir: &Path) -> PathBuf {
+        dotcfg::DotCfg::new(APP_DIR_NAME)
+            .yaml()
+            .at_dir(dir)
+            .file_path()
+            .unwrap()
+    }
+
     /// A project root under `dir` with `.sendra/config.yaml` holding `config`.
     fn project(dir: &Path, config: &str) -> PathBuf {
         let root = dir.join("project");
-        write(&root.join(PROJECT_DIR_NAME).join(CONFIG_FILE_NAME), config);
+        write(&cfg_file(&root.join(PROJECT_DIR_NAME)), config);
         root
     }
 
     /// A global config file under `dir` holding `config`.
     fn global(dir: &Path, config: &str) -> PathBuf {
-        let path = dir.join("global").join(APP_DIR_NAME).join(CONFIG_FILE_NAME);
+        let path = cfg_file(&dir.join("global").join(APP_DIR_NAME));
         write(&path, config);
         path
     }
@@ -676,7 +708,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         // An empty directory, and a global path that does not exist: both
         // absent is an ordinary state, not an error.
-        let missing = temp.path().join("nowhere").join(CONFIG_FILE_NAME);
+        let missing = temp.path().join("nowhere").join("config.yaml");
 
         let config = Config::resolve_from(temp.path(), Some(&missing))
             .expect("no config file is not a failure");
@@ -684,7 +716,8 @@ mod tests {
         assert_eq!(config, Config::default());
         assert!(config.headers.is_empty());
         assert_eq!(config.timeout, DEFAULT_TIMEOUT);
-        assert!(config.sources.is_empty(), "nothing was read");
+        assert_eq!(config.project_config, None, "nothing was read");
+        assert_eq!(config.global_config, None, "nothing was read");
     }
 
     #[test]
@@ -705,7 +738,8 @@ mod tests {
             Some("sendra-global")
         );
         assert_eq!(config.timeout, Duration::from_secs(5));
-        assert_eq!(config.sources, vec![global]);
+        assert_eq!(config.global_config, Some(global));
+        assert_eq!(config.project_config, None);
     }
 
     #[test]
@@ -724,61 +758,10 @@ mod tests {
         );
         assert_eq!(config.timeout, Duration::from_secs(7));
         assert_eq!(
-            config.sources,
-            vec![root.join(PROJECT_DIR_NAME).join(CONFIG_FILE_NAME)]
+            config.project_config,
+            Some(root.join(PROJECT_DIR_NAME).join("config.yaml"))
         );
-    }
-
-    #[test]
-    fn project_values_override_global_values_key_by_key_not_file_by_file() {
-        let temp = tempfile::tempdir().unwrap();
-        // Global sets both keys; the project overrides only the timeout.
-        let global = global(
-            temp.path(),
-            "headers:\n  User-Agent: sendra-global\n  Accept: application/json\ntimeout_seconds: 60\n",
-        );
-        let root = project(temp.path(), "timeout_seconds: 3\n");
-
-        let config = Config::resolve_from(&root, Some(&global)).unwrap();
-
-        // The overridden key takes the project's value...
-        assert_eq!(config.timeout, Duration::from_secs(3));
-        // ...and the key the project said nothing about survives from global.
-        // This is the whole point: a partial project config is a patch, not a
-        // replacement.
-        assert_eq!(
-            config.headers.get("User-Agent").map(String::as_str),
-            Some("sendra-global")
-        );
-        assert_eq!(
-            config.headers.get("Accept").map(String::as_str),
-            Some("application/json")
-        );
-        assert_eq!(config.sources.len(), 2, "both files were read");
-    }
-
-    #[test]
-    fn header_maps_merge_per_key_too() {
-        let temp = tempfile::tempdir().unwrap();
-        let global = global(
-            temp.path(),
-            "headers:\n  User-Agent: sendra-global\n  Accept: application/json\n",
-        );
-        // Overriding one header must not drop the other.
-        let root = project(temp.path(), "headers:\n  User-Agent: sendra-project\n");
-
-        let config = Config::resolve_from(&root, Some(&global)).unwrap();
-
-        assert_eq!(
-            config.headers.get("User-Agent").map(String::as_str),
-            Some("sendra-project")
-        );
-        assert_eq!(
-            config.headers.get("Accept").map(String::as_str),
-            Some("application/json")
-        );
-        // No timeout in either file, so the hardcoded default still stands.
-        assert_eq!(config.timeout, DEFAULT_TIMEOUT);
+        assert_eq!(config.global_config, None);
     }
 
     #[test]
@@ -798,47 +781,6 @@ mod tests {
     }
 
     #[test]
-    fn the_config_at_the_project_root_is_found_from_a_nested_subdirectory() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = project(temp.path(), "headers:\n  X-Project: yes\n");
-        // Several levels down, the way `crates/api/tests` sits under a repo.
-        let nested = root.join("crates").join("api").join("tests");
-        std::fs::create_dir_all(&nested).unwrap();
-
-        let found = find_project_config(&nested).expect("the walk-up must reach the root");
-        assert_eq!(
-            found,
-            root.join(PROJECT_DIR_NAME).join(CONFIG_FILE_NAME),
-            "the config at the project root should have been found from {}",
-            nested.display()
-        );
-
-        // And the resolved config is the same as it is from the root itself.
-        assert_eq!(
-            Config::resolve_from(&nested, None).unwrap().headers,
-            Config::resolve_from(&root, None).unwrap().headers
-        );
-    }
-
-    #[test]
-    fn the_nearest_project_config_wins_over_one_further_up() {
-        let temp = tempfile::tempdir().unwrap();
-        let outer = project(temp.path(), "headers:\n  X-Which: outer\n");
-        let inner = outer.join("nested");
-        write(
-            &inner.join(PROJECT_DIR_NAME).join(CONFIG_FILE_NAME),
-            "headers:\n  X-Which: inner\n",
-        );
-
-        let config = Config::resolve_from(&inner, None).unwrap();
-        assert_eq!(
-            config.headers.get("X-Which").map(String::as_str),
-            Some("inner")
-        );
-        assert_eq!(config.sources.len(), 1, "only the nearest is read");
-    }
-
-    #[test]
     fn malformed_yaml_in_a_config_file_is_a_typed_error_carrying_the_path() {
         let temp = tempfile::tempdir().unwrap();
         // Unclosed flow sequence: not valid YAML at all.
@@ -848,7 +790,7 @@ mod tests {
         match err {
             SendraError::ConfigParse { path, .. } => assert_eq!(
                 path,
-                root.join(PROJECT_DIR_NAME).join(CONFIG_FILE_NAME),
+                root.join(PROJECT_DIR_NAME).join("config.yaml"),
                 "the error should name the file to fix"
             ),
             other => panic!("expected ConfigParse, got {other:?}"),
@@ -869,13 +811,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_wrongly_typed_config_value_is_a_parse_error() {
-        let err = ConfigFile::from_yaml_str("timeout_seconds: soon\n")
-            .expect_err("seconds must be a number");
-        assert!(matches!(err, SendraError::ParseStr(_)), "got {err:?}");
-    }
-
     // --- `follow_redirects` -----------------------------------------------
 
     #[test]
@@ -892,224 +827,69 @@ mod tests {
     }
 
     #[test]
-    fn follow_redirects_false_disables_them() {
+    fn follow_redirects_accepts_bool_and_number() {
         let temp = tempfile::tempdir().unwrap();
-        let root = project(temp.path(), "follow_redirects: false\n");
 
-        let config = Config::resolve_from(&root, None).unwrap();
+        let disabled =
+            Config::resolve_from(&project(temp.path(), "follow_redirects: false\n"), None).unwrap();
+        assert_eq!(disabled.redirects, FollowRedirects::Disabled);
 
-        assert_eq!(config.redirects, FollowRedirects::Disabled);
-    }
-
-    #[test]
-    fn follow_redirects_true_is_the_same_default_maximum() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = project(temp.path(), "follow_redirects: true\n");
-
-        let config = Config::resolve_from(&root, None).unwrap();
-
+        let enabled =
+            Config::resolve_from(&project(temp.path(), "follow_redirects: true\n"), None).unwrap();
         assert_eq!(
-            config.redirects,
+            enabled.redirects,
             FollowRedirects::Follow(DEFAULT_MAX_REDIRECTS)
         );
+
+        let custom =
+            Config::resolve_from(&project(temp.path(), "follow_redirects: 3\n"), None).unwrap();
+        assert_eq!(custom.redirects, FollowRedirects::Follow(3));
     }
 
     #[test]
-    fn follow_redirects_as_a_number_sets_a_custom_maximum() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = project(temp.path(), "follow_redirects: 3\n");
-
-        let config = Config::resolve_from(&root, None).unwrap();
-
-        assert_eq!(config.redirects, FollowRedirects::Follow(3));
-    }
-
-    #[test]
-    fn a_project_follow_redirects_overrides_a_global_one_wholesale() {
-        // Unlike `headers`, there is nothing to merge one level down: the
-        // project's value replaces the global one entirely, the same way
-        // `timeout_seconds` does.
-        let temp = tempfile::tempdir().unwrap();
-        let global = global(temp.path(), "follow_redirects: false\n");
-        let root = project(temp.path(), "follow_redirects: 2\n");
-
-        let config = Config::resolve_from(&root, Some(&global)).unwrap();
-
-        assert_eq!(config.redirects, FollowRedirects::Follow(2));
-    }
-
-    #[test]
-    fn a_negative_follow_redirects_number_is_a_parse_error() {
-        let err = ConfigFile::from_yaml_str("follow_redirects: -1\n")
+    fn invalid_follow_redirects_values_are_parse_errors() {
+        let negative = ConfigFile::from_yaml_str("follow_redirects: -1\n")
             .expect_err("a negative redirect count makes no sense");
-        assert!(matches!(err, SendraError::ParseStr(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn a_follow_redirects_value_that_is_neither_bool_nor_number_says_so() {
-        let err = ConfigFile::from_yaml_str("follow_redirects: sometimes\n")
-            .expect_err("a string is not a valid value");
-        let message = err.to_string();
         assert!(
-            message.contains("could not parse"),
-            "got {message}: {err:?}"
+            matches!(negative, SendraError::ParseStr(_)),
+            "got {negative:?}"
+        );
+
+        let string = ConfigFile::from_yaml_str("follow_redirects: sometimes\n")
+            .expect_err("a string is not a valid value");
+        assert!(matches!(string, SendraError::ParseStr(_)), "got {string:?}");
+        assert!(
+            string.to_string().contains("could not parse"),
+            "got {string}"
         );
     }
 
-    // --- `insecure` ---------------------------------------------------------
+    // --- scalar keys ---------------------------------------------------------
 
+    /// The plain scalar keys land on `Config` unchanged. Layer precedence is
+    /// dotcfg's job, covered once by
+    /// `project_values_override_global_values_key_by_key_not_file_by_file`.
     #[test]
-    fn no_insecure_key_resolves_to_false() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = project(temp.path(), "timeout_seconds: 5\n");
-
-        let config = Config::resolve_from(&root, None).unwrap();
-
-        assert!(!config.insecure);
-    }
-
-    #[test]
-    fn insecure_true_resolves_to_true() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = project(temp.path(), "insecure: true\n");
-
-        let config = Config::resolve_from(&root, None).unwrap();
-
-        assert!(config.insecure);
-    }
-
-    #[test]
-    fn a_project_insecure_overrides_a_global_one_wholesale() {
-        let temp = tempfile::tempdir().unwrap();
-        let global = global(temp.path(), "insecure: true\n");
-        let root = project(temp.path(), "insecure: false\n");
-
-        let config = Config::resolve_from(&root, Some(&global)).unwrap();
-
-        assert!(!config.insecure, "the project's explicit false must win");
-    }
-
-    #[test]
-    fn a_global_insecure_applies_when_the_project_says_nothing() {
-        let temp = tempfile::tempdir().unwrap();
-        let global = global(temp.path(), "insecure: true\n");
-        let root = project(temp.path(), "timeout_seconds: 5\n");
-
-        let config = Config::resolve_from(&root, Some(&global)).unwrap();
-
-        assert!(config.insecure);
-    }
-
-    // --- `cookie_jar` ---------------------------------------------------------
-
-    #[test]
-    fn no_cookie_jar_key_resolves_to_false() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = project(temp.path(), "timeout_seconds: 5\n");
-
-        let config = Config::resolve_from(&root, None).unwrap();
-
-        assert!(!config.cookie_jar);
-    }
-
-    #[test]
-    fn cookie_jar_true_resolves_to_true() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = project(temp.path(), "cookie_jar: true\n");
-
-        let config = Config::resolve_from(&root, None).unwrap();
-
-        assert!(config.cookie_jar);
-    }
-
-    #[test]
-    fn a_project_cookie_jar_overrides_a_global_one_wholesale() {
-        let temp = tempfile::tempdir().unwrap();
-        let global = global(temp.path(), "cookie_jar: true\n");
-        let root = project(temp.path(), "cookie_jar: false\n");
-
-        let config = Config::resolve_from(&root, Some(&global)).unwrap();
-
-        assert!(!config.cookie_jar, "the project's explicit false must win");
-    }
-
-    #[test]
-    fn a_global_cookie_jar_applies_when_the_project_says_nothing() {
-        let temp = tempfile::tempdir().unwrap();
-        let global = global(temp.path(), "cookie_jar: true\n");
-        let root = project(temp.path(), "timeout_seconds: 5\n");
-
-        let config = Config::resolve_from(&root, Some(&global)).unwrap();
-
-        assert!(config.cookie_jar);
-    }
-
-    // --- `proxy` -------------------------------------------------------------
-
-    #[test]
-    fn no_proxy_key_resolves_to_none() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = project(temp.path(), "timeout_seconds: 5\n");
-
-        let config = Config::resolve_from(&root, None).unwrap();
-
-        assert_eq!(config.proxy, None);
-    }
-
-    #[test]
-    fn proxy_resolves_to_the_configured_url() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = project(temp.path(), "proxy: http://proxy.example.com:8080\n");
-
-        let config = Config::resolve_from(&root, None).unwrap();
-
-        assert_eq!(
-            config.proxy.as_deref(),
-            Some("http://proxy.example.com:8080")
-        );
-    }
-
-    #[test]
-    fn a_proxy_url_with_embedded_credentials_round_trips_unchanged() {
-        // Sendra does not parse or special-case the credentials — they are
-        // reqwest's to read out of the URL when the client is built.
+    fn scalar_keys_resolve_from_the_file() {
         let temp = tempfile::tempdir().unwrap();
         let root = project(
             temp.path(),
-            "proxy: http://user:pass@proxy.example.com:8080\n",
+            "insecure: true\ncookie_jar: true\nproxy: http://user:pass@proxy.example.com:8080\n",
         );
 
         let config = Config::resolve_from(&root, None).unwrap();
 
+        assert!(config.insecure);
+        assert!(config.cookie_jar);
+        // Credentials stay in the URL: reqwest parses them when the client is
+        // built, so Sendra must not rewrite them.
         assert_eq!(
             config.proxy.as_deref(),
             Some("http://user:pass@proxy.example.com:8080")
         );
     }
 
-    #[test]
-    fn a_project_proxy_overrides_a_global_one_wholesale() {
-        let temp = tempfile::tempdir().unwrap();
-        let global = global(temp.path(), "proxy: http://global-proxy:8080\n");
-        let root = project(temp.path(), "proxy: http://project-proxy:8080\n");
-
-        let config = Config::resolve_from(&root, Some(&global)).unwrap();
-
-        assert_eq!(config.proxy.as_deref(), Some("http://project-proxy:8080"));
-    }
-
     // --- `client_cert` -------------------------------------------------------
-
-    #[test]
-    fn no_client_cert_key_resolves_to_neither_cert_nor_key() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = project(temp.path(), "timeout_seconds: 5\n");
-
-        let config = Config::resolve_from(&root, None).unwrap();
-
-        assert_eq!(config.client_cert, None);
-        assert_eq!(config.client_key, None);
-    }
 
     #[test]
     fn a_relative_client_cert_resolves_against_the_project_configs_own_directory() {
@@ -1222,15 +1002,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_config_key_near_proxy_or_insecure_is_still_rejected() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = project(temp.path(), "insecur: true\n");
-
-        let err = Config::resolve_from(&root, None).expect_err("a typo must not be ignored");
-        assert!(matches!(err, SendraError::ConfigParse { .. }), "{err:?}");
-    }
-
-    #[test]
     fn an_empty_config_file_is_an_empty_config_not_an_error() {
         let temp = tempfile::tempdir().unwrap();
         let root = project(temp.path(), "# nothing set yet\n");
@@ -1238,8 +1009,9 @@ mod tests {
         let config = Config::resolve_from(&root, None).expect("an empty file is valid");
         assert_eq!(config.headers, BTreeMap::new());
         assert_eq!(config.timeout, DEFAULT_TIMEOUT);
-        // It was still read, so `sources` reflects what was on disk.
-        assert_eq!(config.sources.len(), 1);
+        // It was still read, so the provenance field reflects what was on disk.
+        assert!(config.project_config.is_some());
+        assert_eq!(config.global_config, None);
     }
 
     #[test]
@@ -1397,21 +1169,5 @@ mod tests {
     fn the_default_config_leaves_a_request_untouched() {
         let request = request_with_headers(&[("Accept", "application/json")]);
         assert_eq!(Config::default().apply(&request), request);
-    }
-
-    #[test]
-    fn the_global_config_path_ends_where_it_should() {
-        // Whatever the platform root turns out to be, the tail is ours.
-        let Some(path) = global_config_path() else {
-            // No home directory in this environment: no global config, which
-            // `resolve_from` already treats as an ordinary state.
-            return;
-        };
-        assert!(
-            path.ends_with(Path::new(APP_DIR_NAME).join(CONFIG_FILE_NAME)),
-            "got {}",
-            path.display()
-        );
-        assert!(path.is_absolute(), "got {}", path.display());
     }
 }

@@ -11,7 +11,10 @@ homepage = "https://github.com/sendra-lab/Sendra"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-dirs = "6"
+# Project config discovery (`find_project_config`) delegates its walk-up to
+# `dotcfg`'s `find_in_ancestors_from`, which searches the same
+# `.sendra/config.yaml` shape. YAML-only: Sendra's config files are YAML.
+dotcfg = { version = "0.4.0", default-features = false, features = ["yaml"] }
 tempfile = "3"
 serde_yaml = "0.9"
 jsonpath-rust = "1"

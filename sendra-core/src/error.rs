@@ -190,8 +190,12 @@ pub enum SendraError {
     ConfigParse {
         path: PathBuf,
         #[source]
-        source: serde_yaml::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    /// Valid layers could not be combined into a configuration.
+    #[error("could not merge config layers")]
+    ConfigMerge(#[source] dotcfg::Error),
 
     /// The working directory could not be read, so the walk-up looking for a
     /// project config has nowhere to start.
